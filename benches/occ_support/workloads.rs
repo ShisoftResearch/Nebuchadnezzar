@@ -1195,7 +1195,7 @@ pub async fn run_blind_remove_batch(
             Box::pin(async move {
                 match fixture
                     .client
-                    .write_cell(counter_cell(fixture.schema.id, id, logical_index, 0))
+                    .write_cell(counter_cell(fixture.schema.vid, id, logical_index, 0))
                     .await
                 {
                     Ok(Ok(_)) => Ok(()),

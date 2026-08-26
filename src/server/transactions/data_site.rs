@@ -238,8 +238,7 @@ impl PinnedReadSet {
 /// doubt" from "everything in doubt was presumed abort".
 pub static TERMINATION_COMMITTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long an in-doubt transaction keeps its write heads while a
 /// participant stays silent, before this node gives up and presumes abort.
@@ -755,7 +754,9 @@ impl DataManager {
                     // the give-up is loud.
                     let waited = {
                         let mut since = self.in_doubt_since.lock();
-                        let first = since.entry(tid.clone()).or_insert_with(std::time::Instant::now);
+                        let first = since
+                            .entry(tid.clone())
+                            .or_insert_with(std::time::Instant::now);
                         first.elapsed()
                     };
                     if waited < grace {
@@ -813,11 +814,7 @@ impl DataManager {
     ///
     /// A `Committed` cannot be wrong: only `end` writes a decision record,
     /// and only a coordinator that decided commit sends `end`.
-    async fn ask_participants(
-        &self,
-        tid: &TxnId,
-        participants: &[u64],
-    ) -> (TxnOutcome, bool) {
+    async fn ask_participants(&self, tid: &TxnId, participants: &[u64]) -> (TxnOutcome, bool) {
         let Some(txn_manager) = self.database_runtime.txn_manager() else {
             return (TxnOutcome::Unknown, true);
         };
@@ -1059,7 +1056,9 @@ impl DataManager {
         // lives, defeating the point of pinning partial reads. The index guard
         // is released inside the call, before we take the transaction lock.
         let (addr, version) = self.chunks().cell_location_and_version(id).ok()?;
-        let chunk = self.chunks().locate_chunk_by_partition(id.locality() as u64);
+        let chunk = self
+            .chunks()
+            .locate_chunk_by_partition(id.locality() as u64);
         let chunk_idx = chunk.id;
         let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
 
@@ -1074,8 +1073,14 @@ impl DataManager {
         if let Some(existing) = txn.pinned_reads.get(id).copied() {
             return Some(existing.location);
         }
-        txn.pinned_reads
-            .insert(*id, PinnedRead { location: addr, version }, Some(guard));
+        txn.pinned_reads.insert(
+            *id,
+            PinnedRead {
+                location: addr,
+                version,
+            },
+            Some(guard),
+        );
         Some(addr)
     }
 
@@ -1327,7 +1332,9 @@ impl DataManager {
                             let cell_ref = shared_cell.to_owned().into_ref();
                             (addr, cell_ref)
                         };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.locality() as u64);
+                        let chunk = self
+                            .chunks()
+                            .locate_chunk_by_partition(cell_id.locality() as u64);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
@@ -1342,7 +1349,6 @@ impl DataManager {
                                 break;
                             }
                         };
-
 
                         match self
                             .chunks()
@@ -1395,7 +1401,9 @@ impl DataManager {
                             }
                             shared_cell.cell_guard().get_ptr()
                         };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.locality() as u64);
+                        let chunk = self
+                            .chunks()
+                            .locate_chunk_by_partition(cell_id.locality() as u64);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
@@ -1727,12 +1735,13 @@ impl DataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::transactions::test_hlc;
     use crate::ram::cell::OwnedCell;
     use crate::ram::schema::Schema;
+    use crate::ram::schema::SchemaVid;
     use crate::ram::segs::SEGMENT_SIZE;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{Id, OwnedMap, OwnedValue};
+    use crate::server::transactions::test_hlc;
     use crate::server::{NebServer, ServerOptions, Service as NebService};
     use bifrost::rpc::DEFAULT_CLIENT_POOL;
     use dovahkiin::types::Map as OwnedMapTrait;
@@ -1751,8 +1760,14 @@ mod tests {
             },
             None,
         );
-        assert_eq!(set.get(&Id::allocated(0, 0, 42)).map(|p| p.version), Some(7));
-        assert_eq!(set.get(&Id::allocated(0, 0, 42)).map(|p| p.location), Some(0x1000));
+        assert_eq!(
+            set.get(&Id::allocated(0, 0, 42)).map(|p| p.version),
+            Some(7)
+        );
+        assert_eq!(
+            set.get(&Id::allocated(0, 0, 42)).map(|p| p.location),
+            Some(0x1000)
+        );
         assert!(set.get(&Id::allocated(0, 0, 99)).is_none());
         assert!(!set.is_empty());
         set.drain();
@@ -1898,7 +1913,7 @@ mod tests {
         data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
         data.insert(&String::from("score"), OwnedValue::U64(score));
         data.insert(&String::from("name"), OwnedValue::String(name.to_string()));
-        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+        OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
     }
 
     // A cell whose stored length is well above the default 4096-byte read-pin
@@ -1910,7 +1925,7 @@ mod tests {
         data.insert(&String::from("score"), OwnedValue::U64(score));
         let payload = format!("{}-{}", marker, "x".repeat(8192));
         data.insert(&String::from("name"), OwnedValue::String(payload));
-        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+        OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
     }
 
     fn seed_cell_version(
@@ -1975,9 +1990,16 @@ mod tests {
         tid: &TxnId,
         ops: Vec<PrepareOp>,
     ) -> DMPrepareResult {
-        <DataManager as Service>::prepare(manager, coordinator_id, tid.clone(), tid.clone(), ops, vec![])
-            .await
-            .payload
+        <DataManager as Service>::prepare(
+            manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            ops,
+            vec![],
+        )
+        .await
+        .payload
     }
 
     async fn commit_ops_local(
@@ -2011,7 +2033,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::allocated(0, 0, 99001);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 3, 0);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 3, 0);
         let tid = test_hlc(1, 11);
 
         let result = client
@@ -2049,7 +2071,7 @@ mod tests {
         // pin=true) pins the read version regardless of cell size, so a small
         // (normal) cell pins just as a large one would (shape-gated, not size).
         let score_a: u64 = 100;
-        let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
+        let mut cell_a = counter_cell(schema.vid.get(), cell_id, score_a, "A");
         let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
 
         let tid = test_hlc(1, 41);
@@ -2067,7 +2089,7 @@ mod tests {
 
         // Externally advance the cell to version B.
         let score_b: u64 = 200;
-        let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
+        let mut cell_b = counter_cell(schema.vid.get(), cell_id, score_b, "B");
         let version_b = runtime.chunks().update_cell(&mut cell_b).unwrap().version;
         assert_ne!(version_a, version_b);
 
@@ -2103,10 +2125,15 @@ mod tests {
 
         // A different transaction, never having pinned, sees the current version B.
         let other_tid = test_hlc(1, 42);
-        let read_current =
-            <DataManager as Service>::read(&manager, 42, other_tid.clone(), other_tid.clone(), cell_id)
-                .await
-                .payload;
+        let read_current = <DataManager as Service>::read(
+            &manager,
+            42,
+            other_tid.clone(),
+            other_tid.clone(),
+            cell_id,
+        )
+        .await
+        .payload;
         let current_cell = match read_current {
             TxnExecResult::Accepted(cell) => cell,
             other => panic!("expected read to be accepted, got {:?}", other),
@@ -2134,7 +2161,7 @@ mod tests {
 
         // Seed a version, then pin it with a partial read (head with pin=true),
         // which creates a participant transaction holding a segment guard.
-        let mut cell = counter_cell(schema.id, cell_id, 500, "A");
+        let mut cell = counter_cell(schema.vid.get(), cell_id, 500, "A");
         let version = runtime.chunks().write_cell(&mut cell).unwrap().version;
 
         let tid = test_hlc(1, 44);
@@ -2202,7 +2229,7 @@ mod tests {
 
         // Seed version A.
         let score_a: u64 = 300;
-        let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
+        let mut cell_a = counter_cell(schema.vid.get(), cell_id, score_a, "A");
         let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
 
         let tid = test_hlc(1, 43);
@@ -2224,7 +2251,7 @@ mod tests {
 
         // Externally advance the cell to version B.
         let score_b: u64 = 400;
-        let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
+        let mut cell_b = counter_cell(schema.vid.get(), cell_id, score_b, "B");
         let version_b = runtime.chunks().update_cell(&mut cell_b).unwrap().version;
         assert_ne!(version_a, version_b);
 
@@ -2263,7 +2290,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::allocated(0, 0, 99002);
-        seed_cell_version(&runtime, schema.id, cell_id, 4, 0);
+        seed_cell_version(&runtime, schema.vid.get(), cell_id, 4, 0);
         let tid = test_hlc(1, 12);
 
         let result = client
@@ -2336,7 +2363,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 99004);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 5, 0);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 5, 0);
         let tid = test_hlc(1, 14);
         let op = PrepareOp {
             id: cell_id,
@@ -2349,7 +2376,9 @@ mod tests {
             14,
             tid.clone(),
             tid.clone(),
-            vec![op.clone(), op], vec![])
+            vec![op.clone(), op],
+            vec![],
+        )
         .await
         .payload;
 
@@ -2370,10 +2399,16 @@ mod tests {
 
         assert!(manager.find_transaction(&tid).is_none());
 
-        let result =
-            <DataManager as Service>::prepare(&manager, 19, tid.clone(), tid.clone(), vec![], vec![])
-                .await
-                .payload;
+        let result = <DataManager as Service>::prepare(
+            &manager,
+            19,
+            tid.clone(),
+            tid.clone(),
+            vec![],
+            vec![],
+        )
+        .await
+        .payload;
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
@@ -2392,8 +2427,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::allocated(0, 0, 99006);
         let cell_b = Id::allocated(0, 0, 99007);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 7, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 8, 0);
+        let version_a = seed_cell_version(&runtime, schema.vid.get(), cell_a, 7, 0);
+        let version_b = seed_cell_version(&runtime, schema.vid.get(), cell_b, 8, 0);
         let tid = test_hlc(1, 15);
         let coordinator_id = 15;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -2413,7 +2448,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_a.clone()], vec![])
+            vec![op_a.clone()],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2423,7 +2460,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_b.clone()], vec![])
+            vec![op_b.clone()],
+            vec![],
+        )
         .await
         .payload;
 
@@ -2473,7 +2512,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 99008);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 9, 0);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 9, 0);
         let tid = test_hlc(1, 16);
         let original_coordinator = 16;
         let requester = TxnPriority::new(tid.clone(), original_coordinator);
@@ -2488,7 +2527,9 @@ mod tests {
             original_coordinator,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()], vec![])
+            vec![op.clone()],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2498,7 +2539,9 @@ mod tests {
             99,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()], vec![])
+            vec![op.clone()],
+            vec![],
+        )
         .await
         .payload;
 
@@ -2541,8 +2584,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::allocated(0, 0, 99009);
         let cell_b = Id::allocated(0, 0, 99010);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 10, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 11, 0);
+        let version_a = seed_cell_version(&runtime, schema.vid.get(), cell_a, 10, 0);
+        let version_b = seed_cell_version(&runtime, schema.vid.get(), cell_b, 11, 0);
         let tid = test_hlc(1, 17);
         let coordinator_id = 17;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -2562,7 +2605,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_b.clone(), op_a.clone()], vec![])
+            vec![op_b.clone(), op_a.clone()],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2579,7 +2624,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_a.clone(), op_b.clone()], vec![])
+            vec![op_a.clone(), op_b.clone()],
+            vec![],
+        )
         .await
         .payload;
 
@@ -2627,7 +2674,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 99011);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 12, 0);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 12, 0);
         let tid = test_hlc(1, 18);
         let coordinator_id = 18;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -2643,7 +2690,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()], vec![])
+            vec![op.clone()],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2660,7 +2709,9 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()], vec![])
+            vec![op.clone()],
+            vec![],
+        )
         .await
         .payload;
 
@@ -2709,7 +2760,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::allocated(0, 0, 99005);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 6, 0);
         let older_tid = test_hlc(1, 11);
         let younger_tid = test_hlc(1, 22);
         let op = PrepareOp {
@@ -2719,12 +2770,24 @@ mod tests {
         };
 
         let first = client
-            .prepare(11, older_tid.clone(), older_tid.clone(), vec![op.clone()], vec![])
+            .prepare(
+                11,
+                older_tid.clone(),
+                older_tid.clone(),
+                vec![op.clone()],
+                vec![],
+            )
             .await
             .unwrap()
             .payload;
         let second = client
-            .prepare(22, younger_tid.clone(), younger_tid.clone(), vec![op], vec![])
+            .prepare(
+                22,
+                younger_tid.clone(),
+                younger_tid.clone(),
+                vec![op],
+                vec![],
+            )
             .await
             .unwrap()
             .payload;
@@ -2775,7 +2838,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 99011);
-        seed_cell_version(&runtime, schema.id, cell_id, 7, 0);
+        seed_cell_version(&runtime, schema.vid.get(), cell_id, 7, 0);
         let tid = test_hlc(1, 31);
 
         let response =
@@ -2798,9 +2861,7 @@ mod tests {
         let group = "txn_data_site_cleanup";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let tids = (0..64)
-            .map(|_| manager.hlc.now())
-            .collect::<Vec<_>>();
+        let tids = (0..64).map(|_| manager.hlc.now()).collect::<Vec<_>>();
 
         for tid in &tids {
             let txn = manager.get_or_create_transaction(tid);
@@ -2971,9 +3032,9 @@ mod tests {
         let read_id = Id::allocated(0, 0, 8202);
         let read_only_id = Id::allocated(0, 0, 8203);
         let unprepared = Id::allocated(0, 0, 8204);
-        let write_version = seed_cell_version(&runtime, schema.id, write_id, 7, 0);
-        let read_version = seed_cell_version(&runtime, schema.id, read_id, 9, 0);
-        let read_only_version = seed_cell_version(&runtime, schema.id, read_only_id, 11, 0);
+        let write_version = seed_cell_version(&runtime, schema.vid.get(), write_id, 7, 0);
+        let read_version = seed_cell_version(&runtime, schema.vid.get(), read_id, 9, 0);
+        let read_only_version = seed_cell_version(&runtime, schema.vid.get(), read_only_id, 11, 0);
 
         let read_only_tid = manager.hlc.now();
         let read_only_prepare = prepare_ops_local(
@@ -3190,7 +3251,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8204);
         let initial_score = 13;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_version =
+            seed_cell_version(&runtime, schema.vid.get(), cell_id, initial_score, 0);
         let tid = manager.hlc.now();
         let expected_owner = TxnPriority::new(tid.clone(), 0);
 
@@ -3214,7 +3276,7 @@ mod tests {
             tid.clone(),
             tid.clone(),
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 99,
                 "counter_missing_coordinator_updated",
@@ -3269,7 +3331,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8205);
         let initial_score = 21;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_version =
+            seed_cell_version(&runtime, schema.vid.get(), cell_id, initial_score, 0);
         let t1 = test_hlc(1, 21);
         let t2 = test_hlc(1, 22);
         let t1_owner = TxnPriority::new(t1.clone(), 21);
@@ -3285,7 +3348,9 @@ mod tests {
             21,
             t1.clone(),
             t1.clone(),
-            vec![prepare_op.clone()], vec![])
+            vec![prepare_op.clone()],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -3305,7 +3370,9 @@ mod tests {
             22,
             t2.clone(),
             t2.clone(),
-            vec![prepare_op], vec![])
+            vec![prepare_op],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(second, DMPrepareResult::Success);
@@ -3319,7 +3386,7 @@ mod tests {
             t1.clone(),
             t1.clone(),
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 99,
                 "counter_stale_owner_commit",
@@ -3378,7 +3445,8 @@ mod tests {
         let cell_id = Id::allocated(0, 0, 8206);
         let initial_score = 41;
         let committed_score = 55;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_version =
+            seed_cell_version(&runtime, schema.vid.get(), cell_id, initial_score, 0);
         let tid = test_hlc(1, 23);
         let owner = TxnPriority::new(tid.clone(), 23);
         let prepare_op = PrepareOp {
@@ -3392,7 +3460,9 @@ mod tests {
             23,
             tid.clone(),
             tid.clone(),
-            vec![prepare_op], vec![])
+            vec![prepare_op],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(prepare, DMPrepareResult::Success);
@@ -3402,7 +3472,7 @@ mod tests {
             tid.clone(),
             tid.clone(),
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 committed_score,
                 "counter_abort_missing_coordinator_commit",
@@ -3469,7 +3539,8 @@ mod tests {
         let cell_id = Id::allocated(0, 0, 8207);
         let initial_score = 61;
         let committed_score = 77;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_version =
+            seed_cell_version(&runtime, schema.vid.get(), cell_id, initial_score, 0);
         let t1 = test_hlc(1, 24);
         let t2 = test_hlc(1, 25);
         let t1_owner = TxnPriority::new(t1.clone(), 24);
@@ -3485,7 +3556,9 @@ mod tests {
             24,
             t1.clone(),
             t1.clone(),
-            vec![t1_prepare], vec![])
+            vec![t1_prepare],
+            vec![],
+        )
         .await
         .payload;
         assert_eq!(prepare_t1, DMPrepareResult::Success);
@@ -3495,7 +3568,7 @@ mod tests {
             t1.clone(),
             t1.clone(),
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 committed_score,
                 "counter_abort_stale_owner_commit",
@@ -3595,7 +3668,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8210);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 0, 0);
+        let initial_version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 0, 0);
         let t1 = test_hlc(1, 11);
         let t2 = test_hlc(1, 22);
         let prepare_op = PrepareOp {
@@ -3616,7 +3689,7 @@ mod tests {
             &manager,
             &t1,
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 1,
                 "counter_concurrent_stale_t1",
@@ -3650,7 +3723,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8211);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 1, 0);
+        let initial_version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 1, 0);
         let tid = test_hlc(1, 31);
 
         let prepare = prepare_ops_local(
@@ -3666,7 +3739,7 @@ mod tests {
         .await;
         assert_eq!(prepare, DMPrepareResult::Success);
 
-        let mut external = counter_cell(schema.id, cell_id, 7, "counter_commit_external");
+        let mut external = counter_cell(schema.vid.get(), cell_id, 7, "counter_commit_external");
         let external_header = runtime.chunks().update_cell(&mut external).unwrap();
         assert!(external_header.version > initial_version);
 
@@ -3674,7 +3747,7 @@ mod tests {
             &manager,
             &tid,
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 99,
                 "counter_commit_after_certification",
@@ -3707,7 +3780,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8212);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 2, 0);
+        let initial_version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 2, 0);
         let tid = test_hlc(1, 32);
 
         let prepare = prepare_ops_local(
@@ -3723,7 +3796,7 @@ mod tests {
         .await;
         assert_eq!(prepare, DMPrepareResult::Success);
 
-        let mut external = counter_cell(schema.id, cell_id, 8, "counter_remove_external");
+        let mut external = counter_cell(schema.vid.get(), cell_id, 8, "counter_remove_external");
         let external_header = runtime.chunks().update_cell(&mut external).unwrap();
         assert!(external_header.version > initial_version);
 
@@ -3754,7 +3827,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::allocated(0, 0, 8216);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let initial_version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 6, 0);
         let tid = test_hlc(1, 35);
 
         let prepare = prepare_ops_local(
@@ -3779,7 +3852,7 @@ mod tests {
             &manager,
             &tid,
             vec![CommitOp::Update(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 18,
                 "counter_update_after_external_remove",
@@ -3830,14 +3903,14 @@ mod tests {
         .await;
         assert_eq!(prepare, DMPrepareResult::Success);
 
-        let mut external = counter_cell(schema.id, cell_id, 5, "counter_write_external");
+        let mut external = counter_cell(schema.vid.get(), cell_id, 5, "counter_write_external");
         let external_header = runtime.chunks().write_cell(&mut external).unwrap();
 
         let commit = commit_ops_local(
             &manager,
             &tid,
             vec![CommitOp::Write(counter_cell(
-                schema.id,
+                schema.vid.get(),
                 cell_id,
                 11,
                 "counter_write_after_absent_prepare",
@@ -3871,8 +3944,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::allocated(0, 0, 8214);
         let cell_b = Id::allocated(0, 0, 8215);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 3, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 4, 0);
+        let version_a = seed_cell_version(&runtime, schema.vid.get(), cell_a, 3, 0);
+        let version_b = seed_cell_version(&runtime, schema.vid.get(), cell_b, 4, 0);
         let tid = test_hlc(1, 34);
 
         let prepare = prepare_ops_local(
@@ -3901,8 +3974,18 @@ mod tests {
             &manager,
             &tid,
             vec![
-                CommitOp::Update(counter_cell(schema.id, cell_a, 13, "counter_prevalidate_a")),
-                CommitOp::Update(counter_cell(schema.id, cell_b, 14, "counter_prevalidate_b")),
+                CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    cell_a,
+                    13,
+                    "counter_prevalidate_a",
+                )),
+                CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    cell_b,
+                    14,
+                    "counter_prevalidate_b",
+                )),
             ],
         )
         .await;
@@ -3937,8 +4020,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::allocated(0, 0, 8217);
         let cell_b = Id::allocated(0, 0, 8218);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 15, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 25, 0);
+        let version_a = seed_cell_version(&runtime, schema.vid.get(), cell_a, 15, 0);
+        let version_b = seed_cell_version(&runtime, schema.vid.get(), cell_b, 25, 0);
         let tid = test_hlc(1, 36);
 
         let prepare = prepare_ops_local(
@@ -3964,7 +4047,12 @@ mod tests {
         let before_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
         let before_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
 
-        let mut external_b = counter_cell(schema.id, cell_b, 26, "counter_prevalidate_external_b");
+        let mut external_b = counter_cell(
+            schema.vid.get(),
+            cell_b,
+            26,
+            "counter_prevalidate_external_b",
+        );
         let external_b_header = runtime.chunks().update_cell(&mut external_b).unwrap();
         assert!(external_b_header.version > version_b);
 
@@ -3973,13 +4061,13 @@ mod tests {
             &tid,
             vec![
                 CommitOp::Update(counter_cell(
-                    schema.id,
+                    schema.vid.get(),
                     cell_a,
                     115,
                     "counter_prevalidate_storage_a",
                 )),
                 CommitOp::Update(counter_cell(
-                    schema.id,
+                    schema.vid.get(),
                     cell_b,
                     126,
                     "counter_prevalidate_storage_b",
@@ -4418,11 +4506,7 @@ impl Service for DataManager {
         let _phase_guard = phase_guard;
         self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
     }
-    fn abort(
-        &self,
-        clock: Hlc,
-        tid: TxnId,
-    ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
+    fn abort(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let _phase_guard =
@@ -4529,11 +4613,7 @@ impl Service for DataManager {
         async move { self.response_with(outcome).await }.boxed()
     }
 
-    fn end(
-        &self,
-        clock: Hlc,
-        tid: TxnId,
-    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+    fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
@@ -4674,7 +4754,9 @@ impl Service for DataManager {
                         tid, error
                     );
                     self.cleanup_signal.store(true, Relaxed);
-                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd)).await;
+                    return self
+                        .response_with(EndResult::CheckFailed(CheckError::CannotEnd))
+                        .await;
                 }
             }
 

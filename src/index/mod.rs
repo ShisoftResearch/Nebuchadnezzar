@@ -41,6 +41,7 @@ use std::time::Duration;
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedIndexerClient;
 use self::ranged::tree::service::Range;
+use crate::ram::schema::SchemaUid;
 
 pub type Feature = [u8; FEATURE_SIZE];
 
@@ -103,9 +104,14 @@ impl IndexerClients {
         self.fulltext_indexer.get()
     }
 
+    /// Schema ids arriving over RPC are bare numbers, and every one of them
+    /// names a schema FAMILY: a caller asking about "person" is making a
+    /// logical request, and there is no wire form that could name a
+    /// generation. This is the boundary where that convention is stated, so
+    /// the rest of the index layer can be typed.
     pub fn overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
         self.fulltext_indexer()
-            .and_then(|indexer| indexer.try_overall_schema_statistics(schema_id))
+            .and_then(|indexer| indexer.try_overall_schema_statistics(SchemaUid(schema_id)))
     }
 
     /// Create IndexerClients without hybrid inverted indexer (for query-only clients)
@@ -174,7 +180,7 @@ impl IndexerClients {
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         match self.fulltext_indexer() {
             Some(indexer) => match indexer
-                .bm25_search(schema_id, field_id, query, limit, phrase_boost)
+                .bm25_search(SchemaUid(schema_id), field_id, query, limit, phrase_boost)
                 .await
             {
                 Ok(hits) => Ok(Ok(hits)),

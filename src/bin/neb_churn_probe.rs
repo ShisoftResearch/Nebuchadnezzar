@@ -15,7 +15,12 @@ impl log::Log for ChurnLogger {
     }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {} - {}", record.level(), record.target(), record.args());
+            eprintln!(
+                "[{}] {} - {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
     fn flush(&self) {}
@@ -59,13 +64,14 @@ fn main() -> ExitCode {
 }
 
 async fn probe(addr: String, group: String, base_dir: String, max_seq: u64) -> Result<(), String> {
-    use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
-    use neb::query::data_client::{ValueRange, ValueRangeTerm};
-    use neb::ram::types::Id;
-    use neb::server::{NebServer, ServerOptions, Service};
     use bifrost_hasher::hash_str;
     use dovahkiin::expr::serde::Expr;
     use dovahkiin::types::*;
+    use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
+    use neb::query::data_client::{ValueRange, ValueRangeTerm};
+    use neb::ram::schema::SchemaUid;
+    use neb::ram::types::Id;
+    use neb::server::{NebServer, ServerOptions, Service};
 
     let dir = std::path::Path::new(&base_dir);
     let server = NebServer::new_from_opts(
@@ -105,8 +111,11 @@ async fn probe(addr: String, group: String, base_dir: String, max_seq: u64) -> R
             Err(e) => println!("RPC error reading {}: {:?}", seq, e),
         }
     }
-    println!("MISSING_CELLS count={} sample={:?}", missing_cells.len(),
-        &missing_cells[..missing_cells.len().min(50)]);
+    println!(
+        "MISSING_CELLS count={} sample={:?}",
+        missing_cells.len(),
+        &missing_cells[..missing_cells.len().min(50)]
+    );
     if missing_cells.len() > 50 {
         println!("MISSING_CELLS_FULL {:?}", missing_cells);
     }
@@ -122,7 +131,7 @@ async fn probe(addr: String, group: String, base_dir: String, max_seq: u64) -> R
     let mut count = 0u64;
     let mut cursor = idx_client
         .range_index_scan(
-            CHURN_SCHEMA_ID,
+            SchemaUid(CHURN_SCHEMA_ID),
             field_id,
             val_range,
             vec![],
@@ -146,12 +155,13 @@ async fn probe(addr: String, group: String, base_dir: String, max_seq: u64) -> R
             Err(e) => return Err(format!("scan: {:?}", e)),
         }
     }
-    let missing_idx: Vec<u64> = (0..max_seq)
-        .filter(|s| !seen[*s as usize])
-        .collect();
+    let missing_idx: Vec<u64> = (0..max_seq).filter(|s| !seen[*s as usize]).collect();
     println!("SCANNED n={}", count);
-    println!("MISSING_INDEX count={} sample={:?}", missing_idx.len(),
-        &missing_idx[..missing_idx.len().min(100)]);
+    println!(
+        "MISSING_INDEX count={} sample={:?}",
+        missing_idx.len(),
+        &missing_idx[..missing_idx.len().min(100)]
+    );
     if missing_idx.len() > 100 {
         // Print ranges compactly.
         let mut ranges = Vec::new();

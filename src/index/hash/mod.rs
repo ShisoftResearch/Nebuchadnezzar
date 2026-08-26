@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static HASH_BUCKET_LEN_SUM: AtomicU64 = AtomicU64::new(0);
 pub static HASH_BUCKET_SAMPLES: AtomicU64 = AtomicU64::new(0);
 pub static HASH_BUCKET_MAX: AtomicU64 = AtomicU64::new(0);
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
@@ -20,7 +20,7 @@ const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 
 lazy_static! {
-    pub static ref HASH_INDEX_SCHEMA_ID: u32 = key_hash(HASH_SCHEMA) as u32;
+    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
 }
 
@@ -386,7 +386,7 @@ impl HashIndexer {
 
 pub fn hash_index_schema() -> Schema {
     Schema::new_with_id(
-        *HASH_INDEX_SCHEMA_ID,
+        HASH_INDEX_SCHEMA_ID.get(),
         &HASH_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id)]),
@@ -423,15 +423,22 @@ impl HashedIndexClient {
     }
 }
 
-pub fn get_hash_id(schema: u32, field: u64, hash_feat: Feature) -> Id {
-    Id::from_obj(&(schema, field, hash_feat))
+/// The id of a hash-index bucket cell.
+///
+/// Keyed by the schema FAMILY: a bucket holds the cells of one schema's field
+/// whatever generation each of them was written under, so evolving the schema
+/// must not move the bucket out from under the entries already in it. Passing
+/// the raw number keeps the derivation independent of `SchemaUid` staying
+/// `#[serde(transparent)]`, since these ids are durable.
+pub fn get_hash_id(schema: SchemaUid, field: u64, hash_feat: Feature) -> Id {
+    Id::from_obj(&(schema.get(), field, hash_feat))
 }
 
-pub fn get_null_hash_id(schema: u32, field: u64) -> Id {
-    Id::from_obj(&(schema, field, "NULL_BUCKET"))
+pub fn get_null_hash_id(schema: SchemaUid, field: u64) -> Id {
+    Id::from_obj(&(schema.get(), field, "NULL_BUCKET"))
 }
 
-pub fn get_hash_id_from_value(schema: u32, field: u64, value: &OwnedValue) -> Id {
+pub fn get_hash_id_from_value(schema: SchemaUid, field: u64, value: &OwnedValue) -> Id {
     let hash_feat = hash_indexable_owned_value(value)
         .expect("hash index values must be scalar values or flat scalar arrays");
     get_hash_id(schema, field, hash_feat)
@@ -898,7 +905,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_hash_id_functions() {
-        let schema_id = 123u32;
+        let schema_id = SchemaUid(123);
         let field_id = 456u64;
         let hash_feat: Feature = [1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -908,8 +915,8 @@ mod tests {
         // Same inputs should produce same hash ID
         assert_eq!(hash_id_1, hash_id_2);
 
-        // Different inputs should produce different hash IDs
-        let hash_id_3 = get_hash_id(schema_id + 1, field_id, hash_feat);
+        // A different family must get a different bucket.
+        let hash_id_3 = get_hash_id(SchemaUid(schema_id.get() + 1), field_id, hash_feat);
         assert_ne!(hash_id_1, hash_id_3);
     }
 }

@@ -543,7 +543,6 @@ impl MasterTreeSM {
         Ok(())
     }
 
-
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
         if self.is_plane_leader().await {
             // Only the leader can initiate the request to load the sub tree

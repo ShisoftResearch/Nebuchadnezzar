@@ -9,6 +9,7 @@ use std::sync::Arc;
 use bifrost::rpc::RPCError;
 
 use crate::index::vector::{VectorHit, VectorIndexClient};
+use crate::ram::schema::SchemaUid;
 
 /// Client for vector similarity search operations
 ///
@@ -68,7 +69,13 @@ impl VectorClient {
     ) -> Result<Vec<VectorHit>, RPCError> {
         match self
             .vector_client
-            .search(schema_id, field_id, query_vector, limit, ef_search)
+            .search(
+                SchemaUid(schema_id),
+                field_id,
+                query_vector,
+                limit,
+                ef_search,
+            )
             .await
         {
             Ok(hits) => Ok(hits),

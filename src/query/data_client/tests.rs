@@ -1,3 +1,4 @@
+use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::{
     index::builder::IndexBuilder,
     index::builder::IndexError,
@@ -49,7 +50,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
     fn insert(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _metric_encoding: MetricEncoding,
         _config: VectorIndexConfig,
@@ -60,7 +61,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
     fn remove(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -68,7 +69,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         _query_vector: &[f32],
         limit: usize,
@@ -77,7 +78,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
         let should_fail = self.fail_search;
         let hits = self
             .hits_by_field
-            .get(&(schema_id, field_id))
+            .get(&(schema_id.get(), field_id))
             .cloned()
             .unwrap_or_default();
         async move {
@@ -92,7 +93,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn new_index_with_config(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
@@ -101,7 +102,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn delete_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -146,7 +147,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
     fn insert(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _model: &EmbeddingModel,
         _text: &str,
@@ -157,7 +158,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
     fn remove(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -165,7 +166,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         _query: &str,
         limit: usize,
@@ -180,7 +181,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
         }
         let hits = self
             .hits_by_field
-            .get(&(schema_id, field_id))
+            .get(&(schema_id.get(), field_id))
             .cloned()
             .unwrap_or_default();
         async move { Ok(hits.into_iter().take(limit).collect()) }.boxed()
@@ -188,7 +189,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn new_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _model: &EmbeddingModel,
         _vector_config: VectorIndexConfig,
@@ -198,7 +199,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn delete_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -263,7 +264,7 @@ async fn scan_all() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
     crate::index::builder::IndexBuilder::await_all_indices().await;
@@ -272,7 +273,7 @@ async fn scan_all() {
     {
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_1,
+                SchemaUid(schema_id_1),
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
@@ -304,7 +305,7 @@ async fn scan_all() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 3) as u32);
-        let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id_2), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
     crate::index::builder::IndexBuilder::await_all_indices().await;
@@ -312,7 +313,7 @@ async fn scan_all() {
     {
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_2,
+                SchemaUid(schema_id_2),
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
@@ -336,7 +337,7 @@ async fn scan_all() {
     {
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_1,
+                SchemaUid(schema_id_1),
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
@@ -356,7 +357,7 @@ async fn scan_all() {
             parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))").unwrap()[0].clone();
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_1,
+                SchemaUid(schema_id_1),
                 vec![],
                 select_expr,
                 Expr::nothing(),
@@ -384,7 +385,7 @@ async fn scan_all() {
             parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))").unwrap()[0].clone();
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_1,
+                SchemaUid(schema_id_1),
                 vec![],
                 select_expr,
                 Expr::nothing(),
@@ -411,7 +412,7 @@ async fn scan_all() {
         let proc_expr = parse_to_serde_expr("(+ DATA_1 (u64 DATA_2))").unwrap()[0].clone();
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id_1,
+                SchemaUid(schema_id_1),
                 vec![],
                 Expr::nothing(),
                 proc_expr,
@@ -481,7 +482,7 @@ async fn range_query_scan() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
     await_ranged_indices_ready().await;
@@ -492,7 +493,7 @@ async fn range_query_scan() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id_1,
+            SchemaUid(schema_id_1),
             hash_str(DATA_1),
             val_range,
             vec![],
@@ -574,7 +575,7 @@ async fn range_query_scan_inclusive_exclusive() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -589,7 +590,7 @@ async fn range_query_scan_inclusive_exclusive() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -623,7 +624,7 @@ async fn range_query_scan_inclusive_exclusive() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -656,7 +657,7 @@ async fn range_query_scan_inclusive_exclusive() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -716,7 +717,7 @@ async fn range_query_scan_open_ranges() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -732,7 +733,7 @@ async fn range_query_scan_open_ranges() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -783,7 +784,7 @@ async fn range_query_scan_open_ranges() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -816,7 +817,7 @@ async fn range_query_scan_open_ranges() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -870,7 +871,7 @@ async fn range_query_scan_backward_ordering() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -884,7 +885,7 @@ async fn range_query_scan_backward_ordering() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -938,7 +939,7 @@ async fn range_query_scan_edge_cases() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -952,7 +953,7 @@ async fn range_query_scan_edge_cases() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -978,7 +979,7 @@ async fn range_query_scan_edge_cases() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1001,7 +1002,7 @@ async fn range_query_scan_edge_cases() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1024,7 +1025,7 @@ async fn range_query_scan_edge_cases() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1096,7 +1097,7 @@ async fn range_query_scan_large_dataset() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1110,7 +1111,7 @@ async fn range_query_scan_large_dataset() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1171,7 +1172,7 @@ async fn range_query_scan_with_selection() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1188,7 +1189,7 @@ async fn range_query_scan_with_selection() {
     let select_expr = parse_to_serde_expr("(>= DATA_1 10u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1251,7 +1252,7 @@ async fn range_query_scan_sparse_data() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1265,7 +1266,7 @@ async fn range_query_scan_sparse_data() {
     };
     let mut cursor = idx_data_client
         .range_index_scan(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             val_range,
             vec![],
@@ -1317,7 +1318,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1328,7 +1329,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
         .clone();
     let mut cursor = idx_data_client
         .scan_all(
-            schema_id,
+            SchemaUid(schema_id),
             vec![],
             selection,
             Expr::nothing(),
@@ -1370,7 +1371,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(if i % 10 == 0 { 42 } else { i });
         value[DATA_2] = OwnedValue::U32((i * 3) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1379,7 +1380,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
         parse_to_serde_expr("(and (= DATA_1 42u64) (> DATA_2 80u32))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .scan_all(
-            schema_id,
+            SchemaUid(schema_id),
             vec![],
             selection,
             Expr::nothing(),
@@ -1427,7 +1428,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 4) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1435,7 +1436,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             projection_fields(&[DATA_1]),
@@ -1480,7 +1481,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 5) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1489,7 +1490,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
         parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             projection_fields(&[DATA_1]),
@@ -1534,7 +1535,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1542,7 +1543,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             projection_fields(&[DATA_1, DATA_2]),
@@ -1593,7 +1594,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U64(i % 4);
         value[DATA_3] = OwnedValue::U32((i % 3) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1605,7 +1606,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
         .clone();
     let mut cursor = idx_data_client
         .query(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             projection_fields(&[DATA_1, DATA_2, DATA_3]),
@@ -1657,7 +1658,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U64(9);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1667,7 +1668,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
             [0]
         .clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc, vec![])
+        .query(SchemaUid(schema_id), selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
 
@@ -1704,7 +1705,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i % 3);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1712,7 +1713,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Desc, vec![])
+        .query(SchemaUid(schema_id), selection, QueryOrdering::Desc, vec![])
         .await
         .unwrap();
 
@@ -1723,7 +1724,12 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
 
     assert_eq!(
         values,
-        vec![Id::from_parts(8, 19), Id::from_parts(8, 13), Id::from_parts(8, 7), Id::from_parts(8, 1)]
+        vec![
+            Id::from_parts(8, 19),
+            Id::from_parts(8, 13),
+            Id::from_parts(8, 7),
+            Id::from_parts(8, 1)
+        ]
     );
 }
 
@@ -1757,7 +1763,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1769,7 +1775,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
     ]);
     let mut cursor = idx_data_client
         .scan_by_expr_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -1785,7 +1791,14 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
     while let Some(row) = cursor.next().await.unwrap() {
         ids.push(row.id.unwrap());
     }
-    assert_eq!(ids, vec![Id::from_parts(18, 9), Id::from_parts(18, 7), Id::from_parts(18, 5)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(18, 9),
+            Id::from_parts(18, 7),
+            Id::from_parts(18, 5)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1818,7 +1831,7 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1830,7 +1843,7 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
     ]);
     let mut cursor = idx_data_client
         .scan_by_expr_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -1880,7 +1893,7 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -1888,7 +1901,12 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 3u64))").unwrap()[0].clone();
     let explain = idx_data_client
-        .scan_by_expr_plan(schema_id, selection, Some(hash_str(DATA_2)), Some(2))
+        .scan_by_expr_plan(
+            SchemaUid(schema_id),
+            selection,
+            Some(hash_str(DATA_2)),
+            Some(2),
+        )
         .await
         .expect("expected indexed plan");
 
@@ -1929,7 +1947,7 @@ async fn scan_by_expr_plan_reports_heuristic_when_stats_missing() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(= DATA_1 1u64)").unwrap()[0].clone();
     let explain = idx_data_client
-        .scan_by_expr_plan(schema_id, selection, None, Some(10))
+        .scan_by_expr_plan(SchemaUid(schema_id), selection, None, Some(10))
         .await
         .expect("expected indexed plan");
 
@@ -1965,7 +1983,7 @@ async fn scan_by_expr_plan_reports_or_heuristic_when_stats_missing() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let explain = idx_data_client
-        .scan_by_expr_plan(schema_id, selection, None, Some(10))
+        .scan_by_expr_plan(SchemaUid(schema_id), selection, None, Some(10))
         .await
         .expect("expected indexed plan");
 
@@ -2003,7 +2021,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
         let id = Id::from_parts(20, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2011,7 +2029,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc, vec![])
+        .query(SchemaUid(schema_id), selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -2046,7 +2064,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
         let id = Id::from_parts(21, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2054,7 +2072,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     let selection =
         parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc, vec![])
+        .query(SchemaUid(schema_id), selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -2090,7 +2108,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i % 3);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2098,7 +2116,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Desc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Desc)
         .await
         .unwrap();
 
@@ -2147,7 +2165,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2159,7 +2177,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2174,7 +2192,14 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::from_parts(14, 9), Id::from_parts(14, 7), Id::from_parts(14, 5)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(14, 9),
+            Id::from_parts(14, 7),
+            Id::from_parts(14, 5)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2207,7 +2232,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2219,7 +2244,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2267,7 +2292,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2279,7 +2304,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
     ]);
     let mut cursor = idx_data_client
         .scan_by_expr_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2328,7 +2353,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(1);
         value[DATA_2] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2340,7 +2365,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2384,7 +2409,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2396,7 +2421,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Desc,
             Some(hash_str(DATA_2)),
@@ -2443,7 +2468,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
         let id = Id::from_parts(31, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2451,7 +2476,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
     let selection = parse_to_serde_expr("(>= DATA_1 3u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Desc,
             None,
@@ -2499,7 +2524,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2511,7 +2536,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2555,7 +2580,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2567,7 +2592,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
     ]);
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
@@ -2616,7 +2641,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[RANGE_FIELD] = OwnedValue::U64(i);
         value[ORDER_FIELD] = OwnedValue::U64((i * 3) % 11);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -2627,7 +2652,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
 
     let mut equality_cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             equality_selection,
             QueryOrdering::Asc,
             None,
@@ -2637,12 +2662,15 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
         )
         .await
         .unwrap();
-    assert_eq!(equality_cursor.next().await.unwrap(), Some(Id::from_parts(9, 0)));
+    assert_eq!(
+        equality_cursor.next().await.unwrap(),
+        Some(Id::from_parts(9, 0))
+    );
     assert!(equality_cursor.next().await.unwrap().is_none());
 
     let mut plain_cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection.clone(),
             QueryOrdering::Asc,
             None,
@@ -2660,7 +2688,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
 
     let mut ordered_cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(ORDER_FIELD)),
@@ -2728,7 +2756,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
         value[GROUP_FIELD] = OwnedValue::U64(group);
         value[SCORE_FIELD] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -2738,7 +2766,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
     let mut cursor = server
         .indexed_data_client()
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
@@ -2788,7 +2816,7 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -2797,7 +2825,7 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
     let selection = parse_to_serde_expr("(not (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -2806,7 +2834,14 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(34, 0), Id::from_parts(34, 2), Id::from_parts(34, 4)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(34, 0),
+            Id::from_parts(34, 2),
+            Id::from_parts(34, 4)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2847,7 +2882,7 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         value[TAG] = OwnedValue::U64(tag);
         value[SCORE] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -2857,7 +2892,7 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         parse_to_serde_expr("(and (>= SCORE 2u64) (not (= TAG 1u64)))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -2866,7 +2901,14 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(35, 1), Id::from_parts(35, 3), Id::from_parts(35, 5)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(35, 1),
+            Id::from_parts(35, 3),
+            Id::from_parts(35, 5)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2899,7 +2941,7 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -2908,7 +2950,7 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(not (= SCORE 3u64))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -2959,7 +3001,7 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TAG] = OwnedValue::U64(tag);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -2968,7 +3010,7 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(in TAG 1u64 3u64 5u64)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -2977,7 +3019,14 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(37, 1), Id::from_parts(37, 3), Id::from_parts(37, 5)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(37, 1),
+            Id::from_parts(37, 3),
+            Id::from_parts(37, 5)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3010,7 +3059,7 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3019,7 +3068,7 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(between SCORE 2u64 5u64)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3068,7 +3117,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3077,7 +3126,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
     let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3119,7 +3168,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3128,7 +3177,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
     let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3176,7 +3225,7 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3185,7 +3234,7 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
     let selection = parse_to_serde_expr("(is-not-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3194,7 +3243,14 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(40, 0), Id::from_parts(40, 2), Id::from_parts(40, 4)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(40, 0),
+            Id::from_parts(40, 2),
+            Id::from_parts(40, 4)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3227,7 +3283,7 @@ async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3236,7 +3292,7 @@ async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
     let selection = parse_to_serde_expr("(is-null SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3281,7 +3337,7 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
         value[GROUP_FIELD] = OwnedValue::U64(group);
         value[SCORE_FIELD] = OwnedValue::U64(score);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -3291,7 +3347,7 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
     let mut cursor = server
         .indexed_data_client()
         .scan_by_expr_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Desc,
             Some(hash_str(SCORE_FIELD)),
@@ -3341,14 +3397,14 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 3);
         value[DATA_2] = OwnedValue::U32(i as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Desc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Desc)
         .await
         .unwrap();
 
@@ -3400,7 +3456,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 3);
         value[DATA_2] = OwnedValue::U32(i as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -3408,7 +3464,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Desc,
             None,
@@ -3423,7 +3479,14 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::from_parts(23, 11), Id::from_parts(23, 10), Id::from_parts(23, 8)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(23, 11),
+            Id::from_parts(23, 10),
+            Id::from_parts(23, 8)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3456,14 +3519,14 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 4);
         value[DATA_2] = OwnedValue::U32((i % 5) as u32);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3513,14 +3576,14 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
         let id = Id::from_parts(10, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 100u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc, vec![])
+        .query(SchemaUid(schema_id), selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
 
@@ -3586,13 +3649,13 @@ async fn hashed_query_test() {
     let mut value = OwnedValue::Map(OwnedMap::new());
     value[DATA_1] = OwnedValue::U64(target_value);
     value[DATA_2] = OwnedValue::U32(0);
-    let cell = OwnedCell::new_with_id(schema_id_1, &single_case_id, value);
+    let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &single_case_id, value);
     client.write_cell(cell).await.unwrap().unwrap();
     info!("Single case cell written id: {:?}", single_case_id);
     let idx_data_client = server.indexed_data_client();
     let single_case_result = idx_data_client
         .hashed_query(
-            schema_id_1,
+            SchemaUid(schema_id_1),
             hash_str(DATA_1),
             &OwnedValue::U64(target_value),
         )
@@ -3606,7 +3669,7 @@ async fn hashed_query_test() {
     client.remove_cell(single_case_id).await.unwrap().unwrap();
     let single_case_result = idx_data_client
         .hashed_query(
-            schema_id_1,
+            SchemaUid(schema_id_1),
             hash_str(DATA_1),
             &OwnedValue::U64(target_value),
         )
@@ -3627,7 +3690,7 @@ async fn hashed_query_test() {
             expected_ids.push(id);
         }
 
-        let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -3636,7 +3699,7 @@ async fn hashed_query_test() {
     let field_id = hash_str(DATA_1);
 
     let query_result = idx_data_client
-        .hashed_query(schema_id_1, field_id, &query_value)
+        .hashed_query(SchemaUid(schema_id_1), field_id, &query_value)
         .await
         .unwrap()
         .unwrap();
@@ -3669,7 +3732,7 @@ async fn hashed_query_test() {
     let non_existent_value = OwnedValue::U64(9999u64);
 
     let empty_result = idx_data_client
-        .hashed_query(schema_id_1, field_id, &non_existent_value)
+        .hashed_query(SchemaUid(schema_id_1), field_id, &non_existent_value)
         .await
         .unwrap()
         .unwrap();
@@ -3716,7 +3779,7 @@ async fn hashed_query_test() {
             string_expected_ids.push(id);
         }
 
-        let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id_2), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -3725,7 +3788,7 @@ async fn hashed_query_test() {
     let string_field_id = hash_str(string_field_name);
 
     let string_query_result = idx_data_client
-        .hashed_query(schema_id_2, string_field_id, &string_query_value)
+        .hashed_query(SchemaUid(schema_id_2), string_field_id, &string_query_value)
         .await
         .unwrap()
         .unwrap();
@@ -3811,7 +3874,7 @@ async fn hashed_query_supports_array_values() {
     array_cell[TAGS] = OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(11)]);
     client
         .write_cell(OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &contains_both,
             array_cell,
         ))
@@ -3823,7 +3886,7 @@ async fn hashed_query_supports_array_values() {
     prim_array_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![11, 13]));
     client
         .write_cell(OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &contains_eleven,
             prim_array_cell,
         ))
@@ -3835,7 +3898,7 @@ async fn hashed_query_supports_array_values() {
     array_match_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![13]));
     client
         .write_cell(OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &contains_thirteen,
             array_match_cell,
         ))
@@ -3847,7 +3910,7 @@ async fn hashed_query_supports_array_values() {
     non_match_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![99]));
     client
         .write_cell(OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &non_match,
             non_match_cell,
         ))
@@ -3859,7 +3922,7 @@ async fn hashed_query_supports_array_values() {
     let field_id = hash_str(TAGS);
 
     let direct_scalar_matches = idx_data_client
-        .hashed_query(schema_id, field_id, &OwnedValue::U64(11))
+        .hashed_query(SchemaUid(schema_id), field_id, &OwnedValue::U64(11))
         .await
         .unwrap()
         .unwrap();
@@ -3869,7 +3932,7 @@ async fn hashed_query_supports_array_values() {
     assert!(!direct_scalar_matches.contains(&contains_thirteen));
 
     let direct_array_matches = idx_data_client
-        .hashed_query(schema_id, field_id, &query_array)
+        .hashed_query(SchemaUid(schema_id), field_id, &query_array)
         .await
         .unwrap()
         .unwrap();
@@ -3880,7 +3943,7 @@ async fn hashed_query_supports_array_values() {
     assert!(!direct_array_matches.contains(&non_match));
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, scalar_expr, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), scalar_expr, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut queried_ids = vec![];
@@ -3892,7 +3955,7 @@ async fn hashed_query_supports_array_values() {
     assert!(queried_ids.contains(&contains_eleven));
 
     let mut array_cursor = idx_data_client
-        .query_ids(schema_id, array_expr, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), array_expr, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut array_query_ids = vec![];
@@ -3960,7 +4023,7 @@ async fn ranged_query_supports_array_values() {
         let mut cell = OwnedValue::Map(OwnedMap::new());
         cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(tags));
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, cell))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, cell))
             .await
             .unwrap()
             .unwrap();
@@ -3979,7 +4042,7 @@ async fn ranged_query_supports_array_values() {
 
     let idx_data_client = server.indexed_data_client();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut matched_ids = vec![];
@@ -4044,7 +4107,7 @@ async fn hashed_query_rejects_map_values() {
     let idx_data_client = server.indexed_data_client();
     let err = idx_data_client
         .hashed_query(
-            schema_id,
+            SchemaUid(schema_id),
             hash_str(DATA_1),
             &OwnedValue::Map(OwnedMap::new()),
         )
@@ -4132,7 +4195,7 @@ async fn bm25_search_returns_ranked_results() {
     for (id, text) in &docs {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TEXT_FIELD] = OwnedValue::String(text.to_string());
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4145,7 +4208,13 @@ async fn bm25_search_returns_ranked_results() {
 
     let idx_data_client = server.indexed_data_client();
     let hits = idx_data_client
-        .bm25_search(schema_id, hash_str(TEXT_FIELD), "database ranking", 5, true)
+        .bm25_search(
+            SchemaUid(schema_id),
+            hash_str(TEXT_FIELD),
+            "database ranking",
+            5,
+            true,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -4164,7 +4233,13 @@ async fn bm25_search_returns_ranked_results() {
     );
 
     let empty_hits = idx_data_client
-        .bm25_search(schema_id, hash_str(TEXT_FIELD), "quantum muffins", 5, true)
+        .bm25_search(
+            SchemaUid(schema_id),
+            hash_str(TEXT_FIELD),
+            "quantum muffins",
+            5,
+            true,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -4237,14 +4312,18 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
             "ranking algorithms for search and bm25 scoring",
             "search",
         ),
-        (Id::from_parts(6, 3), "kitchen recipes and baking tips", "infra"),
+        (
+            Id::from_parts(6, 3),
+            "kitchen recipes and baking tips",
+            "infra",
+        ),
     ];
 
     for (id, body, tag) in &rows {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4271,7 +4350,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4339,7 +4418,11 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
             "modern database storage engine with ranking support",
             "docs",
         ),
-        (Id::from_parts(7, 2), "kitchen recipes and baking tips", "infra"),
+        (
+            Id::from_parts(7, 2),
+            "kitchen recipes and baking tips",
+            "infra",
+        ),
         (
             Id::from_parts(7, 3),
             "ranking algorithms for search and bm25 scoring",
@@ -4351,7 +4434,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4378,7 +4461,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4386,7 +4469,14 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(7, 1), Id::from_parts(7, 2), Id::from_parts(7, 3)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(7, 1),
+            Id::from_parts(7, 2),
+            Id::from_parts(7, 3)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4447,7 +4537,11 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             30u64,
         ),
         (Id::from_parts(8, 2), "database ranking for analysts", 10u64),
-        (Id::from_parts(8, 3), "ranking reports and database metrics", 20u64),
+        (
+            Id::from_parts(8, 3),
+            "ranking reports and database metrics",
+            20u64,
+        ),
         (Id::from_parts(8, 4), "kitchen recipes and baking", 5u64),
     ];
 
@@ -4455,7 +4549,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
         value[SCORE_FIELD] = OwnedValue::U64(*score);
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4475,7 +4569,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
 
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
@@ -4554,7 +4648,7 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
     for (id, body) in &rows {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4573,7 +4667,7 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4651,7 +4745,13 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
             "active",
             "keep",
         ),
-        (Id::from_parts(9, 2), "kitchen recipes", "ops", "active", "keep"),
+        (
+            Id::from_parts(9, 2),
+            "kitchen recipes",
+            "ops",
+            "active",
+            "keep",
+        ),
         (
             Id::from_parts(9, 3),
             "database ranking handbook",
@@ -4666,7 +4766,13 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
             "active",
             "drop",
         ),
-        (Id::from_parts(9, 5), "travel notes", "docs", "active", "keep"),
+        (
+            Id::from_parts(9, 5),
+            "travel notes",
+            "docs",
+            "active",
+            "keep",
+        ),
     ];
 
     for (id, body, tag, state, note) in &rows {
@@ -4675,7 +4781,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
         value[STATE_FIELD] = OwnedValue::String((*state).to_string());
         value[NOTE_FIELD] = OwnedValue::String((*note).to_string());
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4715,7 +4821,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4780,7 +4886,12 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let rows = vec![
-        (Id::from_parts(10, 1), "database ranking deep dive", "infra", 30u64),
+        (
+            Id::from_parts(10, 1),
+            "database ranking deep dive",
+            "infra",
+            30u64,
+        ),
         (Id::from_parts(10, 2), "ranking notes", "infra", 10u64),
         (Id::from_parts(10, 3), "operations handbook", "ops", 20u64),
         (Id::from_parts(10, 4), "ops runbook", "ops", 5u64),
@@ -4792,7 +4903,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
         value[SCORE_FIELD] = OwnedValue::U64(*score);
-        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -4836,7 +4947,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
 
     let mut cursor = idx_data_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
@@ -4851,7 +4962,14 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::from_parts(10, 4), Id::from_parts(10, 2), Id::from_parts(10, 3)]);
+    assert_eq!(
+        ids,
+        vec![
+            Id::from_parts(10, 4),
+            Id::from_parts(10, 2),
+            Id::from_parts(10, 3)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4942,7 +5060,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), id, value))
             .await
             .unwrap()
             .unwrap();
@@ -4971,7 +5089,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -5075,7 +5193,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
         value[NOTE_FIELD] = OwnedValue::String((*note).to_string());
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), id, value))
             .await
             .unwrap()
             .unwrap();
@@ -5112,7 +5230,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -5186,7 +5304,11 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     let mut value = OwnedValue::Map(OwnedMap::new());
     value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
     client
-        .write_cell(OwnedCell::new_with_id(schema_id, &Id::from_parts(13, 1), value))
+        .write_cell(OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &Id::from_parts(13, 1),
+            value,
+        ))
         .await
         .unwrap()
         .unwrap();
@@ -5206,7 +5328,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
 
     let query_res = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
         .await;
     assert!(
         query_res.is_err(),
@@ -5246,7 +5368,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         value[DATA_1] = OwnedValue::U64(i % 5);
         value[DATA_2] = OwnedValue::U64(i % 120_000);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -5260,7 +5382,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
     for _ in 0..2 {
         let mut c = idx_data_client
             .query_ids_with_options(
-                schema_id,
+                SchemaUid(schema_id),
                 selection.clone(),
                 QueryOrdering::Desc,
                 None,
@@ -5282,7 +5404,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         let t0 = Instant::now();
         let mut optimized = idx_data_client
             .query_ids_with_options(
-                schema_id,
+                SchemaUid(schema_id),
                 selection.clone(),
                 QueryOrdering::Desc,
                 None,
@@ -5300,7 +5422,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(schema_id, selection.clone(), QueryOrdering::Desc)
+            .query_ids(SchemaUid(schema_id), selection.clone(), QueryOrdering::Desc)
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -5375,7 +5497,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         value[DATA_1] = OwnedValue::U64(i % 17);
         value[DATA_2] = OwnedValue::U32((i % 9) as u32);
         client
-            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .write_cell(OwnedCell::new_with_id(SchemaVid(schema_id), &id, value))
             .await
             .unwrap()
             .unwrap();
@@ -5390,7 +5512,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
     for _ in 0..2 {
         let mut c = idx_data_client
             .query_ids_with_options(
-                schema_id,
+                SchemaUid(schema_id),
                 selection.clone(),
                 QueryOrdering::Desc,
                 None,
@@ -5411,7 +5533,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         let t0 = Instant::now();
         let mut optimized = idx_data_client
             .query_ids_with_options(
-                schema_id,
+                SchemaUid(schema_id),
                 selection.clone(),
                 QueryOrdering::Desc,
                 None,
@@ -5429,7 +5551,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(schema_id, selection.clone(), QueryOrdering::Desc)
+            .query_ids(SchemaUid(schema_id), selection.clone(), QueryOrdering::Desc)
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -5520,7 +5642,7 @@ async fn aggregate_groups_and_computes_builtins() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(1, raw_id), value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &Id::from_parts(1, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5530,7 +5652,7 @@ async fn aggregate_groups_and_computes_builtins() {
         server
             .indexed_data_client()
             .aggregate(
-                schema_id,
+                SchemaUid(schema_id),
                 AggregateQuery {
                     selection: Expr::nothing(),
                     group_by_fields: vec![region_field],
@@ -5685,7 +5807,7 @@ async fn query_shapes_selected_fields() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[NAME] = OwnedValue::String(name.to_string());
         value[SCORE] = OwnedValue::U64(score);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(3, raw_id), value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &Id::from_parts(3, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5693,7 +5815,7 @@ async fn query_shapes_selected_fields() {
         server
             .indexed_data_client()
             .query(
-                schema_id,
+                SchemaUid(schema_id),
                 Expr::nothing(),
                 QueryOrdering::Asc,
                 vec![
@@ -5756,7 +5878,7 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(4, raw_id), value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &Id::from_parts(4, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5766,7 +5888,7 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
         server
             .indexed_data_client()
             .aggregate(
-                schema_id,
+                SchemaUid(schema_id),
                 AggregateQuery {
                     selection: Expr::nothing(),
                     group_by_fields: vec![region_field],
@@ -5851,7 +5973,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[SCORE] = OwnedValue::U64(score);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(1, raw_id), value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &Id::from_parts(1, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5861,7 +5983,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         server
             .indexed_data_client()
             .aggregate(
-                schema_id,
+                SchemaUid(schema_id),
                 AggregateQuery {
                     selection: Expr::nothing(),
                     group_by_fields: vec![region_field],
@@ -5970,7 +6092,7 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32(7);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
     crate::index::builder::IndexBuilder::await_all_indices().await;
@@ -5981,7 +6103,7 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
     let before = crate::query::data_client::read::cells_read_count();
     let mut cursor = idx_data_client
         .query_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             parse_to_serde_expr(&format!("(= {} 7u32)", DATA_2)).unwrap()[0].clone(),
             QueryOrdering::Asc,
             None,

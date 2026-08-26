@@ -11,6 +11,7 @@ use crate::ram::types::{Bytes, Id, Map, OwnedMap, OwnedValue, Type};
 use std::collections::BTreeSet;
 
 use super::cell::CHUNK_SIZE;
+use crate::ram::schema::SchemaVid;
 
 const BYTES_LENGTH_PREFIX_SIZE: usize = std::mem::size_of::<u32>();
 const BYTES_ALIGNMENT: usize = std::mem::align_of::<u32>();
@@ -22,7 +23,7 @@ fn bytes_cell(schema_id: u32, id: Id, payload_len: usize) -> OwnedCell {
         OwnedValue::Bytes(Bytes::from_vec(vec![7_u8; payload_len])),
     );
     OwnedCell {
-        header: CellHeader::new(schema_id, &id),
+        header: CellHeader::new(SchemaVid(schema_id), &id),
         data: OwnedValue::Map(map),
     }
 }
@@ -106,7 +107,7 @@ fn blob_schema_serde_is_persisted_and_defaults_to_false_when_missing() {
     let deserialized: Schema = serde_json::from_value(serialized).unwrap();
 
     assert!(!deserialized.blobs);
-    assert_eq!(deserialized.id, schema.id);
+    assert_eq!(deserialized.vid, schema.vid);
     assert_eq!(deserialized.name, schema.name);
 }
 
@@ -133,11 +134,19 @@ fn blob_schema_regular_schema_accepts_exact_one_mib_boundary_and_rejects_next_ed
     );
     assert!(rejected_size > MAX_CELL_SIZE as usize);
 
-    let accepted = bytes_cell(schema.id, Id::allocated(42, 0, 1), accepted_payload_len);
+    let accepted = bytes_cell(
+        schema.vid.get(),
+        Id::allocated(42, 0, 1),
+        accepted_payload_len,
+    );
     let accepted_plan = accepted.plan_write(chunk).unwrap();
     assert_eq!(accepted_plan.total_size() as usize, MAX_CELL_SIZE as usize);
 
-    let rejected = bytes_cell(schema.id, Id::allocated(42, 0, 2), rejected_payload_len);
+    let rejected = bytes_cell(
+        schema.vid.get(),
+        Id::allocated(42, 0, 2),
+        rejected_payload_len,
+    );
 
     assert!(matches!(
         rejected.plan_write(chunk),
@@ -169,14 +178,22 @@ fn blob_schema_blob_schema_accepts_exact_two_mib_boundary_and_rejects_next_edge(
     );
     assert!(rejected_size > MAX_BLOB_CELL_SIZE as usize);
 
-    let accepted = bytes_cell(schema.id, Id::allocated(43, 0, 1), accepted_payload_len);
+    let accepted = bytes_cell(
+        schema.vid.get(),
+        Id::allocated(43, 0, 1),
+        accepted_payload_len,
+    );
     let accepted_plan = accepted.plan_write(chunk).unwrap();
     assert_eq!(
         accepted_plan.total_size() as usize,
         MAX_BLOB_CELL_SIZE as usize
     );
 
-    let rejected = bytes_cell(schema.id, Id::allocated(43, 0, 2), rejected_payload_len);
+    let rejected = bytes_cell(
+        schema.vid.get(),
+        Id::allocated(43, 0, 2),
+        rejected_payload_len,
+    );
     assert!(matches!(
         rejected.plan_write(chunk),
         Err(WriteError::CellIsTooLarge(actual_size)) if actual_size == rejected_size
@@ -200,8 +217,8 @@ fn blob_schema_blob_and_regular_cells_land_in_different_segment_classes() {
 
     let regular_id = Id::allocated(44, 0, 1);
     let blob_id = Id::allocated(44, 0, 2);
-    let mut regular_cell = bytes_cell(regular_schema.id, regular_id, 1024);
-    let mut blob_cell = bytes_cell(blob_schema.id, blob_id, 1024);
+    let mut regular_cell = bytes_cell(regular_schema.vid.get(), regular_id, 1024);
+    let mut blob_cell = bytes_cell(blob_schema.vid.get(), blob_id, 1024);
 
     chunks.write_cell(&mut regular_cell).unwrap();
     chunks.write_cell(&mut blob_cell).unwrap();
@@ -233,13 +250,13 @@ fn blob_schema_chunk_keeps_independent_blob_and_regular_heads() {
     assert_eq!(initial_blob_head, None);
 
     let regular_id = Id::allocated(46, 0, 1);
-    let mut regular_cell = bytes_cell(regular_schema.id, regular_id, 128);
+    let mut regular_cell = bytes_cell(regular_schema.vid.get(), regular_id, 128);
     chunks.write_cell(&mut regular_cell).unwrap();
 
     assert_eq!(chunk.head_seg_ids_for_test(), (initial_regular_head, None));
 
     let blob_id = Id::allocated(46, 0, 2);
-    let mut blob_cell = bytes_cell(blob_schema.id, blob_id, 128);
+    let mut blob_cell = bytes_cell(blob_schema.vid.get(), blob_id, 128);
     chunks.write_cell(&mut blob_cell).unwrap();
 
     let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
@@ -266,10 +283,10 @@ fn blob_schema_active_blob_head_is_excluded_from_cleaner_candidates() {
         .debug_only_new_schema(blob_schema.clone());
 
     let id = Id::allocated(48, 0, 1);
-    let mut original = bytes_cell(blob_schema.id, id, 256 * 1024);
+    let mut original = bytes_cell(blob_schema.vid.get(), id, 256 * 1024);
     chunks.write_cell(&mut original).unwrap();
 
-    let mut updated = bytes_cell(blob_schema.id, id, 384 * 1024);
+    let mut updated = bytes_cell(blob_schema.vid.get(), id, 384 * 1024);
     chunks.update_cell(&mut updated).unwrap();
 
     let (_, blob_head) = chunk.head_seg_ids_for_test();
@@ -307,7 +324,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let mut regular_cells = Vec::new();
     for index in 0..64_u64 {
         let id = Id::from_parts(4_900, 10_000 + index);
-        let mut cell = bytes_cell(regular_schema.id, id, 512 * 1024);
+        let mut cell = bytes_cell(regular_schema.vid.get(), id, 512 * 1024);
         chunks.write_cell(&mut cell).unwrap();
 
         let segment_id = written_segment_id(&chunks, &id);
@@ -344,7 +361,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let mut blob_cells = Vec::new();
     for index in 0..64_u64 {
         let id = Id::from_parts(5_000, 20_000 + index);
-        let mut cell = bytes_cell(blob_schema.id, id, payload_len);
+        let mut cell = bytes_cell(blob_schema.vid.get(), id, payload_len);
         chunks.write_cell(&mut cell).unwrap();
 
         let segment_id = written_segment_id(&chunks, &id);
@@ -421,7 +438,7 @@ fn blob_schema_combine_preserves_blob_segment_class() {
 
     for index in 0..32_u64 {
         let id = Id::allocated(51, 0, index);
-        let mut cell = bytes_cell(blob_schema.id, id, payload_len);
+        let mut cell = bytes_cell(blob_schema.vid.get(), id, payload_len);
         chunks.write_cell(&mut cell).unwrap();
 
         let segment_id = written_segment_id(&chunks, &id);

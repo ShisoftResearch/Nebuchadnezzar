@@ -61,9 +61,7 @@ where
                             // Position at the largest key <= the seek key; when
                             // no such key exists in this page, fall through to
                             // the previous page.
-                            if pos < n.len
-                                && n.keys.cmp_at(pos, key) == std::cmp::Ordering::Equal
-                            {
+                            if pos < n.len && n.keys.cmp_at(pos, key) == std::cmp::Ordering::Equal {
                                 Some(pos)
                             } else if pos > 0 {
                                 Some(pos - 1)
@@ -122,11 +120,7 @@ where
                     .right
                     .try_clone_speculative()
                     .unwrap_or_else(|| node_ref.clone())),
-                &NodeData::None => Ok(RTCursor::empty(
-                    ordering,
-                    deletion.clone(),
-                    filter_deleted,
-                )),
+                &NodeData::None => Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted)),
             }
         });
         match r {
@@ -194,12 +188,10 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
-        &NodeData::Internal(ref n) => {
-            match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
-                Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
-                None => Err(node_ref.clone()),
-            }
-        }
+        &NodeData::Internal(ref n) => match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
+            Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
+            None => Err(node_ref.clone()),
+        },
         &NodeData::External(_) => Ok(MutSearchResult::External),
         &NodeData::Empty(ref n) => Err(n
             .right

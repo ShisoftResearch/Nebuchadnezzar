@@ -22,11 +22,12 @@ use super::{
     sort::range_index_order_for_range,
     IndexedDataClient, QueryHitTable, QueryHitType, QueryOrdering, ValueRange,
 };
+use crate::ram::schema::SchemaUid;
 
 impl IndexedDataClient {
     pub(super) async fn execute_clause_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         clause: &IndexedClausePlan,
         _ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -120,7 +121,7 @@ impl IndexedDataClient {
 
     pub(super) async fn execute_predicate_plan_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         plan: &IndexedPredicatePlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -140,7 +141,7 @@ impl IndexedDataClient {
 
     async fn execute_disjunct_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         disjunct: &IndexedDisjunctPlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -217,7 +218,7 @@ impl IndexedDataClient {
 
     async fn vector_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
@@ -258,7 +259,7 @@ impl IndexedDataClient {
 
     async fn embedding_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -287,7 +288,7 @@ impl IndexedDataClient {
 
     async fn fulltext_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -305,7 +306,7 @@ impl IndexedDataClient {
 
     async fn range_query_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field: u64,
         range: &ValueRange,
         ordering: Ordering,

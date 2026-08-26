@@ -1,3 +1,4 @@
+use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::{
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
@@ -667,7 +668,7 @@ async fn materialize_neb_dataset(
             .nullable_value
             .map(OwnedValue::U64)
             .unwrap_or(OwnedValue::Null);
-        let cell = OwnedCell::new_with_id(schema_id, &row.id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &row.id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
     crate::index::builder::IndexBuilder::await_all_indices().await;
@@ -731,7 +732,7 @@ async fn assert_query_alignment(
     let selection = parse_to_serde_expr(&neb_lisp).unwrap()[0].clone();
     let mut neb_cursor = idx_client
         .query_ids_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             query.ordering,
             query.order_by_field.map(AlignField::field_id),
@@ -774,7 +775,7 @@ async fn assert_projection_alignment(
     let selection = parse_to_serde_expr(&neb_lisp).unwrap()[0].clone();
     let mut neb_cursor = idx_client
         .query_with_options(
-            schema_id,
+            SchemaUid(schema_id),
             selection,
             query.query.ordering,
             query.query.order_by_field.map(AlignField::field_id),
@@ -951,7 +952,7 @@ async fn assert_aggregate_alignment(
     let mut neb_cursor = tokio::time::timeout(
         Duration::from_secs(30),
         idx_client.aggregate(
-            schema_id,
+            SchemaUid(schema_id),
             AggregateQuery {
                 selection,
                 group_by_fields: query

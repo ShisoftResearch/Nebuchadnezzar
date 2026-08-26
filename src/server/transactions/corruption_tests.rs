@@ -65,7 +65,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
         OwnedValue::String(String::from("Test")),
     );
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -78,7 +78,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     for i in 0..txn_count {
         let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
-        let sid = schema.id;
+        let sid = schema.vid;
 
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
@@ -174,7 +174,7 @@ async fn test_varying_size_concurrent_updates() {
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
     data_map.insert(&String::from("name"), OwnedValue::String(String::from("X")));
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -186,7 +186,7 @@ async fn test_varying_size_concurrent_updates() {
     for i in 0..txn_count {
         let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
-        let sid = schema.id;
+        let sid = schema.vid;
 
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
@@ -280,7 +280,7 @@ async fn test_multi_cell_concurrent_transactions() {
             &String::from("name"),
             OwnedValue::String(format!("Cell{}", i)),
         );
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
         server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
@@ -380,7 +380,7 @@ async fn test_rapid_commit_sequence() {
         OwnedValue::String(String::from("Test")),
     );
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -470,7 +470,7 @@ async fn test_interleaved_prepare_commit() {
             &String::from("name"),
             OwnedValue::String(format!("Cell{}", i)),
         );
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
         server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
@@ -570,7 +570,7 @@ async fn test_maximum_concurrency_stress() {
         OwnedValue::String(String::from("StressTest")),
     );
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -687,7 +687,7 @@ async fn test_wikidata_import_scenario() {
         // Each batch processes multiple items concurrently
         for item in 0..items_per_batch {
             let txn_client = scoped_txn_client(&server_addr, "test").await;
-            let sid = schema.id;
+            let sid = schema.vid;
 
             batch_tasks.push(tokio::spawn(async move {
                 let txn_id = match txn_client.begin().await {
@@ -811,7 +811,7 @@ async fn test_update_cell_by_stress() {
         OwnedValue::String(String::from("Test")),
     );
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 

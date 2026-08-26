@@ -1,6 +1,7 @@
 use super::*;
 use crate::ram::cell::{OwnedCell, ReadError};
 use crate::ram::schema::Schema;
+use crate::ram::schema::SchemaVid;
 use crate::ram::tests::default_fields;
 use crate::ram::types::{Id, OwnedMap, OwnedValue};
 use crate::server::transactions;
@@ -113,7 +114,7 @@ fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
     data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
     data.insert(&String::from("score"), OwnedValue::U64(score));
     data.insert(&String::from("name"), OwnedValue::String(name.to_string()));
-    OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+    OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
 }
 
 /// Two ids that genuinely live on different members.
@@ -259,14 +260,14 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         .get(&fail_server_id)
         .expect("fast-failure cell owner should exist");
 
-    let mut slow_seed = counter_cell(schema.id, slow_id, 1, "counter_slow_seed");
+    let mut slow_seed = counter_cell(schema.vid.get(), slow_id, 1, "counter_slow_seed");
     slow_server
         .current_database()
         .chunks()
         .write_cell(&mut slow_seed)
         .unwrap();
 
-    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "counter_fail_seed");
+    let mut fail_seed = counter_cell(schema.vid.get(), fail_id, 2, "counter_fail_seed");
     fail_server
         .current_database()
         .chunks()
@@ -281,13 +282,13 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     assert_eq!(score_of(&slow_first), 1);
     assert_eq!(score_of(&fail_first), 2);
 
-    let fail_update = counter_cell(schema.id, fail_id, 9, "counter_fail_txn");
+    let fail_update = counter_cell(schema.vid.get(), fail_id, 9, "counter_fail_txn");
     assert_eq!(
         txn.update(tid.clone(), fail_update).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
     );
 
-    let mut external_fail = counter_cell(schema.id, fail_id, 12, "counter_fail_external");
+    let mut external_fail = counter_cell(schema.vid.get(), fail_id, 12, "counter_fail_external");
     let external_header = fail_server
         .current_database()
         .chunks()
@@ -332,7 +333,7 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), slow_id).await.unwrap().unwrap());
     assert_eq!(score_of(&retry_first), 1);
 
-    let retry_update = counter_cell(schema.id, slow_id, 15, "counter_slow_retry");
+    let retry_update = counter_cell(schema.vid.get(), slow_id, 15, "counter_slow_retry");
     assert_eq!(
         txn.update(retry_tid.clone(), retry_update.clone())
             .await
@@ -407,14 +408,14 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
         .get(&fail_server_id)
         .expect("fast-failure cell owner should exist");
 
-    let mut slow_seed = counter_cell(schema.id, slow_id, 1, "counter_cancel_slow_seed");
+    let mut slow_seed = counter_cell(schema.vid.get(), slow_id, 1, "counter_cancel_slow_seed");
     slow_server
         .current_database()
         .chunks()
         .write_cell(&mut slow_seed)
         .unwrap();
 
-    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "counter_cancel_fail_seed");
+    let mut fail_seed = counter_cell(schema.vid.get(), fail_id, 2, "counter_cancel_fail_seed");
     fail_server
         .current_database()
         .chunks()
@@ -430,13 +431,18 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
     assert_eq!(score_of(&slow_first), 1);
     assert_eq!(score_of(&fail_first), 2);
 
-    let fail_update = counter_cell(schema.id, fail_id, 9, "counter_cancel_fail_txn");
+    let fail_update = counter_cell(schema.vid.get(), fail_id, 9, "counter_cancel_fail_txn");
     assert_eq!(
         txn.update(tid.clone(), fail_update).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
     );
 
-    let mut external_fail = counter_cell(schema.id, fail_id, 12, "counter_cancel_fail_external");
+    let mut external_fail = counter_cell(
+        schema.vid.get(),
+        fail_id,
+        12,
+        "counter_cancel_fail_external",
+    );
     let external_header = fail_server
         .current_database()
         .chunks()
@@ -481,7 +487,7 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), slow_id).await.unwrap().unwrap());
     assert_eq!(score_of(&retry_first), 1);
 
-    let retry_update = counter_cell(schema.id, slow_id, 15, "counter_cancel_slow_retry");
+    let retry_update = counter_cell(schema.vid.get(), slow_id, 15, "counter_cancel_slow_retry");
     assert_eq!(
         txn.update(retry_tid.clone(), retry_update.clone())
             .await
@@ -542,7 +548,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90114);
 
-    let mut initial = counter_cell(schema.id, cell_id, 1, "counter_cancel_success_seed");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 1, "counter_cancel_success_seed");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -551,7 +557,12 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&first), 1);
 
-    let pending = counter_cell(schema.id, cell_id, 9, "counter_cancel_success_pending");
+    let pending = counter_cell(
+        schema.vid.get(),
+        cell_id,
+        9,
+        "counter_cancel_success_pending",
+    );
     assert_eq!(
         txn.update(tid.clone(), pending).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -582,7 +593,12 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let retry_tid = txn.begin().await.unwrap().unwrap();
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&retry_first), 1);
-    let retry = counter_cell(schema.id, cell_id, 15, "counter_cancel_success_retry");
+    let retry = counter_cell(
+        schema.vid.get(),
+        cell_id,
+        15,
+        "counter_cancel_success_retry",
+    );
     assert_eq!(
         txn.update(retry_tid.clone(), retry.clone())
             .await
@@ -621,13 +637,13 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90115);
 
-    let mut initial = counter_cell(schema.id, cell_id, 1, "commit-abort-seed");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 1, "commit-abort-seed");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
     let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    let committed = counter_cell(schema.id, cell_id, 9, "commit-abort-committed");
+    let committed = counter_cell(schema.vid.get(), cell_id, 9, "commit-abort-committed");
     assert_eq!(
         txn.update(tid.clone(), committed.clone())
             .await
@@ -686,13 +702,18 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
         .get(&fail_server_id)
         .expect("failing abort participant should exist");
 
-    let mut success_seed = counter_cell(schema.id, success_id, 1, "partial-abort-success-seed");
+    let mut success_seed = counter_cell(
+        schema.vid.get(),
+        success_id,
+        1,
+        "partial-abort-success-seed",
+    );
     success_server
         .current_database()
         .chunks()
         .write_cell(&mut success_seed)
         .unwrap();
-    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "partial-abort-fail-seed");
+    let mut fail_seed = counter_cell(schema.vid.get(), fail_id, 2, "partial-abort-fail-seed");
     fail_server
         .current_database()
         .chunks()
@@ -710,7 +731,12 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
     assert_eq!(
         txn.update(
             tid.clone(),
-            counter_cell(schema.id, success_id, 11, "partial-abort-success-update"),
+            counter_cell(
+                schema.vid.get(),
+                success_id,
+                11,
+                "partial-abort-success-update"
+            ),
         )
         .await
         .unwrap()
@@ -720,7 +746,7 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
     assert_eq!(
         txn.update(
             tid.clone(),
-            counter_cell(schema.id, fail_id, 12, "partial-abort-fail-update"),
+            counter_cell(schema.vid.get(), fail_id, 12, "partial-abort-fail-update"),
         )
         .await
         .unwrap()
@@ -803,7 +829,7 @@ async fn repeatable_full_read_uses_first_snapshot() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90101);
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_full_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 0, "counter_full_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -812,7 +838,7 @@ async fn repeatable_full_read_uses_first_snapshot() {
     let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&first), 0);
 
-    let mut updated = counter_cell(schema.id, cell_id, 9, "counter_full_updated");
+    let mut updated = counter_cell(schema.vid.get(), cell_id, 9, "counter_full_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
     assert!(updated_header.version > first.header.version);
 
@@ -839,7 +865,7 @@ async fn repeatable_missing_read_caches_absence() {
 
     assert_missing(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
 
-    let mut inserted = counter_cell(schema.id, missing_id, 9, "counter_missing_inserted");
+    let mut inserted = counter_cell(schema.vid.get(), missing_id, 9, "counter_missing_inserted");
     runtime.chunks().write_cell(&mut inserted).unwrap();
 
     assert_missing(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
@@ -858,7 +884,7 @@ async fn repeatable_selected_and_head_share_full_snapshot() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90103);
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_select_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 0, "counter_select_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -875,7 +901,7 @@ async fn repeatable_selected_and_head_share_full_snapshot() {
     assert_eq!(selected.header.version, head.version);
     assert_eq!(selected_score_of(&selected), 0);
 
-    let mut updated = counter_cell(schema.id, cell_id, 9, "counter_select_updated");
+    let mut updated = counter_cell(schema.vid.get(), cell_id, 9, "counter_select_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
     assert!(updated_header.version > head.version);
 
@@ -897,7 +923,7 @@ async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90104);
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_select_all_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 0, "counter_select_all_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -912,7 +938,7 @@ async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
     assert!(matches!(&selected_all.data, OwnedValue::Map(_)));
     assert_eq!(selected_all.data, initial.data);
 
-    let mut updated = counter_cell(schema.id, cell_id, 9, "counter_select_all_updated");
+    let mut updated = counter_cell(schema.vid.get(), cell_id, 9, "counter_select_all_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
     assert!(updated_header.version > selected_all.header.version);
 
@@ -936,7 +962,12 @@ async fn repeatable_selected_dynamic_fields_fall_back_to_map_lookup() {
     let dynamic_field = hash_str("bonus");
     let missing_field = hash_str("bonus_missing");
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_select_dynamic_initial");
+    let mut initial = counter_cell(
+        schema.vid.get(),
+        cell_id,
+        0,
+        "counter_select_dynamic_initial",
+    );
     match &mut initial.data {
         OwnedValue::Map(map) => {
             map.insert(&String::from("bonus"), OwnedValue::U64(7));
@@ -978,7 +1009,7 @@ async fn repeatable_absence_rejects_update_and_preserves_create_path() {
 
     assert_missing(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
 
-    let missing_update = counter_cell(schema.id, missing_id, 5, "counter_absence_update");
+    let missing_update = counter_cell(schema.vid.get(), missing_id, 5, "counter_absence_update");
     assert_eq!(
         txn.update(tid.clone(), missing_update.clone())
             .await
@@ -1012,7 +1043,7 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90107);
 
-    let mut initial = counter_cell(schema.id, cell_id, 1, "counter_replace_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 1, "counter_replace_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -1026,7 +1057,7 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
         TxnExecResult::Accepted(())
     );
 
-    let replacement = counter_cell(schema.id, cell_id, 9, "counter_replace_updated");
+    let replacement = counter_cell(schema.vid.get(), cell_id, 9, "counter_replace_updated");
     assert_eq!(
         txn.write(tid.clone(), replacement).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -1057,7 +1088,12 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90108);
 
-    let mut initial = counter_cell(schema.id, cell_id, 2, "counter_blind_replace_initial");
+    let mut initial = counter_cell(
+        schema.vid.get(),
+        cell_id,
+        2,
+        "counter_blind_replace_initial",
+    );
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -1068,7 +1104,12 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
         TxnExecResult::Accepted(())
     );
 
-    let replacement = counter_cell(schema.id, cell_id, 8, "counter_blind_replace_updated");
+    let replacement = counter_cell(
+        schema.vid.get(),
+        cell_id,
+        8,
+        "counter_blind_replace_updated",
+    );
     assert_eq!(
         txn.write(tid.clone(), replacement).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -1107,7 +1148,12 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
         TxnExecResult::Error(WriteError::CellDoesNotExisted)
     );
 
-    let created = counter_cell(schema.id, missing_id, 8, "counter_blind_remove_missing");
+    let created = counter_cell(
+        schema.vid.get(),
+        missing_id,
+        8,
+        "counter_blind_remove_missing",
+    );
     assert_eq!(
         txn.write(tid.clone(), created).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -1130,10 +1176,10 @@ async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
     let read_id = Id::from_parts(0, 90110);
     let write_id = Id::from_parts(0, 90111);
 
-    let mut read_seed = counter_cell(schema.id, read_id, 3, "counter_mixed_read_seed");
+    let mut read_seed = counter_cell(schema.vid.get(), read_id, 3, "counter_mixed_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
 
-    let mut write_seed = counter_cell(schema.id, write_id, 5, "counter_mixed_write_seed");
+    let mut write_seed = counter_cell(schema.vid.get(), write_id, 5, "counter_mixed_write_seed");
     runtime.chunks().write_cell(&mut write_seed).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -1142,7 +1188,12 @@ async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
     let observed_read = accepted_cell(txn.read(tid.clone(), read_id).await.unwrap().unwrap());
     assert_eq!(observed_read.data, read_seed.data);
 
-    let updated_write = counter_cell(schema.id, write_id, 12, "counter_mixed_write_updated");
+    let updated_write = counter_cell(
+        schema.vid.get(),
+        write_id,
+        12,
+        "counter_mixed_write_updated",
+    );
     assert_eq!(
         txn.update(tid.clone(), updated_write.clone())
             .await
@@ -1179,14 +1230,14 @@ async fn repeatable_blind_update_after_clock_advance_uses_transaction_observatio
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90112);
 
-    let mut initial = counter_cell(schema.id, cell_id, 4, "counter_blind_clock_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 4, "counter_blind_clock_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
     let later_tid = txn.begin().await.unwrap().unwrap();
 
-    let updated = counter_cell(schema.id, cell_id, 11, "counter_blind_clock_updated");
+    let updated = counter_cell(schema.vid.get(), cell_id, 11, "counter_blind_clock_updated");
     assert_eq!(
         txn.update(tid.clone(), updated.clone())
             .await
@@ -1221,7 +1272,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90113);
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_lost_update_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 0, "counter_lost_update_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -1234,8 +1285,8 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     assert_eq!(score_of(&second), 0);
     assert_eq!(first.header.version, second.header.version);
 
-    let t1_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t1");
-    let t2_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t2");
+    let t1_update = counter_cell(schema.vid.get(), cell_id, 1, "counter_lost_update_t1");
+    let t2_update = counter_cell(schema.vid.get(), cell_id, 1, "counter_lost_update_t2");
     assert_eq!(
         txn.update(t1.clone(), t1_update).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -1270,7 +1321,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     let retry_read = accepted_cell(txn.read(retry.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&retry_read), 1);
 
-    let retry_update = counter_cell(schema.id, cell_id, 2, "counter_lost_update_retry");
+    let retry_update = counter_cell(schema.vid.get(), cell_id, 2, "counter_lost_update_retry");
     assert_eq!(
         txn.update(retry.clone(), retry_update)
             .await
@@ -1303,7 +1354,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::from_parts(0, 90130);
 
-    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_shape_gated_initial");
+    let mut initial = counter_cell(schema.vid.get(), cell_id, 0, "counter_shape_gated_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
     let seeded_version = initial.header.version;
 
@@ -1333,7 +1384,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 
     // A concurrent update advances the current version; the pin must keep the txn
     // observing its snapshot for the later full read.
-    let mut updated = counter_cell(schema.id, cell_id, 9, "counter_shape_gated_updated");
+    let mut updated = counter_cell(schema.vid.get(), cell_id, 9, "counter_shape_gated_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
     assert!(updated_header.version > head.version);
 
@@ -1386,10 +1437,10 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     let read_id = Id::from_parts(0, 90131);
     let write_id = Id::from_parts(0, 90132);
 
-    let mut read_seed = counter_cell(schema.id, read_id, 0, "counter_certify_read_seed");
+    let mut read_seed = counter_cell(schema.vid.get(), read_id, 0, "counter_certify_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
     let read_version = read_seed.header.version;
-    let mut write_seed = counter_cell(schema.id, write_id, 0, "counter_certify_write_seed");
+    let mut write_seed = counter_cell(schema.vid.get(), write_id, 0, "counter_certify_write_seed");
     runtime.chunks().write_cell(&mut write_seed).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
@@ -1407,14 +1458,22 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     );
 
     // A write on a different cell makes this a read-write transaction so prepare runs.
-    let write_update = counter_cell(schema.id, write_id, 5, "counter_certify_write_update");
+    let write_update = counter_cell(
+        schema.vid.get(),
+        write_id,
+        5,
+        "counter_certify_write_update",
+    );
     assert_eq!(
-        txn.update(tid.clone(), write_update).await.unwrap().unwrap(),
+        txn.update(tid.clone(), write_update)
+            .await
+            .unwrap()
+            .unwrap(),
         TxnExecResult::Accepted(())
     );
 
     // A concurrent writer advances the header-read cell past the pinned version.
-    let mut conflicting = counter_cell(schema.id, read_id, 7, "counter_certify_conflict");
+    let mut conflicting = counter_cell(schema.vid.get(), read_id, 7, "counter_certify_conflict");
     let conflicting_header = runtime.chunks().update_cell(&mut conflicting).unwrap();
     assert!(conflicting_header.version > head.version);
 
@@ -1446,7 +1505,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let cell_id = Id::from_parts(0, 90133);
 
     // Seed version A.
-    let mut version_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
+    let mut version_a = counter_cell(schema.vid.get(), cell_id, 100, "counter_overwrite_a");
     runtime.chunks().write_cell(&mut version_a).unwrap();
     let version_a_version = version_a.header.version;
 
@@ -1459,7 +1518,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
 
     // Overwrite the cell NON-transactionally: this writes a NEW version B and
     // only marks version A dead (copy-on-write) rather than mutating it in place.
-    let mut version_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
+    let mut version_b = counter_cell(schema.vid.get(), cell_id, 200, "counter_overwrite_b");
     let version_b_header = runtime.chunks().update_cell(&mut version_b).unwrap();
     assert!(version_b_header.version > head_a.version);
 
@@ -1516,7 +1575,7 @@ async fn head_pin_survives_concurrent_transactional_remove() {
     let cell_id = Id::from_parts(0, 90134);
 
     // Seed version A.
-    let mut version_a = counter_cell(schema.id, cell_id, 42, "counter_remove_pin_seed");
+    let mut version_a = counter_cell(schema.vid.get(), cell_id, 42, "counter_remove_pin_seed");
     runtime.chunks().write_cell(&mut version_a).unwrap();
     let version_a_version = version_a.header.version;
 
@@ -1582,7 +1641,7 @@ async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     // Concurrently, a different transaction inserts the cell transactionally
     // (write, then prepare/commit) and it becomes visible in storage.
     let tid2 = txn.begin().await.unwrap().unwrap();
-    let inserted = counter_cell(schema.id, missing_id, 77, "counter_absence_insert");
+    let inserted = counter_cell(schema.vid.get(), missing_id, 77, "counter_absence_insert");
     assert_eq!(
         txn.write(tid2.clone(), inserted.clone())
             .await

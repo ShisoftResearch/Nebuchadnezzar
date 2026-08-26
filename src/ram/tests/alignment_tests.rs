@@ -107,7 +107,7 @@ async fn test_cell_location_alignment_after_write() {
             OwnedValue::String(format!("Cell_{}", i)),
         );
 
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
         let result = server.chunks().write_cell(&mut cell);
 
         assert!(
@@ -182,7 +182,7 @@ async fn test_cell_location_alignment_after_update() {
     );
 
     let mut cell =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server
         .chunks()
         .write_cell(&mut cell)
@@ -205,7 +205,7 @@ async fn test_cell_location_alignment_after_update() {
         data_map.insert(&String::from("score"), OwnedValue::U64(i));
 
         let mut updated_cell =
-            OwnedCell::new_with_id(schema.id, &cell_id, OwnedValue::Map(data_map.clone()));
+            OwnedCell::new_with_id(schema.vid, &cell_id, OwnedValue::Map(data_map.clone()));
 
         let update_result = server.chunks().update_cell(&mut updated_cell);
         assert!(
@@ -284,7 +284,7 @@ async fn test_varying_size_alignment() {
         let test_string = "A".repeat(*size);
         data_map.insert(&String::from("name"), OwnedValue::String(test_string));
 
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
 
         let write_result = server.chunks().write_cell(&mut cell);
         assert!(
@@ -468,7 +468,7 @@ async fn test_alignment_after_multiple_segments() {
         let test_string = "B".repeat(string_size);
         data_map.insert(&String::from("name"), OwnedValue::String(test_string));
 
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
 
         match server.chunks().write_cell(&mut cell) {
             Ok(_) => {

@@ -13,7 +13,7 @@ use crate::index::builder::IndexError;
 use crate::query::statistics::{merge_statistics, SchemaStatistics};
 use crate::ram::cell::{Cell, OwnedCell};
 use crate::ram::chunk::Chunks;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
 
 use super::{
@@ -32,7 +32,8 @@ const SEGMENT_DOC_LENGTHS_FIELD: &str = "doc_lengths";
 const SEGMENT_NEXT_FIELD: &str = "_next";
 
 lazy_static! {
-    pub static ref INVERTED_SEGMENT_SCHEMA_ID: u32 = hash_str(INVERTED_SEGMENT_SCHEMA) as u32;
+    pub static ref INVERTED_SEGMENT_SCHEMA_ID: SchemaVid =
+        SchemaVid(hash_str(INVERTED_SEGMENT_SCHEMA) as u32);
     static ref SEGMENT_DOC_IDS_FIELD_ID: u64 = hash_str(SEGMENT_DOC_IDS_FIELD);
     static ref SEGMENT_VERSIONS_FIELD_ID: u64 = hash_str(SEGMENT_VERSIONS_FIELD);
     static ref SEGMENT_TERM_FREQS_FIELD_ID: u64 = hash_str(SEGMENT_TERM_FREQS_FIELD);
@@ -42,7 +43,7 @@ lazy_static! {
 
 pub fn inverted_segment_schema() -> Schema {
     Schema::new_with_id(
-        *INVERTED_SEGMENT_SCHEMA_ID,
+        INVERTED_SEGMENT_SCHEMA_ID.get(),
         &INVERTED_SEGMENT_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![
@@ -164,11 +165,10 @@ use crate::ram::chunk::Chunk;
 /// The posting list ID has higher=0 (local-only, not globally routed) and
 /// lower=hash(schema, field, term, segment).
 struct SegmentedPostingList {
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     term_hash: u64,
 }
-
 
 /// Hashed-class id composition for full-text internals: the locality
 /// bits carry the document partition so posting lists stay
@@ -234,7 +234,7 @@ impl SegmentedPostingList {
         })
     }
 
-    fn new(schema_id: u32, field_id: u64, term_hash: u64) -> Self {
+    fn new(schema_id: SchemaUid, field_id: u64, term_hash: u64) -> Self {
         Self {
             schema_id,
             field_id,
@@ -248,8 +248,8 @@ impl SegmentedPostingList {
         // locality carries the partition (matches document partition for
         // proper recovery); low bits hash (schema_id, field_id, term_hash,
         // segment_idx).
-        let hash = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx))
-            .bits();
+        let hash =
+            Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx)).bits();
         compose_partitioned_hash_id(partition, hash)
     }
 
@@ -581,16 +581,19 @@ impl InvertedIndexer {
     }
 
     /// Hash key for field_stats: (schema_id, field_id) -> u64
-    pub fn stats_key(schema_id: u32, field_id: u64) -> u64 {
+    pub fn stats_key(schema_id: SchemaUid, field_id: u64) -> u64 {
         Id::from_obj(&(schema_id, field_id)).bits()
     }
 
     /// Hash key for doc_metadata: (schema_id, field_id, doc_id) -> u64
-    pub fn doc_meta_key(schema_id: u32, field_id: u64, doc_id: &Id) -> u64 {
+    pub fn doc_meta_key(schema_id: SchemaUid, field_id: u64, doc_id: &Id) -> u64 {
         Id::from_obj(&(schema_id, field_id, doc_id.bits())).bits()
     }
 
-    pub fn try_overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
+    pub fn try_overall_schema_statistics(
+        &self,
+        schema_id: SchemaUid,
+    ) -> Option<Arc<SchemaStatistics>> {
         let all_stats = self
             .chunks
             .all_chunk_statistics(schema_id)
@@ -600,19 +603,19 @@ impl InvertedIndexer {
         merge_statistics(all_stats).map(Arc::new)
     }
 
-    fn stats_cell_id(schema_id: u32, field_id: u64) -> Id {
+    fn stats_cell_id(schema_id: SchemaUid, field_id: u64) -> Id {
         Id::from_obj(&(schema_id, field_id, b"stats"))
     }
 
-    fn doc_meta_cell_id(schema_id: u32, field_id: u64, doc_id: &Id) -> Id {
+    fn doc_meta_cell_id(schema_id: SchemaUid, field_id: u64, doc_id: &Id) -> Id {
         Id::from_obj(&(schema_id, field_id, doc_id.bits()))
     }
 
-    fn mark_field_stats_dirty(&self, schema_id: u32, field_id: u64) -> u64 {
+    fn mark_field_stats_dirty(&self, schema_id: SchemaUid, field_id: u64) -> u64 {
         let stats_key = Self::stats_key(schema_id, field_id);
         self.dirty_field_stats_keys
             .lock()
-            .insert(stats_key, (schema_id, field_id));
+            .insert(stats_key, (schema_id.get(), field_id));
         stats_key
     }
 
@@ -746,7 +749,7 @@ impl InvertedIndexer {
     }
 
     /// Get field statistics from memory, loading from disk if not found
-    pub fn get_field_stats(&self, schema_id: u32, field_id: u64) -> FieldStats {
+    pub fn get_field_stats(&self, schema_id: SchemaUid, field_id: u64) -> FieldStats {
         let stats_key = Self::stats_key(schema_id, field_id);
 
         // Check memory first
@@ -799,7 +802,7 @@ impl InvertedIndexer {
     /// Note: Version is stored for GC but not filtered at query time for performance
     pub fn get_term_postings(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         term_hash: u64,
     ) -> Vec<(Id, u32, u32)> {
@@ -821,7 +824,7 @@ impl InvertedIndexer {
     /// Get postings with version information (for GC or verified search)
     pub fn get_term_postings_with_version(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         term_hash: u64,
     ) -> Vec<(Id, u64, u32, u32)> {
@@ -847,7 +850,7 @@ impl InvertedIndexer {
     /// in results until GC runs.
     pub async fn bm25_search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -1021,7 +1024,7 @@ impl InvertedIndexer {
         for (hash_key, (schema_id, field_id)) in dirty_keys.iter() {
             if let Some(stats_arc) = self.field_stats.get(hash_key) {
                 let stat = stats_arc.lock();
-                let stats_id = Self::stats_cell_id(*schema_id, *field_id);
+                let stats_id = Self::stats_cell_id(SchemaUid(*schema_id), *field_id);
                 let cell =
                     OwnedCell::new_with_id(*INVERTED_STATS_SCHEMA_ID, &stats_id, stat.to_value());
 
@@ -1112,7 +1115,7 @@ impl InvertedIndexer {
             let fid = field_id.unwrap_or(0);
 
             for term_hash in hashes {
-                let (scanned, removed) = self.gc_posting_list(sid, fid, term_hash)?;
+                let (scanned, removed) = self.gc_posting_list(SchemaUid(sid), fid, term_hash)?;
                 total_scanned += scanned;
                 total_removed += removed;
             }
@@ -1131,7 +1134,7 @@ impl InvertedIndexer {
     /// Locks each chunk individually as it processes to allow concurrent GC on different chunks
     fn gc_posting_list(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         term_hash: u64,
     ) -> Result<(usize, usize), IndexError> {
@@ -1257,7 +1260,7 @@ mod tests {
 
     // Helper to create test document metadata
     fn create_test_meta(
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         doc_id: Id,
         text: &str,
@@ -1267,7 +1270,7 @@ mod tests {
 
     // Helper to create test document metadata with specific version
     fn create_test_meta_with_version(
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         doc_id: Id,
         text: &str,
@@ -1439,16 +1442,22 @@ mod tests {
             content_field,
             OwnedValue::String("hello world test document".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("hello rust programming language".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         server.chunks().write_cell(&mut cell1).unwrap();
         server.chunks().write_cell(&mut cell2).unwrap();
@@ -1463,17 +1472,17 @@ mod tests {
 
             // Test search via the indexer directly
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(schema_id, content_field_id);
+                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
                 assert_eq!(stats.doc_count, 2, "Should have 2 documents indexed");
 
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "hello", 10, false)
+                    .bm25_search(SchemaUid(schema_id), content_field_id, "hello", 10, false)
                     .await
                     .unwrap();
                 assert_eq!(hits.len(), 2, "Should find both documents with 'hello'");
 
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "rust", 10, false)
+                    .bm25_search(SchemaUid(schema_id), content_field_id, "rust", 10, false)
                     .await
                     .unwrap();
                 assert_eq!(hits.len(), 1, "Should find 1 document with 'rust'");
@@ -1581,8 +1590,11 @@ mod tests {
                         i
                     )),
                 );
-                let mut cell =
-                    OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                let mut cell = OwnedCell::new_with_id(
+                    SchemaVid(schema_id),
+                    &doc_id,
+                    OwnedValue::Map(cell_data),
+                );
 
                 // Write cell
                 server_clone.chunks().write_cell(&mut cell).unwrap();
@@ -1612,7 +1624,7 @@ mod tests {
         // Verify all documents are searchable
         if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(schema_id, content_field_id);
+                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
                 assert_eq!(
                     stats.doc_count, num_docs as u64,
                     "Should have {} documents indexed, got {}",
@@ -1621,7 +1633,13 @@ mod tests {
 
                 // Search for the common term - should find all documents
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "concurrent", 100, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        content_field_id,
+                        "concurrent",
+                        100,
+                        false,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1751,8 +1769,11 @@ mod tests {
                         content_field,
                         OwnedValue::String(format!("overflow stress test document {}", i)),
                     );
-                    let mut cell =
-                        OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                    let mut cell = OwnedCell::new_with_id(
+                        SchemaVid(schema_id),
+                        &doc_id,
+                        OwnedValue::Map(cell_data),
+                    );
 
                     server_clone.chunks().write_cell(&mut cell).unwrap();
 
@@ -1781,7 +1802,7 @@ mod tests {
         // Verify all documents are searchable
         if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(schema_id, content_field_id);
+                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
                 info!(
                     "Stats: doc_count={}, total_length={}",
                     stats.doc_count, stats.total_length
@@ -1789,7 +1810,13 @@ mod tests {
 
                 // Search for the common term
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "overflow", 500, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        content_field_id,
+                        "overflow",
+                        500,
+                        false,
+                    )
                     .await
                     .unwrap();
 
@@ -1826,8 +1853,13 @@ mod tests {
         let doc2_id = Id::from_parts(1, 2);
 
         // Create metadata
-        let meta1 = create_test_meta(schema_id, field_id, doc1_id, "hello world test");
-        let meta2 = create_test_meta(schema_id, field_id, doc2_id, "hello rust programming");
+        let meta1 = create_test_meta(SchemaUid(schema_id), field_id, doc1_id, "hello world test");
+        let meta2 = create_test_meta(
+            SchemaUid(schema_id),
+            field_id,
+            doc2_id,
+            "hello rust programming",
+        );
 
         // Verify metadata creation
         assert!(meta1.doc_length > 0);
@@ -1936,7 +1968,8 @@ mod tests {
         for (i, doc_id) in owned_doc_ids.iter().enumerate() {
             let mut cell_data = OwnedMap::new();
             cell_data.insert(content_field, OwnedValue::String(texts[i].to_string()));
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server.chunks().write_cell(&mut cell).unwrap();
 
@@ -1952,7 +1985,13 @@ mod tests {
         if let Some(index_builder) = server.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "rust programming", 10, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        content_field_id,
+                        "rust programming",
+                        10,
+                        false,
+                    )
                     .await
                     .unwrap();
 
@@ -2068,9 +2107,14 @@ mod tests {
         let doc2_id = doc2_id.expect("Should find at least two owned documents");
 
         // Create test documents
-        let meta1 = create_test_meta(schema_id, field_id, doc1_id, "hello world test document");
+        let meta1 = create_test_meta(
+            SchemaUid(schema_id),
+            field_id,
+            doc1_id,
+            "hello world test document",
+        );
         let meta2 = create_test_meta(
-            schema_id,
+            SchemaUid(schema_id),
             field_id,
             doc2_id,
             "hello rust programming language",
@@ -2083,13 +2127,13 @@ mod tests {
         indexer.update_stats_for_add(&meta2);
 
         // Verify stats
-        let stats = indexer.get_field_stats(schema_id, field_id);
+        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
         assert_eq!(stats.doc_count, 2);
         assert!(stats.total_length > 0);
 
         // Search for "hello"
         let hits = indexer
-            .bm25_search(schema_id, field_id, "hello", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "hello", 10, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -2098,7 +2142,7 @@ mod tests {
 
         // Search for "world" - should find doc1
         let hits = indexer
-            .bm25_search(schema_id, field_id, "world", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "world", 10, false)
             .await
             .unwrap();
         assert!(!hits.is_empty());
@@ -2106,7 +2150,7 @@ mod tests {
 
         // Search for "rust" - should find doc2
         let hits = indexer
-            .bm25_search(schema_id, field_id, "rust", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "rust", 10, false)
             .await
             .unwrap();
         assert!(!hits.is_empty());
@@ -2168,8 +2212,13 @@ mod tests {
         }
 
         let doc_id = doc_id.expect("Should find an owned document");
-        let meta = create_test_meta(schema_id, field_id, doc_id, "test document to remove");
-        let stats_key = InvertedIndexer::stats_key(schema_id, field_id);
+        let meta = create_test_meta(
+            SchemaUid(schema_id),
+            field_id,
+            doc_id,
+            "test document to remove",
+        );
+        let stats_key = InvertedIndexer::stats_key(SchemaUid(schema_id), field_id);
 
         // Add document
         indexer.add_document(&meta).unwrap();
@@ -2190,7 +2239,7 @@ mod tests {
         );
 
         // Verify it's indexed
-        let stats = indexer.get_field_stats(schema_id, field_id);
+        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
         assert_eq!(stats.doc_count, 1);
 
         // Remove document
@@ -2211,12 +2260,12 @@ mod tests {
         );
 
         // Verify it's removed
-        let stats = indexer.get_field_stats(schema_id, field_id);
+        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
         assert_eq!(stats.doc_count, 0);
 
         // Search should return nothing
         let hits = indexer
-            .bm25_search(schema_id, field_id, "test", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "test", 10, false)
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -2286,7 +2335,7 @@ mod tests {
         // Add documents
         for (i, doc_id) in doc_ids.iter().enumerate() {
             let text = format!("document {} with test content", i);
-            let meta = create_test_meta(schema_id, field_id, *doc_id, &text);
+            let meta = create_test_meta(SchemaUid(schema_id), field_id, *doc_id, &text);
             indexer.add_document(&meta).unwrap();
             indexer.update_stats_for_add(&meta);
         }
@@ -2296,12 +2345,12 @@ mod tests {
 
         // Verify data is persisted by reading from disk
         // We can check that stats are persisted
-        let stats = indexer.get_field_stats(schema_id, field_id);
+        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
         assert_eq!(stats.doc_count, doc_ids.len() as u64);
 
         // Search should still work after flush
         let hits = indexer
-            .bm25_search(schema_id, field_id, "test", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "test", 10, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), doc_ids.len());
@@ -2350,8 +2399,13 @@ mod tests {
         let doc1_id = Id::from_parts(0, 1); // Partition 0 -> Chunk 0
         let doc2_id = Id::from_parts(1, 2); // Partition 1 -> Chunk 1
 
-        let meta1 = create_test_meta(schema_id, field_id, doc1_id, "hello world test");
-        let meta2 = create_test_meta(schema_id, field_id, doc2_id, "hello universe test");
+        let meta1 = create_test_meta(SchemaUid(schema_id), field_id, doc1_id, "hello world test");
+        let meta2 = create_test_meta(
+            SchemaUid(schema_id),
+            field_id,
+            doc2_id,
+            "hello universe test",
+        );
 
         // Add documents - they should go to different chunks
         let result1 = indexer.add_document(&meta1);
@@ -2372,7 +2426,7 @@ mod tests {
 
         // Search should find documents from all chunks
         let hits = indexer
-            .bm25_search(schema_id, field_id, "hello", 10, false)
+            .bm25_search(SchemaUid(schema_id), field_id, "hello", 10, false)
             .await;
         assert!(hits.is_ok(), "Search should succeed");
         let hits = hits.unwrap();
@@ -2483,16 +2537,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust programming language tutorial".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("database storage engine design".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         let mut cell3_data = OwnedMap::new();
         cell3_data.insert(
@@ -2500,7 +2560,7 @@ mod tests {
             OwnedValue::String("rust async programming with tokio".to_string()),
         );
         let mut cell3 = OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &owned_doc_ids[2 % owned_doc_ids.len()],
             OwnedValue::Map(cell3_data),
         );
@@ -2531,7 +2591,7 @@ mod tests {
 
         // Verify field statistics using coordinator
         let stats = coordinator
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         assert!(
@@ -2542,7 +2602,14 @@ mod tests {
 
         // Search for "rust" - should find doc1 and doc3
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2554,7 +2621,14 @@ mod tests {
 
         // Search for "database" - should find doc2
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "database", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "database",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2565,7 +2639,14 @@ mod tests {
 
         // Search for "programming" - should find doc1 and doc3
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "programming", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "programming",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2576,7 +2657,14 @@ mod tests {
 
         // Search for "storage" - should find doc2
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "storage", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "storage",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2679,7 +2767,8 @@ mod tests {
             content_field,
             OwnedValue::String("initial content about testing".to_string()),
         );
-        let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc_id, OwnedValue::Map(cell_data));
 
         // Write and index
         info!("Writing initial cell...");
@@ -2703,7 +2792,14 @@ mod tests {
         // Verify initial indexing
         info!("Verifying initial indexing...");
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "initial", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "initial",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2717,8 +2813,11 @@ mod tests {
             content_field,
             OwnedValue::String("updated content about rust".to_string()),
         );
-        let mut updated_cell =
-            OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(updated_cell_data));
+        let mut updated_cell = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &doc_id,
+            OwnedValue::Map(updated_cell_data),
+        );
 
         // Update cell and ensure indices
         info!("Updating cell...");
@@ -2741,14 +2840,28 @@ mod tests {
 
         // Should find "updated" and "rust"
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "updated", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "updated",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
         assert!(!hits.is_empty(), "Should find 'updated' after update");
 
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2762,7 +2875,7 @@ mod tests {
         if let Some(index_builder) = server.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let removal_meta = create_test_meta(
-                    schema_id,
+                    SchemaUid(schema_id),
                     content_field_id,
                     doc_id,
                     "updated content about rust",
@@ -2784,7 +2897,7 @@ mod tests {
         // The stats are updated (doc_count decremented) but posting entries remain.
         // Callers should verify document existence or use a compaction process.
         let stats = coordinator
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         assert_eq!(
@@ -2920,7 +3033,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(texts[i % texts.len()].to_string()),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server1.chunks().write_cell(&mut cell).unwrap();
 
@@ -2958,7 +3072,7 @@ mod tests {
         if let Some(index_builder) = server1.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let stats_before_flush =
-                    inverted_indexer.get_field_stats(schema_id, content_field_id);
+                    inverted_indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
                 info!(
                     "Stats in memory before flush: doc_count={}, total_length={}",
                     stats_before_flush.doc_count, stats_before_flush.total_length
@@ -2970,7 +3084,8 @@ mod tests {
 
                 // Verify stats are actually in the map (using PtrHashMap)
                 {
-                    let stats_key = InvertedIndexer::stats_key(schema_id, content_field_id);
+                    let stats_key =
+                        InvertedIndexer::stats_key(SchemaUid(schema_id), content_field_id);
                     if let Some(stat_arc) = inverted_indexer.field_stats.get(&stats_key) {
                         let stat = stat_arc.lock();
                         info!(
@@ -3044,11 +3159,12 @@ mod tests {
         );
 
         // Verify stats cell ID before archiving
-        let stats_id = InvertedIndexer::stats_cell_id(schema_id, content_field_id);
+        let stats_id = InvertedIndexer::stats_cell_id(SchemaUid(schema_id), content_field_id);
         info!("Stats cell ID to recover: {:?}", stats_id);
         info!(
             "Stats cell partition: {}, hash: {}",
-            stats_id.locality() as u64, stats_id.bits()
+            stats_id.locality() as u64,
+            stats_id.bits()
         );
 
         // Try to read stats cell before archiving to verify it exists
@@ -3109,7 +3225,7 @@ mod tests {
         );
 
         let stats1 = coordinator1
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         assert!(
@@ -3118,7 +3234,14 @@ mod tests {
         );
 
         let hits_result = coordinator1
-            .distributed_search(schema_id, content_field_id, "recovery", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "recovery",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits1 = hits_result.unwrap();
@@ -3198,7 +3321,7 @@ mod tests {
         // However, if stats cells aren't in archived segments, they won't be recovered
         // Let's verify that stats can be loaded from disk after recovery
         let stats2 = coordinator2
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
 
@@ -3215,7 +3338,7 @@ mod tests {
             );
 
             // Try to manually verify if stats cell exists after recovery
-            let stats_id = InvertedIndexer::stats_cell_id(schema_id, content_field_id);
+            let stats_id = InvertedIndexer::stats_cell_id(SchemaUid(schema_id), content_field_id);
             match server2.chunks().read_cell(&stats_id) {
                 Ok(cell) => {
                     info!("Stats cell found after recovery: {:?}", stats_id);
@@ -3255,7 +3378,14 @@ mod tests {
 
         // Search should still work - indices should be recoverable from disk
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "recovery", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "recovery",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits2 = hits_result.unwrap();
@@ -3267,7 +3397,14 @@ mod tests {
 
         // Verify specific terms
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "document", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "document",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -3278,7 +3415,14 @@ mod tests {
         );
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "one", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "one",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -3395,7 +3539,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(format!("initial document {}", i)),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server1.chunks().write_cell(&mut cell).unwrap();
 
@@ -3469,7 +3614,7 @@ mod tests {
         );
 
         let stats_before = coordinator2
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         assert_eq!(
@@ -3500,7 +3645,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(format!("new document after recovery {}", i)),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server2.chunks().write_cell(&mut cell).unwrap();
 
@@ -3513,7 +3659,7 @@ mod tests {
 
         // Verify both recovered and new documents are searchable
         let stats_after = coordinator2
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         assert_eq!(
@@ -3523,14 +3669,28 @@ mod tests {
         );
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "initial", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "initial",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
         assert_eq!(hits.len(), initial_count, "Should find recovered documents");
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "new", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "new",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -3618,14 +3778,16 @@ mod tests {
             content_field,
             OwnedValue::String("Bill Gates founded Microsoft".to_string()),
         );
-        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+        let mut cell1 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc1_id, OwnedValue::Map(cell1_data));
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("The gates are open for Bill".to_string()),
         );
-        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+        let mut cell2 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc2_id, OwnedValue::Map(cell2_data));
 
         // Index documents
         server.chunks().write_cell(&mut cell1).unwrap();
@@ -3642,7 +3804,13 @@ mod tests {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 // Search WITHOUT re-ranking
                 let hits_no_rerank = indexer
-                    .bm25_search(schema_id, content_field_id, "Bill Gates", 10, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        content_field_id,
+                        "Bill Gates",
+                        10,
+                        false,
+                    )
                     .await
                     .unwrap();
 
@@ -3665,7 +3833,13 @@ mod tests {
 
                 // Search WITH re-ranking
                 let hits_rerank = indexer
-                    .bm25_search(schema_id, content_field_id, "Bill Gates", 10, true)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        content_field_id,
+                        "Bill Gates",
+                        10,
+                        true,
+                    )
                     .await
                     .unwrap();
 
@@ -3778,7 +3952,8 @@ mod tests {
                 "William Gates".to_string(),
             ])),
         );
-        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+        let mut cell1 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc1_id, OwnedValue::Map(cell1_data));
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
@@ -3788,7 +3963,8 @@ mod tests {
                 "Open Gates".to_string(),
             ])),
         );
-        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+        let mut cell2 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc2_id, OwnedValue::Map(cell2_data));
 
         server.chunks().write_cell(&mut cell1).unwrap();
         server.chunks().write_cell(&mut cell2).unwrap();
@@ -3803,7 +3979,13 @@ mod tests {
         if let Some(index_builder) = server.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let hits_no_rerank = indexer
-                    .bm25_search(schema_id, aliases_field_id, "Bill Gates", 10, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        aliases_field_id,
+                        "Bill Gates",
+                        10,
+                        false,
+                    )
                     .await
                     .unwrap();
 
@@ -3820,7 +4002,13 @@ mod tests {
                     .score;
 
                 let hits_rerank = indexer
-                    .bm25_search(schema_id, aliases_field_id, "Bill Gates", 10, true)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        aliases_field_id,
+                        "Bill Gates",
+                        10,
+                        true,
+                    )
                     .await
                     .unwrap();
 

@@ -59,7 +59,7 @@ pub async fn workspace_wr() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    let cell_1 = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1.to_owned())
         .await
@@ -85,7 +85,7 @@ pub async fn workspace_wr() {
     }
     data_map.insert(&String::from("score"), OwnedValue::U64(90));
     let cell_1_w2 =
-        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -203,7 +203,7 @@ pub async fn data_site_wr() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    let cell_1 = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_non_exists_read = txn
         .read(txn_id.to_owned(), cell_1.id())
         .await
@@ -237,7 +237,7 @@ pub async fn data_site_wr() {
     }
     data_map.insert(&String::from("score"), OwnedValue::U64(90));
     let cell_1_w2 =
-        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
+        OwnedCell::new_with_id(schema.vid, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .update(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -316,7 +316,7 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+    let cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
 
     let write_result = txn
         .write(txn_id.to_owned(), cell.to_owned())
@@ -339,7 +339,7 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
 
     let query_result = server
         .indexed_data_client()
-        .hashed_query(schema.id, hash_str("id"), &OwnedValue::U64(100))
+        .hashed_query(schema.uid, hash_str("id"), &OwnedValue::U64(100))
         .await
         .unwrap()
         .unwrap();
@@ -389,7 +389,7 @@ pub async fn multi_transaction() {
         OwnedValue::String(String::from("Jack")),
     );
     let cell_1 =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     assert_eq!(
         txn.update(txn_1_id.to_owned(), cell_1.to_owned())
             .await
@@ -399,8 +399,11 @@ pub async fn multi_transaction() {
     );
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), OwnedValue::U64(90));
-    let cell_2 =
-        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map_2.clone()));
+    let cell_2 = OwnedCell::new_with_id(
+        schema.vid,
+        &cell_1.id(),
+        OwnedValue::Map(data_map_2.clone()),
+    );
     let _cell_1_t2_write = txn
         .write(txn_2_id.to_owned(), cell_2.to_owned())
         .await
@@ -510,7 +513,7 @@ pub async fn smoke_rw() {
         OwnedValue::String(String::from("Jack")),
     );
     let mut cell_1 =
-        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
+        OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     server.chunks().write_cell(&mut cell_1).unwrap();
     let cell_id = cell_1.id();
     let thread_count = 200;
@@ -593,7 +596,7 @@ pub async fn head_then_remove_commits() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+    let cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
     let cell_id = cell.id();
 
     let setup_txn = txn.begin().await.unwrap().unwrap();
@@ -638,7 +641,10 @@ pub async fn head_then_remove_commits() {
 
     let verify_txn = txn.begin().await.unwrap().unwrap();
     assert!(matches!(
-        txn.read(verify_txn.to_owned(), cell_id).await.unwrap().unwrap(),
+        txn.read(verify_txn.to_owned(), cell_id)
+            .await
+            .unwrap()
+            .unwrap(),
         TxnExecResult::Error(ReadError::CellDoesNotExisted)
     ));
     assert!(matches!(

@@ -1,8 +1,9 @@
 use crate::index::builder::IndexBuilder;
-use crate::server::DatabaseRuntime;
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
+use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::ram::types::*;
+use crate::server::DatabaseRuntime;
 use crate::server::*;
 use crate::{client, ram::cell::OwnedCell};
 use dovahkiin::types::custom_types::id::Id;
@@ -20,7 +21,7 @@ fn cell_construct(b: &mut Bencher) {
         let id = Id::from_parts(0, 1);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(2);
-        OwnedCell::new_with_id(1, &id, value);
+        OwnedCell::new_with_id(SchemaVid(1), &id, value);
     })
 }
 
@@ -29,7 +30,7 @@ fn cell_clone(b: &mut Bencher) {
     let id = Id::from_parts(0, 1);
     let mut value = OwnedValue::Map(OwnedMap::new());
     value["DATA"] = OwnedValue::U64(2);
-    let cell = OwnedCell::new_with_id(1, &id, value);
+    let cell = OwnedCell::new_with_id(SchemaVid(1), &id, value);
     b.iter(|| {
         let _ = cell.clone();
     })
@@ -525,7 +526,7 @@ pub async fn smoke_test() {
         let id = Id::from_parts(1, i / 2);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.upsert_cell(cell).await.unwrap().unwrap();
 
         // read
@@ -541,7 +542,7 @@ pub async fn smoke_test() {
         let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i * 2);
-        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.upsert_cell(cell).await.unwrap().unwrap();
 
         // verify
@@ -625,7 +626,7 @@ pub async fn smoke_test_parallel() {
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[DATA] = OwnedValue::U64(j);
                 value[ARRAY] = (1..rng.gen_range(1..1024)).collect::<Vec<u64>>().value();
-                let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
                 debug!("Upsert {:?}, i {}, j {}", id, i, j);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
                 // read
@@ -709,7 +710,7 @@ pub async fn txn() {
                 let id = Id::from_parts(0, 1);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[DATA] = OwnedValue::U64(2);
-                let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
                 txn.upsert(cell).await
             })
             .await
@@ -783,7 +784,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
                 value[CONTENT] = OwnedValue::String(format!(
                     "shared-term worker-{worker} sequence-{seq} shared-term"
                 ));
-                let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
             }
             true
@@ -800,7 +801,11 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         "concurrent indexed RPC writes should finish without stalling on unrelated index backlog",
     );
 
-    let sample = client.read_cell(Id::from_parts(1, 1)).await.unwrap().unwrap();
+    let sample = client
+        .read_cell(Id::from_parts(1, 1))
+        .await
+        .unwrap()
+        .unwrap();
     let content = sample.data[CONTENT].string().unwrap();
     assert!(content.contains("shared-term"));
 
@@ -917,7 +922,7 @@ pub async fn schema_wal_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved.id, 100);
+        assert_eq!(retrieved.vid, SchemaVid(100));
         info!("✓ Schemas verified before shutdown");
 
         // Check files - should have WAL but NO snapshot
@@ -990,7 +995,7 @@ pub async fn schema_wal_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(s1.id, 100);
+        assert_eq!(s1.vid, SchemaVid(100));
         info!("✓ Schema 'users' recovered from WAL");
 
         let s2 = client2
@@ -998,7 +1003,7 @@ pub async fn schema_wal_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(s2.id, 200);
+        assert_eq!(s2.vid, SchemaVid(200));
         info!("✓ Schema 'products' recovered from WAL");
 
         let s3 = client2
@@ -1006,7 +1011,7 @@ pub async fn schema_wal_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(s3.id, 300);
+        assert_eq!(s3.vid, SchemaVid(300));
         info!("✓ Schema 'orders' recovered from WAL");
 
         info!("✓ WAL log replay recovery works!");
@@ -1128,7 +1133,7 @@ pub async fn schema_snapshot_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_schema1.id, 100);
+        assert_eq!(retrieved_schema1.vid, SchemaVid(100));
         assert_eq!(retrieved_schema1.name, "users");
 
         let retrieved_schema2 = client
@@ -1136,14 +1141,14 @@ pub async fn schema_snapshot_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_schema2.id, 200);
+        assert_eq!(retrieved_schema2.vid, SchemaVid(200));
 
         let retrieved_schema3 = client
             .schema_by_name(&"orders".to_string())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_schema3.id, 300);
+        assert_eq!(retrieved_schema3.vid, SchemaVid(300));
 
         info!("All schemas verified before shutdown");
 
@@ -1208,7 +1213,7 @@ pub async fn schema_snapshot_recovery_test() {
         let all_schemas = client2.get_all_schema().await.unwrap();
         info!("Found {} schemas after recovery", all_schemas.len());
         for s in &all_schemas {
-            info!("  - Schema: id={}, name={}", s.id, s.name);
+            info!("  - Schema: id={}, name={}", s.vid, s.name);
         }
 
         // Verify all schemas were recovered
@@ -1217,7 +1222,7 @@ pub async fn schema_snapshot_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(recovered_schema1.id, 100);
+        assert_eq!(recovered_schema1.vid, SchemaVid(100));
         assert_eq!(recovered_schema1.name, "users");
         info!("✓ Schema 'users' recovered successfully");
 
@@ -1226,7 +1231,7 @@ pub async fn schema_snapshot_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(recovered_schema2.id, 200);
+        assert_eq!(recovered_schema2.vid, SchemaVid(200));
         assert_eq!(recovered_schema2.name, "products");
         info!("✓ Schema 'products' recovered successfully");
 
@@ -1235,7 +1240,7 @@ pub async fn schema_snapshot_recovery_test() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(recovered_schema3.id, 300);
+        assert_eq!(recovered_schema3.vid, SchemaVid(300));
         assert_eq!(recovered_schema3.name, "orders");
         info!("✓ Schema 'orders' recovered successfully");
 
@@ -1596,14 +1601,9 @@ pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
     let schema = Schema::new_with_id(91, &String::from("dyn_layout"), None, fields, true, false);
     server.meta().schemas.debug_only_new_schema(schema.clone());
     let client = Arc::new(
-        client::AsyncClient::new(
-            &server.rpc,
-            &server.membership,
-            &vec![server_addr],
-            "test",
-        )
-        .await
-        .unwrap(),
+        client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], "test")
+            .await
+            .unwrap(),
     );
 
     for len in 0..12usize {
@@ -1622,7 +1622,7 @@ pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
         // overran into adjacent memory and decoded garbage strings).
         map.insert_key_id(0xdead_beef_dead_beef, OwnedValue::U64(42));
         let id = Id::rand();
-        let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(map));
+        let cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(map));
         client.write_cell(cell).await.unwrap().unwrap();
         let read = client.read_cell(id).await.unwrap().unwrap();
         assert_eq!(
@@ -1713,7 +1713,10 @@ async fn a_server_that_goes_away_gives_its_threads_back() {
         .unwrap()
     }
 
-    spawn_server("thread_lifecycle_warmup").await.shutdown().await;
+    spawn_server("thread_lifecycle_warmup")
+        .await
+        .shutdown()
+        .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     for graceful in [true, false] {
@@ -1846,7 +1849,10 @@ async fn unloading_a_database_gives_its_threads_back() {
 
     // One load/unload first, so the baseline includes anything a database
     // initialises once per process rather than once per database.
-    server.ensure_database_runtime("churn_warmup").await.unwrap();
+    server
+        .ensure_database_runtime("churn_warmup")
+        .await
+        .unwrap();
     assert!(server.unload_database_runtime("churn_warmup").await);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -2077,7 +2083,11 @@ async fn server_shutdown_thread_retention_probe() {
             "PROBE cycle={cycle} before={before} peak={peak} after={after} \
              retained_vs_before={} retained_vs_prev_cycle={}",
             after.saturating_sub(before),
-            if cycle == 0 { 0 } else { after.saturating_sub(after_prev) }
+            if cycle == 0 {
+                0
+            } else {
+                after.saturating_sub(after_prev)
+            }
         );
         after_prev = after;
     }
@@ -2144,14 +2154,17 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
     let mut control = {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(u64::MAX);
-        OwnedCell::new_with_id(SCHEMA, &cell_id(1_000_000), value)
+        OwnedCell::new_with_id(SchemaVid(SCHEMA), &cell_id(1_000_000), value)
     };
-    server.chunks().write_cell(&mut control).expect("control write");
+    server
+        .chunks()
+        .write_cell(&mut control)
+        .expect("control write");
 
     for index in 0..CELLS {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(index);
-        let mut cell = OwnedCell::new_with_id(SCHEMA, &cell_id(index), value);
+        let mut cell = OwnedCell::new_with_id(SchemaVid(SCHEMA), &cell_id(index), value);
         dynamic
             .chunks()
             .write_cell(&mut cell)
@@ -2261,7 +2274,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(schema_id, 64)
+            .scan_schema(SchemaUid(schema_id), 64)
             .await
             .expect("scan should not error")
         {
@@ -2296,28 +2309,34 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     let tiny_schema_id = schema_id;
     let big_schema_id = schema_id + 4;
     if multi {
-        dynamic.meta().schemas.register_internal_schema(Schema::new_with_id(
-            big_schema_id,
-            "secondary_index_restart_big_schema",
-            None,
-            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
-            false,
-            true,
-        ));
-        server.meta().schemas.register_internal_schema(Schema::new_with_id(
-            big_schema_id,
-            "secondary_index_restart_big_schema",
-            None,
-            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
-            false,
-            true,
-        ));
+        dynamic
+            .meta()
+            .schemas
+            .register_internal_schema(Schema::new_with_id(
+                big_schema_id,
+                "secondary_index_restart_big_schema",
+                None,
+                Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+                false,
+                true,
+            ));
+        server
+            .meta()
+            .schemas
+            .register_internal_schema(Schema::new_with_id(
+                big_schema_id,
+                "secondary_index_restart_big_schema",
+                None,
+                Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+                false,
+                true,
+            ));
     }
     let tiny_count: u64 = if multi { 1 } else { cells };
     for index in 0..tiny_count {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(index);
-        let mut cell = OwnedCell::new_with_id(tiny_schema_id, &cell_id(index), value);
+        let mut cell = OwnedCell::new_with_id(SchemaVid(tiny_schema_id), &cell_id(index), value);
         dynamic
             .chunks()
             .write_cell(&mut cell)
@@ -2327,8 +2346,11 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         for index in 0..cells {
             let mut value = OwnedValue::Map(OwnedMap::new());
             value["DATA"] = OwnedValue::U64(index);
-            let mut cell =
-                OwnedCell::new_with_id(big_schema_id, &cell_id(index + 1_000_000), value);
+            let mut cell = OwnedCell::new_with_id(
+                SchemaVid(big_schema_id),
+                &cell_id(index + 1_000_000),
+                value,
+            );
             dynamic
                 .chunks()
                 .write_cell(&mut cell)
@@ -2367,16 +2389,22 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         .expect("dynamic database should reload");
     dynamic.meta().schemas.register_internal_schema(schema());
     if multi {
-        dynamic.meta().schemas.register_internal_schema(Schema::new_with_id(
-            big_schema_id,
-            "secondary_index_restart_big_schema",
-            None,
-            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
-            false,
-            true,
-        ));
+        dynamic
+            .meta()
+            .schemas
+            .register_internal_schema(Schema::new_with_id(
+                big_schema_id,
+                "secondary_index_restart_big_schema",
+                None,
+                Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+                false,
+                true,
+            ));
         let big = scan_count(&dynamic, big_schema_id).await;
-        assert_eq!(big, cells as usize, "big schema lost cells: {big} of {cells}");
+        assert_eq!(
+            big, cells as usize,
+            "big schema lost cells: {big} of {cells}"
+        );
     }
     let tiny_count: u64 = if multi { 1 } else { cells };
     let recovered = scan_count(&dynamic, tiny_schema_id).await;
@@ -2451,7 +2479,11 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
             .register_internal_schema(schema_for(HIGH_SCHEMA, "tombstone_high_schema"));
     };
     let cell_id = |schema: u32, index: u64| {
-        Id::allocated((index % 4) as u16, 11, (schema as u64) * 1_000_000 + index + 1)
+        Id::allocated(
+            (index % 4) as u16,
+            11,
+            (schema as u64) * 1_000_000 + index + 1,
+        )
     };
 
     async fn scan_count(runtime: &Arc<DatabaseRuntime>, schema_id: u32) -> usize {
@@ -2459,7 +2491,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(schema_id, 64)
+            .scan_schema(SchemaUid(schema_id), 64)
             .await
             .expect("scan should not error")
         {
@@ -2490,7 +2522,8 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         for index in 0..CELLS_PER_SCHEMA {
             let mut value = OwnedValue::Map(OwnedMap::new());
             value["DATA"] = OwnedValue::U64(index);
-            let mut cell = OwnedCell::new_with_id(schema, &cell_id(schema, index), value);
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema), &cell_id(schema, index), value);
             dynamic
                 .chunks()
                 .write_cell(&mut cell)

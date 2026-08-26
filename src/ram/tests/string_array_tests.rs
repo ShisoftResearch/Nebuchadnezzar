@@ -46,7 +46,7 @@ fn test_string_array_basic() {
 
     let id1 = Id::allocated(1, 0, 1);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -96,7 +96,7 @@ fn test_string_array_utf8() {
 
     let id1 = Id::allocated(2, 0, 2);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -137,7 +137,7 @@ fn test_string_array_empty() {
 
     let id1 = Id::allocated(3, 0, 3);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -184,7 +184,7 @@ fn test_string_array_long_strings() {
 
     let id1 = Id::allocated(4, 0, 4);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -236,7 +236,7 @@ fn test_string_array_mixed() {
 
     let id1 = Id::allocated(5, 0, 5);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -286,7 +286,7 @@ fn test_string_array_with_other_fields() {
 
     let id1 = Id::allocated(10, 0, 10);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -334,7 +334,7 @@ fn test_string_array_vector_size() {
 
     let id1 = Id::allocated(11, 0, 11);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -375,7 +375,7 @@ fn test_string_array_single_element() {
 
     let id1 = Id::allocated(12, 0, 12);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -424,7 +424,7 @@ fn test_string_array_with_empty_strings() {
 
     let id1 = Id::allocated(13, 0, 13);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -485,7 +485,7 @@ fn test_string_array_in_nested_map() {
 
     let id1 = Id::allocated(20, 0, 20);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -526,7 +526,7 @@ fn test_string_array_large_size() {
 
     let id1 = Id::allocated(30, 0, 30);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();

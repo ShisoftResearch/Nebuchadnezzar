@@ -172,9 +172,10 @@ where
         let mut target = write_targeted(current_root_guard, &pivot);
         // The walk stays on the current root's level, which is internal here.
         assert!(!target.is_ext());
-        let insert_result = target
-            .innode_mut()
-            .insert(pivot, new_right_node, &tree.root_versioning);
+        let insert_result =
+            target
+                .innode_mut()
+                .insert(pivot, new_right_node, &tree.root_versioning);
         match insert_result {
             None => return,
             Some(mut next_split) => {

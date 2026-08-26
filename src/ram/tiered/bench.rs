@@ -13,11 +13,11 @@ use crate::ram::schema::*;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
+use crate::utils::test_temp::temp_path;
 use log::info;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::utils::test_temp::temp_path;
 
 fn default_fields() -> Field {
     use dovahkiin::types::Type;
@@ -195,7 +195,7 @@ fn bench_hot_segment_reads() {
     info!("Writing {} cells ({} segments)...", num_cells, 3);
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, 1000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 1000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(1000 + i as i64));
         data_map.insert(
@@ -209,7 +209,7 @@ fn bench_hot_segment_reads() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -220,7 +220,7 @@ fn bench_hot_segment_reads() {
 
     // Warm up
     for i in 0..(num_cells / 10) {
-        let id = Id::from_parts(schema.id as u64, 1000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 1000 + i as u64);
         let _ = chunks.read_cell(&id);
     }
 
@@ -232,7 +232,7 @@ fn bench_hot_segment_reads() {
 
     for i in 0..num_reads {
         let cell_idx = i % num_cells;
-        let id = Id::from_parts(schema.id as u64, 1000 + cell_idx as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 1000 + cell_idx as u64);
 
         let start = Instant::now();
         let _ = chunks.read_cell(&id);
@@ -304,7 +304,7 @@ fn bench_cold_segment_reads() {
     info!("Writing {} cells ({} segments)...", num_cells, 5);
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, 2000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 2000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(2000 + i as i64));
         data_map.insert(
@@ -318,7 +318,7 @@ fn bench_cold_segment_reads() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -368,7 +368,7 @@ fn bench_cold_segment_reads() {
     let mut rng = rand::thread_rng();
     for _ in 0..num_reads {
         let cell_idx = rng.gen_range(0..num_cells);
-        let id = Id::from_parts(schema.id as u64, 2000 + cell_idx as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 2000 + cell_idx as u64);
 
         let start = Instant::now();
         let _ = chunks.read_cell(&id);
@@ -456,7 +456,7 @@ fn bench_mixed_uniform() {
     info!("Writing {} cells ({} segments)...", num_cells, 5);
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, 3000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 3000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(3000 + i as i64));
         data_map.insert(
@@ -470,7 +470,7 @@ fn bench_mixed_uniform() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -510,7 +510,7 @@ fn bench_mixed_uniform() {
     let mut rng = rand::thread_rng();
     for _ in 0..num_reads {
         let cell_idx = rng.gen_range(0..num_cells);
-        let id = Id::from_parts(schema.id as u64, 3000 + cell_idx as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 3000 + cell_idx as u64);
 
         let start = Instant::now();
         let _ = chunks.read_cell(&id);
@@ -600,7 +600,7 @@ fn bench_mixed_zipf() {
     info!("Writing {} cells ({} segments)...", num_cells, 5);
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, 4000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 4000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(4000 + i as i64));
         data_map.insert(
@@ -614,7 +614,7 @@ fn bench_mixed_zipf() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -656,7 +656,7 @@ fn bench_mixed_zipf() {
     let mut rng = rand::thread_rng();
     for _ in 0..num_reads {
         let cell_idx = zipf.sample(&mut rng);
-        let id = Id::from_parts(schema.id as u64, 4000 + cell_idx as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 4000 + cell_idx as u64);
 
         let start = Instant::now();
         let _ = chunks.read_cell(&id);

@@ -22,6 +22,7 @@ use super::rpc::{
     TermPostingsResponse,
 };
 use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
+use crate::ram::schema::SchemaUid;
 
 /// Distributed inverted index coordinator
 ///
@@ -96,7 +97,7 @@ impl DistributedInvertedIndexCoordinator {
     /// 4. Returns top K results globally
     pub async fn distributed_search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -203,7 +204,7 @@ impl DistributedInvertedIndexCoordinator {
     /// and recomputes BM25 scores with global IDF values.
     async fn rerank_with_global_stats(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         hits: Vec<BM25Hit>,
@@ -312,7 +313,7 @@ impl DistributedInvertedIndexCoordinator {
     /// Get global field statistics across all partitions
     pub async fn get_global_stats(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> Result<FieldStatsResponse, RPCError> {
         let server_ids = self.get_all_server_ids().await;
@@ -459,6 +460,7 @@ impl Default for CoordinatorBuilder {
 mod tests {
     use super::*;
     use crate::ram::cell::OwnedCell;
+    use crate::ram::schema::SchemaVid;
     use crate::ram::types::{Map, OwnedMap, OwnedValue};
     use bifrost_hasher::hash_str;
     use log::info;
@@ -588,16 +590,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust programming language guide".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &shard1_docs[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard1_docs[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("database storage systems".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &shard1_docs[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard1_docs[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         shard1.chunks().write_cell(&mut cell1).unwrap();
         shard1.chunks().write_cell(&mut cell2).unwrap();
@@ -612,16 +620,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust async programming tokio".to_string()),
         );
-        let mut cell3 =
-            OwnedCell::new_with_id(schema_id, &shard2_docs[0], OwnedValue::Map(cell3_data));
+        let mut cell3 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard2_docs[0],
+            OwnedValue::Map(cell3_data),
+        );
 
         let mut cell4_data = OwnedMap::new();
         cell4_data.insert(
             content_field,
             OwnedValue::String("search engine architecture".to_string()),
         );
-        let mut cell4 =
-            OwnedCell::new_with_id(schema_id, &shard2_docs[1], OwnedValue::Map(cell4_data));
+        let mut cell4 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard2_docs[1],
+            OwnedValue::Map(cell4_data),
+        );
 
         shard2.chunks().write_cell(&mut cell3).unwrap();
         shard2.chunks().write_cell(&mut cell4).unwrap();
@@ -642,14 +656,21 @@ mod tests {
         );
 
         let stats1 = coord1
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         info!("Shard1 stats: doc_count={}", stats1.doc_count);
         assert_eq!(stats1.doc_count, 2, "Shard1 should have 2 documents");
 
         let hits1 = coord1
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -667,14 +688,21 @@ mod tests {
         );
 
         let stats2 = coord2
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         info!("Shard2 stats: doc_count={}", stats2.doc_count);
         assert_eq!(stats2.doc_count, 2, "Shard2 should have 2 documents");
 
         let hits2 = coord2
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -704,7 +732,10 @@ mod tests {
             "Merged results should have 2 unique documents"
         );
         // Score for id (1000,1) should be 1.5 + 0.5 = 2.0
-        let hit_1_1 = merged.iter().find(|h| h.id == Id::from_parts(1000, 1)).unwrap();
+        let hit_1_1 = merged
+            .iter()
+            .find(|h| h.id == Id::from_parts(1000, 1))
+            .unwrap();
         assert!(
             (hit_1_1.score - 2.0).abs() < 0.001,
             "Scores should be aggregated"
@@ -721,7 +752,14 @@ mod tests {
 
         // Test 5: Each shard finds its unique content
         let db_hits = coord1
-            .distributed_search(schema_id, content_field_id, "database", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "database",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -730,7 +768,7 @@ mod tests {
 
         let search_hits = coord2
             .distributed_search(
-                schema_id,
+                SchemaUid(schema_id),
                 content_field_id,
                 "search engine",
                 10,
@@ -821,7 +859,8 @@ mod tests {
             content_field,
             OwnedValue::String("hello world from single shard".to_string()),
         );
-        let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc_id, OwnedValue::Map(cell_data));
 
         server.chunks().write_cell(&mut cell).unwrap();
         if let Some(index_builder) = server.indexer() {
@@ -840,7 +879,14 @@ mod tests {
 
         // Search
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "hello world", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "hello world",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -885,7 +931,7 @@ mod tests {
 
         // Empty query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "", 10, false, false)
+            .distributed_search(SchemaUid(100), 1, "", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -893,7 +939,7 @@ mod tests {
 
         // Whitespace-only query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "   ", 10, false, false)
+            .distributed_search(SchemaUid(100), 1, "   ", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();

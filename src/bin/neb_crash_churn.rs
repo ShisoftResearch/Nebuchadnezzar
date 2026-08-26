@@ -27,6 +27,7 @@
 //         vanished: the corpse class),
 //       - after a graceful SIGTERM cycle, the scanned count must be at
 //         least the last acked high-water (the shutdown flush contract).
+use neb::ram::schema::{SchemaUid, SchemaVid};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -744,7 +745,11 @@ fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_files(&path, out);
-        } else if path.extension().map(|e| e == "nlog" || e == "nbackup").unwrap_or(false) {
+        } else if path
+            .extension()
+            .map(|e| e == "nlog" || e == "nbackup")
+            .unwrap_or(false)
+        {
             out.push(path);
         }
     }
@@ -762,7 +767,12 @@ impl log::Log for ChurnLogger {
     }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {} - {}", record.level(), record.target(), record.args());
+            eprintln!(
+                "[{}] {} - {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
     fn flush(&self) {}
@@ -840,15 +850,15 @@ async fn child_async(
     txn_verify_to: u64,
     txn_verify_from: u64,
 ) -> Result<(), String> {
+    use bifrost_hasher::hash_str;
+    use dovahkiin::expr::serde::Expr;
+    use dovahkiin::types::*;
     use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
     use neb::query::data_client::{ValueRange, ValueRangeTerm};
     use neb::ram::cell::OwnedCell;
     use neb::ram::schema::{Field, IndexType, Schema};
     use neb::ram::types::{Id, Type};
     use neb::server::{NebServer, ServerOptions, Service};
-    use bifrost_hasher::hash_str;
-    use dovahkiin::expr::serde::Expr;
-    use dovahkiin::types::*;
 
     let dir = std::path::Path::new(&base_dir);
     for sub in ["backup", "wal", "undo", "raft"] {
@@ -936,7 +946,7 @@ async fn child_async(
     let mut count: u64 = 0;
     match idx_client
         .range_index_scan(
-            CHURN_SCHEMA_ID,
+            SchemaUid(CHURN_SCHEMA_ID),
             field_id,
             val_range,
             vec![],
@@ -1045,7 +1055,7 @@ async fn child_async(
         };
         if let Ok(mut cursor) = idx_client
             .range_index_scan(
-                CHURN_SCHEMA_ID,
+                SchemaUid(CHURN_SCHEMA_ID),
                 field_id,
                 val_range,
                 vec![],
@@ -1085,7 +1095,7 @@ async fn child_async(
         };
         if let Ok(mut cursor) = idx_client
             .range_index_scan(
-                CHURN_SCHEMA_ID,
+                SchemaUid(CHURN_SCHEMA_ID),
                 field_id,
                 val_range,
                 vec![],
@@ -1125,8 +1135,7 @@ async fn child_async(
         let mut reported = false;
         loop {
             if !reported
-                && neb::ram::chunk::ALLOCATION_EXHAUSTED
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && neb::ram::chunk::ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed)
                     > 0
             {
                 println!("STORE_EXHAUSTED");
@@ -1243,8 +1252,9 @@ async fn child_async(
     // key below this point is durable" is a property the store actually owes,
     // and holes above the cursor are the harness's business, not the store's.
     let acked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(count));
-    let pending_acks =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<u64>::new()));
+    let pending_acks = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeSet::<u64>::new(),
+    ));
     const WRITERS: usize = 4;
     // The churn clock starts HERE, not at SCANNED.
     //
@@ -1273,7 +1283,7 @@ async fn child_async(
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[KEY_FIELD] = OwnedValue::U64(seq);
                 value[PAD_FIELD] = OwnedValue::String(format!("pad-{:0>200}", seq));
-                let cell = OwnedCell::new_with_id(CHURN_SCHEMA_ID, &id, value);
+                let cell = OwnedCell::new_with_id(SchemaVid(CHURN_SCHEMA_ID), &id, value);
                 if let Ok(Ok(_)) = client.write_cell(cell).await {
                     // Advance the cursor over whatever contiguous run this
                     // completes; anything above it waits for its predecessor.
@@ -1334,7 +1344,7 @@ async fn child_async(
                         let mut value = OwnedValue::Map(OwnedMap::new());
                         value[KEY_FIELD] = OwnedValue::U64(seq);
                         value[PAD_FIELD] = OwnedValue::String(format!("txn-{:0>200}", seq));
-                        OwnedCell::new_with_id(CHURN_SCHEMA_ID, &id, value)
+                        OwnedCell::new_with_id(SchemaVid(CHURN_SCHEMA_ID), &id, value)
                     })
                     .collect();
                 let result = client
@@ -1435,7 +1445,7 @@ async fn child_async(
                 }
                 if delete_rate < 100 {
                     tokio::time::sleep(Duration::from_millis(
-                        ((100 - delete_rate) / 10).max(1) as u64,
+                        ((100 - delete_rate) / 10).max(1) as u64
                     ))
                     .await;
                 }
@@ -1466,9 +1476,8 @@ async fn child_async(
 
     // Serve until SIGTERM (graceful) or the churn window elapses; SIGKILL
     // needs no cooperation.
-    let mut term =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|e| e.to_string())?;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| e.to_string())?;
     tokio::select! {
         _ = term.recv() => {
             println!("TERM: graceful shutdown");

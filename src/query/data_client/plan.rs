@@ -8,11 +8,12 @@ use crate::query::planner::{
 };
 
 use super::IndexedDataClient;
+use crate::ram::schema::SchemaUid;
 
 impl IndexedDataClient {
     pub(super) async fn indexed_predicate_plan(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         selection: &Expr,
         order_by_field: Option<u64>,
         limit: Option<usize>,
@@ -23,23 +24,25 @@ impl IndexedDataClient {
         let schema = self
             .index_clients
             .neb_client
-            .schema_by_id(schema_id)
+            .schema_by_id(schema_id.get())
             .await
             .ok()
             .flatten()?;
-        let stats = self.index_clients.overall_schema_statistics(schema_id);
+        let stats = self
+            .index_clients
+            .overall_schema_statistics(schema_id.get());
         build_indexed_predicate_plan(&schema, selection, stats.as_deref(), order_by_field, limit)
     }
 
     pub(super) async fn ensure_orderable_field(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> Result<(), RPCError> {
         let schema = self
             .index_clients
             .neb_client
-            .schema_by_id(schema_id)
+            .schema_by_id(schema_id.get())
             .await
             .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e.to_string())))?
             .ok_or_else(|| {
@@ -60,7 +63,7 @@ impl IndexedDataClient {
 
     pub(super) async fn ensure_distinct_fields(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_ids: &[u64],
     ) -> Result<(), RPCError> {
         if field_ids.is_empty() {
@@ -72,7 +75,7 @@ impl IndexedDataClient {
         let schema = self
             .index_clients
             .neb_client
-            .schema_by_id(schema_id)
+            .schema_by_id(schema_id.get())
             .await
             .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e.to_string())))?
             .ok_or_else(|| {

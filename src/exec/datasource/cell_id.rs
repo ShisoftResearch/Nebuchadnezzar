@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::DataSource;
+use crate::ram::schema::SchemaUid;
 
 const BUFFER_SIZE: u16 = 64;
 
@@ -22,7 +23,7 @@ pub struct CellIds {
 }
 
 pub struct CellIdQuery {
-    schema: u32,
+    schema: SchemaUid,
     field: u64,
     range: ValueRange,
     ordering: Ordering,

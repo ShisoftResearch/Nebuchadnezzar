@@ -29,6 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::OwnedPrimArray;
 
 const COMPOUND_MISSING_PLACEHOLDER: &str = "";
@@ -37,7 +38,7 @@ const COMPOUND_MISSING_PLACEHOLDER: &str = "";
 /// Extracts text content from String or String array values.
 fn build_embedding_index_meta(
     cell_id: Id,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     model: EmbeddingModel,
     value: crate::ram::types::OwnedValue,
@@ -149,7 +150,7 @@ pub struct NullIndexMeta {
 #[derive(Hash, Debug)]
 pub struct VectorIndexMeta {
     cell_id: Id,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     config: VectorIndexConfig,
 }
@@ -159,7 +160,7 @@ pub struct VectorIndexMeta {
 #[derive(Debug)]
 pub struct EmbeddingIndexMeta {
     pub cell_id: Id,
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub model: EmbeddingModel,
     pub text: String,
@@ -192,7 +193,7 @@ pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
     Null,
-    Vector(Id, u32, u64, VectorIndexConfig),
+    Vector(Id, SchemaUid, u64, VectorIndexConfig),
 }
 
 #[derive(Debug)]
@@ -401,15 +402,13 @@ pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// them from the cells through the write path's own probe -- so this is a
 /// repair job, not data loss. What was missing was any way to know a repair
 /// was owed.
-pub static INDEX_TASKS_FAILED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static INDEX_TASKS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Failures already reported, so the log carries the first one loudly and
 /// then a periodic total instead of one line per cell. A full chunk produced
 /// 193,360 lines in a single crash-churn run, which is how a real signal
 /// becomes something operators filter out.
-static INDEX_FAILURES_REPORTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static INDEX_FAILURES_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record index-entry failures and say so at a rate a human can read.
 ///
@@ -455,10 +454,10 @@ pub static IDX_SPAWN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static IDX_SCOPE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static IDX_SCOPE_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static IDX_SCOPE_TASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static IDX_SCOPE_WAIT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The index task's own run time, against the caller's wait above.
-pub static IDX_TASK_EXEC_NANOS: std::sync::atomic::AtomicU64 =
+pub static IDX_SCOPE_WAIT_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// The index task's own run time, against the caller's wait above.
+pub static IDX_TASK_EXEC_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per-index-type insert cost: ranged, hashed, vector, full text, embedding.
 pub static IDX_BY_TYPE_NANOS: [std::sync::atomic::AtomicU64; 5] = [
@@ -549,8 +548,10 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
     });
     let t0 = std::time::Instant::now();
     let mut guard = PENDING_INDEX_TASKS.lock();
-    INDEX_GLOBAL_WAIT_NANOS
-        .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    INDEX_GLOBAL_WAIT_NANOS.fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     guard.push(handle);
 }
 
@@ -602,9 +603,9 @@ impl IndexBuilder {
         old_indices: Option<Vec<IndexRes>>,
     ) {
         log::debug!(
-            "ensure_indices: cell_id={:?}, schema_id={}, schema_name={}, is_scannable={}",
+            "ensure_indices: cell_id={:?}, schema_uid={}, schema_name={}, is_scannable={}",
             cell.id(),
-            schema.id,
+            schema.uid,
             schema.name,
             schema.is_scannable
         );
@@ -613,41 +614,54 @@ impl IndexBuilder {
         let scannable_key = if schema.is_scannable {
             log::debug!(
                 "Schema {} is scannable, scheduling scannable insert for cell {:?}",
-                schema.id,
+                schema.uid,
                 cell.id()
             );
-            Some(EntryKey::for_scannable(&cell.id(), cell.header.schema))
+            // The scannable key is a family key, and the record is right
+            // here -- taking it from `cell.header.schema` would put the
+            // generation in the prefix.
+            Some(EntryKey::for_scannable(&cell.id(), schema.uid))
         } else {
             log::debug!(
                 "Schema {} is NOT scannable for cell {:?}",
-                schema.id,
+                schema.uid,
                 cell.id()
             );
             None
         };
-        IDX_KEY_NANOS.fetch_add(t_key.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        IDX_KEY_NANOS.fetch_add(
+            t_key.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Get new indices for the cell
         let t_probe = std::time::Instant::now();
         let new_indices = probe_cell_indices(cell, schema);
-        IDX_PROBE_NANOS
-            .fetch_add(t_probe.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        IDX_PROBE_NANOS.fetch_add(
+            t_probe.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if scannable_key.is_some() || !new_indices.is_empty() {
             debug!("New indices: {:?}", new_indices);
             let cell_id = cell.id();
-            let schema_id = cell.header.schema;
+            // The scannable insert names a namespace, so it takes the family.
+            // The header would have given the generation that encoded this
+            // cell, which is not what the key is prefixed by.
+            let schema_uid = schema.uid;
             let t_spawn = std::time::Instant::now();
             new_index_task(async move {
                 if let Some(key) = scannable_key {
-                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id)
+                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid)
                         .await?;
                 }
                 let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
                 debug!("Ensure indices result: {:?}", res);
                 res
             });
-            IDX_SPAWN_NANOS
-                .fetch_add(t_spawn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            IDX_SPAWN_NANOS.fetch_add(
+                t_spawn.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -655,7 +669,7 @@ impl IndexBuilder {
         indexers: Arc<IndexerClients>,
         key: EntryKey,
         cell_id: Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
     ) -> Result<(), IndexError> {
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
@@ -731,15 +745,24 @@ impl IndexBuilder {
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
         let indexers = self.clients.clone();
         if schema.is_scannable {
-            self.remove_scannable(cell, &indexers);
+            self.remove_scannable(cell, schema.uid, &indexers);
         }
         let indices = probe_cell_indices(cell, schema);
         new_index_task(async move { Self::remove_indices_(indices, indexers).await });
     }
 
     // Remove scannable indices
-    fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
-        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+    /// Takes the family explicitly: a cell header names the generation that
+    /// encoded it, which is not what the key is prefixed by, and a removal
+    /// that derived the prefix from the header would miss the entry it meant
+    /// to delete once the cell had been migrated.
+    fn remove_scannable(
+        &self,
+        cell: &SharedCell,
+        schema_uid: SchemaUid,
+        indexers: &Arc<IndexerClients>,
+    ) {
+        let key = EntryKey::for_scannable(&cell.id(), schema_uid);
         let indexers = indexers.clone();
         new_index_task(async move {
             indexers
@@ -830,8 +853,10 @@ impl IndexBuilder {
                 out
             })
             .await;
-            IDX_SCOPE_WAIT_NANOS
-                .fetch_add(t_wait.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            IDX_SCOPE_WAIT_NANOS.fetch_add(
+                t_wait.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let results = match joined {
                 // Shape preserved for callers: each index result stays wrapped
                 // in the join layer it had when every future was its own task.
@@ -1112,7 +1137,7 @@ where
                         // For vector, only provide its property
                         &IndexType::Vector(config) => components.push(IndexComps::Vector(
                             cell.id(),
-                            schema.id,
+                            schema.uid,
                             *field_id,
                             config,
                         )),
@@ -1120,7 +1145,7 @@ where
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
-                                schema.id,
+                                schema.uid,
                                 *field_id,
                                 owned_value.clone(),
                             ) {
@@ -1130,7 +1155,7 @@ where
                         &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
-                                schema.id,
+                                schema.uid,
                                 *field_id,
                                 config.model.clone(),
                                 owned_value.clone(),
@@ -1169,7 +1194,7 @@ where
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
-                                schema.id,
+                                schema.uid,
                                 *field_id,
                                 owned_value.clone(),
                             ) {
@@ -1179,7 +1204,7 @@ where
                         &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
-                                schema.id,
+                                schema.uid,
                                 *field_id,
                                 config.model.clone(),
                                 owned_value.clone(),
@@ -1197,15 +1222,15 @@ where
             for comp in components {
                 match comp {
                     IndexComps::Hashed(feat) => {
-                        let hash_id = get_hash_id(schema.id, *field_id, feat);
+                        let hash_id = get_hash_id(schema.uid, *field_id, feat);
                         metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Null => {
-                        let hash_id = get_null_hash_id(schema.id, *field_id);
+                        let hash_id = get_null_hash_id(schema.uid, *field_id);
                         metas.push(IndexMeta::Null(NullIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Ranged(feat) => {
-                        let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.id);
+                        let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.uid);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }
                     IndexComps::Vector(cell_id, schema_id, field_id, config) => {
@@ -1233,7 +1258,7 @@ where
                         if let Some(text) = build_compound_embedding_text(cell, schema, compound) {
                             metas.push(IndexMeta::Embedding(EmbeddingIndexMeta {
                                 cell_id: cell.id(),
-                                schema_id: schema.id,
+                                schema_id: schema.uid,
                                 field_id: *compound_id,
                                 model: config.model.clone(),
                                 text,
@@ -1293,7 +1318,7 @@ mod tests {
         data.insert("title", OwnedValue::String("hello".to_string()));
         data.insert("body", OwnedValue::String("world".to_string()));
         let cell = crate::ram::cell::OwnedCell::new_with_id(
-            schema.id,
+            schema.vid,
             &Id::from_parts(1, 1),
             OwnedValue::Map(data),
         );
@@ -1332,7 +1357,7 @@ mod tests {
         );
         data.insert("body", OwnedValue::String("world".to_string()));
         let cell = crate::ram::cell::OwnedCell::new_with_id(
-            schema.id,
+            schema.vid,
             &Id::from_parts(1, 2),
             OwnedValue::Map(data),
         );

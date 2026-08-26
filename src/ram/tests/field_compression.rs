@@ -50,7 +50,7 @@ fn compressed_string_roundtrip_to_owned() {
     map.insert("plain", OwnedValue::String("plain-value".to_string()));
 
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id),
+        header: CellHeader::new(schema.vid, &id),
         data: OwnedValue::Map(map),
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -88,7 +88,7 @@ fn compressed_bytes_roundtrip_to_owned() {
     map.insert("blob", OwnedValue::Bytes(Bytes::from_vec(payload.clone())));
 
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id),
+        header: CellHeader::new(schema.vid, &id),
         data: OwnedValue::Map(map),
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -167,7 +167,7 @@ fn shared_helpers_work_for_uncompressed_fields() {
     );
 
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id),
+        header: CellHeader::new(schema.vid, &id),
         data: OwnedValue::Map(map),
     };
     chunks.write_cell(&mut cell).unwrap();

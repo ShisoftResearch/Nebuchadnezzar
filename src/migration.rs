@@ -280,7 +280,9 @@ async fn enumerate_slots(
         return Ok(held);
     }
     for id in member.cell_ids_in_slots(&slots.to_vec()).await? {
-        held.entry(crate::slots::slot_of(id_ref(&id))).or_default().push(id);
+        held.entry(crate::slots::slot_of(id_ref(&id)))
+            .or_default()
+            .push(id);
     }
     Ok(held)
 }
@@ -435,9 +437,9 @@ async fn transfer_slot(
                 }
                 // A settle is an optimisation, never a precondition: the cells are
                 // already written and durable.
-                Err(error) => warn!(
-                    "recipient {to} could not settle after a batch of slot {slot}: {error:?}"
-                ),
+                Err(error) => {
+                    warn!("recipient {to} could not settle after a batch of slot {slot}: {error:?}")
+                }
             }
         }
     }
@@ -620,8 +622,7 @@ async fn migrate_slot_prepared(
                 if !orphaned.is_empty() {
                     match recipient.drop_migrated_cells(&orphaned).await {
                         Ok(results) => {
-                            let dropped =
-                                results.iter().filter(|result| result.is_ok()).count();
+                            let dropped = results.iter().filter(|result| result.is_ok()).count();
                             warn!(
                                 "slot {slot} transfer aborted; removed {dropped} of {} cells \
                                  already landed on recipient {to}",
@@ -729,10 +730,8 @@ async fn confirm_handover(
             }) if active_from == from && active_to == to => {
                 last = state;
                 if attempt + 1 < HANDOVER_CONFIRM_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        HANDOVER_CONFIRM_DELAY_MS,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(HANDOVER_CONFIRM_DELAY_MS))
+                        .await;
                 }
             }
             other => {
@@ -994,7 +993,9 @@ pub async fn reshard_slots(
     let refused_slots: std::collections::HashSet<u32> =
         refused.iter().map(|(slot, _)| *slot).collect();
     for (slot, reason) in refused {
-        reshard.failed.push((slot, format!("begin refused: {reason}")));
+        reshard
+            .failed
+            .push((slot, format!("begin refused: {reason}")));
     }
     let began: Vec<u32> = slots
         .iter()
@@ -1171,7 +1172,11 @@ pub async fn reshard_slots(
     // a retried migration upserts over it. Slots committed to a THIRD member
     // are deliberately not touched -- those cells are somebody's live data.
     let mut orphaned_slots: Vec<u32> = aborted.iter().copied().collect();
-    orphaned_slots.extend(ready.iter().filter(|slot| !committed_map.contains_key(slot)));
+    orphaned_slots.extend(
+        ready
+            .iter()
+            .filter(|slot| !committed_map.contains_key(slot)),
+    );
     if !orphaned_slots.is_empty() {
         match recipient.cell_ids_in_slots(&orphaned_slots).await {
             Ok(orphaned) if !orphaned.is_empty() => {
@@ -1272,8 +1277,12 @@ pub async fn reshard_slots(
         }
     }
 
-    reshard.handovers.sort_unstable_by_key(|handover| handover.slot);
-    reshard.reclaims.sort_unstable_by_key(|reclaim| reclaim.slot);
+    reshard
+        .handovers
+        .sort_unstable_by_key(|handover| handover.slot);
+    reshard
+        .reclaims
+        .sort_unstable_by_key(|reclaim| reclaim.slot);
     reshard.failed.sort_unstable_by_key(|(slot, _)| *slot);
     reshard
 }
@@ -1301,6 +1310,7 @@ mod tests {
     #[test]
     #[ignore]
     fn codec_share_of_transfer_cost() {
+        use crate::ram::schema::{SchemaUid, SchemaVid};
         use crate::ram::types::{Map, OwnedMap, OwnedValue};
 
         const CELLS: usize = 1024;
@@ -1321,7 +1331,7 @@ mod tests {
                 value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
                 value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
                 crate::ram::cell::OwnedCell::new_with_id(
-                    1,
+                    SchemaVid(1),
                     &Id::from_parts(1, seq as u64),
                     OwnedValue::Map(value),
                 )
@@ -1395,7 +1405,10 @@ mod tests {
             .map(|seq| Id::from_parts(9, seq))
             .chain((0..11).map(|seq| Id::hashed(0xdead_0000_0000_0000 + seq)))
             .collect();
-        let flattened: Vec<Id> = range_batches(ids.clone(), 5).into_iter().flatten().collect();
+        let flattened: Vec<Id> = range_batches(ids.clone(), 5)
+            .into_iter()
+            .flatten()
+            .collect();
         assert_eq!(flattened.len(), ids.len());
         let expected: std::collections::HashSet<Id> = ids.into_iter().collect();
         let got: std::collections::HashSet<Id> = flattened.into_iter().collect();
@@ -1431,6 +1444,7 @@ mod cluster_tests {
     use super::*;
     use crate::client;
     use crate::ram::schema::Schema;
+    use crate::ram::schema::SchemaUid;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{Map, OwnedMap, OwnedValue};
     use crate::server::*;
@@ -1512,7 +1526,11 @@ mod cluster_tests {
         value.insert(&String::from("name"), OwnedValue::String(name.to_string()));
         (
             id,
-            crate::ram::cell::OwnedCell::new_with_id(SCHEMA_ID, &id, OwnedValue::Map(value)),
+            crate::ram::cell::OwnedCell::new_with_id(
+                crate::ram::schema::SchemaVid(SCHEMA_ID),
+                &id,
+                OwnedValue::Map(value),
+            ),
         )
     }
 
@@ -1557,7 +1575,10 @@ mod cluster_tests {
         // exactly as it moves the cells.
         let donor_moving_bytes = servers[0].chunks().slot_bytes.get(MOVING as u32);
         let donor_staying_bytes = servers[0].chunks().slot_bytes.get(STAYING as u32);
-        assert!(donor_moving_bytes > 0, "the donor holds cells, so it must hold bytes");
+        assert!(
+            donor_moving_bytes > 0,
+            "the donor holds cells, so it must hold bytes"
+        );
         assert!(donor_staying_bytes > 0);
         assert_eq!(servers[1].chunks().slot_bytes.get(MOVING as u32), 0);
 
@@ -1571,7 +1592,9 @@ mod cluster_tests {
                 .unwrap(),
             vec![donor_moving_bytes, donor_staying_bytes, 0]
         );
-        assert!(donor_rpc.total_live_bytes().await.unwrap() >= donor_moving_bytes + donor_staying_bytes);
+        assert!(
+            donor_rpc.total_live_bytes().await.unwrap() >= donor_moving_bytes + donor_staying_bytes
+        );
 
         // Deliberately smaller than the slot, so the batching and the settle
         // step are exercised rather than skipped.
@@ -1588,7 +1611,10 @@ mod cluster_tests {
             "9 cells in batches of 4 should take at least 3 batches, took {}",
             handover.batches
         );
-        assert_eq!(handover.delta_rounds_used, 1, "nothing was writing to the slot");
+        assert_eq!(
+            handover.delta_rounds_used, 1,
+            "nothing was writing to the slot"
+        );
 
         // Transferred, and the donor still holds its copy: the drop is a
         // separate, later decision, and until it happens a client with a stale
@@ -2135,9 +2161,11 @@ mod cluster_tests {
 
         // And every cell survived, readable through the ordinary hashed path.
         for id in &expected {
-            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
-                panic!("{id:?} was lost by the drain: {error:?}")
-            });
+            let cell = client
+                .read_cell(*id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{id:?} was lost by the drain: {error:?}"));
             assert_eq!(cell.header.id, *id);
         }
         // The departing member holds none of it.
@@ -2252,9 +2280,11 @@ mod cluster_tests {
 
         // Every acknowledged write, and every seeded cell, still readable.
         for id in acknowledged.iter().chain(seeded.iter()) {
-            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
-                panic!("{id:?} was lost by a drain under load: {error:?}")
-            });
+            let cell = client
+                .read_cell(*id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{id:?} was lost by a drain under load: {error:?}"));
             assert_eq!(cell.header.id, *id);
         }
 
@@ -2338,7 +2368,12 @@ mod cluster_tests {
             Some(SlotState::Stable { owner: donor_id }),
             "the slot must be left stable on its donor, not stuck migrating"
         );
-        assert_eq!(client.locate_server_id(expected.iter().next().unwrap()).unwrap(), donor_id);
+        assert_eq!(
+            client
+                .locate_server_id(expected.iter().next().unwrap())
+                .unwrap(),
+            donor_id
+        );
 
         // And the data is all still there, on the donor.
         assert_eq!(held_in_slot(&servers[0], SLOT), expected);
@@ -2552,11 +2587,10 @@ mod cluster_tests {
                 .transaction(|txn| {
                     Box::pin(async move {
                         let cell = txn.read(id).await?;
-                        let mut cell = cell.ok_or(
-                            crate::client::transaction::TxnError::NotRealizable(
+                        let mut cell =
+                            cell.ok_or(crate::client::transaction::TxnError::NotRealizable(
                                 crate::client::transaction::NotRealizableReason::ReadTooLate(id),
-                            ),
-                        )?;
+                            ))?;
                         if let OwnedValue::Map(ref mut map) = cell.data {
                             map.insert(
                                 &String::from("name"),
@@ -2574,7 +2608,10 @@ mod cluster_tests {
         }
         for id in &ids {
             let cell = client.read_cell(*id).await.unwrap().unwrap();
-            assert_eq!(cell.data["name"].string().map(|s| s.as_str()), Some("after"));
+            assert_eq!(
+                cell.data["name"].string().map(|s| s.as_str()),
+                Some("after")
+            );
         }
     }
 
@@ -2645,13 +2682,13 @@ mod cluster_tests {
         let mut written: HashSet<Id> = HashSet::new();
         for seq in 0..6 {
             let (id, mut cell) = cell_in_slot(SLOT, seq, "indexed");
-            cell.header.schema = SCHEMA;
+            cell.header.schema = crate::ram::schema::SchemaVid(SCHEMA);
             client.write_cell(cell).await.unwrap().unwrap();
             written.insert(id);
         }
         let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
 
-        async fn scan_ids(client: &Arc<AsyncClient>, schema: u32) -> HashSet<Id> {
+        async fn scan_ids(client: &Arc<AsyncClient>, schema: SchemaUid) -> HashSet<Id> {
             let mut found = HashSet::new();
             if let Ok(Some(mut cursor)) = client.ranged().scan_schema(schema, 64).await {
                 loop {
@@ -2666,7 +2703,7 @@ mod cluster_tests {
             found
         }
 
-        let before = scan_ids(&client, SCHEMA).await;
+        let before = scan_ids(&client, SchemaUid(SCHEMA)).await;
         assert!(
             written.is_subset(&before),
             "the scan must find the cells before any migration, or this proves nothing: \
@@ -2689,7 +2726,7 @@ mod cluster_tests {
         }
         let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
 
-        let after = scan_ids(&client, SCHEMA).await;
+        let after = scan_ids(&client, SchemaUid(SCHEMA)).await;
         let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();
         // Is this the residual stale pointer? Ranged index pages ARE cells, so a
         // single zeroed page makes a scan return nothing -- which is exactly what
@@ -2757,7 +2794,11 @@ mod cluster_tests {
             .unwrap()
             .unwrap();
         let ids = donor.cell_ids_in_slots(&vec![SLOT as u32]).await.unwrap();
-        donor.push_cells_to(&ids, recipient_id).await.unwrap().unwrap();
+        donor
+            .push_cells_to(&ids, recipient_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         // The donor is still the serving owner, so this write is correct to accept.
         let (_, updated) = cell_in_slot(SLOT, 1, "UPDATED-mid-transfer");
@@ -2840,8 +2881,8 @@ mod cluster_tests {
         // is very often a tmpfs -- i.e. RAM. A tier test whose "disk" is memory
         // measures nothing and dies by OOM partway through, so say where the
         // data is going and refuse a root that cannot hold it.
-        let storage_root = std::env::temp_dir()
-            .join(format!("neb-lifecycle-{}", std::process::id()));
+        let storage_root =
+            std::env::temp_dir().join(format!("neb-lifecycle-{}", std::process::id()));
         std::fs::create_dir_all(&storage_root).expect("storage root should be creatable");
         {
             let path = std::ffi::CString::new(storage_root.to_string_lossy().as_bytes()).unwrap();
@@ -2950,7 +2991,7 @@ mod cluster_tests {
                 value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
                 client
                     .write_cell(crate::ram::cell::OwnedCell::new_with_id(
-                        SCHEMA_ID,
+                        crate::ram::schema::SchemaVid(SCHEMA_ID),
                         &id,
                         OwnedValue::Map(value),
                     ))
@@ -3083,7 +3124,9 @@ mod cluster_tests {
             "LIFECYCLE: drain of {} finished in {:.1}s: {:?}",
             leaving,
             drain_at.elapsed().as_secs_f64(),
-            outcome.as_ref().map(|o| (o.moved.len(), o.cells_transferred, o.stranded.len()))
+            outcome
+                .as_ref()
+                .map(|o| (o.moved.len(), o.cells_transferred, o.stranded.len()))
         );
         let outcome = outcome.expect("draining a live member should succeed");
         assert!(
@@ -3210,7 +3253,11 @@ mod cluster_tests {
         let placement = placement_client(&client);
         let group = slot_group_id(client.group_name());
         assert_eq!(
-            placement.slots_owned_by(&group, &first).await.unwrap().len(),
+            placement
+                .slots_owned_by(&group, &first)
+                .await
+                .unwrap()
+                .len(),
             crate::slots::SLOT_COUNT,
             "the first member up should still own the whole space after two joins"
         );
@@ -3227,9 +3274,13 @@ mod cluster_tests {
 
         // Everything readable, and all of it on the first member.
         for id in &expected {
-            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
-                panic!("{id:?} became unreachable across two joins: {error:?}")
-            });
+            let cell = client
+                .read_cell(*id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| {
+                    panic!("{id:?} became unreachable across two joins: {error:?}")
+                });
             assert_eq!(cell.header.id, *id);
             assert_eq!(client.locate_server_id(id).unwrap(), first);
         }
@@ -3297,7 +3348,11 @@ mod cluster_tests {
              re-pointing it at a survivor would claim data moved when nothing did"
         );
         assert_eq!(
-            placement.slots_owned_by(&group, &first).await.unwrap().len(),
+            placement
+                .slots_owned_by(&group, &first)
+                .await
+                .unwrap()
+                .len(),
             crate::slots::SLOT_COUNT - 1,
             "and the survivor must own exactly what it owned before, no more"
         );
@@ -3413,7 +3468,7 @@ mod cluster_tests {
                 value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
                 client
                     .write_cell(crate::ram::cell::OwnedCell::new_with_id(
-                        SCHEMA_ID,
+                        crate::ram::schema::SchemaVid(SCHEMA_ID),
                         &id,
                         OwnedValue::Map(value),
                     ))
@@ -3521,10 +3576,8 @@ mod cluster_tests {
             crate::utils::test_port::unique_localhost_addr(),
             crate::utils::test_port::unique_localhost_addr(),
         ];
-        let storage_root = std::env::temp_dir().join(format!(
-            "neb-migration-memory-{}",
-            std::process::id()
-        ));
+        let storage_root =
+            std::env::temp_dir().join(format!("neb-migration-memory-{}", std::process::id()));
 
         let mut servers = Vec::new();
         for (index, address) in addresses.iter().enumerate() {
@@ -3605,7 +3658,7 @@ mod cluster_tests {
                 value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
                 client
                     .write_cell(crate::ram::cell::OwnedCell::new_with_id(
-                        1500,
+                        crate::ram::schema::SchemaVid(1500),
                         &id,
                         OwnedValue::Map(value),
                     ))
@@ -3850,7 +3903,6 @@ mod cluster_tests {
                 .unwrap_or(0)
         );
 
-
         // The property under test, stated against the baseline rather than
         // against the tier limit.
         //
@@ -4065,7 +4117,6 @@ mod cluster_tests {
     }
 }
 
-
 /// Draining a member: moving everything it owns elsewhere, so it can leave
 /// without taking data with it.
 ///
@@ -4268,8 +4319,7 @@ pub mod drain {
             // consensus per slot put a 2048-slot drain at 9.2 MB/s while the
             // same store reshard ran at 1.3 GB/s. The destinations hold
             // disjoint slot sets from one donor, so they proceed together.
-            let mut by_destination: std::collections::HashMap<u64, Vec<u32>> =
-                Default::default();
+            let mut by_destination: std::collections::HashMap<u64, Vec<u32>> = Default::default();
             for (slot, destination) in assign(&with_data, &sorted) {
                 by_destination.entry(destination).or_default().push(slot);
             }

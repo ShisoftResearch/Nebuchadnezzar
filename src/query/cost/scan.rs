@@ -1,3 +1,4 @@
+use crate::ram::schema::SchemaUid;
 use std::sync::Arc;
 
 use crate::server::DatabaseRuntime;
@@ -11,7 +12,7 @@ pub struct ScanIndexCost {
 impl CostFunction for ScanIndexCost {
     fn cost<'a>(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         _field: Option<u64>,
         _range: Option<&ValueRange>,
         projection: Vec<u64>,

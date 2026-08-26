@@ -23,6 +23,7 @@ use crate::{
 };
 
 use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
+use crate::ram::schema::SchemaUid;
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
 
@@ -47,7 +48,7 @@ pub(crate) fn cells_read_count() -> usize {
 impl IndexedDataClient {
     pub(super) async fn scan_schema_index<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         projection: Vec<u64>,
         selection: Expr,
         proc: Expr,
@@ -69,7 +70,7 @@ impl IndexedDataClient {
 
     pub(super) async fn scan_schema_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         _ordering: QueryOrdering,
     ) -> Result<Vec<Id>, RPCError> {
         let key = EntryKey::for_schema(schema);
@@ -108,7 +109,7 @@ impl IndexedDataClient {
     /// correctness comes from sorting the full set.
     pub(super) async fn stream_schema_scan_filtered(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         selection: &Expr,
         limit: usize,
     ) -> Result<Vec<Id>, RPCError> {

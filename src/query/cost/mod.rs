@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::server::ServerMeta;
 
 use super::{planner::ValueRange, statistics::SchemaStatistics};
@@ -20,7 +21,7 @@ pub struct DistHostCostResult {
 trait CostFunction {
     fn cost<'a>(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field: Option<u64>,
         range: Option<&ValueRange>,
         projection: Vec<u64>,
@@ -52,7 +53,7 @@ impl Default for CostResult {
 }
 
 fn row_bytes(
-    schema: u32,
+    schema: SchemaUid,
     projection: &Vec<u64>,
     meta: &Arc<ServerMeta>,
     stat: &Arc<SchemaStatistics>,
@@ -63,6 +64,12 @@ fn row_bytes(
         }
         Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
-        Some(meta.schemas.fields_size(&schema, projection.as_slice())?)
+        // The selector is a family; the record lookup needs the generation
+        // that family currently writes. Same number until the first evolution
+        // -- Task 4's handle map makes this a real resolution.
+        Some(
+            meta.schemas
+                .fields_size(&SchemaVid(schema.get()), projection.as_slice())?,
+        )
     }
 }

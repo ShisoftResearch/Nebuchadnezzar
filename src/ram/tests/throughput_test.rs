@@ -84,7 +84,7 @@ fn test_write_throughput_with_wal_and_backup() {
     for thread_id in 0..NUM_THREADS {
         let chunks = Arc::clone(&chunks);
         let progress = Arc::clone(&progress_counter);
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
         let start_id = thread_id * writes_per_thread;
         let end_id = start_id + writes_per_thread;
 

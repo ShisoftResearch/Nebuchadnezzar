@@ -168,9 +168,7 @@ where
                             {
                                 let mut terminal_node = write_node::<KS, PS>(&terminal_ref);
                                 let innode = terminal_node.innode_mut();
-                                innode
-                                    .keys
-                                    .set(&new_keys.as_slice_immute()[..num_keys]);
+                                innode.keys.set(&new_keys.as_slice_immute()[..num_keys]);
                                 innode.ptrs = new_ptrs;
                                 innode.len = num_keys;
                             }

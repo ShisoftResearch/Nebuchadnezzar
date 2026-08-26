@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-
 // Write-back state is scoped per server instance, keyed by the identity of
 // the server's AsyncClient. Sharing one process-wide queue meant two servers
 // in one process waited on each other's progress and a dead fleet poisoned
@@ -37,7 +36,8 @@ pub struct WriteBackHub {
     // while the link rewrite that unlinks it was still queued; a crash in
     // that window left the on-disk chain pointing at deleted pages (TB16's
     // genesis tree, 3M keys stranded behind a mid-chain hole).
-    deletions: Mutex<std::collections::VecDeque<(usize, crate::ram::types::Id, Arc<client::AsyncClient>)>>,
+    deletions:
+        Mutex<std::collections::VecDeque<(usize, crate::ram::types::Id, Arc<client::AsyncClient>)>>,
     counter: AtomicUsize,
     // usize::MAX = nothing processed yet (avoids counter=1/progress=0
     // looking like "operation 0 done").
@@ -390,9 +390,7 @@ impl WriteBackHub {
                             let mut retry: Vec<crate::ram::cell::OwnedCell> = Vec::new();
                             match client.upsert_all_cells(round).await {
                                 Ok(results) => {
-                                    for (r, cell) in
-                                        results.into_iter().zip(pending.into_iter())
-                                    {
+                                    for (r, cell) in results.into_iter().zip(pending.into_iter()) {
                                         match r {
                                             Ok(_) => {}
                                             Err(
@@ -687,7 +685,9 @@ impl WriteBackHub {
         }
         loop {
             if self.barrier_failed.load(Ordering::SeqCst) {
-                warn!("wait_until_updated: worker abandoned cells mid-wait; barrier NOT established");
+                warn!(
+                    "wait_until_updated: worker abandoned cells mid-wait; barrier NOT established"
+                );
                 return false;
             }
             let current = self.progress.load(Ordering::Acquire);
@@ -858,10 +858,10 @@ mod tests {
         // A worker gave up on a page it could not place: the barrier is down
         // and stays down while the image is outstanding.
         hub.barrier_failed.store(true, Ordering::SeqCst);
-        hub.retry_lane
-            .lock()
-            .unwrap()
-            .push((client.clone(), vec![page_cell_for_test(Id::from_parts(7, 7))]));
+        hub.retry_lane.lock().unwrap().push((
+            client.clone(),
+            vec![page_cell_for_test(Id::from_parts(7, 7))],
+        ));
         assert!(
             !hub.wait_until_updated().await,
             "the barrier must stay unestablished while a page is outstanding"
@@ -948,9 +948,8 @@ mod tests {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[*NEXT_PAGE_KEY_HASH] = OwnedValue::Id(Id::unit_id());
         value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(Id::unit_id());
-        value[*KEYS_KEY_HASH] = OwnedValue::PrimArray(
-            dovahkiin::types::OwnedPrimArray::SmallBytes(Vec::new()),
-        );
+        value[*KEYS_KEY_HASH] =
+            OwnedValue::PrimArray(dovahkiin::types::OwnedPrimArray::SmallBytes(Vec::new()));
         crate::ram::cell::OwnedCell::new_with_id(*PAGE_SCHEMA_ID, &id, value)
     }
 

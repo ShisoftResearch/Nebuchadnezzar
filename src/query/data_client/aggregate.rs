@@ -8,6 +8,7 @@ use super::{
     AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateRow,
     IndexedDataClient, QueryOrdering,
 };
+use crate::ram::schema::SchemaUid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AggregateValueType {
@@ -64,7 +65,7 @@ pub(super) struct AggregateGroupState {
 impl IndexedDataClient {
     pub(super) async fn validate_aggregate_query(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         query: &AggregateQuery,
     ) -> Result<Vec<ValidatedAggregateSpec>, RPCError> {
         if query.aggregates.is_empty() {
@@ -77,7 +78,7 @@ impl IndexedDataClient {
         let schema = self
             .index_clients
             .neb_client
-            .schema_by_id(schema_id)
+            .schema_by_id(schema_id.get())
             .await
             .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e.to_string())))?
             .ok_or_else(|| {

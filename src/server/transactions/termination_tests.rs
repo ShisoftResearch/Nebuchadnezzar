@@ -18,11 +18,12 @@
 use super::*;
 use crate::client::AsyncClient;
 use crate::ram::cell::OwnedCell;
+use crate::ram::chunk::DurableTxnStatus;
 use crate::ram::schema::Schema;
+use crate::ram::schema::SchemaVid;
 use crate::ram::tests::default_fields;
 use crate::ram::types::{Id, Map, OwnedMap, OwnedValue};
-use crate::ram::chunk::DurableTxnStatus;
-use crate::server::{NebServer, Service, ServerOptions};
+use crate::server::{NebServer, ServerOptions, Service};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,10 +132,13 @@ async fn two_ids_on_distinct_servers(
 
 fn cell_of(id: Id, score: u64) -> OwnedCell {
     let mut data = OwnedMap::new();
-    data.insert(&String::from("id"), OwnedValue::I64((id.bits() & ((1u64 << 48) - 1)) as i64));
+    data.insert(
+        &String::from("id"),
+        OwnedValue::I64((id.bits() & ((1u64 << 48) - 1)) as i64),
+    );
     data.insert(&String::from("score"), OwnedValue::U64(score));
     data.insert(&String::from("name"), OwnedValue::String(String::from("t")));
-    OwnedCell::new_with_id(SCHEMA_ID, &id, OwnedValue::Map(data))
+    OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &id, OwnedValue::Map(data))
 }
 
 /// Put one slot on the second server, so a transaction over both slots has
@@ -145,12 +149,7 @@ fn cell_of(id: Id, score: u64) -> OwnedCell {
 /// (the auto-fill watcher is off by default). 199,999 probes all routed to one
 /// server before this was added -- the ring had two members and the placement
 /// table had one owner.
-async fn place_slot_on(
-    client: &Arc<AsyncClient>,
-    slot: u16,
-    from: u64,
-    to: u64,
-) {
+async fn place_slot_on(client: &Arc<AsyncClient>, slot: u16, from: u64, to: u64) {
     let plan = crate::migration::MigrationPlan {
         batch_cells: 8,
         ..Default::default()
@@ -442,9 +441,15 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     let mut servers = Vec::new();
     for (address, dir) in addresses.iter().zip(temp.iter()) {
         servers.push(
-            NebServer::new_cluster_from_opts(&opts_for(dir), address, &addresses, group, async |_| {})
-                .await
-                .unwrap(),
+            NebServer::new_cluster_from_opts(
+                &opts_for(dir),
+                address,
+                &addresses,
+                group,
+                async |_| {},
+            )
+            .await
+            .unwrap(),
         );
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -559,10 +564,8 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
         DurableTxnStatus::Prepared,
         "the untold server must be in doubt"
     );
-    let leases_before = crate::ram::chunk::transaction_lease_count(
-        &tid,
-        &in_doubt.chunks().address_range(),
-    );
+    let leases_before =
+        crate::ram::chunk::transaction_lease_count(&tid, &in_doubt.chunks().address_range());
     assert!(
         leases_before > 0,
         "an in-doubt participant must still hold the heads its bracket needs"

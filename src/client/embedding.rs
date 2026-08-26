@@ -9,6 +9,7 @@ use std::sync::Arc;
 use bifrost::rpc::RPCError;
 
 use crate::index::embedding::{EmbeddingHit, EmbeddingIndexClient, EmbeddingModelInfo};
+use crate::ram::schema::SchemaUid;
 
 /// Client for semantic embedding search operations
 ///
@@ -82,7 +83,7 @@ impl EmbeddingClient {
     ) -> Result<Vec<EmbeddingHit>, RPCError> {
         match self
             .embedding_client
-            .search(schema_id, field_id, query, limit)
+            .search(SchemaUid(schema_id), field_id, query, limit)
             .await
         {
             Ok(hits) => Ok(hits),

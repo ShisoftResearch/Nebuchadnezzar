@@ -280,9 +280,10 @@ impl ClientCursor {
                     current_key,
                     reason
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    migration_retry_delay_ms(retried, current_key),
-                ))
+                tokio::time::sleep(std::time::Duration::from_millis(migration_retry_delay_ms(
+                    retried,
+                    current_key,
+                )))
                 .await;
                 retried += 1;
                 continue;

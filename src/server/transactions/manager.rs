@@ -3,8 +3,8 @@ use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{ClientPool, RPCClient};
 use bifrost::hlc::Hlc;
+use bifrost::rpc::{ClientPool, RPCClient};
 use bifrost::utils::time::get_time;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
@@ -1067,7 +1067,7 @@ impl TransactionManager {
             .deps
             .schemas()
             .get(&schema_id)
-            .ok_or(ReadError::SchemaDoesNotExisted(schema_id))?;
+            .ok_or(ReadError::SchemaDoesNotExisted(schema_id.get()))?;
 
         let map = match &cell.data {
             OwnedValue::Map(map) => map,
@@ -1601,20 +1601,21 @@ impl TransactionManager {
             .map(|(server, objs)| {
                 let participants = participants.clone();
                 async move {
-                let data_site = data_sites.get(server).unwrap().clone();
-                let result = TransactionManager::site_prepare(
-                    &self.deps,
-                    &self.wait_config,
-                    &tid,
-                    &objs,
-                    &data_site,
-                    &participants,
-                )
-                .await;
-                #[cfg(test)]
-                Self::notify_prepare_results_observed(tid, objs);
-                result
-            }})
+                    let data_site = data_sites.get(server).unwrap().clone();
+                    let result = TransactionManager::site_prepare(
+                        &self.deps,
+                        &self.wait_config,
+                        &tid,
+                        &objs,
+                        &data_site,
+                        &participants,
+                    )
+                    .await;
+                    #[cfg(test)]
+                    Self::notify_prepare_results_observed(tid, objs);
+                    result
+                }
+            })
             .collect();
         let results: Vec<Result<DMPrepareResult, TMError>> = prepare_futures.collect().await;
         Self::reduce_prepare_results(results)
@@ -1879,7 +1880,10 @@ impl TransactionManager {
         let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
         for (tid, servers) in pending {
             for server_id in servers {
-                tids_by_server.entry(server_id).or_default().push(tid.clone());
+                tids_by_server
+                    .entry(server_id)
+                    .or_default()
+                    .push(tid.clone());
             }
         }
         for (server_id, tids) in tids_by_server {
@@ -2077,6 +2081,7 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use crate::ram::schema::Schema;
+    use crate::ram::schema::SchemaVid;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{OwnedMap, OwnedValue};
     use crate::server::transactions;
@@ -2093,7 +2098,6 @@ mod tests {
             generate_scoped_service_id(group, "db_b")
         );
     }
-
 
     #[test]
     fn data_object_pinned_representation_defers_full_cell() {
@@ -2199,8 +2203,11 @@ mod tests {
             &String::from("name"),
             OwnedValue::String(format!("cell-{score}")),
         );
-        let mut cell =
-            crate::ram::cell::OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data));
+        let mut cell = crate::ram::cell::OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &id,
+            OwnedValue::Map(data),
+        );
         runtime.chunks().write_cell(&mut cell).unwrap();
     }
 
@@ -2212,7 +2219,7 @@ mod tests {
             &String::from("name"),
             OwnedValue::String(format!("cell-{score}")),
         );
-        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+        OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
     }
 
     #[test]
@@ -2411,14 +2418,14 @@ mod tests {
         let schema = install_basic_schema(&runtime);
         let cell_id = Id::allocated(0, 0, 7301);
 
-        let mut seeded = counter_cell(schema.id, cell_id, 2);
+        let mut seeded = counter_cell(schema.vid.get(), cell_id, 2);
         runtime.chunks().write_cell(&mut seeded).unwrap();
         let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
 
         let txn = scoped_txn_client_for_database(address, group, group).await;
         let tid = txn.begin().await.unwrap().unwrap();
 
-        let blind_update = counter_cell(schema.id, cell_id, 7);
+        let blind_update = counter_cell(schema.vid.get(), cell_id, 7);
         assert_eq!(
             txn.update(tid.clone(), blind_update)
                 .await
@@ -2459,7 +2466,7 @@ mod tests {
         let schema = install_basic_schema(&runtime);
         let cell_id = Id::allocated(0, 0, 7302);
 
-        let mut seeded = counter_cell(schema.id, cell_id, 4);
+        let mut seeded = counter_cell(schema.vid.get(), cell_id, 4);
         runtime.chunks().write_cell(&mut seeded).unwrap();
         let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
 
@@ -2506,7 +2513,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for (index, cell_id) in cell_ids.iter().enumerate() {
-            seed_counter_cell(&runtime, schema.id, *cell_id, index as u64).await;
+            seed_counter_cell(&runtime, schema.vid.get(), *cell_id, index as u64).await;
         }
 
         let results = join_all((0..48).map(|worker| {
@@ -2580,8 +2587,14 @@ mod tests {
         let default_cell = Id::allocated(0, 0, 1001);
         let analytics_cell = Id::allocated(0, 0, 2001);
 
-        seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
-        seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
+        seed_counter_cell(&default_runtime, default_schema.vid.get(), default_cell, 1).await;
+        seed_counter_cell(
+            &analytics_runtime,
+            analytics_schema.vid.get(),
+            analytics_cell,
+            1,
+        )
+        .await;
 
         let tasks = join_all((0..40).map(|index| {
             let address = address.to_string();
@@ -2671,7 +2684,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_basic_schema(&runtime);
         let hot_cell = Id::allocated(0, 0, 3001);
-        seed_counter_cell(&runtime, schema.id, hot_cell, 1).await;
+        seed_counter_cell(&runtime, schema.vid.get(), hot_cell, 1).await;
 
         let txn_client = scoped_txn_client_for_database(address, group, group).await;
         for iteration in 0..48 {
@@ -2699,7 +2712,7 @@ mod tests {
                 OwnedValue::String(format!("writer-{iteration}")),
             );
             let updated_cell = crate::ram::cell::OwnedCell::new_with_id(
-                schema.id,
+                schema.vid,
                 &hot_cell,
                 OwnedValue::Map(data),
             );
@@ -2764,8 +2777,8 @@ mod tests {
         let analytics_schema = install_basic_schema(&analytics_runtime);
         for index in 0..24 {
             let cell = Id::allocated(0, 0, 4001 + index);
-            seed_counter_cell(&default_runtime, default_schema.id, cell, 1).await;
-            seed_counter_cell(&analytics_runtime, analytics_schema.id, cell, 1).await;
+            seed_counter_cell(&default_runtime, default_schema.vid.get(), cell, 1).await;
+            seed_counter_cell(&analytics_runtime, analytics_schema.vid.get(), cell, 1).await;
         }
 
         let results = join_all((0..48).map(|iteration| {
@@ -2773,9 +2786,9 @@ mod tests {
             let group = group.to_string();
             async move {
                 let (database_name, schema_id) = if iteration % 2 == 0 {
-                    (group.clone(), default_schema.id)
+                    (group.clone(), default_schema.vid)
                 } else {
-                    ("analytics".to_string(), analytics_schema.id)
+                    ("analytics".to_string(), analytics_schema.vid)
                 };
                 // Each writer/reader pair shares a cell so the newer reader forces the
                 // older writer's prepare failure. Using the same IDs in both databases

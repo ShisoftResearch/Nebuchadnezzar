@@ -169,8 +169,7 @@ impl std::fmt::Display for ScrubReport {
 /// A blocking pass on the startup path has to be answerable about its price,
 /// and a number that only exists inside a log line at whatever level happened
 /// to be enabled is not an answer.
-pub static LAST_RECONCILE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LAST_RECONCILE_SCANNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static LAST_RECONCILE_NOIDX: std::sync::atomic::AtomicU64 =
@@ -354,8 +353,7 @@ fn derive_into(
 /// run for the life of the process -- an operator who runs the scrub a
 /// second time is entitled to see examples again, and a counter that only
 /// ever counts up would silently stop explaining itself after the first run.
-static UNREACHABLE_LOGGED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static UNREACHABLE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Examples of MISSING keys logged this pass. Same reset discipline.
 static MISSING_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -501,11 +499,7 @@ fn concurrency() -> usize {
 /// the check: if a concurrent writer inserts between the two, `insert`
 /// returns false and this reports the key as present, which is what it then
 /// is. The check only decides whether to attempt the write.
-async fn check_one(
-    indexers: &Arc<IndexerClients>,
-    key: &EntryKey,
-    mode: ScrubMode,
-) -> KeyOutcome {
+async fn check_one(indexers: &Arc<IndexerClients>, key: &EntryKey, mode: ScrubMode) -> KeyOutcome {
     match indexers.ranged_client.contains(key).await {
         Ok(true) => KeyOutcome::Present,
         Ok(false) if mode.repairs() => match indexers.ranged_client.insert(key).await {
@@ -563,9 +557,10 @@ mod tests {
     use crate::index::ranged::tree::btree::page_schema;
     use crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA;
     use crate::ram::cell::OwnedCell;
+    use crate::ram::schema::SchemaVid;
     use crate::ram::schema::{Field, IndexType, Schema};
     use crate::ram::types::{Map, OwnedMap, OwnedValue, Type};
-    use crate::server::{NebServer, Service, ServerOptions};
+    use crate::server::{NebServer, ServerOptions, Service};
     use tempfile::TempDir;
 
     const PRICE_FIELD: &str = "price";
@@ -633,11 +628,7 @@ mod tests {
             true,
         );
         let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
-        client
-            .new_schema_with_id(schema)
-            .await
-            .unwrap()
-            .unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
         (server, Arc::new(client))
     }
 
@@ -645,7 +636,7 @@ mod tests {
         for i in 0..count {
             let mut value = OwnedValue::Map(OwnedMap::new());
             value[PRICE_FIELD] = OwnedValue::U64(i);
-            let cell = OwnedCell::new_with_id(SCHEMA_ID, &Id::from_parts(3, i), value);
+            let cell = OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &Id::from_parts(3, i), value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
     }
@@ -657,8 +648,12 @@ mod tests {
     async fn a_healthy_index_scrubs_clean() {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
-        let (server, client) =
-            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_clean", &dir).await;
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_clean",
+            &dir,
+        )
+        .await;
         write_products(&client, 40).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
@@ -673,7 +668,11 @@ mod tests {
         );
         assert_eq!(report.entries_missing, 0, "healthy index reported holes");
         assert_eq!(report.entries_present, report.entries_derived);
-        assert!(report.is_clean(), "healthy index did not scrub clean: {}", report);
+        assert!(
+            report.is_clean(),
+            "healthy index did not scrub clean: {}",
+            report
+        );
     }
 
     /// The whole point: an entry lost from the index is found, and repair
@@ -684,8 +683,12 @@ mod tests {
     async fn a_hole_in_the_index_is_found_and_repaired() {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
-        let (server, client) =
-            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_repair", &dir).await;
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_repair",
+            &dir,
+        )
+        .await;
         write_products(&client, 40).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
@@ -725,17 +728,28 @@ mod tests {
 
         let found = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("after damage: {}", found);
-        assert_eq!(found.entries_missing, 3, "scrub did not find the holes: {}", found);
+        assert_eq!(
+            found.entries_missing, 3,
+            "scrub did not find the holes: {}",
+            found
+        );
         assert_eq!(found.entries_repaired, 0, "verify mode must not write");
         assert!(!found.is_clean());
 
         let repaired = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
         println!("after repair: {}", repaired);
-        assert_eq!(repaired.entries_repaired, 3, "repair did not fill the holes");
+        assert_eq!(
+            repaired.entries_repaired, 3,
+            "repair did not fill the holes"
+        );
 
         let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("after re-verify: {}", after);
-        assert!(after.is_clean(), "index still holed after repair: {}", after);
+        assert!(
+            after.is_clean(),
+            "index still holed after repair: {}",
+            after
+        );
         assert_eq!(after.entries_present, baseline.entries_present);
     }
 
@@ -807,8 +821,12 @@ mod tests {
     async fn the_scrub_is_reachable_over_rpc() {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
-        let (server, client) =
-            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_rpc", &dir).await;
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_rpc",
+            &dir,
+        )
+        .await;
         write_products(&client, 20).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
@@ -820,8 +838,7 @@ mod tests {
         // The fan-out must agree with what the node itself sees; a
         // silently-empty report would pass every assertion above.
         let indexers = &server.indexer().unwrap().clients;
-        let in_process =
-            scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        let in_process = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         assert_eq!(
             over_rpc.entries_derived, in_process.entries_derived,
             "rpc scrub disagreed with the in-process walk"
@@ -836,8 +853,12 @@ mod tests {
     async fn repairing_a_healthy_index_changes_nothing() {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
-        let (server, client) =
-            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_idempotent", &dir).await;
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_idempotent",
+            &dir,
+        )
+        .await;
         write_products(&client, 25).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 

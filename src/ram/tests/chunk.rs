@@ -44,7 +44,7 @@ pub fn cell_rw() {
     let schemas = LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     let chunks = Chunks::new(
@@ -73,7 +73,7 @@ pub fn cell_rw() {
     );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id2),
+        header: CellHeader::new(schema.vid, &id2),
         data,
     };
     let header = chunks.write_cell(&mut cell).unwrap();
@@ -99,7 +99,7 @@ pub fn cell_rw() {
     );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id2),
+        header: CellHeader::new(schema.vid, &id2),
         data,
     };
     let header = chunks.update_cell(&mut cell).unwrap();
@@ -166,7 +166,7 @@ pub fn simple_cell_rw() {
     let schemas = LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     let chunks = Chunks::new(
@@ -202,7 +202,10 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     );
 
     let mut first_map = OwnedMap::new();
-    first_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::allocated(100, 0, 1)));
+    first_map.insert_key_id(
+        *RANGED_TREE_HEAD_HASH,
+        OwnedValue::Id(Id::allocated(100, 0, 1)),
+    );
     first_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
     let mut tree_cell =
         OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, &tree_id, OwnedValue::Map(first_map));
@@ -214,7 +217,10 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     );
 
     let mut update_map = OwnedMap::new();
-    update_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::allocated(100, 0, 2)));
+    update_map.insert_key_id(
+        *RANGED_TREE_HEAD_HASH,
+        OwnedValue::Id(Id::allocated(100, 0, 2)),
+    );
     update_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
     let mut updated_tree_cell = OwnedCell::new_with_id(
         *RANGED_TREE_SCHEMA_ID,
@@ -233,7 +239,7 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
 pub fn ranged_btree_page_cells_do_not_build_chunk_statistics_when_forced() {
     let _ = env_logger::try_init();
     let page_schema = page_schema();
-    let page_schema_id = page_schema.id;
+    let page_schema_id = page_schema.vid;
     let schemas = LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(page_schema);
     let chunks = Chunks::new(
@@ -260,7 +266,7 @@ pub fn ranged_btree_page_cells_do_not_build_chunk_statistics_when_forced() {
     chunks.ensure_statistics();
 
     assert!(
-        chunks.all_chunk_statistics(page_schema_id)[0].is_none(),
+        chunks.all_chunk_statistics(SchemaUid(page_schema_id.get()))[0].is_none(),
         "forced statistics rebuild should skip internal ranged B-tree page schemas"
     );
 }
@@ -339,7 +345,7 @@ pub fn sparse_sidecar_system_cells_do_not_build_chunk_statistics_when_forced() {
     chunks.ensure_statistics();
 
     assert!(
-        chunks.all_chunk_statistics(sidecar_schema_id)[0].is_none(),
+        chunks.all_chunk_statistics(SchemaUid(sidecar_schema_id))[0].is_none(),
         "forced statistics rebuild should skip internal sparse sidecar schemas"
     );
 }
@@ -369,7 +375,7 @@ pub fn array_dyn_map() {
         dynamic: dyn_map_value()
     );
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -434,7 +440,7 @@ pub fn complex_cell_sel_read() {
         )
     );
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     chunks.write_cell(&mut cell).unwrap();
@@ -465,7 +471,7 @@ pub fn complex_cell_sel_read() {
                 true,
             )
             .unwrap();
-        assert_eq!(partial_cell.header.schema, schema.id);
+        assert_eq!(partial_cell.header.schema, schema.vid);
     }
     {
         // Verify schema id with minimal header
@@ -476,7 +482,7 @@ pub fn complex_cell_sel_read() {
                 false,
             )
             .unwrap();
-        assert_eq!(partial_cell.header.schema, schema.id);
+        assert_eq!(partial_cell.header.schema, schema.vid);
     }
     {
         // Selecting one in nested map
@@ -755,7 +761,7 @@ fn test_wal_cleanup_after_archive() {
     );
     let data = OwnedValue::Map(data_map);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &cell_id),
+        header: CellHeader::new(schema.vid, &cell_id),
         data,
     };
 
@@ -866,7 +872,7 @@ fn test_wal_file_handle_properly_closed() {
     );
     let data = OwnedValue::Map(data_map);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &cell_id),
+        header: CellHeader::new(schema.vid, &cell_id),
         data,
     };
 
@@ -951,7 +957,7 @@ fn test_multiple_segments_wal_cleanup() {
         data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data,
         };
         chunks.write_cell(&mut cell).unwrap();
@@ -1088,7 +1094,7 @@ fn test_archive_idempotency() {
     );
     let data = OwnedValue::Map(data_map);
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &cell_id),
+        header: CellHeader::new(schema.vid, &cell_id),
         data,
     };
 
@@ -1175,7 +1181,7 @@ fn test_multiple_segments_in_chunk() {
 
     for thread_id in 0..num_threads {
         let chunks_clone = StdArc::clone(&chunks);
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
 
         let handle = thread::spawn(move || {
             for i in 0..cells_per_thread {
@@ -1310,7 +1316,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
 
     for thread_id in 0..num_threads {
         let chunks_clone = StdArc::clone(&chunks);
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
 
         let handle = thread::spawn(move || {
             for i in 0..cells_per_thread {
@@ -1335,7 +1341,8 @@ fn test_concurrent_segment_allocation_and_cleanup() {
 
                         // Occasionally delete old cells to create dead space for cleaner
                         if i > 10 && i % 5 == 0 {
-                            let old_cell_id = Id::from_parts(1, thread_id * cells_per_thread + (i - 10));
+                            let old_cell_id =
+                                Id::from_parts(1, thread_id * cells_per_thread + (i - 10));
                             let _ = chunks_clone.remove_cell(&old_cell_id);
                             trace!("Thread {} deleted cell {}", thread_id, i - 10);
                         }
@@ -1417,7 +1424,7 @@ fn create_test_cell(schema_id: u32, id: &Id, name: &str, score: u64) -> OwnedCel
         OwnedValue::String(String::from(name)),
     );
     OwnedCell {
-        header: CellHeader::new(schema_id, id),
+        header: CellHeader::new(SchemaVid(schema_id), id),
         data: OwnedValue::Map(data_map),
     }
 }
@@ -1433,7 +1440,7 @@ pub fn test_compare_version_and_update_cell_success() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
@@ -1445,7 +1452,7 @@ pub fn test_compare_version_and_update_cell_success() {
     }
 
     // Update with matching version - should succeed
-    let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 85);
+    let mut updated_cell = create_test_cell(schema.vid.get(), &id, "Bob", 85);
     let result = chunks.compare_version_and_update_cell(&id, initial_version, &mut updated_cell);
     assert!(
         result.is_ok(),
@@ -1466,12 +1473,12 @@ pub fn test_compare_version_and_update_cell_version_mismatch() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
     // Try to update with FUTURE version (higher than current) - should fail
-    let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 85);
+    let mut updated_cell = create_test_cell(schema.vid.get(), &id, "Bob", 85);
     let result =
         chunks.compare_version_and_update_cell(&id, initial_version + 1, &mut updated_cell);
     assert!(result.is_err(), "Update should fail with future version");
@@ -1491,18 +1498,18 @@ pub fn test_compare_version_and_update_cell_stale_version() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
     // Perform a successful update to increment version
-    let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 80);
+    let mut updated_cell = create_test_cell(schema.vid.get(), &id, "Bob", 80);
     chunks
         .compare_version_and_update_cell(&id, initial_version, &mut updated_cell)
         .unwrap();
 
     // Now try to update with STALE version (the old initial_version)
-    let mut stale_cell = create_test_cell(schema.id, &id, "Charlie", 90);
+    let mut stale_cell = create_test_cell(schema.vid.get(), &id, "Charlie", 90);
     let result = chunks.compare_version_and_update_cell(&id, initial_version, &mut stale_cell);
     assert!(result.is_err(), "Update should fail with stale version");
     assert_eq!(result.unwrap_err(), WriteError::CellVersionMismatch);
@@ -1521,7 +1528,7 @@ pub fn test_compare_version_and_set_field_success() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
@@ -1560,13 +1567,13 @@ pub fn test_compare_version_sequential_updates() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "v1", 10);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "v1", 10);
     let header = chunks.write_cell(&mut cell).unwrap();
     let mut current_version = header.version;
 
     // Perform multiple sequential updates, each tracking the new version
     for i in 2..=5 {
-        let mut updated_cell = create_test_cell(schema.id, &id, &format!("v{}", i), i * 10);
+        let mut updated_cell = create_test_cell(schema.vid.get(), &id, &format!("v{}", i), i * 10);
         let result =
             chunks.compare_version_and_update_cell(&id, current_version, &mut updated_cell);
         assert!(result.is_ok(), "Update {} should succeed", i);
@@ -1591,7 +1598,7 @@ pub fn test_compare_version_optimistic_retry_pattern() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell with score=100
-    let mut cell = create_test_cell(schema.id, &id, "Player", 100);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Player", 100);
     chunks.write_cell(&mut cell).unwrap();
 
     // Simulate an optimistic update: read-modify-write with retry on conflict
@@ -1608,7 +1615,7 @@ pub fn test_compare_version_optimistic_retry_pattern() {
 
         // Step 2: Compute new value (increment score by 10)
         let new_score = current_score + 10;
-        let mut updated_cell = create_test_cell(schema.id, &id, "Player", new_score);
+        let mut updated_cell = create_test_cell(schema.vid.get(), &id, "Player", new_score);
 
         // Step 3: Attempt compare-and-swap
         match chunks.compare_version_and_update_cell(&id, current_version, &mut updated_cell) {
@@ -1638,7 +1645,7 @@ pub fn test_compare_version_and_set_field_version_mismatch() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
@@ -1679,7 +1686,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Initial", 0);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
@@ -1705,7 +1712,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
             barrier_clone.wait();
 
             let mut updated_cell =
-                create_test_cell(schema.id, &id, &format!("Thread{}", i), i as u64);
+                create_test_cell(schema.vid.get(), &id, &format!("Thread{}", i), i as u64);
             match chunks_clone.compare_version_and_update_cell(
                 &id,
                 initial_version,
@@ -1763,7 +1770,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
     let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
-    let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Initial", 0);
     let header = chunks.write_cell(&mut cell).unwrap();
     let initial_version = header.version;
 
@@ -1844,7 +1851,7 @@ pub fn test_compare_version_and_update_cell_nonexistent_cell() {
     let (chunks, schema) = setup_test_chunks();
     let id = Id::allocated(1, 0, 999); // Non-existent cell
 
-    let mut cell = create_test_cell(schema.id, &id, "Test", 70);
+    let mut cell = create_test_cell(schema.vid.get(), &id, "Test", 70);
     let result = chunks.compare_version_and_update_cell(&id, 1, &mut cell);
 
     assert!(result.is_err(), "Update should fail for non-existent cell");

@@ -16,6 +16,7 @@ use neb::index::full_text::shard::InvertedIndexer;
 use neb::index::full_text::{build_index_meta, FullTextIndexMeta};
 use neb::ram::chunk::Chunks;
 use neb::ram::schema::LocalSchemasCache;
+use neb::ram::schema::SchemaUid;
 use neb::ram::types::{Id, OwnedValue};
 use neb::server::ServerMeta;
 use std::sync::Arc;
@@ -57,6 +58,7 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
         // For benchmarks, we can use a feature flag or just accept that schemas
         // need to be registered differently. Let's use a workaround by accessing
         // the internal structure via unsafe (safe in benchmark context)
+        use neb::ram::schema::SchemaUid;
         use std::mem;
         use std::sync::Arc;
 
@@ -76,7 +78,7 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
         let internal: &LocalSchemasCacheInternal = unsafe { mem::transmute(schemas) };
 
         let name = schema.name.clone();
-        let id = schema.id;
+        let id = schema.vid;
 
         // Check if schema already exists
         if let Some(existing_id) = internal.map.name_map.get(&name) {
@@ -198,7 +200,7 @@ fn create_test_meta(schema_id: u32, field_id: u64, doc_id: Id, text: &str) -> Fu
     build_index_meta(
         doc_id,
         1, // version
-        schema_id,
+        SchemaUid(schema_id),
         field_id,
         OwnedValue::String(text.to_string()),
     )
@@ -341,7 +343,13 @@ fn bench_search(c: &mut Criterion) {
                 |b, query| {
                     b.to_async(&rt).iter(|| async {
                         let hits = indexer
-                            .bm25_search(schema_id, field_id, black_box(query), 10, false)
+                            .bm25_search(
+                                SchemaUid(schema_id),
+                                field_id,
+                                black_box(query),
+                                10,
+                                false,
+                            )
                             .await
                             .unwrap();
                         black_box(hits);
@@ -458,7 +466,13 @@ fn bench_search_limit(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(limit), limit, |b, limit| {
             b.to_async(&rt).iter(|| async {
                 let hits = indexer
-                    .bm25_search(schema_id, field_id, black_box("rust programming"), *limit, false)
+                    .bm25_search(
+                        SchemaUid(schema_id),
+                        field_id,
+                        black_box("rust programming"),
+                        *limit,
+                        false,
+                    )
                     .await
                     .unwrap();
                 black_box(hits);

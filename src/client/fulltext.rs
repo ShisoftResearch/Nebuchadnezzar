@@ -11,6 +11,7 @@ use bifrost::rpc::{ClientPool, RPCError};
 
 use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
 use crate::index::full_text::BM25Hit;
+use crate::ram::schema::SchemaUid;
 
 /// Client for distributed full-text search operations
 ///
@@ -94,7 +95,14 @@ impl FullTextClient {
         let coordinator = self.coordinator();
 
         match coordinator
-            .distributed_search(schema_id, field_id, query, limit, false, phrase_boost)
+            .distributed_search(
+                SchemaUid(schema_id),
+                field_id,
+                query,
+                limit,
+                false,
+                phrase_boost,
+            )
             .await
         {
             Ok(Ok(hits)) => Ok(hits),
@@ -124,7 +132,14 @@ impl FullTextClient {
         let coordinator = self.coordinator();
 
         match coordinator
-            .distributed_search(schema_id, field_id, query, limit, true, phrase_boost)
+            .distributed_search(
+                SchemaUid(schema_id),
+                field_id,
+                query,
+                limit,
+                true,
+                phrase_boost,
+            )
             .await
         {
             Ok(Ok(hits)) => Ok(hits),

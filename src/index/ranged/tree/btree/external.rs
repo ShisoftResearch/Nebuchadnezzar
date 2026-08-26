@@ -4,7 +4,7 @@ use super::*;
 use crate::client::AsyncClient;
 use crate::index::ranged::tree::tree::DeletionSet;
 use crate::ram::cell::OwnedCell;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::*;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
@@ -37,13 +37,13 @@ lazy_static! {
     pub static ref KEYS_KEY_HASH: u64 = key_hash(KEYS_FIELD);
     pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
-    pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
+    pub static ref PAGE_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(PAGE_SCHEMA) as u32);
 }
 
 fn invalid_page_format(cell: &OwnedCell, reason: impl Into<String>) -> ReconstructError {
     ReconstructError::InvalidPageFormat {
         page_id: cell.id(),
-        schema_id: cell.header.schema,
+        schema_id: cell.header.schema.get(),
         reason: reason.into(),
     }
 }
@@ -511,7 +511,7 @@ where
 
 pub fn page_schema() -> Schema {
     Schema::new_with_id(
-        *PAGE_SCHEMA_ID,
+        PAGE_SCHEMA_ID.get(),
         &String::from(PAGE_SCHEMA),
         None,
         Field::new_schema(vec![

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
 use crate::ram::cell::{OwnedCell, ReadError};
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedValue};
 
 // Submodules
@@ -38,9 +38,9 @@ const TOTAL_LENGTH_FIELD: &str = "TOTAL_LENGTH";
 const DOC_LENGTH_FIELD: &str = "DOC_LENGTH";
 
 lazy_static! {
-    pub static ref INVERTED_INDEX_SCHEMA_ID: u32 = hash_str(INVERTED_INDEX_SCHEMA) as u32;
-    pub static ref INVERTED_STATS_SCHEMA_ID: u32 = hash_str(INVERTED_STATS_SCHEMA) as u32;
-    pub static ref INVERTED_DOC_SCHEMA_ID: u32 = hash_str(INVERTED_DOC_SCHEMA) as u32;
+    pub static ref INVERTED_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(hash_str(INVERTED_INDEX_SCHEMA) as u32);
+    pub static ref INVERTED_STATS_SCHEMA_ID: SchemaVid = SchemaVid(hash_str(INVERTED_STATS_SCHEMA) as u32);
+    pub static ref INVERTED_DOC_SCHEMA_ID: SchemaVid = SchemaVid(hash_str(INVERTED_DOC_SCHEMA) as u32);
 
     // Made public for use in submodules
     pub(crate) static ref DOC_IDS_FIELD_ID: u64 = hash_str(DOC_IDS_FIELD);
@@ -71,7 +71,7 @@ pub struct TokenStat {
 pub struct FullTextIndexMeta {
     pub cell_id: Id,
     pub version: u64, // Cell version for filtering stale entries
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub doc_length: u32,
     pub tokens: Vec<TokenStat>,
@@ -105,7 +105,7 @@ impl<T: ToOwnedValue + ?Sized> ToOwnedValue for &T {
 
 pub fn inverted_index_schema() -> Schema {
     Schema::new_with_id(
-        *INVERTED_INDEX_SCHEMA_ID,
+        INVERTED_INDEX_SCHEMA_ID.get(),
         &INVERTED_INDEX_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![
@@ -120,7 +120,7 @@ pub fn inverted_index_schema() -> Schema {
 
 pub fn inverted_stats_schema() -> Schema {
     Schema::new_with_id(
-        *INVERTED_STATS_SCHEMA_ID,
+        INVERTED_STATS_SCHEMA_ID.get(),
         &INVERTED_STATS_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![
@@ -134,7 +134,7 @@ pub fn inverted_stats_schema() -> Schema {
 
 pub fn inverted_doc_schema() -> Schema {
     Schema::new_with_id(
-        *INVERTED_DOC_SCHEMA_ID,
+        INVERTED_DOC_SCHEMA_ID.get(),
         &INVERTED_DOC_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![Field::new_unindexed(
@@ -153,7 +153,7 @@ pub fn inverted_doc_schema() -> Schema {
 pub fn build_index_meta(
     cell_id: Id,
     version: u64,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     value: OwnedValue,
 ) -> Option<FullTextIndexMeta> {

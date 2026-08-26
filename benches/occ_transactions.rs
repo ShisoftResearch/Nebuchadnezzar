@@ -89,7 +89,7 @@ fn seed(runtime: &Runtime, fixture: &OccFixture, ids: &[Id], payload_bytes: usiz
         for id in ids {
             fixture
                 .client
-                .write_cell(counter_cell(fixture.schema.id, *id, 0, payload_bytes))
+                .write_cell(counter_cell(fixture.schema.vid, *id, 0, payload_bytes))
                 .await
                 .expect("seed OCC benchmark counter RPC")
                 .expect("seed OCC benchmark counter");

@@ -1,6 +1,6 @@
-use crate::ram::cell::Cell;
 use crate::index::scrub::{scrub_ranged_index, ScrubMode, ScrubReport};
-use crate::ram::schema::{post_schema_add, post_schema_delete};
+use crate::ram::cell::Cell;
+use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
 use crate::{
@@ -76,6 +76,7 @@ service! {
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
     rpc post_schema_add(schema_id: u32) -> Result<(), String>;
+    rpc post_schema_evolve(previous_id: u32, evolved_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
     rpc scrub_ranged_index(repair: bool) -> Result<ScrubReport, String>;
 }
@@ -403,9 +404,7 @@ impl Service for NebRPCService {
         // the cells back to answer that would double the cost of the move.
         future::ready(
             keys.into_iter()
-                .map(|id| {
-                    self.database_runtime.chunks().head_cell(id)
-                })
+                .map(|id| self.database_runtime.chunks().head_cell(id))
                 .collect(),
         )
         .boxed()
@@ -564,8 +563,7 @@ impl Service for NebRPCService {
             crate::slots::SLOT_COUNT,
             applied_index,
         );
-        self.neb_client
-            .note_slot_owner(slot, owner, applied_index);
+        self.neb_client.note_slot_owner(slot, owner, applied_index);
         future::ready(()).boxed()
     }
 
@@ -598,19 +596,15 @@ impl Service for NebRPCService {
                     // Enumerated a moment ago and gone now: nothing to move, and
                     // nothing wrong.
                     Err(crate::ram::cell::ReadError::CellDoesNotExisted) => {}
-                    Err(error) => {
-                        return Err(format!("donor could not read {key:?}: {error:?}"))
-                    }
+                    Err(error) => return Err(format!("donor could not read {key:?}: {error:?}")),
                 }
             }
             crate::migration::MIGRATION_DONOR_READ_NANOS.fetch_add(
                 t_read.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            crate::migration::MIGRATION_CELLS_READ.fetch_add(
-                cells.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            crate::migration::MIGRATION_CELLS_READ
+                .fetch_add(cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if cells.is_empty() {
                 return Ok(Vec::new());
             }
@@ -639,24 +633,18 @@ impl Service for NebRPCService {
         .boxed()
     }
 
-    fn note_slot_owners(
-        &self,
-        owners: &Vec<(u32, u64)>,
-        applied_index: u64,
-    ) -> BoxFuture<'_, ()> {
+    fn note_slot_owners(&self, owners: &Vec<(u32, u64)>, applied_index: u64) -> BoxFuture<'_, ()> {
         // The batched form of `note_slot_owner`, for a bulk migration that has
         // just committed many slots at once. Same reasoning as the single version
         // -- pushed by the committer, because a query can be answered with the
         // state the commit replaced -- and one round trip instead of one per slot.
         for (slot, owner) in owners {
-            self.database_runtime
-                .consh
-                .note_slot_owner(
-                    *slot as u64,
-                    *owner,
-                    crate::slots::SLOT_COUNT,
-                    applied_index,
-                );
+            self.database_runtime.consh.note_slot_owner(
+                *slot as u64,
+                *owner,
+                crate::slots::SLOT_COUNT,
+                applied_index,
+            );
             self.neb_client
                 .note_slot_owner(*slot, *owner, applied_index);
         }
@@ -874,6 +862,34 @@ impl Service for NebRPCService {
         .boxed()
     }
 
+    fn post_schema_evolve<'a>(
+        &'a self,
+        previous_id: u32,
+        evolved_id: u32,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        async move {
+            let previous = self
+                .neb_client
+                .schema_by_id(previous_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Superseded schema {} not found", previous_id))?;
+            let evolved = self
+                .neb_client
+                .schema_by_id(evolved_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Evolved schema {} not found", evolved_id))?;
+            // Both generations, so the reconciler can tell an index namespace
+            // that is merely carried over from one that is genuinely new.
+            self.database_runtime
+                .schemas()
+                .apply_evolution(evolved.clone());
+            post_schema_evolve(&previous, &evolved, &self.database_runtime).await
+        }
+        .boxed()
+    }
+
     fn post_schema_delete<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
             let schema = self
@@ -924,7 +940,10 @@ impl NebRPCService {
             }
         }
     }
-    fn upsert_cell_unchecked(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+    fn upsert_cell_unchecked(
+        &self,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().upsert_cell(&mut cell))

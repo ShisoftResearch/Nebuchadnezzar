@@ -48,11 +48,9 @@ fn main() {
         map.insert("weight", OwnedValue::U64(1));
         map.insert(
             "refs",
-            OwnedValue::PrimArray(OwnedPrimArray::Id(
-                (0..refs).map(|_| Id::rand()).collect(),
-            )),
+            OwnedValue::PrimArray(OwnedPrimArray::Id((0..refs).map(|_| Id::rand()).collect())),
         );
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(map));
         chunks.write_cell(&mut cell).expect("prelude write");
     }
 
@@ -62,11 +60,9 @@ fn main() {
         map.insert("weight", OwnedValue::U64(i as u64));
         map.insert(
             "refs",
-            OwnedValue::PrimArray(OwnedPrimArray::Id(
-                (0..refs).map(|_| Id::rand()).collect(),
-            )),
+            OwnedValue::PrimArray(OwnedPrimArray::Id((0..refs).map(|_| Id::rand()).collect())),
         );
-        let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(map));
         chunks.write_cell(&mut cell).expect("probe write");
     }
     let rss_after = rss_kib();
