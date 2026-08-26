@@ -1067,7 +1067,32 @@ impl AsyncClient {
         // Need to do the post processing before deleting the schema from the schema client
         return self.schema_client.del_schema(&name).await;
     }
+    /// Every schema, one row per FAMILY.
+    ///
+    /// The state machine stores one record per GENERATION, because a stale
+    /// generation is still needed to decode the cells that were written under
+    /// it. That is the right thing for a snapshot and the wrong thing for a
+    /// listing: without this filter, one family appears N times after N
+    /// evolutions, in every list route, in search, and in anything that walks
+    /// "all schemas" to do something once per schema.
+    ///
+    /// Use [`Self::get_all_schema_generations`] where every generation is
+    /// genuinely wanted.
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
+        Ok(self
+            .schema_client
+            .get_all()
+            .await?
+            .into_iter()
+            .filter(|schema| schema.status.is_current())
+            .collect())
+    }
+
+    /// Every schema GENERATION, stale ones included.
+    ///
+    /// For callers that must see superseded layouts -- diagnostics, migration
+    /// tooling, anything decoding cells written before an evolution.
+    pub async fn get_all_schema_generations(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await
     }
 

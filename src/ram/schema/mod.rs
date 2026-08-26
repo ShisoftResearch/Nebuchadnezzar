@@ -1224,8 +1224,22 @@ impl LocalSchemasCache {
         debug!("Counted schema length {}", len);
         len
     }
+    /// Every GENERATION this node knows, stale ones included.
+    ///
+    /// A stale generation is still needed to decode cells written under it, so
+    /// this must not filter. Anything presenting a LIST to a caller wants one
+    /// row per family instead -- see [`Self::get_all_current`].
     pub fn get_all(&self) -> Vec<Schema> {
         self.map.get_all()
+    }
+
+    /// One row per FAMILY: the generation each family currently writes into.
+    pub fn get_all_current(&self) -> Vec<Schema> {
+        self.map
+            .get_all()
+            .into_iter()
+            .filter(|schema| schema.status.is_current())
+            .collect()
     }
     pub fn fields_size(&self, schema_id: &SchemaVid, fields: &[u64]) -> Option<usize> {
         const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
@@ -3326,6 +3340,29 @@ mod tests {
             "got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn a_listing_shows_one_row_per_family_not_one_per_generation() {
+        // The state machine keeps one record per generation because a stale
+        // layout still has to decode its own cells. A listing must not inherit
+        // that: without the filter one family appears once per evolution, in
+        // every list route, in search, and in anything that walks "all
+        // schemas" to act once per schema.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(1, "person", 900);
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        assert_eq!(
+            cache.get_all().len(),
+            2,
+            "both generations stay reachable for decoding"
+        );
+
+        let listed = cache.get_all_current();
+        assert_eq!(listed.len(), 1, "the family lists once");
+        assert_eq!(listed[0].vid, SchemaVid(900), "and it is the current one");
     }
 
     #[test]
