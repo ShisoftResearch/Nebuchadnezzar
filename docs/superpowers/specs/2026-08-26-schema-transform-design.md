@@ -181,15 +181,15 @@ uid/vid campaign used: focused tests, then the full lib suite at
 
 ## The delta API
 
-`evolve_schema` takes a whole target shape, which turned out to be a poor thing
+Evolution first took a whole target shape, which turned out to be a poor thing
 to ask a caller for: every unchanged field has to be re-declared, and one left
 off the list is silently dropped rather than refused. Losing a column by
 omission is not an acceptable failure mode for a schema tool.
 
-`SchemaEdit` describes the CHANGE instead:
+`evolve_schema` therefore takes a `SchemaEdit` -- the CHANGE, not the shape:
 
 ```rust
-client.evolve("person", SchemaEdit::new()
+client.evolve_schema("person", SchemaEdit::new()
     .rename("old_name", "new_name")
     .retype("age", Type::U64)
     .add(Field::new_unindexed("rank", Type::U64).with_default(OwnedValue::U64(0)))
@@ -204,16 +204,22 @@ Three properties earn it:
   just moving the field, and `.drop()` on a dynamic schema records the purge.
   Neither can be forgotten, which is the other way a hand-built target goes
   wrong.
-- **A stale base is refused.** `evolve` reads the current generation, applies
-  the edit, and sends that vid as a precondition. An evolution landing in
-  between yields `StaleBase { expected, actual }` with nothing changed, rather
-  than an edit built on an old shape quietly undoing it.
+- **A stale base is refused.** It reads the current generation, applies the
+  edit, and sends that vid as a precondition. An evolution landing in between
+  yields `StaleBase { expected, actual }` with nothing changed, rather than an
+  edit built on an old shape quietly undoing it.
 
-It is ergonomics over `evolve_schema`, not a way around admission: an edit that
-produces an inexpressible schema is refused exactly as a hand-built one is. And
-it rebuilds through `Schema::new` rather than mutating a clone, so offsets, the
-field indexes and the compression plan are recomputed -- hand-patching those is
-how a schema ends up describing a layout it does not produce.
+It is ergonomics, not a way around admission: an edit that produces an
+inexpressible schema is refused exactly as a hand-built one is. And it rebuilds
+through `Schema::new` rather than mutating a clone, so offsets, the field
+indexes and the compression plan are recomputed -- hand-patching those is how a
+schema ends up describing a layout it does not produce.
+
+The shape-taking form survives only as a private helper,
+`propose_schema_generation`. Leaving it public would have left two ways to
+evolve a schema, one of which drops whatever the caller forgets -- and the
+client's other schema calls are all `<verb>_schema`, so the delta API takes
+that name.
 
 ## Non-goals
 

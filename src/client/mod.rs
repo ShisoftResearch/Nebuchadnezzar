@@ -898,16 +898,17 @@ impl AsyncClient {
             .await
             .map(|r| r.map(|_| schema_id))
     }
-    /// Evolve a schema into a new generation.
+    /// Propose a complete schema as the next generation.
+    ///
+    /// Private on purpose: a caller who hands over a whole shape silently drops
+    /// every field they forget to include, which is exactly why
+    /// [`Self::evolve_schema`] takes an edit instead. This is the plumbing
+    /// underneath it.
     ///
     /// The proposed record supplies field content only; its identity is
     /// assigned by the cluster, and its name is taken from the family rather
     /// than the request, so an evolution cannot smuggle in a rename.
-    ///
-    /// Existing cells are not rewritten. They stay readable through the
-    /// generation that encoded them, and drain into the new one as they are
-    /// updated.
-    pub async fn evolve_schema(
+    async fn propose_schema_generation(
         &self,
         name: String,
         schema: Schema,
@@ -953,17 +954,21 @@ impl AsyncClient {
         res
     }
 
-    /// Evolve a schema by describing the CHANGE rather than the whole shape.
+    /// Evolve a schema into a new generation, by describing the CHANGE.
     ///
     /// Fetches the current generation, applies the edit to it, and proposes the
     /// result -- carrying every field the edit does not mention, so a column
-    /// cannot be lost by being left off a list. The generation it read is sent
-    /// as a precondition, so an evolution that lands in between is reported as
-    /// `StaleBase` rather than silently undone.
+    /// cannot be lost by being left off a list. The generation it read goes
+    /// along as a precondition, so an evolution landing in between is reported
+    /// as `StaleBase` rather than silently undone.
+    ///
+    /// Existing cells are not rewritten. They stay readable through the
+    /// generation that encoded them, and drain into the new one as they are
+    /// updated.
     ///
     /// The edit still has to describe an expressible evolution; this is
-    /// ergonomics over `evolve_schema`, not a way around admission.
-    pub async fn evolve(
+    /// ergonomics, not a way around admission.
+    pub async fn evolve_schema(
         &self,
         name: &str,
         edit: SchemaEdit,
@@ -975,7 +980,7 @@ impl AsyncClient {
             Ok(schema) => schema,
             Err(e) => return Ok(Err(EvolveSchemaError::BadEdit(format!("{:?}", e)))),
         };
-        self.evolve_schema(name.to_owned(), evolved, Some(base.vid))
+        self.propose_schema_generation(name.to_owned(), evolved, Some(base.vid))
             .await
     }
 
