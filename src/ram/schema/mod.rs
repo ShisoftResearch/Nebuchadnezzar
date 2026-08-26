@@ -94,6 +94,31 @@ pub struct SchemaTransform {
     /// A name that is later re-declared stops being a drop in practice: a
     /// declared field never reaches the dynamic region at all.
     pub dynamic_drops: Vec<u64>,
+    /// Where a field's value used to live: `(historical name, current name)`,
+    /// oldest first.
+    ///
+    /// Cumulative, like `dynamic_drops`, and for the same reason -- migration
+    /// takes one hop, so a generation that knew only its own renames could not
+    /// find a value last seen two generations ago. Folding each hop forward
+    /// (`a -> b` then `b -> c` becomes `a -> c` plus `b -> c`) means the target
+    /// record alone can resolve any ancestor's field name, and NO ordered
+    /// replay of the generations in between is needed.
+    pub renames: Vec<(u64, u64)>,
+}
+
+impl SchemaTransform {
+    /// Every name a value for `current` might be stored under, newest first.
+    ///
+    /// Newest first because a cell only one generation behind holds the more
+    /// recent name, and taking the oldest match would read a field that
+    /// generation had already stopped using.
+    pub fn historical_names(&self, current: u64) -> impl Iterator<Item = u64> + '_ {
+        self.renames
+            .iter()
+            .rev()
+            .filter(move |(_, to)| *to == current)
+            .map(|(from, _)| *from)
+    }
 }
 
 /// Where a generation sits in its family's history.
@@ -297,6 +322,18 @@ impl Schema {
         self
     }
 
+    /// Declare that a field's values used to be stored under another name.
+    ///
+    /// Without this an evolution that renames a field reads as a drop plus an
+    /// add: the old values are abandoned and the new field comes back empty.
+    pub fn with_renamed_field(mut self, from: &str, to: &str) -> Schema {
+        let pair = (types::key_hash(from), types::key_hash(to));
+        if !self.transform.renames.contains(&pair) {
+            self.transform.renames.push(pair);
+        }
+        self
+    }
+
     pub fn with_blobs(mut self, blobs: bool) -> Schema {
         self.blobs = blobs;
         self
@@ -337,6 +374,24 @@ impl Schema {
             );
         }
 
+        // A swap -- `a -> b` and `b -> a` in one step -- is order-dependent, and
+        // the lookup that resolves a rename has no idea which generation a cell
+        // came from. Refuse rather than resolve it wrongly half the time.
+        for (from, to) in &proposed.transform.renames {
+            if proposed
+                .transform
+                .renames
+                .iter()
+                .any(|(other_from, other_to)| other_from == to && other_to == from)
+            {
+                return EvolutionKind::Illegal(
+                    "a rename that swaps two field names cannot be resolved without knowing \
+                     which generation each cell came from"
+                        .to_owned(),
+                );
+            }
+        }
+
         for (path_hash, id_path) in &self.id_index {
             let Some(before) = self.field_by_id_path(id_path) else {
                 continue;
@@ -348,6 +403,16 @@ impl Schema {
             }
             match proposed.id_index.get(path_hash) {
                 None => {
+                    // Renamed away, not dropped: its values are claimed by
+                    // whatever field the rename points at.
+                    if proposed
+                        .transform
+                        .renames
+                        .iter()
+                        .any(|(from, _)| *from == before.name_id)
+                    {
+                        continue;
+                    }
                     // Dropped. The new encoder simply never reads it -- unless
                     // the schema is dynamic, in which case an undeclared field
                     // falls through to the dynamic region and is re-encoded
@@ -387,6 +452,29 @@ impl Schema {
             // An added field has no value in any existing cell. Nullable, that
             // encodes as null; otherwise the encoder refuses, and a default
             // has to come from somewhere the transform engine can supply.
+            // A field that inherits an older field's values is not new, so it
+            // needs no default -- the values are already there.
+            let inherits = proposed
+                .transform
+                .renames
+                .iter()
+                .any(|(_, to)| *to == added.name_id);
+            if inherits {
+                // ...but only if nothing else still claims the name it takes
+                // its values from. Two fields reading one source is ambiguous,
+                // and a lookup cannot tell which was meant.
+                for (from, _) in proposed.transform.renames.iter() {
+                    if proposed.id_index.contains_key(from) {
+                        return EvolutionKind::Illegal(format!(
+                            "`{}` takes its values from a name this schema still declares; \
+                             a rename cannot reuse a live field's name, because a lookup \
+                             cannot tell the two apart",
+                            added.name
+                        ));
+                    }
+                }
+                continue;
+            }
             if !added.nullable && added.default.is_none() {
                 return EvolutionKind::NeedsTransform(format!(
                     "`{}` is new and not nullable, so existing cells have no value to encode \
@@ -1875,6 +1963,165 @@ mod tests {
         let before = schema_of(base_fields());
         let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
         assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn a_declared_rename_is_admitted_and_is_not_a_drop_plus_add() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            // `b` becomes `label`, same type.
+            Field::new_unindexed("label", Type::String),
+        ])
+        .with_renamed_field("b", "label");
+        assert_eq!(
+            before.classify_evolution(&after),
+            EvolutionKind::Identity,
+            "a declared rename carries the values across, so it is neither a drop nor an add"
+        );
+    }
+
+    /// Without declaring it, the same change reads as dropping `b` and adding
+    /// a required `label` -- and is refused for want of a default.
+    #[test]
+    fn an_undeclared_rename_is_still_refused() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("label", Type::String),
+        ]);
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
+    fn a_rename_that_swaps_two_names_is_illegal() {
+        let before = schema_of(base_fields());
+        let after = schema_of(base_fields())
+            .with_renamed_field("a", "b")
+            .with_renamed_field("b", "a");
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::Illegal(_)
+        ));
+    }
+
+    /// Renaming onto a name the schema still declares means two fields reading
+    /// one source, which a lookup cannot disambiguate.
+    #[test]
+    fn a_rename_onto_a_live_field_name_is_illegal() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("b", Type::String),
+            Field::new_unindexed("c", Type::String),
+        ])
+        .with_renamed_field("b", "c");
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::Illegal(_)
+        ));
+    }
+
+    /// Cumulative renames are what let migration keep taking ONE hop: a
+    /// generation-0 cell must reach generation 2's name directly.
+    #[test]
+    fn renames_fold_forward_so_the_oldest_name_still_resolves() {
+        let mut transform = SchemaTransform::default();
+        let (a, b, c) = (
+            types::key_hash("a"),
+            types::key_hash("b"),
+            types::key_hash("c"),
+        );
+        // What `install_evolution` produces for a -> b then b -> c.
+        transform.renames = vec![(a, c), (b, c)];
+        let sources: Vec<u64> = transform.historical_names(c).collect();
+        assert!(
+            sources.contains(&a) && sources.contains(&b),
+            "both the original and the intermediate name must resolve to the current one"
+        );
+        assert_eq!(
+            sources.first(),
+            Some(&b),
+            "newest first: a cell one generation behind holds the more recent name"
+        );
+    }
+
+    /// The end-to-end proof: a cell written under the old name reads back
+    /// under the new one, with its value intact.
+    #[test]
+    fn a_cell_written_before_a_rename_keeps_its_value_under_the_new_name() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("old_name", Type::U64),
+            ]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("new_name", Type::U64),
+            ]),
+            false,
+            false,
+        )
+        .with_renamed_field("old_name", "new_name");
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a declared rename must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("keep", OwnedValue::U32(1));
+        value.insert("old_name", OwnedValue::U64(42));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+
+        meta.schemas.apply_evolution(gen1);
+
+        // Touch it naming the old generation, supplying the OLD shape -- which
+        // is exactly what a client holding a stale schema would send.
+        let mut touched = OwnedMap::new();
+        touched.insert("keep", OwnedValue::U32(2));
+        touched.insert("old_name", OwnedValue::U64(42));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(touched));
+        chunks.update_cell(&mut update).unwrap();
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["keep"].u32(), Some(&2));
+        assert_eq!(
+            read.data["new_name"].u64(),
+            Some(&42),
+            "the value must follow the rename, not be abandoned with the old name"
+        );
     }
 
     #[test]

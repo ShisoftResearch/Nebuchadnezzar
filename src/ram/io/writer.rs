@@ -1,7 +1,7 @@
 use crate::ram::io::align_ptr_addr;
-use crate::ram::schema::{coerce_value, Field, FieldCompression};
+use crate::ram::schema::{coerce_value, Field, FieldCompression, SchemaTransform};
 use crate::ram::types;
-use crate::ram::types::OwnedValue;
+use crate::ram::types::{OwnedMap, OwnedValue};
 use crate::ram::{cell::*, compression, io::align_address_with_ty};
 
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,7 @@ pub fn plan_write_field<'a>(
     value: &'a OwnedValue,
     mut ins: &mut WriteInstructions<'a>,
     is_var: bool,
+    transform: &SchemaTransform,
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
@@ -114,8 +115,8 @@ pub fn plan_write_field<'a>(
             tail_offset
         } else if let OwnedValue::Map(map) = value {
             for sub in subs {
-                let val = map.get_by_key_id(sub.name_id);
-                plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
+                let val = lookup_field_value(map, sub.name_id, transform);
+                plan_write_field(tail_offset, &sub, val, &mut ins, is_var, transform)?;
             }
             return Ok(());
         } else {
@@ -164,7 +165,7 @@ pub fn plan_write_field<'a>(
             trace!("Pushing array len inst with {} at {}", len, *offset);
             plan_write_array_len(len, offset, &sub_field, value, &mut ins)?;
             for val in array {
-                plan_write_field(offset, &sub_field, val, &mut ins, true)?;
+                plan_write_field(offset, &sub_field, val, &mut ins, true, transform)?;
             }
         } else if let OwnedValue::PrimArray(ref array) = value {
             let len = array.len();
@@ -287,6 +288,31 @@ fn plan_write_array_len<'a>(
         *offset += types::u32_io::type_size();
     }
     return Ok(());
+}
+
+/// The value for `name_id`, following a rename back to wherever it used to
+/// live.
+///
+/// Direct hit first: a cell already in the target generation's shape holds the
+/// current name, and that must win. Only when the current name is absent is
+/// the value looked for under the names this family used before -- which is
+/// exactly the case of a cell written before the rename happened.
+fn lookup_field_value<'a>(
+    map: &'a OwnedMap,
+    name_id: u64,
+    transform: &SchemaTransform,
+) -> &'a OwnedValue {
+    let direct = map.get_by_key_id(name_id);
+    if !matches!(direct, OwnedValue::Null | OwnedValue::NA) {
+        return direct;
+    }
+    for historical in transform.historical_names(name_id) {
+        let candidate = map.get_by_key_id(historical);
+        if !matches!(candidate, OwnedValue::Null | OwnedValue::NA) {
+            return candidate;
+        }
+    }
+    direct
 }
 
 pub fn plan_write_dynamic_fields<'a>(
@@ -503,7 +529,15 @@ mod tests {
         let mut field = Field::new_unindexed_nullable("char_offset_start", Type::U64);
         field.offset = Some(36);
 
-        plan_write_field(&mut offset, &field, &OwnedValue::U64(10), &mut ins, false).unwrap();
+        plan_write_field(
+            &mut offset,
+            &field,
+            &OwnedValue::U64(10),
+            &mut ins,
+            false,
+            &SchemaTransform::default(),
+        )
+        .unwrap();
 
         match &ins.inner[0].val {
             InstData::Val(OwnedValue::U32(pointer)) => assert_eq!(*pointer, 80),

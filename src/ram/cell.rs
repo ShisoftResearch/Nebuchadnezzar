@@ -254,6 +254,7 @@ impl OwnedCell {
             &self.data,
             &mut instructions,
             false,
+            &schema.transform,
         )?;
         if schema.is_dynamic {
             writer::plan_write_dynamic_fields(

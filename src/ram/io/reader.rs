@@ -499,7 +499,15 @@ mod tests {
 
         let mut tail = schema.static_bound;
         let mut ins = WriteInstructions::new();
-        plan_write_field(&mut tail, &schema.fields, &value, &mut ins, false).unwrap();
+        plan_write_field(
+            &mut tail,
+            &schema.fields,
+            &value,
+            &mut ins,
+            false,
+            &schema.transform,
+        )
+        .unwrap();
         let mut buf = vec![0u8; tail + 64];
         execute_plan(buf.as_mut_ptr() as usize, &ins);
 

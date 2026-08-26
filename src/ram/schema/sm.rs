@@ -569,16 +569,40 @@ impl SchemasMap {
         // generation 0 straight to generation 3 -- so a generation that only
         // knew its own drops would resurrect everything the generations before
         // it removed.
-        let inherited: Vec<u64> = self
+        let inherited = self
             .schema_map
             .get(&previous_vid)
-            .map(|previous| previous.transform.dynamic_drops.clone())
+            .map(|previous| previous.transform.clone())
             .unwrap_or_default();
-        for id in inherited {
+        for id in inherited.dynamic_drops {
             if !proposed.transform.dynamic_drops.contains(&id) {
                 proposed.transform.dynamic_drops.push(id);
             }
         }
+
+        // Renames fold FORWARD rather than merely appending: if the family
+        // already knew `a -> b` and this hop renames `b -> c`, then `a`'s
+        // values now live at `c`, so the inherited entry is rewritten to point
+        // there. Appending both pairs unchanged would leave a generation-0
+        // cell looking for `b`, which no longer exists anywhere.
+        let this_hop = proposed.transform.renames.clone();
+        let mut folded: Vec<(u64, u64)> = Vec::new();
+        for (from, to) in inherited.renames {
+            let final_to = this_hop
+                .iter()
+                .find(|(hop_from, _)| *hop_from == to)
+                .map(|(_, hop_to)| *hop_to)
+                .unwrap_or(to);
+            if !folded.contains(&(from, final_to)) {
+                folded.push((from, final_to));
+            }
+        }
+        for pair in this_hop {
+            if !folded.contains(&pair) {
+                folded.push(pair);
+            }
+        }
+        proposed.transform.renames = folded;
 
         handle.current_vid = new_vid;
         handle.generation = proposed.generation;
