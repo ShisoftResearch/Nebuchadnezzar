@@ -34,15 +34,32 @@ information lives* gives a much smaller design:
 | **default** | the target `Field` itself | none -- "absent" is absent however many generations back |
 | **coercion** | the source and target `Field` types | none -- both records are in hand |
 | **dynamic drop** | an explicit purge list on the target | set union; order does not matter |
-| **rename** | an explicit old->new mapping per hop | **ordered** -- must replay each generation in turn |
+| **rename** | an explicit old->new mapping, folded forward | none -- see the correction below |
 
-Only renames need the ordered per-record op list. That matters because
-resolution is deliberately ONE hop: a generation-0 cell migrates straight to
-generation 3 without materializing 1 or 2. Defaults and coercions stay correct
-under that shortcut because they are computed from the endpoints. A rename
-cannot be -- `a` became `b` became `c` is not recoverable from comparing
-generation 0 with generation 3 -- so each record carries the renames that
-produced it, and migration replays generations `source+1 ..= target` in order.
+**Correction, made during implementation.** This section originally said
+renames need an ordered replay of generations `source+1 ..= target`, on the
+grounds that `a` became `b` became `c` is not recoverable from comparing the
+endpoints. That is true of the endpoints, but it is not true of the record: a
+rename list that is FOLDED FORWARD at evolution time carries the answer.
+
+If a family already knows `a -> b` and the next hop renames `b -> c`, the
+inherited entry is rewritten to `a -> c` and `b -> c` is added. Both the
+original and the intermediate name then resolve to the current one from the
+target record alone, and no generation in between is ever consulted.
+
+So **nothing replays.** Every transform here resolves from the target record:
+defaults ride on the field, drops and renames accumulate. That is what keeps
+migration a single hop whatever the generation depth -- the hundredth evolution
+costs a cell no more than the first, which an ordered replay would not have.
+
+What survives of the original worry is narrower, and is handled by refusal
+rather than machinery: two rename shapes genuinely cannot be resolved without
+knowing which generation a cell came from.
+
+- a **swap** (`a -> b` and `b -> a` in one hop) is order-dependent
+- renaming **onto a live field name** leaves two fields reading one source
+
+Both are `Illegal`.
 
 ## Metadata
 
@@ -104,20 +121,22 @@ supplies data already in the new shape is not corrupted -- a rename finds no
 source key and does nothing, a default fills only what is absent, a coercion
 that sees the target type already is a no-op.
 
-## Ordering within one hop
+## Ordering within one field
 
-Renames first, then coercions, then defaults, then dynamic drops:
+The transforms did not become a pipeline of passes over a value map. Each one
+lands where the encoder already makes the decision it affects, which gets the
+ordering for free rather than by arranging it:
 
-1. **renames** move values to their new keys, so everything after sees the
-   target generation's names
-2. **coercions** convert values that are present
-3. **defaults** fill what is still absent -- after renames, so a renamed field
-   is not mistaken for a missing one and overwritten with its default
-4. **dynamic drops** purge undeclared names last, so a rename out of the
-   dynamic region has already happened
+1. **rename** resolves at the field LOOKUP -- before anything has a value, so a
+   renamed field is never mistaken for a missing one
+2. **coercion** and **default** are one substitution at the point the encoder
+   would otherwise write the value or refuse
+3. **dynamic drops** filter the dynamic region, which is walked after the
+   declared fields
 
-Getting 1 before 3 wrong is the subtle one: a rename applied after defaults
-would leave the default sitting in the new key and the real value orphaned.
+The hazard the original ordering worried about -- a default overwriting a
+renamed value -- cannot arise, because the default is only reached when the
+lookup, rename fallback included, found nothing.
 
 ## Admission
 
