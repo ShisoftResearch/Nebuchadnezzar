@@ -363,6 +363,23 @@ impl Schema {
             ));
         }
 
+        // Guarding the key field's IDENTITY is not enough: an edit passes the
+        // key NAMES through untouched, so `Schema::new` rehashes the same
+        // names and the two lists compare equal however the fields changed
+        // underneath. Dropping or renaming the field the key points at leaves
+        // a schema whose key names something it no longer declares, and no
+        // cell id can be derived from it.
+        if let Some(keys) = &proposed.key_field {
+            if proposed.field_by_id_path(keys).is_none() {
+                return EvolutionKind::Illegal(format!(
+                    "the key field {:?} is not declared by this schema; every keyed cell's id \
+                     is derived from it, so a schema that cannot resolve its own key can \
+                     address nothing",
+                    proposed.str_key_field
+                ));
+            }
+        }
+
         // A dynamic schema carries fields the schema does not declare, in a
         // region a static encoder does not write. Going static would drop them
         // silently on the next rewrite.
@@ -2467,6 +2484,53 @@ mod tests {
                 .err(),
             Some(EditError::NoSuchCompoundIndex("ghost".to_owned()))
         );
+    }
+
+    /// Dropping the field the key is derived from must not be admitted.
+    ///
+    /// The guard compares hashed key-field lists, and an edit passes the key
+    /// NAMES through untouched -- so `Schema::new` rehashes the same names and
+    /// the two lists compare equal however the fields changed underneath.
+    #[test]
+    fn dropping_the_key_field_is_refused() {
+        let base = Schema::new_with_id(
+            1,
+            "keyed",
+            Some(vec!["id".to_owned()]),
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::U64),
+                Field::new_unindexed("other", Type::U32),
+            ]),
+            false,
+            false,
+        );
+        let evolved = SchemaEdit::new().drop("id").apply(&base).unwrap();
+        assert!(
+            matches!(base.classify_evolution(&evolved), EvolutionKind::Illegal(_)),
+            "a schema whose key names a field it no longer declares can derive no cell id"
+        );
+    }
+
+    /// Same hole by another route: renaming the key field leaves the key
+    /// pointing at a name nothing declares.
+    #[test]
+    fn renaming_the_key_field_is_refused() {
+        let base = Schema::new_with_id(
+            1,
+            "keyed",
+            Some(vec!["id".to_owned()]),
+            Field::new_schema(vec![Field::new_unindexed("id", Type::U64)]),
+            false,
+            false,
+        );
+        let evolved = SchemaEdit::new()
+            .rename("id", "ident")
+            .apply(&base)
+            .unwrap();
+        assert!(matches!(
+            base.classify_evolution(&evolved),
+            EvolutionKind::Illegal(_)
+        ));
     }
 
     #[test]
