@@ -298,7 +298,7 @@ where the cell actually landed rather than where it asked to go.
 - Modify: `src/ram/schema/mod.rs` (classification, `post_schema_add` diffing)
 - Modify: `src/client/mod.rs`
 
-- [ ] Add `Schema::classify_evolution(from: &Schema, to: &Schema) -> EvolutionKind`
+- [x] Add `Schema::classify_evolution(from: &Schema, to: &Schema) -> EvolutionKind`
       returning `Identity`, `NeedsTransform(reason)`, or `Illegal(reason)`.
       `Identity` covers: added nullable fields, dropped fields **on a
       non-dynamic schema**, index-set changes, and `is_scannable`/`blobs`
@@ -308,21 +308,21 @@ where the cell actually landed rather than where it asked to go.
       renamed fields, and type changes are `NeedsTransform`. A changed
       `key_field` is `Illegal` -- it would change the cell ids of every future
       write and orphan every existing one.
-- [ ] Add `def cmd evolve_schema(name: String, schema: Schema) -> Result<SchemaVid, EvolveSchemaError>`
+- [x] Add `def cmd evolve_schema(name: String, schema: Schema) -> Result<SchemaVid, EvolveSchemaError>`
       and `def sub on_schema_evolved() -> Schema`.
-- [ ] SM behaviour: resolve name -> uid -> current record; classify; refuse
+- [x] SM behaviour: resolve name -> uid -> current record; classify; refuse
       anything but `Identity` with `EvolveSchemaError::TransformRequired(reason)`;
       allocate a new vid from the same `next_id` counter; insert the new record
       with `uid` carried over, `generation + 1`, `status: Current`; set the old
       record to `Stale { superseded_by: new_vid }`; update the handle.
-- [ ] Local cache handles `on_schema_evolved` by inserting the new record and
+- [x] Local cache handles `on_schema_evolved` by inserting the new record and
       updating both the old record's status and the handle. Subscribe inside
       the existing subscribe-before-read block.
-- [ ] `post_schema_add` must **diff** the two generations' index sets rather
+- [x] `post_schema_add` must **diff** the two generations' index sets rather
       than recreating every index: create what the new generation adds, destroy
       what it drops, leave the rest alone.
-- [ ] Add `NebClient::evolve_schema(name, schema)`.
-- [ ] Tests, each writing cells under generation 0 first:
+- [x] Add `NebClient::evolve_schema(name, schema)`.
+- [x] Tests, each writing cells under generation 0 first:
       - add a nullable field; old cells still read (missing field is null), new
         writes land in generation 1, a full scan returns both
       - drop a field on a non-dynamic schema; old cells still read
@@ -336,8 +336,8 @@ where the cell actually landed rather than where it asked to go.
         generation-1 cell with the same `Id` and a bumped version
       - a ranged scan by schema returns cells of both generations from one
         `EntryKey::for_schema(uid)` prefix, with no fanout
-- [ ] Full suite locally at `--test-threads=8`.
-- [ ] Commit: `feat(schema): evolve a schema into a new generation`.
+- [x] Full suite locally at `--test-threads=8`.
+- [x] Commit: `feat(schema): evolve a schema into a new generation`.
 
 ## Task 8: Cleaner-driven lazy migration
 
@@ -351,31 +351,56 @@ without being touched.
   `plan_segment_layout`, `execute_combine_phases`)
 - Modify: `src/ram/cleaner/tests.rs`
 
-- [ ] During `collect_and_deduplicate_entries`, read each live entry's header
+- [x] During `collect_and_deduplicate_entries`, read each live entry's header
       and mark entries whose vid is stale as needing migration.
-- [ ] Decode, transform, and re-encode migrating cells into an owned buffer
+- [x] Decode, transform, and re-encode migrating cells into an owned buffer
       **before** `plan_segment_layout`, so `DummyEntry::size` is the
       post-migration size. The planner's size arithmetic is what keeps the
       destination copy inside its segment (`combine.rs:311`, the COMBINE
       OVERRUN probe); it must never see a stale size.
-- [ ] In `execute_combine_phases`, a migrating entry is copied from its owned
+- [x] In `execute_combine_phases`, a migrating entry is copied from its owned
       buffer instead of `libc::memcpy` from the source address.
-- [ ] The index-swap step gains what a version-bumping write does: bump the
+- [x] The index-swap step gains what a version-bumping write does: bump the
       cell version, maintain index entries for any index the two generations
       disagree on, and refresh statistics for the uid. Reuse the existing
       write-path helpers rather than reimplementing them -- and note that the
       counter-only-write plus sweeper rule applies here too: do **not** do an
       O(cells) statistics refresh inline on a cleaner thread.
-- [ ] A cell that cannot be migrated -- transform refuses, schema record
+- [x] A cell that cannot be migrated -- transform refuses, schema record
       missing -- is relocated verbatim and left stale. Log it; never drop it.
-- [ ] Tests: a segment of stale cells combines to current cells with the same
+- [x] Tests: a segment of stale cells combines to current cells with the same
       ids and readable values; a mixed segment migrates only the stale ones; a
       cell whose schema record is missing survives unchanged; the
       destination-overrun probe never fires (assert the error log is empty --
       the probe is a `break`, not a panic).
-- [ ] Run the crash-churn fuzzer over a store with a mid-flight evolution.
-- [ ] Full suite locally at `--test-threads=8`.
-- [ ] Commit: `feat(cleaner): migrate stale cells while combining`.
+- [x] Run the crash-churn fuzzer over a store with a mid-flight evolution.
+- [x] Full suite locally at `--test-threads=8`.
+- [x] Commit: `feat(cleaner): migrate stale cells while combining`.
+
+## Progress note, Tasks 7-8 (2026-08-25)
+
+**Task 8 migrates cell bytes only, and declines when the two generations index
+differently.** Migrating a cell across an index-set change implies adding and
+removing its index entries, and the indexer clients are async RPC while the
+combiner is a synchronous rayon worker. Those cells are left to the write path,
+which already has the machinery; they stay readable and drain on their next
+update. Statistics are likewise untouched -- the sweeper owns them, and an
+O(cells) refresh on a cleaner thread is the exact shape that once froze the
+shard workers for 25 minutes.
+
+**A migration does NOT bump the cell version**, against the plan's text. Re-encoding
+a cell does not change what it says, so presenting it as a new version would
+abort every OCC transaction that had read the cell -- turning background
+cleaning into user-visible write conflicts. The index swap's
+`actual_addr == old` check is version-independent, and recovery picking either
+copy is benign because both decode to the same value.
+
+**Getting `CombinedCleaner` to run in a test needs three things**, and missing
+any one makes it a silent no-op that passes every assertion vacuously: at least
+two candidate segments, room for the destinations on top of the sources, and a
+released head slot. Build on the `full_clean_cycle_without_compact` recipe --
+16 cells, delete 8 -- and assert the combine actually ran before believing
+anything.
 
 ## Task 9: Transform engine
 

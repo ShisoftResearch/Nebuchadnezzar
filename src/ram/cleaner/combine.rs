@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use libc;
+use std::sync::Arc;
 
 // Rayon threads default to a small stack; combining can touch large frames when
 // copying entries. Give the pools a larger stack to avoid overflow under heavy loads.
@@ -32,6 +33,105 @@ lazy_static! {
         .unwrap();
 }
 
+/// Re-encode a cell whose schema generation has been superseded, if that can
+/// be done here and now.
+///
+/// Returns the encoded entry image and its size, or `None` to relocate the
+/// cell verbatim. Every `None` is a cell left stale, which is always safe: it
+/// stays readable through the generation its header names, and the next
+/// ordinary update migrates it anyway. Migration here is opportunistic, and
+/// nothing about it may risk the cell.
+///
+/// Deliberately declines when the two generations declare different index
+/// sets. Migrating a cell then implies adding or removing its index entries,
+/// and the indexer clients are async RPC while this runs on a synchronous
+/// rayon worker -- so the honest move is to leave those cells to the write
+/// path, which already has the machinery.
+fn try_migrate_entry(
+    chunk: &Chunk,
+    header: &cell::CellHeader,
+    entry_addr: usize,
+) -> Option<(Arc<Vec<u64>>, usize)> {
+    let schemas = &chunk.meta.schemas;
+    let named = schemas.get(&header.schema)?;
+    if named.status.is_current() {
+        return None;
+    }
+    let current = schemas.resolve_for_write(header.schema)?;
+    if current.vid == named.vid {
+        return None;
+    }
+    if named.index_fields != current.index_fields
+        || named.compound_index_fields != current.compound_index_fields
+        || named.is_scannable != current.is_scannable
+    {
+        trace!(
+            "Not migrating cell {:?}: generations {} and {} index differently",
+            header.id,
+            named.vid,
+            current.vid
+        );
+        return None;
+    }
+
+    // Decode THIS entry, at the address being relocated -- not whatever the
+    // cell index currently points at. A concurrent update moves the index to a
+    // newer copy, and re-encoding that one into this slot would put a version
+    // here that does not belong to it. The index swap would then refuse the
+    // slot and mark it dead, so nothing would be corrupted, but the work would
+    // be wrong and the reasoning about it worse.
+    let hash = header.id.bits();
+    let decoded = match chunk.read_cell_at(hash, entry_addr) {
+        Ok(cell) => cell,
+        Err(e) => {
+            debug!("Not migrating cell {:?}: unreadable ({:?})", header.id, e);
+            return None;
+        }
+    };
+
+    // Name the current generation; `plan_write` resolves and the encoder
+    // stamps whatever it resolved to.
+    let mut migrating = decoded;
+    migrating.header.schema = current.vid;
+    let plan = match migrating.plan_write(chunk) {
+        Ok(plan) => plan,
+        Err(e) => {
+            debug!(
+                "Not migrating cell {:?} to generation {}: {:?}",
+                header.id, current.vid, e
+            );
+            return None;
+        }
+    };
+    let total_size = plan.total_size as usize;
+    let mut buffer: Vec<u64> = vec![0; (total_size + 7) / 8];
+    let addr = buffer.as_mut_ptr() as usize;
+    debug_assert_eq!(addr % 8, 0, "Vec<u64> must be 8-byte aligned");
+
+    // The SAME version, not a bump. A migration re-encodes a cell without
+    // changing what it says, so presenting it as a new version would abort
+    // every OCC transaction that had read the cell -- turning background
+    // cleaning into user-visible write conflicts. `write_to_addr` computes
+    // `old + 1`, so it is handed one less than the version being preserved.
+    let preserved = header.version;
+    if let Err(e) = migrating.write_to_addr(&plan, addr, preserved.saturating_sub(1)) {
+        debug!(
+            "Not migrating cell {:?}: encode failed ({:?})",
+            header.id, e
+        );
+        return None;
+    }
+    trace!(
+        "Migrating cell {:?} from generation {} to {} ({} -> {} bytes)",
+        header.id,
+        named.vid,
+        current.vid,
+        0,
+        total_size
+    );
+    Some((Arc::new(buffer), total_size))
+}
+
 pub struct CombinedCleaner;
 
 #[derive(Clone)]
@@ -41,6 +141,14 @@ struct DummyEntry {
     cell_ver: u64,
     cell_hash: Option<u64>,
     timestamp: u32,
+    /// A re-encoded copy of this cell, when its schema generation has been
+    /// superseded and it is being migrated rather than relocated.
+    ///
+    /// `Vec<u64>` for its alignment, not its element type: the entry encoder
+    /// asserts an 8-byte-aligned destination, and a `Vec<u8>` gives no such
+    /// guarantee. `Arc` because `DummyEntry` is cloned during deduplication
+    /// and the buffer must not be.
+    migrated: Option<Arc<Vec<u64>>>,
 }
 
 struct DummySegment {
@@ -176,12 +284,25 @@ impl CombinedCleaner {
                 EntryContent::Cell(header) => Some(header),
                 _ => None,
             };
+            // A cell whose generation has been superseded is re-encoded HERE,
+            // before the layout is planned, so the planner sees the size the
+            // destination will actually receive. Handing it the pre-migration
+            // size is what would let a copy run past the end of its segment,
+            // which is the failure the overrun probe below exists to catch.
+            let migrated = cell_header
+                .as_ref()
+                .and_then(|header| try_migrate_entry(chunk, header, entry_addr));
+            let (entry_size, migrated) = match migrated {
+                Some((buffer, size)) => (size, Some(buffer)),
+                None => (entry_size, None),
+            };
             let dummy_entry = DummyEntry {
                 size: entry_size,
                 addr: entry_addr,
                 timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
                 cell_hash: cell_header.map(|h| h.id.bits()),
                 cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
+                migrated,
             };
 
             if let Some(hash) = dummy_entry.cell_hash {
@@ -323,10 +444,17 @@ impl CombinedCleaner {
                             );
                             break;
                         }
+                        // A migrated cell is copied from the image built
+                        // during collection; everything else is the verbatim
+                        // relocation this cleaner has always done.
+                        let source_addr = match entry.migrated.as_ref() {
+                            Some(buffer) => buffer.as_ptr() as usize,
+                            None => entry_addr,
+                        };
                         unsafe {
                             libc::memcpy(
                                 seg_cursor as *mut libc::c_void,
-                                entry_addr as *mut libc::c_void,
+                                source_addr as *mut libc::c_void,
                                 entry.size,
                             );
                         }
