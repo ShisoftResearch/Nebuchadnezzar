@@ -1,5 +1,5 @@
 use crate::ram::io::align_ptr_addr;
-use crate::ram::schema::{Field, FieldCompression};
+use crate::ram::schema::{coerce_value, Field, FieldCompression};
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
 use crate::ram::{cell::*, compression, io::align_address_with_ty};
@@ -188,15 +188,33 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else {
-        if !field.nullable && is_null {
+        // A cell with no value of its own for this field takes the field's
+        // default, when it has one. That is what lets a schema gain a required
+        // field, or take nullability away from an existing one, without
+        // stranding every cell written before the change.
+        //
+        // Substitutions are OWNED instructions rather than references: a
+        // default lives in the schema, which the write plan deliberately does
+        // not borrow from, and a coerced value does not exist anywhere until
+        // it is computed. Both are paid only by cells that actually need them.
+        let substitute: Option<OwnedValue> = if is_null {
+            field.default.clone()
+        } else {
+            // The value may be in the shape an older generation used. Widening
+            // it here is what lets a schema change a field's type without
+            // rewriting the cells that still hold the old one.
+            coerce_value(value, field.data_type)
+        };
+        if !field.nullable && is_null && substitute.is_none() {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
+        let effective: &OwnedValue = substitute.as_ref().unwrap_or(value);
 
         let should_compress = matches!(field.compression, Some(FieldCompression::Lz4))
             && (field.data_type == Type::String || field.data_type == Type::Bytes);
 
         if should_compress {
-            let raw_bytes = match value {
+            let raw_bytes = match effective {
                 OwnedValue::String(s) => s.as_bytes(),
                 OwnedValue::Bytes(b) => b.as_slice(),
                 _ => return Err(WriteError::DataMismatchSchema(field.clone(), value.clone())),
@@ -223,11 +241,14 @@ pub fn plan_write_field<'a>(
                 raw_bytes.len()
             );
         } else {
-            let size = types::get_vsize(field.data_type, &value);
+            let size = types::get_vsize(field.data_type, effective);
             *offset = align_address_with_ty(field.data_type, *offset);
             ins.push(Instruction {
                 data_type: field.data_type,
-                val: InstData::Ref(value),
+                val: match substitute {
+                    Some(substituted) => InstData::Val(substituted),
+                    None => InstData::Ref(value),
+                },
                 offset: *offset,
             });
             let new_offset = *offset + size;

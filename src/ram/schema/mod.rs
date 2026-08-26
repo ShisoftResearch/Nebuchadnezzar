@@ -3,7 +3,7 @@ use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
-use dovahkiin::types::Type;
+use dovahkiin::types::{OwnedValue, Type};
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -346,10 +346,18 @@ impl Schema {
             // An added field has no value in any existing cell. Nullable, that
             // encodes as null; otherwise the encoder refuses, and a default
             // has to come from somewhere the transform engine can supply.
-            if !added.nullable {
+            if !added.nullable && added.default.is_none() {
                 return EvolutionKind::NeedsTransform(format!(
                     "`{}` is new and not nullable, so existing cells have no value to encode \
-                     for it",
+                     for it; give it a default to make this evolution expressible",
+                    added.name
+                ));
+            }
+            if added.default.is_some() && !Self::default_is_encodable(added) {
+                return EvolutionKind::NeedsTransform(format!(
+                    "`{}` has a default, but defaults are only injected for scalar fields; \
+                     an array, vector or map default would be admitted here and then fail \
+                     to encode during migration",
                     added.name
                 ));
             }
@@ -358,14 +366,28 @@ impl Schema {
         EvolutionKind::Identity
     }
 
+    /// Whether this field's default is one the encoder will actually inject.
+    ///
+    /// Only scalars. The array, vector and map paths reject a null value
+    /// before the default substitution is reached, so admitting a composite
+    /// default would produce an evolution that passes classification and then
+    /// strands every cell it touches -- the failure mode this design exists to
+    /// avoid.
+    fn default_is_encodable(field: &Field) -> bool {
+        !field.is_array && field.vector_size.is_none() && field.sub_fields.is_none()
+    }
+
     /// Why re-encoding a value of `before` as `after` is not mechanical, if it
     /// is not. Index membership, compression and added nullability are all
     /// absent here on purpose: they change how a value is stored or found, not
     /// what it is.
     fn field_needs_transform(before: &Field, after: &Field) -> Option<String> {
-        if before.data_type != after.data_type {
+        if before.data_type != after.data_type
+            && !widening_exists(before.data_type, after.data_type)
+        {
             return Some(format!(
-                "`{}` changes type ({:?} -> {:?}); even a widening needs the value rewritten",
+                "`{}` changes type ({:?} -> {:?}), and that is not a widening this can perform \
+                 without losing range or precision",
                 before.name, before.data_type, after.data_type
             ));
         }
@@ -381,10 +403,21 @@ impl Schema {
                 before.name, before.vector_size, after.vector_size
             ));
         }
-        if before.nullable && !after.nullable {
+        if before.nullable
+            && !after.nullable
+            && after.default.is_some()
+            && !Self::default_is_encodable(after)
+        {
+            return Some(format!(
+                "`{}` stops being nullable and has a default, but defaults are only injected \
+                 for scalar fields",
+                before.name
+            ));
+        }
+        if before.nullable && !after.nullable && after.default.is_none() {
             return Some(format!(
                 "`{}` stops being nullable, and cells already holding null for it have no \
-                 value to encode",
+                 value to encode; give it a default to make this evolution expressible",
                 before.name
             ));
         }
@@ -478,6 +511,14 @@ pub struct Field {
     pub offset: Option<usize>,
     #[serde(default)]
     pub compression: Option<FieldCompression>,
+    /// What a cell gets for this field when it has no value of its own: one
+    /// written before the field existed, or one holding null for a field that
+    /// has since stopped being nullable.
+    ///
+    /// `None` means genuinely required, and an evolution that introduces the
+    /// field is refused rather than admitted and then stranded.
+    #[serde(default)]
+    pub default: Option<OwnedValue>,
 }
 
 impl Field {
@@ -508,8 +549,20 @@ impl Field {
             offset: None,
             vector_size: None,
             compression: None,
+            default: None,
         }
     }
+
+    /// Give this field a value to fall back on when a cell has none.
+    ///
+    /// This is what lets a later evolution add the field as required, or make
+    /// it stop being nullable, without stranding every cell written before the
+    /// change.
+    pub fn with_default(mut self, default: OwnedValue) -> Self {
+        self.default = Some(default);
+        self
+    }
+
     pub fn new_map(name: &str, sub_fields: Vec<Field>) -> Field {
         Self::new(name, Type::Map, false, false, Some(sub_fields), vec![])
     }
@@ -687,6 +740,7 @@ impl Field {
             indices,
             offset: None,
             compression: None,
+            default: None,
         }
     }
     fn assign_offsets(
@@ -1055,6 +1109,87 @@ pub enum NewSchemaError {
     InvalidSchema(String),
     NotifyError(NotifyError),
     PostProcessError(String),
+}
+
+/// Widen `value` to `target`, if that can be done without losing anything.
+///
+/// Returns `None` when the value is already the target type (nothing to do) or
+/// when no lossless widening exists. Deliberately never returns a value that
+/// would lose precision or range: an evolution that admits at proposal time
+/// and then strands an arbitrary subset of cells at migration time is worse
+/// than one that is refused outright, so narrowing is not a coercion here.
+///
+/// Float targets are limited by mantissa width, not by byte size: `f32` holds
+/// integers exactly only to 2^24, so `u32`/`i32` widen to `f64` but not to
+/// `f32`. Getting that backwards would silently round large ids.
+pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
+    use OwnedValue::*;
+    if value.base_type() == target {
+        return None;
+    }
+    Some(match (value, target) {
+        // Signed widening.
+        (I8(v), Type::I16) => I16(*v as i16),
+        (I8(v), Type::I32) => I32(*v as i32),
+        (I8(v), Type::I64) => I64(*v as i64),
+        (I16(v), Type::I32) => I32(*v as i32),
+        (I16(v), Type::I64) => I64(*v as i64),
+        (I32(v), Type::I64) => I64(*v as i64),
+
+        // Unsigned widening.
+        (U8(v), Type::U16) => U16(*v as u16),
+        (U8(v), Type::U32) => U32(*v as u32),
+        (U8(v), Type::U64) => U64(*v as u64),
+        (U16(v), Type::U32) => U32(*v as u32),
+        (U16(v), Type::U64) => U64(*v as u64),
+        (U32(v), Type::U64) => U64(*v as u64),
+
+        // Unsigned into a signed type wide enough to hold all of it.
+        (U8(v), Type::I16) => I16(*v as i16),
+        (U8(v), Type::I32) => I32(*v as i32),
+        (U8(v), Type::I64) => I64(*v as i64),
+        (U16(v), Type::I32) => I32(*v as i32),
+        (U16(v), Type::I64) => I64(*v as i64),
+        (U32(v), Type::I64) => I64(*v as i64),
+
+        // Into floats, only where every value is exactly representable.
+        (I8(v), Type::F32) => F32(*v as f32),
+        (I16(v), Type::F32) => F32(*v as f32),
+        (U8(v), Type::F32) => F32(*v as f32),
+        (U16(v), Type::F32) => F32(*v as f32),
+        (I8(v), Type::F64) => F64(*v as f64),
+        (I16(v), Type::F64) => F64(*v as f64),
+        (I32(v), Type::F64) => F64(*v as f64),
+        (U8(v), Type::F64) => F64(*v as f64),
+        (U16(v), Type::F64) => F64(*v as f64),
+        (U32(v), Type::F64) => F64(*v as f64),
+        (F32(v), Type::F64) => F64(*v as f64),
+
+        _ => return None,
+    })
+}
+
+/// Whether every value of `from` widens losslessly into `to`.
+///
+/// Answered by asking [`coerce_value`] itself with a probe value, so
+/// admission and migration can never disagree about what is possible -- a
+/// second hand-written table here is exactly how an evolution gets admitted
+/// and then strands the cells it was admitted for.
+pub fn widening_exists(from: Type, to: Type) -> bool {
+    let probe = match from {
+        Type::I8 => OwnedValue::I8(0),
+        Type::I16 => OwnedValue::I16(0),
+        Type::I32 => OwnedValue::I32(0),
+        Type::I64 => OwnedValue::I64(0),
+        Type::U8 => OwnedValue::U8(0),
+        Type::U16 => OwnedValue::U16(0),
+        Type::U32 => OwnedValue::U32(0),
+        Type::U64 => OwnedValue::U64(0),
+        Type::F32 => OwnedValue::F32(0.0),
+        Type::F64 => OwnedValue::F64(0.0),
+        _ => return false,
+    };
+    coerce_value(&probe, to).is_some()
 }
 
 /// What moving a family's cells from one generation to the next would take.
@@ -1646,6 +1781,44 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_required_field_with_a_default_is_admitted() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(Field::new_unindexed("c", Type::U64).with_default(OwnedValue::U64(7)));
+        assert_eq!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::Identity,
+            "a default is what makes a required field expressible"
+        );
+    }
+
+    #[test]
+    fn losing_nullability_with_a_default_is_admitted() {
+        let before = schema_of(vec![Field::new_unindexed_nullable("a", Type::U32)]);
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32).with_default(OwnedValue::U32(0))
+        ]);
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    /// The encoder only injects defaults for scalars. Admitting a composite
+    /// one would pass classification and then strand every cell it touched,
+    /// which is the failure mode the whole admission step exists to prevent.
+    #[test]
+    fn a_composite_default_is_refused_rather_than_stranded() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(
+            Field::new_unindexed_array("c", Type::U64)
+                .with_default(OwnedValue::Array(vec![OwnedValue::U64(1)])),
+        );
+        assert!(matches!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
     fn adding_a_non_nullable_field_needs_a_transform() {
         let before = schema_of(base_fields());
         let mut fields = base_fields();
@@ -1698,16 +1871,95 @@ mod tests {
     }
 
     #[test]
-    fn widening_a_number_needs_a_transform() {
+    fn lossless_widenings_are_admitted() {
+        for (from, to) in [
+            (Type::U32, Type::U64),
+            (Type::I32, Type::I64),
+            (Type::U8, Type::U64),
+            (Type::U32, Type::I64),
+            (Type::U16, Type::F32),
+            (Type::U32, Type::F64),
+            (Type::F32, Type::F64),
+        ] {
+            let before = schema_of(vec![Field::new_unindexed("a", from)]);
+            let after = schema_of(vec![Field::new_unindexed("a", to)]);
+            assert_eq!(
+                before.classify_evolution(&after),
+                EvolutionKind::Identity,
+                "{:?} -> {:?} loses nothing and should be admitted",
+                from,
+                to
+            );
+        }
+    }
+
+    /// Anything that could lose range or precision stays refused. Admitting
+    /// one and then failing per-cell during migration would strand an
+    /// arbitrary subset of the data.
+    #[test]
+    fn lossy_conversions_stay_refused() {
+        for (from, to) in [
+            (Type::U64, Type::U32),
+            (Type::I64, Type::I32),
+            (Type::U64, Type::F64),
+            (Type::U32, Type::F32),
+            (Type::F64, Type::F32),
+            (Type::I32, Type::U32),
+            (Type::String, Type::U64),
+        ] {
+            let before = schema_of(vec![Field::new_unindexed("a", from)]);
+            let after = schema_of(vec![Field::new_unindexed("a", to)]);
+            assert!(
+                matches!(
+                    before.classify_evolution(&after),
+                    EvolutionKind::NeedsTransform(_)
+                ),
+                "{:?} -> {:?} can lose something and must be refused",
+                from,
+                to
+            );
+        }
+    }
+
+    /// `f32` holds integers exactly only to 2^24, so a u32 must NOT widen into
+    /// it even though it is "bigger". Getting this backwards would silently
+    /// round large values.
+    #[test]
+    fn float_widening_is_bounded_by_mantissa_not_byte_width() {
+        assert!(coerce_value(&OwnedValue::U32(1), Type::F32).is_none());
+        assert!(coerce_value(&OwnedValue::U16(1), Type::F32).is_some());
+        assert!(coerce_value(&OwnedValue::U32(1), Type::F64).is_some());
+        assert!(coerce_value(&OwnedValue::U64(1), Type::F64).is_none());
+    }
+
+    #[test]
+    fn coercing_a_value_to_its_own_type_is_a_no_op() {
+        assert!(coerce_value(&OwnedValue::U32(5), Type::U32).is_none());
+    }
+
+    #[test]
+    fn a_widening_preserves_the_value() {
+        assert_eq!(
+            coerce_value(&OwnedValue::U32(4_000_000_000), Type::U64),
+            Some(OwnedValue::U64(4_000_000_000))
+        );
+        assert_eq!(
+            coerce_value(&OwnedValue::I32(-7), Type::I64),
+            Some(OwnedValue::I64(-7))
+        );
+    }
+
+    /// Was `widening_a_number_needs_a_transform` before the transform engine.
+    /// U32 -> U64 is now performed rather than refused; the refusal case it
+    /// used to cover lives in `lossy_conversions_stay_refused`.
+    #[test]
+    fn widening_a_number_is_now_performed() {
         let before = schema_of(base_fields());
         let after = schema_of(vec![
             Field::new_unindexed("a", Type::U64),
             Field::new_unindexed("b", Type::String),
         ]);
-        assert!(matches!(
-            before.classify_evolution(&after),
-            EvolutionKind::NeedsTransform(_)
-        ));
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
     }
 
     /// Cells already holding null have nothing to encode for a field that has
@@ -1739,8 +1991,35 @@ mod tests {
         ));
     }
 
+    /// Nested fields must be inspected, not skipped.
+    ///
+    /// Uses a NARROWING deliberately: a widening is now performed rather than
+    /// refused, so asserting `Identity` here would pass even if sub-maps were
+    /// ignored entirely. Only a change that must be refused proves the walk
+    /// actually reaches inside the map.
     #[test]
     fn a_nested_field_change_is_seen() {
+        let before = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U64)],
+        )]);
+        let after = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U32)],
+        )]);
+        assert!(
+            matches!(
+                before.classify_evolution(&after),
+                EvolutionKind::NeedsTransform(_)
+            ),
+            "a narrowing buried in a sub-map must still be refused"
+        );
+    }
+
+    /// The counterpart: a widening buried in a sub-map is performed, which
+    /// only means anything alongside the narrowing test above.
+    #[test]
+    fn a_nested_widening_is_performed() {
         let before = schema_of(vec![Field::new_map(
             "m",
             vec![Field::new_unindexed("inner", Type::U32)],
@@ -1749,13 +2028,7 @@ mod tests {
             "m",
             vec![Field::new_unindexed("inner", Type::U64)],
         )]);
-        assert!(
-            matches!(
-                before.classify_evolution(&after),
-                EvolutionKind::NeedsTransform(_)
-            ),
-            "a type change buried in a sub-map is still a type change"
-        );
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
     }
 
     #[test]
@@ -2012,6 +2285,79 @@ mod tests {
             "the persisted header must name the current generation, or the redirect never happened"
         );
         assert_eq!(read.data["v"].u32(), Some(&7));
+    }
+
+    /// The transform engine's first real capability, end to end: a schema
+    /// gains a REQUIRED field, and a cell written before that field existed
+    /// comes back carrying the default rather than failing to encode.
+    #[test]
+    fn a_cell_written_before_a_required_field_existed_migrates_with_its_default() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("v", Type::U32),
+                // Required, with a default. Without the default this evolution
+                // is refused outright.
+                Field::new_unindexed("rank", Type::U64).with_default(OwnedValue::U64(99)),
+            ]),
+            false,
+            false,
+        );
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a required field with a default must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("v", OwnedValue::U32(7));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+
+        meta.schemas.apply_evolution(gen1);
+
+        // Touch it the way any client would, still naming the old generation.
+        let mut updated = OwnedMap::new();
+        updated.insert("v", OwnedValue::U32(8));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(updated));
+        chunks
+            .update_cell(&mut update)
+            .expect("the default is what makes this encode at all");
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["v"].u32(), Some(&8));
+        assert_eq!(
+            read.data["rank"].u64(),
+            Some(&99),
+            "a field the cell never had must come back holding its default"
+        );
     }
 
     /// The whole feature, end to end: a schema gains a nullable field, cells
