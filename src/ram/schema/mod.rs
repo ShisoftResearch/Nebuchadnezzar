@@ -1327,6 +1327,19 @@ pub enum EditError {
     FieldExists(String),
     /// Only top-level fields can be edited this way.
     NotATopLevelField(String),
+    /// The edit sets a default whose type the field cannot hold.
+    ///
+    /// A default is the one value the write path takes on trust: unlike a
+    /// supplied value it is NOT passed through `coerce_value`, so whatever is
+    /// admitted here reaches the encoder as-is and is sized by the field's
+    /// DECLARED type. `get_vsize` panics on that mismatch, so admitting a
+    /// mistyped default arms a writer panic that fires later, on some
+    /// unrelated write that happens to leave the field null.
+    DefaultTypeMismatch {
+        field: String,
+        expected: Type,
+        got: Type,
+    },
 }
 
 impl SchemaEdit {
@@ -1474,7 +1487,14 @@ impl SchemaEdit {
                     if position(&fields, &field.name).is_some() {
                         return Err(EditError::FieldExists(field.name.clone()));
                     }
-                    fields.push(field.clone());
+                    // A field arrives carrying its own default, so this is the
+                    // other door onto the same hazard as SetDefault.
+                    let mut field = field.clone();
+                    if let Some(default) = &field.default {
+                        field.default =
+                            Some(admissible_default(&field.name, default, field.data_type)?);
+                    }
+                    fields.push(field);
                 }
                 EditOp::DropField(name) => {
                     let Some(at) = position(&fields, name) else {
@@ -1515,7 +1535,8 @@ impl SchemaEdit {
                     let Some(at) = position(&fields, name) else {
                         return Err(EditError::NoSuchField(name.clone()));
                     };
-                    fields[at].default = Some(default.clone());
+                    let want = fields[at].data_type;
+                    fields[at].default = Some(admissible_default(name, default, want)?);
                 }
                 EditOp::SetNullable { name, nullable } => {
                     let Some(at) = position(&fields, name) else {
@@ -1596,6 +1617,36 @@ impl SchemaEdit {
 /// Float targets are limited by mantissa width, not by byte size: `f32` holds
 /// integers exactly only to 2^24, so `u32`/`i32` widen to `f64` but not to
 /// `f32`. Getting that backwards would silently round large ids.
+/// The form of `default` that `want` can actually hold, or an error.
+///
+/// A default is the one value the write path takes on trust: unlike a supplied
+/// value it is NOT run through `coerce_value` at write time
+/// (`ram/io/writer.rs`), so whatever is admitted reaches the encoder as-is and
+/// is sized by the field's DECLARED type. `get_vsize` panics on that mismatch.
+/// Admitting a mistyped default therefore arms a writer panic that fires later,
+/// on some unrelated write that happens to leave the field null -- which is
+/// exactly the class of thing refuse-at-admission exists to stop.
+///
+/// Widening is accepted and stored ALREADY COERCED, so the encoder is handed a
+/// value of the declared type no matter which form the caller supplied.
+fn admissible_default(
+    field: &str,
+    default: &OwnedValue,
+    want: Type,
+) -> Result<OwnedValue, EditError> {
+    if default.base_type() == want {
+        return Ok(default.clone());
+    }
+    if let Some(widened) = coerce_value(default, want) {
+        return Ok(widened);
+    }
+    Err(EditError::DefaultTypeMismatch {
+        field: field.to_owned(),
+        expected: want,
+        got: default.base_type(),
+    })
+}
+
 pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
     use OwnedValue::*;
     if value.base_type() == target {
@@ -3203,6 +3254,78 @@ mod tests {
             superseded_by: gen1.vid,
         };
         (gen0, gen1)
+    }
+
+    fn schema_with_u32_count() -> Schema {
+        let mut base = cache_test_schema(1, "person");
+        base.fields = Field::new_schema(vec![Field::new_unindexed_nullable("count", Type::U32)]);
+        base
+    }
+
+    #[test]
+    fn a_mistyped_default_is_refused_at_admission() {
+        // Not a taste question: a default is NOT coerced at write time, so an
+        // admitted String on a U32 field reaches get_vsize, which panics. The
+        // refusal has to happen here or it happens in the writer, later, on an
+        // unrelated write.
+        let err = SchemaEdit::new()
+            .set_default("count", OwnedValue::String("banana".to_owned()))
+            .apply(&schema_with_u32_count())
+            .expect_err("a String default on a U32 field must be refused");
+
+        match err {
+            EditError::DefaultTypeMismatch {
+                field,
+                expected,
+                got,
+            } => {
+                assert_eq!(field, "count");
+                assert_eq!(expected, Type::U32);
+                assert_eq!(got, Type::String);
+            }
+            other => panic!("expected DefaultTypeMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_widening_default_is_admitted_already_coerced() {
+        // U8 widens into U32, so the edit is allowed -- but what gets STORED
+        // must be the U32 form. Storing the U8 as given would leave the same
+        // panic armed for a field declared U32.
+        let evolved = SchemaEdit::new()
+            .set_default("count", OwnedValue::U8(7))
+            .apply(&schema_with_u32_count())
+            .expect("a U8 default widens into a U32 field");
+
+        let field = evolved
+            .fields
+            .sub_fields
+            .as_ref()
+            .and_then(|f| f.iter().find(|f| f.name == "count"))
+            .expect("count survives the edit");
+        assert_eq!(
+            field.default,
+            Some(OwnedValue::U32(7)),
+            "the stored default must be the declared type, not the supplied one"
+        );
+    }
+
+    #[test]
+    fn an_added_field_cannot_smuggle_a_mistyped_default() {
+        // The other door onto the same hazard: a Field arrives carrying its
+        // own default, so add() has to police it exactly as set_default does.
+        let err = SchemaEdit::new()
+            .add(
+                Field::new_unindexed_nullable("rank", Type::U64)
+                    .with_default(OwnedValue::String("high".to_owned())),
+            )
+            .apply(&schema_with_u32_count())
+            .expect_err("a String default on a U64 field must be refused");
+        assert!(
+            matches!(err, EditError::DefaultTypeMismatch { .. }),
+            "got {:?}",
+            err
+        );
     }
 
     #[test]
