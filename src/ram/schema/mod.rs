@@ -1281,6 +1281,13 @@ enum EditOp {
     },
     SetScannable(bool),
     SetDynamic(bool),
+    SetBlobs(bool),
+    AddCompoundIndex {
+        name: String,
+        fields: Vec<String>,
+        indices: Vec<IndexType>,
+    },
+    DropCompoundIndex(String),
 }
 
 /// Why an edit could not be turned into a schema. Distinct from
@@ -1290,6 +1297,8 @@ enum EditOp {
 pub enum EditError {
     /// The edit touches a field the current generation does not declare.
     NoSuchField(String),
+    /// The edit drops a compound index that does not exist.
+    NoSuchCompoundIndex(String),
     /// The edit adds a field that already exists.
     FieldExists(String),
     /// Only top-level fields can be edited this way.
@@ -1365,6 +1374,38 @@ impl SchemaEdit {
         self
     }
 
+    /// Move the family between blob and regular segments for FUTURE writes.
+    ///
+    /// Cells already written stay where they are, in the segment class that
+    /// was current when they were written -- as with every other evolution,
+    /// nothing is rewritten.
+    pub fn set_blobs(mut self, blobs: bool) -> Self {
+        self.ops.push(EditOp::SetBlobs(blobs));
+        self
+    }
+
+    /// Add or replace a compound index. Replacing by name, because a compound
+    /// index is identified by its name and redefining one is the ordinary way
+    /// to change its field list.
+    pub fn add_compound_index(
+        mut self,
+        name: &str,
+        fields: &[&str],
+        indices: Vec<IndexType>,
+    ) -> Self {
+        self.ops.push(EditOp::AddCompoundIndex {
+            name: name.to_owned(),
+            fields: fields.iter().map(|f| (*f).to_owned()).collect(),
+            indices,
+        });
+        self
+    }
+
+    pub fn drop_compound_index(mut self, name: &str) -> Self {
+        self.ops.push(EditOp::DropCompoundIndex(name.to_owned()));
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
@@ -1383,6 +1424,20 @@ impl SchemaEdit {
         let mut drops: Vec<String> = Vec::new();
         let mut is_scannable = base.is_scannable;
         let mut is_dynamic = base.is_dynamic;
+        let mut blobs = base.blobs;
+        // Rebuilt from the base rather than carried wholesale, so an index
+        // naming a field this edit drops can be caught rather than left
+        // pointing at nothing.
+        let mut compound: std::collections::BTreeMap<u64, (String, Vec<String>, Vec<IndexType>)> =
+            base.compound_index_fields
+                .iter()
+                .map(|(id, ci)| {
+                    (
+                        *id,
+                        (ci.name.clone(), ci.fields.clone(), ci.indices.clone()),
+                    )
+                })
+                .collect();
 
         let position = |fields: &[Field], name: &str| {
             let id = types::key_hash(name);
@@ -1452,6 +1507,27 @@ impl SchemaEdit {
                 }
                 EditOp::SetScannable(v) => is_scannable = *v,
                 EditOp::SetDynamic(v) => is_dynamic = *v,
+                EditOp::SetBlobs(v) => blobs = *v,
+                EditOp::AddCompoundIndex {
+                    name,
+                    fields: index_fields,
+                    indices,
+                } => {
+                    for field in index_fields {
+                        if position(&fields, field).is_none() {
+                            return Err(EditError::NoSuchField(field.clone()));
+                        }
+                    }
+                    compound.insert(
+                        types::key_hash(name),
+                        (name.clone(), index_fields.clone(), indices.clone()),
+                    );
+                }
+                EditOp::DropCompoundIndex(name) => {
+                    if compound.remove(&types::key_hash(name)).is_none() {
+                        return Err(EditError::NoSuchCompoundIndex(name.clone()));
+                    }
+                }
             }
         }
 
@@ -1462,8 +1538,18 @@ impl SchemaEdit {
             is_dynamic,
             is_scannable,
         );
-        evolved.blobs = base.blobs;
-        evolved.compound_index_fields = base.compound_index_fields.clone();
+        evolved.blobs = blobs;
+        for (_, (name, index_fields, indices)) in compound {
+            let refs: Vec<&str> = index_fields.iter().map(|f| f.as_str()).collect();
+            // Rebuilt through `add_compound_index` so `field_ids` is derived
+            // from the names rather than copied; a compound index whose ids
+            // disagree with its field list indexes nothing.
+            evolved.add_compound_index(
+                &name,
+                refs.iter().map(|f| (*f).to_owned()).collect(),
+                indices,
+            );
+        }
         for (from, to) in &renames {
             evolved = evolved.with_renamed_field(from, to);
         }
@@ -2302,6 +2388,85 @@ mod tests {
         assert_eq!(field.data_type, Type::U64);
         assert!(field.nullable);
         assert_eq!(field.default, Some(OwnedValue::U64(5)));
+    }
+
+    /// A blobs change was expressible through the whole-shape form and became
+    /// unreachable when that went private. This is the op that closes it.
+    #[test]
+    fn an_edit_can_change_the_blobs_flag() {
+        let base = edit_base();
+        assert!(!base.blobs);
+        let evolved = SchemaEdit::new().set_blobs(true).apply(&base).unwrap();
+        assert!(evolved.blobs);
+        assert_eq!(base.classify_evolution(&evolved), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn an_edit_can_add_and_drop_a_compound_index() {
+        let base = edit_base();
+        let with_index = SchemaEdit::new()
+            .add_compound_index("by_age_name", &["age", "keep"], vec![IndexType::Ranged])
+            .apply(&base)
+            .unwrap();
+        let id = types::key_hash("by_age_name");
+        let added = with_index.compound_index_fields.get(&id).expect("added");
+        assert_eq!(added.fields, vec!["age".to_owned(), "keep".to_owned()]);
+        assert_eq!(
+            added.field_ids,
+            vec![types::key_hash("age"), types::key_hash("keep")],
+            "field_ids must be derived from the names, not copied"
+        );
+        assert_eq!(
+            base.classify_evolution(&with_index),
+            EvolutionKind::Identity,
+            "an index-only change needs no transform"
+        );
+
+        let without = SchemaEdit::new()
+            .drop_compound_index("by_age_name")
+            .apply(&with_index)
+            .unwrap();
+        assert!(without.compound_index_fields.is_empty());
+    }
+
+    /// Compound indexes are carried across edits that never mention them --
+    /// the same guarantee ordinary fields get.
+    #[test]
+    fn an_edit_carries_compound_indexes_it_does_not_mention() {
+        let base = SchemaEdit::new()
+            .add_compound_index("pair", &["age", "keep"], vec![IndexType::Ranged])
+            .apply(&edit_base())
+            .unwrap();
+        let evolved = SchemaEdit::new().drop("old_name").apply(&base).unwrap();
+        assert!(evolved
+            .compound_index_fields
+            .contains_key(&types::key_hash("pair")));
+    }
+
+    /// A compound index over a field that does not exist would index nothing,
+    /// so the edit is refused rather than producing one.
+    #[test]
+    fn a_compound_index_over_an_absent_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .add_compound_index("bad", &["ghost"], vec![IndexType::Ranged])
+                .apply(&base)
+                .err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+    }
+
+    #[test]
+    fn dropping_an_absent_compound_index_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .drop_compound_index("ghost")
+                .apply(&base)
+                .err(),
+            Some(EditError::NoSuchCompoundIndex("ghost".to_owned()))
+        );
     }
 
     #[test]
