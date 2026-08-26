@@ -1,7 +1,7 @@
 use crate::ram::io::align_ptr_addr;
-use crate::ram::schema::{Field, FieldCompression};
+use crate::ram::schema::{coerce_value, Field, FieldCompression, SchemaTransform};
 use crate::ram::types;
-use crate::ram::types::OwnedValue;
+use crate::ram::types::{OwnedMap, OwnedValue};
 use crate::ram::{cell::*, compression, io::align_address_with_ty};
 
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,7 @@ pub fn plan_write_field<'a>(
     value: &'a OwnedValue,
     mut ins: &mut WriteInstructions<'a>,
     is_var: bool,
+    transform: &SchemaTransform,
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
@@ -114,8 +115,8 @@ pub fn plan_write_field<'a>(
             tail_offset
         } else if let OwnedValue::Map(map) = value {
             for sub in subs {
-                let val = map.get_by_key_id(sub.name_id);
-                plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
+                let val = lookup_field_value(map, sub.name_id, transform);
+                plan_write_field(tail_offset, &sub, val, &mut ins, is_var, transform)?;
             }
             return Ok(());
         } else {
@@ -164,7 +165,7 @@ pub fn plan_write_field<'a>(
             trace!("Pushing array len inst with {} at {}", len, *offset);
             plan_write_array_len(len, offset, &sub_field, value, &mut ins)?;
             for val in array {
-                plan_write_field(offset, &sub_field, val, &mut ins, true)?;
+                plan_write_field(offset, &sub_field, val, &mut ins, true, transform)?;
             }
         } else if let OwnedValue::PrimArray(ref array) = value {
             let len = array.len();
@@ -188,15 +189,33 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else {
-        if !field.nullable && is_null {
+        // A cell with no value of its own for this field takes the field's
+        // default, when it has one. That is what lets a schema gain a required
+        // field, or take nullability away from an existing one, without
+        // stranding every cell written before the change.
+        //
+        // Substitutions are OWNED instructions rather than references: a
+        // default lives in the schema, which the write plan deliberately does
+        // not borrow from, and a coerced value does not exist anywhere until
+        // it is computed. Both are paid only by cells that actually need them.
+        let substitute: Option<OwnedValue> = if is_null {
+            field.default.clone()
+        } else {
+            // The value may be in the shape an older generation used. Widening
+            // it here is what lets a schema change a field's type without
+            // rewriting the cells that still hold the old one.
+            coerce_value(value, field.data_type)
+        };
+        if !field.nullable && is_null && substitute.is_none() {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
+        let effective: &OwnedValue = substitute.as_ref().unwrap_or(value);
 
         let should_compress = matches!(field.compression, Some(FieldCompression::Lz4))
             && (field.data_type == Type::String || field.data_type == Type::Bytes);
 
         if should_compress {
-            let raw_bytes = match value {
+            let raw_bytes = match effective {
                 OwnedValue::String(s) => s.as_bytes(),
                 OwnedValue::Bytes(b) => b.as_slice(),
                 _ => return Err(WriteError::DataMismatchSchema(field.clone(), value.clone())),
@@ -223,11 +242,14 @@ pub fn plan_write_field<'a>(
                 raw_bytes.len()
             );
         } else {
-            let size = types::get_vsize(field.data_type, &value);
+            let size = types::get_vsize(field.data_type, effective);
             *offset = align_address_with_ty(field.data_type, *offset);
             ins.push(Instruction {
                 data_type: field.data_type,
-                val: InstData::Ref(value),
+                val: match substitute {
+                    Some(substituted) => InstData::Val(substituted),
+                    None => InstData::Ref(value),
+                },
                 offset: *offset,
             });
             let new_offset = *offset + size;
@@ -268,19 +290,48 @@ fn plan_write_array_len<'a>(
     return Ok(());
 }
 
+/// The value for `name_id`, following a rename back to wherever it used to
+/// live.
+///
+/// Direct hit first: a cell already in the target generation's shape holds the
+/// current name, and that must win. Only when the current name is absent is
+/// the value looked for under the names this family used before -- which is
+/// exactly the case of a cell written before the rename happened.
+fn lookup_field_value<'a>(
+    map: &'a OwnedMap,
+    name_id: u64,
+    transform: &SchemaTransform,
+) -> &'a OwnedValue {
+    let direct = map.get_by_key_id(name_id);
+    if !matches!(direct, OwnedValue::Null | OwnedValue::NA) {
+        return direct;
+    }
+    for historical in transform.historical_names(name_id) {
+        let candidate = map.get_by_key_id(historical);
+        if !matches!(candidate, OwnedValue::Null | OwnedValue::NA) {
+            return candidate;
+        }
+    }
+    direct
+}
+
 pub fn plan_write_dynamic_fields<'a>(
     offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
     ins: &mut WriteInstructions<'a>,
+    dropped: &[u64],
 ) -> Result<(), WriteError> {
     *offset = align_ptr_addr(*offset);
     if let (OwnedValue::Map(data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();
+        // Undeclared AND not deliberately dropped. Without the second test,
+        // removing a field from a dynamic schema does not remove it: it stops
+        // being declared, falls in here, and is written straight back out.
         let dynamic_map: HashMap<_, _> = data_all
             .map
             .iter()
-            .filter(|(k, _v)| !schema_keys.contains(k))
+            .filter(|(k, _v)| !schema_keys.contains(k) && !dropped.contains(k))
             .map(|(k, v)| (*k, v))
             .collect();
         let dynamic_names: Vec<_> = data_all
@@ -478,7 +529,15 @@ mod tests {
         let mut field = Field::new_unindexed_nullable("char_offset_start", Type::U64);
         field.offset = Some(36);
 
-        plan_write_field(&mut offset, &field, &OwnedValue::U64(10), &mut ins, false).unwrap();
+        plan_write_field(
+            &mut offset,
+            &field,
+            &OwnedValue::U64(10),
+            &mut ins,
+            false,
+            &SchemaTransform::default(),
+        )
+        .unwrap();
 
         match &ins.inner[0].val {
             InstData::Val(OwnedValue::U32(pointer)) => assert_eq!(*pointer, 80),

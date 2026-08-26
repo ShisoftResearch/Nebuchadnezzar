@@ -64,7 +64,7 @@ raft_state_machine! {
     def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
-    def cmd evolve_schema(name: String, schema: Schema) -> Result<EvolutionOutcome, EvolveSchemaError>;
+    def cmd evolve_schema(name: String, schema: Schema, expected_base: Option<SchemaVid>) -> Result<EvolutionOutcome, EvolveSchemaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
@@ -168,6 +168,7 @@ impl StateMachineCmds for SchemasSM {
         &mut self,
         name: String,
         schema: Schema,
+        expected_base: Option<SchemaVid>,
     ) -> BoxFuture<'_, Result<EvolutionOutcome, EvolveSchemaError>> {
         let is_recovering = self.recovering.load(Ordering::Relaxed);
         async move {
@@ -175,6 +176,17 @@ impl StateMachineCmds for SchemasSM {
                 .map
                 .current_schema_of_name(&name)
                 .ok_or(EvolveSchemaError::SchemaDoesNotExist)?;
+            // A delta was computed against some generation; if that is no
+            // longer the current one, applying it would silently undo whatever
+            // evolved in between. Refuse and let the caller reapply.
+            if let Some(expected) = expected_base {
+                if current.vid != expected {
+                    return Err(EvolveSchemaError::StaleBase {
+                        expected,
+                        actual: current.vid,
+                    });
+                }
+            }
             match current.classify_evolution(&schema) {
                 EvolutionKind::Identity => {}
                 EvolutionKind::NeedsTransform(why) => {
@@ -564,6 +576,45 @@ impl SchemasMap {
         proposed.generation = handle.generation + 1;
         proposed.status = SchemaVersionStatus::Current;
         proposed.name = handle.current_name.clone();
+
+        // Drops accumulate across the family. Migration takes ONE hop --
+        // generation 0 straight to generation 3 -- so a generation that only
+        // knew its own drops would resurrect everything the generations before
+        // it removed.
+        let inherited = self
+            .schema_map
+            .get(&previous_vid)
+            .map(|previous| previous.transform.clone())
+            .unwrap_or_default();
+        for id in inherited.dynamic_drops {
+            if !proposed.transform.dynamic_drops.contains(&id) {
+                proposed.transform.dynamic_drops.push(id);
+            }
+        }
+
+        // Renames fold FORWARD rather than merely appending: if the family
+        // already knew `a -> b` and this hop renames `b -> c`, then `a`'s
+        // values now live at `c`, so the inherited entry is rewritten to point
+        // there. Appending both pairs unchanged would leave a generation-0
+        // cell looking for `b`, which no longer exists anywhere.
+        let this_hop = proposed.transform.renames.clone();
+        let mut folded: Vec<(u64, u64)> = Vec::new();
+        for (from, to) in inherited.renames {
+            let final_to = this_hop
+                .iter()
+                .find(|(hop_from, _)| *hop_from == to)
+                .map(|(_, hop_to)| *hop_to)
+                .unwrap_or(to);
+            if !folded.contains(&(from, final_to)) {
+                folded.push((from, final_to));
+            }
+        }
+        for pair in this_hop {
+            if !folded.contains(&pair) {
+                folded.push(pair);
+            }
+        }
+        proposed.transform.renames = folded;
 
         handle.current_vid = new_vid;
         handle.generation = proposed.generation;

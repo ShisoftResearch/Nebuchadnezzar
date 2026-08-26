@@ -254,6 +254,7 @@ impl OwnedCell {
             &self.data,
             &mut instructions,
             false,
+            &schema.transform,
         )?;
         if schema.is_dynamic {
             writer::plan_write_dynamic_fields(
@@ -261,6 +262,7 @@ impl OwnedCell {
                 &schema.fields,
                 &self.data,
                 &mut instructions,
+                &schema.transform.dynamic_drops,
             )?;
         }
         let entry_body_size = align_address(8, tail_offset + CELL_HEADER_SIZE);

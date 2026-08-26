@@ -20,6 +20,7 @@ use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
     DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+    SchemaEdit, SchemaVid,
 };
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
@@ -897,24 +898,29 @@ impl AsyncClient {
             .await
             .map(|r| r.map(|_| schema_id))
     }
-    /// Evolve a schema into a new generation.
+    /// Propose a complete schema as the next generation.
+    ///
+    /// Private on purpose: a caller who hands over a whole shape silently drops
+    /// every field they forget to include, which is exactly why
+    /// [`Self::evolve_schema`] takes an edit instead. This is the plumbing
+    /// underneath it.
     ///
     /// The proposed record supplies field content only; its identity is
     /// assigned by the cluster, and its name is taken from the family rather
     /// than the request, so an evolution cannot smuggle in a rename.
-    ///
-    /// Existing cells are not rewritten. They stay readable through the
-    /// generation that encoded them, and drain into the new one as they are
-    /// updated.
-    pub async fn evolve_schema(
+    async fn propose_schema_generation(
         &self,
         name: String,
         schema: Schema,
+        expected_base: Option<SchemaVid>,
     ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
         if let Err(err) = schema.validate_for_registration() {
             return Ok(Err(EvolveSchemaError::Illegal(format!("{:?}", err))));
         }
-        let res = self.schema_client.evolve_schema(&name, &schema).await;
+        let res = self
+            .schema_client
+            .evolve_schema(&name, &schema, &expected_base)
+            .await;
         if let Ok(Ok(outcome)) = &res {
             // Reconcile index namespaces against the generation this one
             // supersedes, so an index both generations declare is left alone
@@ -946,6 +952,36 @@ impl AsyncClient {
             }
         }
         res
+    }
+
+    /// Evolve a schema into a new generation, by describing the CHANGE.
+    ///
+    /// Fetches the current generation, applies the edit to it, and proposes the
+    /// result -- carrying every field the edit does not mention, so a column
+    /// cannot be lost by being left off a list. The generation it read goes
+    /// along as a precondition, so an evolution landing in between is reported
+    /// as `StaleBase` rather than silently undone.
+    ///
+    /// Existing cells are not rewritten. They stay readable through the
+    /// generation that encoded them, and drain into the new one as they are
+    /// updated.
+    ///
+    /// The edit still has to describe an expressible evolution; this is
+    /// ergonomics, not a way around admission.
+    pub async fn evolve_schema(
+        &self,
+        name: &str,
+        edit: SchemaEdit,
+    ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
+        let Some(base) = self.schema_by_name(&name.to_owned()).await? else {
+            return Ok(Err(EvolveSchemaError::SchemaDoesNotExist));
+        };
+        let evolved = match edit.apply(&base) {
+            Ok(schema) => schema,
+            Err(e) => return Ok(Err(EvolveSchemaError::BadEdit(format!("{:?}", e)))),
+        };
+        self.propose_schema_generation(name.to_owned(), evolved, Some(base.vid))
+            .await
     }
 
     /// Rename a schema.

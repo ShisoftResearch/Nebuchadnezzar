@@ -3,7 +3,7 @@ use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
-use dovahkiin::types::Type;
+use dovahkiin::types::{OwnedValue, Type};
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -78,6 +78,49 @@ impl std::fmt::Display for SchemaVid {
     }
 }
 
+/// How a generation was produced from the one it superseded.
+///
+/// Empty for a generation-0 record, which superseded nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaTransform {
+    /// Field names to purge from a DYNAMIC schema's dynamic region.
+    ///
+    /// Cumulative: each generation carries every name its family has ever
+    /// dropped, not just the ones it dropped itself. That is what lets a
+    /// generation-0 cell migrate straight to generation 3 -- the single hop
+    /// resolution deliberately takes -- without replaying the generations in
+    /// between to discover what they removed.
+    ///
+    /// A name that is later re-declared stops being a drop in practice: a
+    /// declared field never reaches the dynamic region at all.
+    pub dynamic_drops: Vec<u64>,
+    /// Where a field's value used to live: `(historical name, current name)`,
+    /// oldest first.
+    ///
+    /// Cumulative, like `dynamic_drops`, and for the same reason -- migration
+    /// takes one hop, so a generation that knew only its own renames could not
+    /// find a value last seen two generations ago. Folding each hop forward
+    /// (`a -> b` then `b -> c` becomes `a -> c` plus `b -> c`) means the target
+    /// record alone can resolve any ancestor's field name, and NO ordered
+    /// replay of the generations in between is needed.
+    pub renames: Vec<(u64, u64)>,
+}
+
+impl SchemaTransform {
+    /// Every name a value for `current` might be stored under, newest first.
+    ///
+    /// Newest first because a cell only one generation behind holds the more
+    /// recent name, and taking the oldest match would read a field that
+    /// generation had already stopped using.
+    pub fn historical_names(&self, current: u64) -> impl Iterator<Item = u64> + '_ {
+        self.renames
+            .iter()
+            .rev()
+            .filter(move |(_, to)| *to == current)
+            .map(|(from, _)| *from)
+    }
+}
+
 /// Where a generation sits in its family's history.
 ///
 /// Exactly one generation of a [`SchemaUid`] is `Current` at any instant; it is
@@ -110,6 +153,9 @@ pub struct Schema {
     pub generation: u32,
     /// Whether new writes may still land in this generation.
     pub status: SchemaVersionStatus,
+    /// How this generation was produced from its predecessor.
+    #[serde(default)]
+    pub transform: SchemaTransform,
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
@@ -212,6 +258,7 @@ impl Schema {
             uid: SchemaUid(0),
             generation: 0,
             status: SchemaVersionStatus::Current,
+            transform: SchemaTransform::default(),
             name: name.to_string(),
             key_field: match key_field {
                 None => None,
@@ -259,6 +306,34 @@ impl Schema {
         self.status = SchemaVersionStatus::Current;
     }
 
+    /// Declare that these field names are being removed from a dynamic
+    /// schema's dynamic region rather than merely undeclared.
+    ///
+    /// Needed because on an `is_dynamic` schema an undeclared field is not
+    /// dropped -- it falls through to the dynamic region and is re-encoded, so
+    /// removing it from the schema alone preserves it forever.
+    pub fn with_dynamic_drops(mut self, names: &[&str]) -> Schema {
+        for name in names {
+            let id = types::key_hash(name);
+            if !self.transform.dynamic_drops.contains(&id) {
+                self.transform.dynamic_drops.push(id);
+            }
+        }
+        self
+    }
+
+    /// Declare that a field's values used to be stored under another name.
+    ///
+    /// Without this an evolution that renames a field reads as a drop plus an
+    /// add: the old values are abandoned and the new field comes back empty.
+    pub fn with_renamed_field(mut self, from: &str, to: &str) -> Schema {
+        let pair = (types::key_hash(from), types::key_hash(to));
+        if !self.transform.renames.contains(&pair) {
+            self.transform.renames.push(pair);
+        }
+        self
+    }
+
     pub fn with_blobs(mut self, blobs: bool) -> Schema {
         self.blobs = blobs;
         self
@@ -299,6 +374,24 @@ impl Schema {
             );
         }
 
+        // A swap -- `a -> b` and `b -> a` in one step -- is order-dependent, and
+        // the lookup that resolves a rename has no idea which generation a cell
+        // came from. Refuse rather than resolve it wrongly half the time.
+        for (from, to) in &proposed.transform.renames {
+            if proposed
+                .transform
+                .renames
+                .iter()
+                .any(|(other_from, other_to)| other_from == to && other_to == from)
+            {
+                return EvolutionKind::Illegal(
+                    "a rename that swaps two field names cannot be resolved without knowing \
+                     which generation each cell came from"
+                        .to_owned(),
+                );
+            }
+        }
+
         for (path_hash, id_path) in &self.id_index {
             let Some(before) = self.field_by_id_path(id_path) else {
                 continue;
@@ -310,14 +403,27 @@ impl Schema {
             }
             match proposed.id_index.get(path_hash) {
                 None => {
+                    // Renamed away, not dropped: its values are claimed by
+                    // whatever field the rename points at.
+                    if proposed
+                        .transform
+                        .renames
+                        .iter()
+                        .any(|(from, _)| *from == before.name_id)
+                    {
+                        continue;
+                    }
                     // Dropped. The new encoder simply never reads it -- unless
                     // the schema is dynamic, in which case an undeclared field
                     // falls through to the dynamic region and is re-encoded
                     // rather than dropped, which is not what dropping means.
-                    if proposed.is_dynamic {
+                    if proposed.is_dynamic
+                        && !proposed.transform.dynamic_drops.contains(&before.name_id)
+                    {
                         return EvolutionKind::NeedsTransform(format!(
                             "dropping `{}` from a dynamic schema would re-encode it into the \
-                             dynamic region instead of removing it",
+                             dynamic region instead of removing it; list it in the schema's \
+                             dynamic drops to remove it for real",
                             before.name
                         ));
                     }
@@ -346,10 +452,41 @@ impl Schema {
             // An added field has no value in any existing cell. Nullable, that
             // encodes as null; otherwise the encoder refuses, and a default
             // has to come from somewhere the transform engine can supply.
-            if !added.nullable {
+            // A field that inherits an older field's values is not new, so it
+            // needs no default -- the values are already there.
+            let inherits = proposed
+                .transform
+                .renames
+                .iter()
+                .any(|(_, to)| *to == added.name_id);
+            if inherits {
+                // ...but only if nothing else still claims the name it takes
+                // its values from. Two fields reading one source is ambiguous,
+                // and a lookup cannot tell which was meant.
+                for (from, _) in proposed.transform.renames.iter() {
+                    if proposed.id_index.contains_key(from) {
+                        return EvolutionKind::Illegal(format!(
+                            "`{}` takes its values from a name this schema still declares; \
+                             a rename cannot reuse a live field's name, because a lookup \
+                             cannot tell the two apart",
+                            added.name
+                        ));
+                    }
+                }
+                continue;
+            }
+            if !added.nullable && added.default.is_none() {
                 return EvolutionKind::NeedsTransform(format!(
                     "`{}` is new and not nullable, so existing cells have no value to encode \
-                     for it",
+                     for it; give it a default to make this evolution expressible",
+                    added.name
+                ));
+            }
+            if added.default.is_some() && !Self::default_is_encodable(added) {
+                return EvolutionKind::NeedsTransform(format!(
+                    "`{}` has a default, but defaults are only injected for scalar fields; \
+                     an array, vector or map default would be admitted here and then fail \
+                     to encode during migration",
                     added.name
                 ));
             }
@@ -358,14 +495,28 @@ impl Schema {
         EvolutionKind::Identity
     }
 
+    /// Whether this field's default is one the encoder will actually inject.
+    ///
+    /// Only scalars. The array, vector and map paths reject a null value
+    /// before the default substitution is reached, so admitting a composite
+    /// default would produce an evolution that passes classification and then
+    /// strands every cell it touches -- the failure mode this design exists to
+    /// avoid.
+    fn default_is_encodable(field: &Field) -> bool {
+        !field.is_array && field.vector_size.is_none() && field.sub_fields.is_none()
+    }
+
     /// Why re-encoding a value of `before` as `after` is not mechanical, if it
     /// is not. Index membership, compression and added nullability are all
     /// absent here on purpose: they change how a value is stored or found, not
     /// what it is.
     fn field_needs_transform(before: &Field, after: &Field) -> Option<String> {
-        if before.data_type != after.data_type {
+        if before.data_type != after.data_type
+            && !widening_exists(before.data_type, after.data_type)
+        {
             return Some(format!(
-                "`{}` changes type ({:?} -> {:?}); even a widening needs the value rewritten",
+                "`{}` changes type ({:?} -> {:?}), and that is not a widening this can perform \
+                 without losing range or precision",
                 before.name, before.data_type, after.data_type
             ));
         }
@@ -381,10 +532,21 @@ impl Schema {
                 before.name, before.vector_size, after.vector_size
             ));
         }
-        if before.nullable && !after.nullable {
+        if before.nullable
+            && !after.nullable
+            && after.default.is_some()
+            && !Self::default_is_encodable(after)
+        {
+            return Some(format!(
+                "`{}` stops being nullable and has a default, but defaults are only injected \
+                 for scalar fields",
+                before.name
+            ));
+        }
+        if before.nullable && !after.nullable && after.default.is_none() {
             return Some(format!(
                 "`{}` stops being nullable, and cells already holding null for it have no \
-                 value to encode",
+                 value to encode; give it a default to make this evolution expressible",
                 before.name
             ));
         }
@@ -478,6 +640,14 @@ pub struct Field {
     pub offset: Option<usize>,
     #[serde(default)]
     pub compression: Option<FieldCompression>,
+    /// What a cell gets for this field when it has no value of its own: one
+    /// written before the field existed, or one holding null for a field that
+    /// has since stopped being nullable.
+    ///
+    /// `None` means genuinely required, and an evolution that introduces the
+    /// field is refused rather than admitted and then stranded.
+    #[serde(default)]
+    pub default: Option<OwnedValue>,
 }
 
 impl Field {
@@ -508,8 +678,20 @@ impl Field {
             offset: None,
             vector_size: None,
             compression: None,
+            default: None,
         }
     }
+
+    /// Give this field a value to fall back on when a cell has none.
+    ///
+    /// This is what lets a later evolution add the field as required, or make
+    /// it stop being nullable, without stranding every cell written before the
+    /// change.
+    pub fn with_default(mut self, default: OwnedValue) -> Self {
+        self.default = Some(default);
+        self
+    }
+
     pub fn new_map(name: &str, sub_fields: Vec<Field>) -> Field {
         Self::new(name, Type::Map, false, false, Some(sub_fields), vec![])
     }
@@ -687,6 +869,7 @@ impl Field {
             indices,
             offset: None,
             compression: None,
+            default: None,
         }
     }
     fn assign_offsets(
@@ -1057,6 +1240,408 @@ pub enum NewSchemaError {
     PostProcessError(String),
 }
 
+/// A change to make to a schema, described as a delta rather than a shape.
+///
+/// Built against no particular schema and applied to whichever generation is
+/// current at the time. The point is that unchanged fields are carried across
+/// automatically: describing the whole target shape by hand means a field left
+/// off the list is silently dropped, which is a poor way to lose a column.
+///
+/// The operations map onto the transforms the engine can perform, and an edit
+/// that produces an inexpressible schema is refused by `classify_evolution`
+/// exactly as a hand-built one would be.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaEdit {
+    ops: Vec<EditOp>,
+}
+
+#[derive(Debug, Clone)]
+enum EditOp {
+    AddField(Field),
+    DropField(String),
+    RenameField {
+        from: String,
+        to: String,
+    },
+    RetypeField {
+        name: String,
+        to: Type,
+    },
+    SetDefault {
+        name: String,
+        default: OwnedValue,
+    },
+    SetNullable {
+        name: String,
+        nullable: bool,
+    },
+    SetIndices {
+        name: String,
+        indices: Vec<IndexType>,
+    },
+    SetScannable(bool),
+    SetDynamic(bool),
+    SetBlobs(bool),
+    AddCompoundIndex {
+        name: String,
+        fields: Vec<String>,
+        indices: Vec<IndexType>,
+    },
+    DropCompoundIndex(String),
+}
+
+/// Why an edit could not be turned into a schema. Distinct from
+/// [`EvolutionKind`], which judges the RESULT: these are complaints about the
+/// edit itself, caught before anything is proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// The edit touches a field the current generation does not declare.
+    NoSuchField(String),
+    /// The edit drops a compound index that does not exist.
+    NoSuchCompoundIndex(String),
+    /// The edit adds a field that already exists.
+    FieldExists(String),
+    /// Only top-level fields can be edited this way.
+    NotATopLevelField(String),
+}
+
+impl SchemaEdit {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a field. Give it a `default` if it is not nullable, or the
+    /// evolution will be refused for the cells that have no value for it.
+    pub fn add(mut self, field: Field) -> Self {
+        self.ops.push(EditOp::AddField(field));
+        self
+    }
+
+    pub fn drop(mut self, name: &str) -> Self {
+        self.ops.push(EditOp::DropField(name.to_owned()));
+        self
+    }
+
+    /// Rename a field, carrying its values across.
+    pub fn rename(mut self, from: &str, to: &str) -> Self {
+        self.ops.push(EditOp::RenameField {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        self
+    }
+
+    /// Change a field's type. Only lossless widenings are accepted.
+    pub fn retype(mut self, name: &str, to: Type) -> Self {
+        self.ops.push(EditOp::RetypeField {
+            name: name.to_owned(),
+            to,
+        });
+        self
+    }
+
+    pub fn set_default(mut self, name: &str, default: OwnedValue) -> Self {
+        self.ops.push(EditOp::SetDefault {
+            name: name.to_owned(),
+            default,
+        });
+        self
+    }
+
+    pub fn set_nullable(mut self, name: &str, nullable: bool) -> Self {
+        self.ops.push(EditOp::SetNullable {
+            name: name.to_owned(),
+            nullable,
+        });
+        self
+    }
+
+    pub fn set_indices(mut self, name: &str, indices: Vec<IndexType>) -> Self {
+        self.ops.push(EditOp::SetIndices {
+            name: name.to_owned(),
+            indices,
+        });
+        self
+    }
+
+    pub fn set_scannable(mut self, scannable: bool) -> Self {
+        self.ops.push(EditOp::SetScannable(scannable));
+        self
+    }
+
+    pub fn set_dynamic(mut self, dynamic: bool) -> Self {
+        self.ops.push(EditOp::SetDynamic(dynamic));
+        self
+    }
+
+    /// Move the family between blob and regular segments for FUTURE writes.
+    ///
+    /// Cells already written stay where they are, in the segment class that
+    /// was current when they were written -- as with every other evolution,
+    /// nothing is rewritten.
+    pub fn set_blobs(mut self, blobs: bool) -> Self {
+        self.ops.push(EditOp::SetBlobs(blobs));
+        self
+    }
+
+    /// Add or replace a compound index. Replacing by name, because a compound
+    /// index is identified by its name and redefining one is the ordinary way
+    /// to change its field list.
+    pub fn add_compound_index(
+        mut self,
+        name: &str,
+        fields: &[&str],
+        indices: Vec<IndexType>,
+    ) -> Self {
+        self.ops.push(EditOp::AddCompoundIndex {
+            name: name.to_owned(),
+            fields: fields.iter().map(|f| (*f).to_owned()).collect(),
+            indices,
+        });
+        self
+    }
+
+    pub fn drop_compound_index(mut self, name: &str) -> Self {
+        self.ops.push(EditOp::DropCompoundIndex(name.to_owned()));
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Turn this edit into the schema it describes, against `base`.
+    ///
+    /// Rebuilds through `Schema::new` rather than mutating a clone, so offsets,
+    /// the field indexes and the compression plan are all recomputed from the
+    /// resulting field list. Editing those by hand is how a schema ends up
+    /// describing a layout it does not actually produce.
+    pub fn apply(&self, base: &Schema) -> Result<Schema, EditError> {
+        let Some(mut fields) = base.fields.sub_fields.clone() else {
+            return Err(EditError::NotATopLevelField(base.name.clone()));
+        };
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let mut drops: Vec<String> = Vec::new();
+        let mut is_scannable = base.is_scannable;
+        let mut is_dynamic = base.is_dynamic;
+        let mut blobs = base.blobs;
+        // Rebuilt from the base rather than carried wholesale, so an index
+        // naming a field this edit drops can be caught rather than left
+        // pointing at nothing.
+        let mut compound: std::collections::BTreeMap<u64, (String, Vec<String>, Vec<IndexType>)> =
+            base.compound_index_fields
+                .iter()
+                .map(|(id, ci)| {
+                    (
+                        *id,
+                        (ci.name.clone(), ci.fields.clone(), ci.indices.clone()),
+                    )
+                })
+                .collect();
+
+        let position = |fields: &[Field], name: &str| {
+            let id = types::key_hash(name);
+            fields.iter().position(|f| f.name_id == id)
+        };
+
+        for op in &self.ops {
+            match op {
+                EditOp::AddField(field) => {
+                    if position(&fields, &field.name).is_some() {
+                        return Err(EditError::FieldExists(field.name.clone()));
+                    }
+                    fields.push(field.clone());
+                }
+                EditOp::DropField(name) => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields.remove(at);
+                    drops.push(name.clone());
+                }
+                EditOp::RenameField { from, to } => {
+                    let Some(at) = position(&fields, from) else {
+                        return Err(EditError::NoSuchField(from.clone()));
+                    };
+                    let existing = fields[at].clone();
+                    // Rebuilt rather than renamed in place: `name_id` is
+                    // derived from the name, and a field whose id disagrees
+                    // with its name is unfindable.
+                    let mut renamed = Field::new(
+                        to,
+                        existing.data_type,
+                        existing.nullable,
+                        existing.is_array,
+                        existing.sub_fields.clone(),
+                        existing.indices.clone(),
+                    );
+                    renamed.vector_size = existing.vector_size;
+                    renamed.compression = existing.compression.clone();
+                    renamed.default = existing.default.clone();
+                    fields[at] = renamed;
+                    renames.push((from.clone(), to.clone()));
+                }
+                EditOp::RetypeField { name, to } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].data_type = *to;
+                }
+                EditOp::SetDefault { name, default } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].default = Some(default.clone());
+                }
+                EditOp::SetNullable { name, nullable } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].nullable = *nullable;
+                }
+                EditOp::SetIndices { name, indices } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].indices = indices.clone();
+                }
+                EditOp::SetScannable(v) => is_scannable = *v,
+                EditOp::SetDynamic(v) => is_dynamic = *v,
+                EditOp::SetBlobs(v) => blobs = *v,
+                EditOp::AddCompoundIndex {
+                    name,
+                    fields: index_fields,
+                    indices,
+                } => {
+                    for field in index_fields {
+                        if position(&fields, field).is_none() {
+                            return Err(EditError::NoSuchField(field.clone()));
+                        }
+                    }
+                    compound.insert(
+                        types::key_hash(name),
+                        (name.clone(), index_fields.clone(), indices.clone()),
+                    );
+                }
+                EditOp::DropCompoundIndex(name) => {
+                    if compound.remove(&types::key_hash(name)).is_none() {
+                        return Err(EditError::NoSuchCompoundIndex(name.clone()));
+                    }
+                }
+            }
+        }
+
+        let mut evolved = Schema::new(
+            &base.name,
+            base.str_key_field.clone(),
+            Field::new_schema(fields),
+            is_dynamic,
+            is_scannable,
+        );
+        evolved.blobs = blobs;
+        for (_, (name, index_fields, indices)) in compound {
+            let refs: Vec<&str> = index_fields.iter().map(|f| f.as_str()).collect();
+            // Rebuilt through `add_compound_index` so `field_ids` is derived
+            // from the names rather than copied; a compound index whose ids
+            // disagree with its field list indexes nothing.
+            evolved.add_compound_index(
+                &name,
+                refs.iter().map(|f| (*f).to_owned()).collect(),
+                indices,
+            );
+        }
+        for (from, to) in &renames {
+            evolved = evolved.with_renamed_field(from, to);
+        }
+        if is_dynamic && !drops.is_empty() {
+            let names: Vec<&str> = drops.iter().map(|s| s.as_str()).collect();
+            evolved = evolved.with_dynamic_drops(&names);
+        }
+        Ok(evolved)
+    }
+}
+
+/// Widen `value` to `target`, if that can be done without losing anything.
+///
+/// Returns `None` when the value is already the target type (nothing to do) or
+/// when no lossless widening exists. Deliberately never returns a value that
+/// would lose precision or range: an evolution that admits at proposal time
+/// and then strands an arbitrary subset of cells at migration time is worse
+/// than one that is refused outright, so narrowing is not a coercion here.
+///
+/// Float targets are limited by mantissa width, not by byte size: `f32` holds
+/// integers exactly only to 2^24, so `u32`/`i32` widen to `f64` but not to
+/// `f32`. Getting that backwards would silently round large ids.
+pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
+    use OwnedValue::*;
+    if value.base_type() == target {
+        return None;
+    }
+    Some(match (value, target) {
+        // Signed widening.
+        (I8(v), Type::I16) => I16(*v as i16),
+        (I8(v), Type::I32) => I32(*v as i32),
+        (I8(v), Type::I64) => I64(*v as i64),
+        (I16(v), Type::I32) => I32(*v as i32),
+        (I16(v), Type::I64) => I64(*v as i64),
+        (I32(v), Type::I64) => I64(*v as i64),
+
+        // Unsigned widening.
+        (U8(v), Type::U16) => U16(*v as u16),
+        (U8(v), Type::U32) => U32(*v as u32),
+        (U8(v), Type::U64) => U64(*v as u64),
+        (U16(v), Type::U32) => U32(*v as u32),
+        (U16(v), Type::U64) => U64(*v as u64),
+        (U32(v), Type::U64) => U64(*v as u64),
+
+        // Unsigned into a signed type wide enough to hold all of it.
+        (U8(v), Type::I16) => I16(*v as i16),
+        (U8(v), Type::I32) => I32(*v as i32),
+        (U8(v), Type::I64) => I64(*v as i64),
+        (U16(v), Type::I32) => I32(*v as i32),
+        (U16(v), Type::I64) => I64(*v as i64),
+        (U32(v), Type::I64) => I64(*v as i64),
+
+        // Into floats, only where every value is exactly representable.
+        (I8(v), Type::F32) => F32(*v as f32),
+        (I16(v), Type::F32) => F32(*v as f32),
+        (U8(v), Type::F32) => F32(*v as f32),
+        (U16(v), Type::F32) => F32(*v as f32),
+        (I8(v), Type::F64) => F64(*v as f64),
+        (I16(v), Type::F64) => F64(*v as f64),
+        (I32(v), Type::F64) => F64(*v as f64),
+        (U8(v), Type::F64) => F64(*v as f64),
+        (U16(v), Type::F64) => F64(*v as f64),
+        (U32(v), Type::F64) => F64(*v as f64),
+        (F32(v), Type::F64) => F64(*v as f64),
+
+        _ => return None,
+    })
+}
+
+/// Whether every value of `from` widens losslessly into `to`.
+///
+/// Answered by asking [`coerce_value`] itself with a probe value, so
+/// admission and migration can never disagree about what is possible -- a
+/// second hand-written table here is exactly how an evolution gets admitted
+/// and then strands the cells it was admitted for.
+pub fn widening_exists(from: Type, to: Type) -> bool {
+    let probe = match from {
+        Type::I8 => OwnedValue::I8(0),
+        Type::I16 => OwnedValue::I16(0),
+        Type::I32 => OwnedValue::I32(0),
+        Type::I64 => OwnedValue::I64(0),
+        Type::U8 => OwnedValue::U8(0),
+        Type::U16 => OwnedValue::U16(0),
+        Type::U32 => OwnedValue::U32(0),
+        Type::U64 => OwnedValue::U64(0),
+        Type::F32 => OwnedValue::F32(0.0),
+        Type::F64 => OwnedValue::F64(0.0),
+        _ => return false,
+    };
+    coerce_value(&probe, to).is_some()
+}
+
 /// What moving a family's cells from one generation to the next would take.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvolutionKind {
@@ -1084,6 +1669,16 @@ pub struct EvolutionOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EvolveSchemaError {
     SchemaDoesNotExist,
+    /// The edit was computed against a generation that is no longer current --
+    /// something else evolved this family first. Nothing was changed; refetch
+    /// and reapply. Reported rather than merged, because an edit built on a
+    /// stale base can silently undo whatever the other evolution did.
+    StaleBase {
+        expected: SchemaVid,
+        actual: SchemaVid,
+    },
+    /// The edit could not be turned into a schema at all.
+    BadEdit(String),
     TransformRequired(String),
     Illegal(String),
     NotifyError(NotifyError),
@@ -1646,6 +2241,44 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_required_field_with_a_default_is_admitted() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(Field::new_unindexed("c", Type::U64).with_default(OwnedValue::U64(7)));
+        assert_eq!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::Identity,
+            "a default is what makes a required field expressible"
+        );
+    }
+
+    #[test]
+    fn losing_nullability_with_a_default_is_admitted() {
+        let before = schema_of(vec![Field::new_unindexed_nullable("a", Type::U32)]);
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32).with_default(OwnedValue::U32(0))
+        ]);
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    /// The encoder only injects defaults for scalars. Admitting a composite
+    /// one would pass classification and then strand every cell it touched,
+    /// which is the failure mode the whole admission step exists to prevent.
+    #[test]
+    fn a_composite_default_is_refused_rather_than_stranded() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(
+            Field::new_unindexed_array("c", Type::U64)
+                .with_default(OwnedValue::Array(vec![OwnedValue::U64(1)])),
+        );
+        assert!(matches!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
     fn adding_a_non_nullable_field_needs_a_transform() {
         let before = schema_of(base_fields());
         let mut fields = base_fields();
@@ -1661,6 +2294,483 @@ mod tests {
         let before = schema_of(base_fields());
         let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
         assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    fn edit_base() -> Schema {
+        Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::String),
+                Field::new_unindexed("age", Type::U32),
+                Field::new_unindexed("old_name", Type::U64),
+            ]),
+            false,
+            false,
+        )
+    }
+
+    /// The reason the delta API exists: a field the edit never mentions must
+    /// survive. Describing the whole target shape by hand loses whatever you
+    /// forget to re-list, silently.
+    #[test]
+    fn an_edit_carries_every_field_it_does_not_mention() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .drop("age")
+            .apply(&base)
+            .expect("edit should apply");
+
+        assert!(
+            evolved.id_index.contains_key(&types::key_hash("keep")),
+            "an untouched field must survive an edit that never mentions it"
+        );
+        assert!(
+            evolved.id_index.contains_key(&types::key_hash("old_name")),
+            "and so must every other one"
+        );
+        assert!(!evolved.id_index.contains_key(&types::key_hash("age")));
+    }
+
+    #[test]
+    fn an_edit_produces_an_admissible_evolution() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .rename("old_name", "new_name")
+            .retype("age", Type::U64)
+            .add(Field::new_unindexed("rank", Type::U64).with_default(OwnedValue::U64(0)))
+            .apply(&base)
+            .expect("edit should apply");
+
+        assert_eq!(
+            base.classify_evolution(&evolved),
+            EvolutionKind::Identity,
+            "rename + widen + defaulted add is expressible, so the edit must be too"
+        );
+    }
+
+    /// A rename through the edit API must declare itself, or the values are
+    /// abandoned exactly as a hand-built rename would abandon them.
+    #[test]
+    fn an_edit_rename_declares_the_rename() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .rename("old_name", "new_name")
+            .apply(&base)
+            .unwrap();
+        assert!(
+            evolved
+                .transform
+                .renames
+                .contains(&(types::key_hash("old_name"), types::key_hash("new_name"))),
+            "the edit must record the rename, not just move the field"
+        );
+    }
+
+    /// A renamed field keeps its type, nullability and default: the rebuild
+    /// exists to fix `name_id`, not to reset the field.
+    #[test]
+    fn an_edit_rename_preserves_the_field_itself() {
+        let base = Schema::new_with_id(
+            1,
+            "s",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed_nullable("a", Type::U64).with_default(OwnedValue::U64(5))
+            ]),
+            false,
+            false,
+        );
+        let evolved = SchemaEdit::new().rename("a", "b").apply(&base).unwrap();
+        let path = evolved.id_index.get(&types::key_hash("b")).unwrap().clone();
+        let field = evolved.field_by_id_path(&path).unwrap();
+        assert_eq!(field.data_type, Type::U64);
+        assert!(field.nullable);
+        assert_eq!(field.default, Some(OwnedValue::U64(5)));
+    }
+
+    /// A blobs change was expressible through the whole-shape form and became
+    /// unreachable when that went private. This is the op that closes it.
+    #[test]
+    fn an_edit_can_change_the_blobs_flag() {
+        let base = edit_base();
+        assert!(!base.blobs);
+        let evolved = SchemaEdit::new().set_blobs(true).apply(&base).unwrap();
+        assert!(evolved.blobs);
+        assert_eq!(base.classify_evolution(&evolved), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn an_edit_can_add_and_drop_a_compound_index() {
+        let base = edit_base();
+        let with_index = SchemaEdit::new()
+            .add_compound_index("by_age_name", &["age", "keep"], vec![IndexType::Ranged])
+            .apply(&base)
+            .unwrap();
+        let id = types::key_hash("by_age_name");
+        let added = with_index.compound_index_fields.get(&id).expect("added");
+        assert_eq!(added.fields, vec!["age".to_owned(), "keep".to_owned()]);
+        assert_eq!(
+            added.field_ids,
+            vec![types::key_hash("age"), types::key_hash("keep")],
+            "field_ids must be derived from the names, not copied"
+        );
+        assert_eq!(
+            base.classify_evolution(&with_index),
+            EvolutionKind::Identity,
+            "an index-only change needs no transform"
+        );
+
+        let without = SchemaEdit::new()
+            .drop_compound_index("by_age_name")
+            .apply(&with_index)
+            .unwrap();
+        assert!(without.compound_index_fields.is_empty());
+    }
+
+    /// Compound indexes are carried across edits that never mention them --
+    /// the same guarantee ordinary fields get.
+    #[test]
+    fn an_edit_carries_compound_indexes_it_does_not_mention() {
+        let base = SchemaEdit::new()
+            .add_compound_index("pair", &["age", "keep"], vec![IndexType::Ranged])
+            .apply(&edit_base())
+            .unwrap();
+        let evolved = SchemaEdit::new().drop("old_name").apply(&base).unwrap();
+        assert!(evolved
+            .compound_index_fields
+            .contains_key(&types::key_hash("pair")));
+    }
+
+    /// A compound index over a field that does not exist would index nothing,
+    /// so the edit is refused rather than producing one.
+    #[test]
+    fn a_compound_index_over_an_absent_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .add_compound_index("bad", &["ghost"], vec![IndexType::Ranged])
+                .apply(&base)
+                .err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+    }
+
+    #[test]
+    fn dropping_an_absent_compound_index_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .drop_compound_index("ghost")
+                .apply(&base)
+                .err(),
+            Some(EditError::NoSuchCompoundIndex("ghost".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_edit_naming_an_absent_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new().drop("ghost").apply(&base).err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+        assert_eq!(
+            SchemaEdit::new().rename("ghost", "x").apply(&base).err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_edit_adding_an_existing_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .add(Field::new_unindexed("keep", Type::String))
+                .apply(&base)
+                .err(),
+            Some(EditError::FieldExists("keep".to_owned()))
+        );
+    }
+
+    /// An edit that produces an inexpressible schema is still refused by
+    /// admission. The delta API is ergonomics, not a way around it.
+    #[test]
+    fn an_edit_cannot_smuggle_past_admission() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .add(Field::new_unindexed("required", Type::U64))
+            .apply(&base)
+            .unwrap();
+        assert!(matches!(
+            base.classify_evolution(&evolved),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    /// Dropping from a dynamic schema declares the drop, which is what makes
+    /// the removal real rather than a fall-through to the dynamic region.
+    #[test]
+    fn an_edit_drop_on_a_dynamic_schema_declares_it() {
+        let mut base = edit_base();
+        base.is_dynamic = true;
+        let evolved = SchemaEdit::new().drop("age").apply(&base).unwrap();
+        assert!(evolved
+            .transform
+            .dynamic_drops
+            .contains(&types::key_hash("age")));
+        assert_eq!(base.classify_evolution(&evolved), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn a_declared_rename_is_admitted_and_is_not_a_drop_plus_add() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            // `b` becomes `label`, same type.
+            Field::new_unindexed("label", Type::String),
+        ])
+        .with_renamed_field("b", "label");
+        assert_eq!(
+            before.classify_evolution(&after),
+            EvolutionKind::Identity,
+            "a declared rename carries the values across, so it is neither a drop nor an add"
+        );
+    }
+
+    /// Without declaring it, the same change reads as dropping `b` and adding
+    /// a required `label` -- and is refused for want of a default.
+    #[test]
+    fn an_undeclared_rename_is_still_refused() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("label", Type::String),
+        ]);
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
+    fn a_rename_that_swaps_two_names_is_illegal() {
+        let before = schema_of(base_fields());
+        let after = schema_of(base_fields())
+            .with_renamed_field("a", "b")
+            .with_renamed_field("b", "a");
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::Illegal(_)
+        ));
+    }
+
+    /// Renaming onto a name the schema still declares means two fields reading
+    /// one source, which a lookup cannot disambiguate.
+    #[test]
+    fn a_rename_onto_a_live_field_name_is_illegal() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("b", Type::String),
+            Field::new_unindexed("c", Type::String),
+        ])
+        .with_renamed_field("b", "c");
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::Illegal(_)
+        ));
+    }
+
+    /// Cumulative renames are what let migration keep taking ONE hop: a
+    /// generation-0 cell must reach generation 2's name directly.
+    #[test]
+    fn renames_fold_forward_so_the_oldest_name_still_resolves() {
+        let mut transform = SchemaTransform::default();
+        let (a, b, c) = (
+            types::key_hash("a"),
+            types::key_hash("b"),
+            types::key_hash("c"),
+        );
+        // What `install_evolution` produces for a -> b then b -> c.
+        transform.renames = vec![(a, c), (b, c)];
+        let sources: Vec<u64> = transform.historical_names(c).collect();
+        assert!(
+            sources.contains(&a) && sources.contains(&b),
+            "both the original and the intermediate name must resolve to the current one"
+        );
+        assert_eq!(
+            sources.first(),
+            Some(&b),
+            "newest first: a cell one generation behind holds the more recent name"
+        );
+    }
+
+    /// The end-to-end proof: a cell written under the old name reads back
+    /// under the new one, with its value intact.
+    #[test]
+    fn a_cell_written_before_a_rename_keeps_its_value_under_the_new_name() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("old_name", Type::U64),
+            ]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("new_name", Type::U64),
+            ]),
+            false,
+            false,
+        )
+        .with_renamed_field("old_name", "new_name");
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a declared rename must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("keep", OwnedValue::U32(1));
+        value.insert("old_name", OwnedValue::U64(42));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+
+        meta.schemas.apply_evolution(gen1);
+
+        // Touch it naming the old generation, supplying the OLD shape -- which
+        // is exactly what a client holding a stale schema would send.
+        let mut touched = OwnedMap::new();
+        touched.insert("keep", OwnedValue::U32(2));
+        touched.insert("old_name", OwnedValue::U64(42));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(touched));
+        chunks.update_cell(&mut update).unwrap();
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["keep"].u32(), Some(&2));
+        assert_eq!(
+            read.data["new_name"].u64(),
+            Some(&42),
+            "the value must follow the rename, not be abandoned with the old name"
+        );
+    }
+
+    #[test]
+    fn a_declared_dynamic_drop_is_admitted() {
+        let mut before = schema_of(base_fields());
+        before.is_dynamic = true;
+        let mut after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        after.is_dynamic = true;
+        let after = after.with_dynamic_drops(&["b"]);
+        assert_eq!(
+            before.classify_evolution(&after),
+            EvolutionKind::Identity,
+            "saying so explicitly is what makes the removal real"
+        );
+    }
+
+    /// The point of the whole increment: a value in the dynamic region is
+    /// written back out unless it is on the drop list.
+    #[test]
+    fn a_dropped_dynamic_field_is_not_re_encoded() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let mut gen0 = Schema::new_with_id(
+            1,
+            "dyn",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("bulky", Type::U64),
+            ]),
+            true,
+            false,
+        );
+        gen0.is_dynamic = true;
+        // Generation 1 stops declaring `bulky` AND says to drop it.
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "dyn",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("keep", Type::U32)]),
+            true,
+            false,
+        );
+        gen1.is_dynamic = true;
+        let mut gen1 = gen1.with_dynamic_drops(&["bulky"]);
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a declared drop must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("keep", OwnedValue::U32(1));
+        value.insert("bulky", OwnedValue::U64(2));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().data["bulky"].u64(),
+            Some(&2),
+            "generation 0 declared it, so it must be there to begin with"
+        );
+
+        meta.schemas.apply_evolution(gen1);
+
+        let mut touched = OwnedMap::new();
+        touched.insert("keep", OwnedValue::U32(9));
+        touched.insert("bulky", OwnedValue::U64(2));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(touched));
+        chunks.update_cell(&mut update).unwrap();
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["keep"].u32(), Some(&9));
+        assert!(
+            read.data["bulky"].u64().is_none(),
+            "a dropped field must be gone, not preserved in the dynamic region"
+        );
     }
 
     /// On a dynamic schema an undeclared field is not dropped -- it falls
@@ -1698,16 +2808,95 @@ mod tests {
     }
 
     #[test]
-    fn widening_a_number_needs_a_transform() {
+    fn lossless_widenings_are_admitted() {
+        for (from, to) in [
+            (Type::U32, Type::U64),
+            (Type::I32, Type::I64),
+            (Type::U8, Type::U64),
+            (Type::U32, Type::I64),
+            (Type::U16, Type::F32),
+            (Type::U32, Type::F64),
+            (Type::F32, Type::F64),
+        ] {
+            let before = schema_of(vec![Field::new_unindexed("a", from)]);
+            let after = schema_of(vec![Field::new_unindexed("a", to)]);
+            assert_eq!(
+                before.classify_evolution(&after),
+                EvolutionKind::Identity,
+                "{:?} -> {:?} loses nothing and should be admitted",
+                from,
+                to
+            );
+        }
+    }
+
+    /// Anything that could lose range or precision stays refused. Admitting
+    /// one and then failing per-cell during migration would strand an
+    /// arbitrary subset of the data.
+    #[test]
+    fn lossy_conversions_stay_refused() {
+        for (from, to) in [
+            (Type::U64, Type::U32),
+            (Type::I64, Type::I32),
+            (Type::U64, Type::F64),
+            (Type::U32, Type::F32),
+            (Type::F64, Type::F32),
+            (Type::I32, Type::U32),
+            (Type::String, Type::U64),
+        ] {
+            let before = schema_of(vec![Field::new_unindexed("a", from)]);
+            let after = schema_of(vec![Field::new_unindexed("a", to)]);
+            assert!(
+                matches!(
+                    before.classify_evolution(&after),
+                    EvolutionKind::NeedsTransform(_)
+                ),
+                "{:?} -> {:?} can lose something and must be refused",
+                from,
+                to
+            );
+        }
+    }
+
+    /// `f32` holds integers exactly only to 2^24, so a u32 must NOT widen into
+    /// it even though it is "bigger". Getting this backwards would silently
+    /// round large values.
+    #[test]
+    fn float_widening_is_bounded_by_mantissa_not_byte_width() {
+        assert!(coerce_value(&OwnedValue::U32(1), Type::F32).is_none());
+        assert!(coerce_value(&OwnedValue::U16(1), Type::F32).is_some());
+        assert!(coerce_value(&OwnedValue::U32(1), Type::F64).is_some());
+        assert!(coerce_value(&OwnedValue::U64(1), Type::F64).is_none());
+    }
+
+    #[test]
+    fn coercing_a_value_to_its_own_type_is_a_no_op() {
+        assert!(coerce_value(&OwnedValue::U32(5), Type::U32).is_none());
+    }
+
+    #[test]
+    fn a_widening_preserves_the_value() {
+        assert_eq!(
+            coerce_value(&OwnedValue::U32(4_000_000_000), Type::U64),
+            Some(OwnedValue::U64(4_000_000_000))
+        );
+        assert_eq!(
+            coerce_value(&OwnedValue::I32(-7), Type::I64),
+            Some(OwnedValue::I64(-7))
+        );
+    }
+
+    /// Was `widening_a_number_needs_a_transform` before the transform engine.
+    /// U32 -> U64 is now performed rather than refused; the refusal case it
+    /// used to cover lives in `lossy_conversions_stay_refused`.
+    #[test]
+    fn widening_a_number_is_now_performed() {
         let before = schema_of(base_fields());
         let after = schema_of(vec![
             Field::new_unindexed("a", Type::U64),
             Field::new_unindexed("b", Type::String),
         ]);
-        assert!(matches!(
-            before.classify_evolution(&after),
-            EvolutionKind::NeedsTransform(_)
-        ));
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
     }
 
     /// Cells already holding null have nothing to encode for a field that has
@@ -1739,8 +2928,35 @@ mod tests {
         ));
     }
 
+    /// Nested fields must be inspected, not skipped.
+    ///
+    /// Uses a NARROWING deliberately: a widening is now performed rather than
+    /// refused, so asserting `Identity` here would pass even if sub-maps were
+    /// ignored entirely. Only a change that must be refused proves the walk
+    /// actually reaches inside the map.
     #[test]
     fn a_nested_field_change_is_seen() {
+        let before = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U64)],
+        )]);
+        let after = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U32)],
+        )]);
+        assert!(
+            matches!(
+                before.classify_evolution(&after),
+                EvolutionKind::NeedsTransform(_)
+            ),
+            "a narrowing buried in a sub-map must still be refused"
+        );
+    }
+
+    /// The counterpart: a widening buried in a sub-map is performed, which
+    /// only means anything alongside the narrowing test above.
+    #[test]
+    fn a_nested_widening_is_performed() {
         let before = schema_of(vec![Field::new_map(
             "m",
             vec![Field::new_unindexed("inner", Type::U32)],
@@ -1749,13 +2965,7 @@ mod tests {
             "m",
             vec![Field::new_unindexed("inner", Type::U64)],
         )]);
-        assert!(
-            matches!(
-                before.classify_evolution(&after),
-                EvolutionKind::NeedsTransform(_)
-            ),
-            "a type change buried in a sub-map is still a type change"
-        );
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
     }
 
     #[test]
@@ -2012,6 +3222,79 @@ mod tests {
             "the persisted header must name the current generation, or the redirect never happened"
         );
         assert_eq!(read.data["v"].u32(), Some(&7));
+    }
+
+    /// The transform engine's first real capability, end to end: a schema
+    /// gains a REQUIRED field, and a cell written before that field existed
+    /// comes back carrying the default rather than failing to encode.
+    #[test]
+    fn a_cell_written_before_a_required_field_existed_migrates_with_its_default() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("v", Type::U32),
+                // Required, with a default. Without the default this evolution
+                // is refused outright.
+                Field::new_unindexed("rank", Type::U64).with_default(OwnedValue::U64(99)),
+            ]),
+            false,
+            false,
+        );
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a required field with a default must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("v", OwnedValue::U32(7));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+
+        meta.schemas.apply_evolution(gen1);
+
+        // Touch it the way any client would, still naming the old generation.
+        let mut updated = OwnedMap::new();
+        updated.insert("v", OwnedValue::U32(8));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(updated));
+        chunks
+            .update_cell(&mut update)
+            .expect("the default is what makes this encode at all");
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["v"].u32(), Some(&8));
+        assert_eq!(
+            read.data["rank"].u64(),
+            Some(&99),
+            "a field the cell never had must come back holding its default"
+        );
     }
 
     /// The whole feature, end to end: a schema gains a nullable field, cells
