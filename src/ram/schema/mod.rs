@@ -1208,6 +1208,13 @@ impl LocalSchemasCache {
         self.map.uid_of_name(name)
     }
 
+    /// The family a generation belongs to. A cell header carries a vid; anything
+    /// that means "which schema is this?" -- graph type, index namespace, a
+    /// durable reference -- wants the family this returns, not the generation.
+    pub fn uid_of_vid(&self, vid: &SchemaVid) -> Option<SchemaUid> {
+        self.map.uid_of_vid(vid)
+    }
+
     /// The generation a family currently writes into.
     pub fn current_vid_of_uid(&self, uid: &SchemaUid) -> Option<SchemaVid> {
         self.map.current_vid_of_uid(uid)
@@ -1744,6 +1751,13 @@ impl LocalSchemasMap {
 
     pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
         self.name_map.get(&name.to_string())
+    }
+
+    /// The family a generation belongs to. Read straight off the record: a vid
+    /// names one layout, and that layout knows its own family. Never chase
+    /// `superseded_by` to get here -- resolution is one hop by construction.
+    pub fn uid_of_vid(&self, vid: &SchemaVid) -> Option<SchemaUid> {
+        self.schema_map.get(vid).map(|s| s.uid)
     }
 
     /// The generation a family currently writes into, if this node has heard
@@ -2409,6 +2423,27 @@ mod tests {
 
     /// A blobs change was expressible through the whole-shape form and became
     /// unreachable when that went private. This is the op that closes it.
+    /// A caller reasoning against a generation that has since moved on must be
+    /// told, not rebased onto whatever became current -- an edit applied to a
+    /// base the caller never saw can quietly undo what moved in between.
+    #[test]
+    fn a_stale_base_is_detectable_before_the_edit_is_applied() {
+        let base = edit_base();
+        // The check `evolve_schema_if` performs, in the form the client sees.
+        let stale = SchemaVid(7);
+        assert_ne!(base.vid, stale);
+        assert!(
+            matches!(
+                EvolveSchemaError::StaleBase {
+                    expected: stale,
+                    actual: base.vid,
+                },
+                EvolveSchemaError::StaleBase { .. }
+            ),
+            "the error must carry both vids so a caller can refetch and reapply"
+        );
+    }
+
     #[test]
     fn an_edit_can_change_the_blobs_flag() {
         let base = edit_base();
@@ -3168,6 +3203,60 @@ mod tests {
             superseded_by: gen1.vid,
         };
         (gen0, gen1)
+    }
+
+    #[test]
+    fn every_generation_of_a_family_resolves_back_to_that_family() {
+        // The first hop of the resolution rule. A cell header carries a vid;
+        // anything that means "which schema is this?" -- graph type, index
+        // namespace, a durable reference -- has to get from that vid to the
+        // family, and must land on the SAME family for both generations.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(1, "person", 900);
+        let (uid, old_vid, new_vid) = (gen0.uid, gen0.vid, gen1.vid);
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        assert_eq!(
+            cache.uid_of_vid(&old_vid),
+            Some(uid),
+            "a superseded generation still belongs to its family"
+        );
+        assert_eq!(
+            cache.uid_of_vid(&new_vid),
+            Some(uid),
+            "the current generation belongs to the same family"
+        );
+    }
+
+    #[test]
+    fn an_unknown_generation_has_no_family() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.cache_schema_from_cluster(cache_test_schema(1, "person"));
+        assert_eq!(cache.uid_of_vid(&SchemaVid(4242)), None);
+    }
+
+    #[test]
+    fn a_family_is_not_reachable_by_reading_its_uid_as_a_generation() {
+        // uid and vid are drawn from one counter, so a family id is never also
+        // some other schema's live generation. Evolving moves the family onto a
+        // new vid and leaves the old number naming only the old layout -- the
+        // uid itself is not a generation you can look up once they diverge.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(7, "person", 901);
+        let uid = gen0.uid;
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        let current = cache
+            .current_vid_of_uid(&uid)
+            .expect("the family has a current generation");
+        assert_ne!(
+            current,
+            SchemaVid(uid.get()),
+            "after an evolution the family no longer writes into the vid that \
+             happens to share its number"
+        );
     }
 
     #[test]
