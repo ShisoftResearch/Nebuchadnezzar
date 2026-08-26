@@ -20,6 +20,7 @@ use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
     DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+    SchemaEdit, SchemaVid,
 };
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
@@ -910,11 +911,15 @@ impl AsyncClient {
         &self,
         name: String,
         schema: Schema,
+        expected_base: Option<SchemaVid>,
     ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
         if let Err(err) = schema.validate_for_registration() {
             return Ok(Err(EvolveSchemaError::Illegal(format!("{:?}", err))));
         }
-        let res = self.schema_client.evolve_schema(&name, &schema).await;
+        let res = self
+            .schema_client
+            .evolve_schema(&name, &schema, &expected_base)
+            .await;
         if let Ok(Ok(outcome)) = &res {
             // Reconcile index namespaces against the generation this one
             // supersedes, so an index both generations declare is left alone
@@ -946,6 +951,32 @@ impl AsyncClient {
             }
         }
         res
+    }
+
+    /// Evolve a schema by describing the CHANGE rather than the whole shape.
+    ///
+    /// Fetches the current generation, applies the edit to it, and proposes the
+    /// result -- carrying every field the edit does not mention, so a column
+    /// cannot be lost by being left off a list. The generation it read is sent
+    /// as a precondition, so an evolution that lands in between is reported as
+    /// `StaleBase` rather than silently undone.
+    ///
+    /// The edit still has to describe an expressible evolution; this is
+    /// ergonomics over `evolve_schema`, not a way around admission.
+    pub async fn evolve(
+        &self,
+        name: &str,
+        edit: SchemaEdit,
+    ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
+        let Some(base) = self.schema_by_name(&name.to_owned()).await? else {
+            return Ok(Err(EvolveSchemaError::SchemaDoesNotExist));
+        };
+        let evolved = match edit.apply(&base) {
+            Ok(schema) => schema,
+            Err(e) => return Ok(Err(EvolveSchemaError::BadEdit(format!("{:?}", e)))),
+        };
+        self.evolve_schema(name.to_owned(), evolved, Some(base.vid))
+            .await
     }
 
     /// Rename a schema.

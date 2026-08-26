@@ -1240,6 +1240,241 @@ pub enum NewSchemaError {
     PostProcessError(String),
 }
 
+/// A change to make to a schema, described as a delta rather than a shape.
+///
+/// Built against no particular schema and applied to whichever generation is
+/// current at the time. The point is that unchanged fields are carried across
+/// automatically: describing the whole target shape by hand means a field left
+/// off the list is silently dropped, which is a poor way to lose a column.
+///
+/// The operations map onto the transforms the engine can perform, and an edit
+/// that produces an inexpressible schema is refused by `classify_evolution`
+/// exactly as a hand-built one would be.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaEdit {
+    ops: Vec<EditOp>,
+}
+
+#[derive(Debug, Clone)]
+enum EditOp {
+    AddField(Field),
+    DropField(String),
+    RenameField {
+        from: String,
+        to: String,
+    },
+    RetypeField {
+        name: String,
+        to: Type,
+    },
+    SetDefault {
+        name: String,
+        default: OwnedValue,
+    },
+    SetNullable {
+        name: String,
+        nullable: bool,
+    },
+    SetIndices {
+        name: String,
+        indices: Vec<IndexType>,
+    },
+    SetScannable(bool),
+    SetDynamic(bool),
+}
+
+/// Why an edit could not be turned into a schema. Distinct from
+/// [`EvolutionKind`], which judges the RESULT: these are complaints about the
+/// edit itself, caught before anything is proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// The edit touches a field the current generation does not declare.
+    NoSuchField(String),
+    /// The edit adds a field that already exists.
+    FieldExists(String),
+    /// Only top-level fields can be edited this way.
+    NotATopLevelField(String),
+}
+
+impl SchemaEdit {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a field. Give it a `default` if it is not nullable, or the
+    /// evolution will be refused for the cells that have no value for it.
+    pub fn add(mut self, field: Field) -> Self {
+        self.ops.push(EditOp::AddField(field));
+        self
+    }
+
+    pub fn drop(mut self, name: &str) -> Self {
+        self.ops.push(EditOp::DropField(name.to_owned()));
+        self
+    }
+
+    /// Rename a field, carrying its values across.
+    pub fn rename(mut self, from: &str, to: &str) -> Self {
+        self.ops.push(EditOp::RenameField {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        self
+    }
+
+    /// Change a field's type. Only lossless widenings are accepted.
+    pub fn retype(mut self, name: &str, to: Type) -> Self {
+        self.ops.push(EditOp::RetypeField {
+            name: name.to_owned(),
+            to,
+        });
+        self
+    }
+
+    pub fn set_default(mut self, name: &str, default: OwnedValue) -> Self {
+        self.ops.push(EditOp::SetDefault {
+            name: name.to_owned(),
+            default,
+        });
+        self
+    }
+
+    pub fn set_nullable(mut self, name: &str, nullable: bool) -> Self {
+        self.ops.push(EditOp::SetNullable {
+            name: name.to_owned(),
+            nullable,
+        });
+        self
+    }
+
+    pub fn set_indices(mut self, name: &str, indices: Vec<IndexType>) -> Self {
+        self.ops.push(EditOp::SetIndices {
+            name: name.to_owned(),
+            indices,
+        });
+        self
+    }
+
+    pub fn set_scannable(mut self, scannable: bool) -> Self {
+        self.ops.push(EditOp::SetScannable(scannable));
+        self
+    }
+
+    pub fn set_dynamic(mut self, dynamic: bool) -> Self {
+        self.ops.push(EditOp::SetDynamic(dynamic));
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Turn this edit into the schema it describes, against `base`.
+    ///
+    /// Rebuilds through `Schema::new` rather than mutating a clone, so offsets,
+    /// the field indexes and the compression plan are all recomputed from the
+    /// resulting field list. Editing those by hand is how a schema ends up
+    /// describing a layout it does not actually produce.
+    pub fn apply(&self, base: &Schema) -> Result<Schema, EditError> {
+        let Some(mut fields) = base.fields.sub_fields.clone() else {
+            return Err(EditError::NotATopLevelField(base.name.clone()));
+        };
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let mut drops: Vec<String> = Vec::new();
+        let mut is_scannable = base.is_scannable;
+        let mut is_dynamic = base.is_dynamic;
+
+        let position = |fields: &[Field], name: &str| {
+            let id = types::key_hash(name);
+            fields.iter().position(|f| f.name_id == id)
+        };
+
+        for op in &self.ops {
+            match op {
+                EditOp::AddField(field) => {
+                    if position(&fields, &field.name).is_some() {
+                        return Err(EditError::FieldExists(field.name.clone()));
+                    }
+                    fields.push(field.clone());
+                }
+                EditOp::DropField(name) => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields.remove(at);
+                    drops.push(name.clone());
+                }
+                EditOp::RenameField { from, to } => {
+                    let Some(at) = position(&fields, from) else {
+                        return Err(EditError::NoSuchField(from.clone()));
+                    };
+                    let existing = fields[at].clone();
+                    // Rebuilt rather than renamed in place: `name_id` is
+                    // derived from the name, and a field whose id disagrees
+                    // with its name is unfindable.
+                    let mut renamed = Field::new(
+                        to,
+                        existing.data_type,
+                        existing.nullable,
+                        existing.is_array,
+                        existing.sub_fields.clone(),
+                        existing.indices.clone(),
+                    );
+                    renamed.vector_size = existing.vector_size;
+                    renamed.compression = existing.compression.clone();
+                    renamed.default = existing.default.clone();
+                    fields[at] = renamed;
+                    renames.push((from.clone(), to.clone()));
+                }
+                EditOp::RetypeField { name, to } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].data_type = *to;
+                }
+                EditOp::SetDefault { name, default } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].default = Some(default.clone());
+                }
+                EditOp::SetNullable { name, nullable } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].nullable = *nullable;
+                }
+                EditOp::SetIndices { name, indices } => {
+                    let Some(at) = position(&fields, name) else {
+                        return Err(EditError::NoSuchField(name.clone()));
+                    };
+                    fields[at].indices = indices.clone();
+                }
+                EditOp::SetScannable(v) => is_scannable = *v,
+                EditOp::SetDynamic(v) => is_dynamic = *v,
+            }
+        }
+
+        let mut evolved = Schema::new(
+            &base.name,
+            base.str_key_field.clone(),
+            Field::new_schema(fields),
+            is_dynamic,
+            is_scannable,
+        );
+        evolved.blobs = base.blobs;
+        evolved.compound_index_fields = base.compound_index_fields.clone();
+        for (from, to) in &renames {
+            evolved = evolved.with_renamed_field(from, to);
+        }
+        if is_dynamic && !drops.is_empty() {
+            let names: Vec<&str> = drops.iter().map(|s| s.as_str()).collect();
+            evolved = evolved.with_dynamic_drops(&names);
+        }
+        Ok(evolved)
+    }
+}
+
 /// Widen `value` to `target`, if that can be done without losing anything.
 ///
 /// Returns `None` when the value is already the target type (nothing to do) or
@@ -1348,6 +1583,16 @@ pub struct EvolutionOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EvolveSchemaError {
     SchemaDoesNotExist,
+    /// The edit was computed against a generation that is no longer current --
+    /// something else evolved this family first. Nothing was changed; refetch
+    /// and reapply. Reported rather than merged, because an edit built on a
+    /// stale base can silently undo whatever the other evolution did.
+    StaleBase {
+        expected: SchemaVid,
+        actual: SchemaVid,
+    },
+    /// The edit could not be turned into a schema at all.
+    BadEdit(String),
     TransformRequired(String),
     Illegal(String),
     NotifyError(NotifyError),
@@ -1963,6 +2208,154 @@ mod tests {
         let before = schema_of(base_fields());
         let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
         assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    fn edit_base() -> Schema {
+        Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::String),
+                Field::new_unindexed("age", Type::U32),
+                Field::new_unindexed("old_name", Type::U64),
+            ]),
+            false,
+            false,
+        )
+    }
+
+    /// The reason the delta API exists: a field the edit never mentions must
+    /// survive. Describing the whole target shape by hand loses whatever you
+    /// forget to re-list, silently.
+    #[test]
+    fn an_edit_carries_every_field_it_does_not_mention() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .drop("age")
+            .apply(&base)
+            .expect("edit should apply");
+
+        assert!(
+            evolved.id_index.contains_key(&types::key_hash("keep")),
+            "an untouched field must survive an edit that never mentions it"
+        );
+        assert!(
+            evolved.id_index.contains_key(&types::key_hash("old_name")),
+            "and so must every other one"
+        );
+        assert!(!evolved.id_index.contains_key(&types::key_hash("age")));
+    }
+
+    #[test]
+    fn an_edit_produces_an_admissible_evolution() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .rename("old_name", "new_name")
+            .retype("age", Type::U64)
+            .add(Field::new_unindexed("rank", Type::U64).with_default(OwnedValue::U64(0)))
+            .apply(&base)
+            .expect("edit should apply");
+
+        assert_eq!(
+            base.classify_evolution(&evolved),
+            EvolutionKind::Identity,
+            "rename + widen + defaulted add is expressible, so the edit must be too"
+        );
+    }
+
+    /// A rename through the edit API must declare itself, or the values are
+    /// abandoned exactly as a hand-built rename would abandon them.
+    #[test]
+    fn an_edit_rename_declares_the_rename() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .rename("old_name", "new_name")
+            .apply(&base)
+            .unwrap();
+        assert!(
+            evolved
+                .transform
+                .renames
+                .contains(&(types::key_hash("old_name"), types::key_hash("new_name"))),
+            "the edit must record the rename, not just move the field"
+        );
+    }
+
+    /// A renamed field keeps its type, nullability and default: the rebuild
+    /// exists to fix `name_id`, not to reset the field.
+    #[test]
+    fn an_edit_rename_preserves_the_field_itself() {
+        let base = Schema::new_with_id(
+            1,
+            "s",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed_nullable("a", Type::U64).with_default(OwnedValue::U64(5))
+            ]),
+            false,
+            false,
+        );
+        let evolved = SchemaEdit::new().rename("a", "b").apply(&base).unwrap();
+        let path = evolved.id_index.get(&types::key_hash("b")).unwrap().clone();
+        let field = evolved.field_by_id_path(&path).unwrap();
+        assert_eq!(field.data_type, Type::U64);
+        assert!(field.nullable);
+        assert_eq!(field.default, Some(OwnedValue::U64(5)));
+    }
+
+    #[test]
+    fn an_edit_naming_an_absent_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new().drop("ghost").apply(&base).err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+        assert_eq!(
+            SchemaEdit::new().rename("ghost", "x").apply(&base).err(),
+            Some(EditError::NoSuchField("ghost".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_edit_adding_an_existing_field_is_refused() {
+        let base = edit_base();
+        assert_eq!(
+            SchemaEdit::new()
+                .add(Field::new_unindexed("keep", Type::String))
+                .apply(&base)
+                .err(),
+            Some(EditError::FieldExists("keep".to_owned()))
+        );
+    }
+
+    /// An edit that produces an inexpressible schema is still refused by
+    /// admission. The delta API is ergonomics, not a way around it.
+    #[test]
+    fn an_edit_cannot_smuggle_past_admission() {
+        let base = edit_base();
+        let evolved = SchemaEdit::new()
+            .add(Field::new_unindexed("required", Type::U64))
+            .apply(&base)
+            .unwrap();
+        assert!(matches!(
+            base.classify_evolution(&evolved),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    /// Dropping from a dynamic schema declares the drop, which is what makes
+    /// the removal real rather than a fall-through to the dynamic region.
+    #[test]
+    fn an_edit_drop_on_a_dynamic_schema_declares_it() {
+        let mut base = edit_base();
+        base.is_dynamic = true;
+        let evolved = SchemaEdit::new().drop("age").apply(&base).unwrap();
+        assert!(evolved
+            .transform
+            .dynamic_drops
+            .contains(&types::key_hash("age")));
+        assert_eq!(base.classify_evolution(&evolved), EvolutionKind::Identity);
     }
 
     #[test]

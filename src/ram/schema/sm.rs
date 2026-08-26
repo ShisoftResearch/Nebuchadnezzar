@@ -64,7 +64,7 @@ raft_state_machine! {
     def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
-    def cmd evolve_schema(name: String, schema: Schema) -> Result<EvolutionOutcome, EvolveSchemaError>;
+    def cmd evolve_schema(name: String, schema: Schema, expected_base: Option<SchemaVid>) -> Result<EvolutionOutcome, EvolveSchemaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
@@ -168,6 +168,7 @@ impl StateMachineCmds for SchemasSM {
         &mut self,
         name: String,
         schema: Schema,
+        expected_base: Option<SchemaVid>,
     ) -> BoxFuture<'_, Result<EvolutionOutcome, EvolveSchemaError>> {
         let is_recovering = self.recovering.load(Ordering::Relaxed);
         async move {
@@ -175,6 +176,17 @@ impl StateMachineCmds for SchemasSM {
                 .map
                 .current_schema_of_name(&name)
                 .ok_or(EvolveSchemaError::SchemaDoesNotExist)?;
+            // A delta was computed against some generation; if that is no
+            // longer the current one, applying it would silently undo whatever
+            // evolved in between. Refuse and let the caller reapply.
+            if let Some(expected) = expected_base {
+                if current.vid != expected {
+                    return Err(EvolveSchemaError::StaleBase {
+                        expected,
+                        actual: current.vid,
+                    });
+                }
+            }
             match current.classify_evolution(&schema) {
                 EvolutionKind::Identity => {}
                 EvolutionKind::NeedsTransform(why) => {
