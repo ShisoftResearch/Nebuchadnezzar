@@ -264,6 +264,133 @@ impl Schema {
         self
     }
 
+    /// What it would take to move a family's cells from `self` to `proposed`.
+    ///
+    /// `Identity` means the existing encoder already handles it: decode a cell
+    /// under the old generation, encode it under the new one, done. That works
+    /// for more than it looks like, because `plan_write_field` rejects exactly
+    /// one shape -- a non-nullable field with no value -- and a map key that is
+    /// absent decodes as `Null`. So adding a nullable field and dropping a
+    /// field both fall out for free.
+    ///
+    /// Anything this cannot express mechanically is refused rather than
+    /// guessed at, and waits for the transform engine.
+    pub fn classify_evolution(&self, proposed: &Schema) -> EvolutionKind {
+        // A cell's id is derived from its family and its key value, so moving
+        // the key would change the id of every future write while leaving
+        // every existing cell addressed the old way. There is no transform
+        // that fixes that; the cells would simply stop being findable.
+        if self.key_field != proposed.key_field {
+            return EvolutionKind::Illegal(format!(
+                "the key field defines every keyed cell's id, so changing it ({:?} -> {:?}) \
+                 would orphan every cell already written",
+                self.str_key_field, proposed.str_key_field
+            ));
+        }
+
+        // A dynamic schema carries fields the schema does not declare, in a
+        // region a static encoder does not write. Going static would drop them
+        // silently on the next rewrite.
+        if self.is_dynamic && !proposed.is_dynamic {
+            return EvolutionKind::NeedsTransform(
+                "a dynamic schema holds fields the schema does not declare; making it static \
+                 would drop them on re-encode"
+                    .to_owned(),
+            );
+        }
+
+        for (path_hash, id_path) in &self.id_index {
+            let Some(before) = self.field_by_id_path(id_path) else {
+                continue;
+            };
+            if before.sub_fields.is_some() {
+                // A map node carries no value of its own; its leaves are
+                // compared on their own entries.
+                continue;
+            }
+            match proposed.id_index.get(path_hash) {
+                None => {
+                    // Dropped. The new encoder simply never reads it -- unless
+                    // the schema is dynamic, in which case an undeclared field
+                    // falls through to the dynamic region and is re-encoded
+                    // rather than dropped, which is not what dropping means.
+                    if proposed.is_dynamic {
+                        return EvolutionKind::NeedsTransform(format!(
+                            "dropping `{}` from a dynamic schema would re-encode it into the \
+                             dynamic region instead of removing it",
+                            before.name
+                        ));
+                    }
+                }
+                Some(after_path) => {
+                    let Some(after) = proposed.field_by_id_path(after_path) else {
+                        continue;
+                    };
+                    if let Some(reason) = Self::field_needs_transform(before, after) {
+                        return EvolutionKind::NeedsTransform(reason);
+                    }
+                }
+            }
+        }
+
+        for (path_hash, id_path) in &proposed.id_index {
+            if self.id_index.contains_key(path_hash) {
+                continue;
+            }
+            let Some(added) = proposed.field_by_id_path(id_path) else {
+                continue;
+            };
+            if added.sub_fields.is_some() {
+                continue;
+            }
+            // An added field has no value in any existing cell. Nullable, that
+            // encodes as null; otherwise the encoder refuses, and a default
+            // has to come from somewhere the transform engine can supply.
+            if !added.nullable {
+                return EvolutionKind::NeedsTransform(format!(
+                    "`{}` is new and not nullable, so existing cells have no value to encode \
+                     for it",
+                    added.name
+                ));
+            }
+        }
+
+        EvolutionKind::Identity
+    }
+
+    /// Why re-encoding a value of `before` as `after` is not mechanical, if it
+    /// is not. Index membership, compression and added nullability are all
+    /// absent here on purpose: they change how a value is stored or found, not
+    /// what it is.
+    fn field_needs_transform(before: &Field, after: &Field) -> Option<String> {
+        if before.data_type != after.data_type {
+            return Some(format!(
+                "`{}` changes type ({:?} -> {:?}); even a widening needs the value rewritten",
+                before.name, before.data_type, after.data_type
+            ));
+        }
+        if before.is_array != after.is_array {
+            return Some(format!(
+                "`{}` changes between a scalar and an array",
+                before.name
+            ));
+        }
+        if before.vector_size != after.vector_size {
+            return Some(format!(
+                "`{}` changes vector width ({:?} -> {:?})",
+                before.name, before.vector_size, after.vector_size
+            ));
+        }
+        if before.nullable && !after.nullable {
+            return Some(format!(
+                "`{}` stops being nullable, and cells already holding null for it have no \
+                 value to encode",
+                before.name
+            ));
+        }
+        None
+    }
+
     pub fn field_by_id_path(&self, path: &[u64]) -> Option<&Field> {
         let mut field = &self.fields;
         for name_id in path {
@@ -725,6 +852,7 @@ impl LocalSchemasCache {
         let m1 = map.clone();
         let m2 = map.clone();
         let m3 = map.clone();
+        let m4 = map.clone();
         let sm =
             sm::client::SMClient::new(sm::generate_scoped_sm_id(group, database_name), raft_client);
         // SUBSCRIBE FIRST, THEN READ. The order is the correctness.
@@ -771,6 +899,12 @@ impl LocalSchemasCache {
                 future::ready(()).boxed()
             })
             .await?;
+        let _ = sm
+            .on_schema_evolved(move |schema| {
+                m4.evolve_schema(schema);
+                future::ready(()).boxed()
+            })
+            .await?;
         let sm_data = sm.get_all().await?;
         {
             debug!("Importing {} schemas from cluster", sm_data.len());
@@ -814,6 +948,11 @@ impl LocalSchemasCache {
     pub fn register_internal_schema(&self, schema: Schema) {
         let m = &self.map;
         m.new_schema(schema)
+    }
+    /// Apply a committed evolution locally. Normally driven by the
+    /// `on_schema_evolved` subscription.
+    pub fn apply_evolution(&self, evolved: Schema) {
+        self.map.evolve_schema(evolved)
     }
     /// Apply a committed rename locally. Normally driven by the
     /// `on_schema_renamed` subscription.
@@ -914,6 +1053,39 @@ pub enum NewSchemaError {
     NameExists(String),
     IdExists(u32),
     InvalidSchema(String),
+    NotifyError(NotifyError),
+    PostProcessError(String),
+}
+
+/// What moving a family's cells from one generation to the next would take.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvolutionKind {
+    /// Decode under the old generation, encode under the new one. No transform.
+    Identity,
+    /// Mechanically expressible, but not by the encoder alone. Refused until
+    /// the transform engine exists.
+    NeedsTransform(String),
+    /// Not expressible at all, whatever machinery is available.
+    Illegal(String),
+}
+
+/// What an evolution produced.
+///
+/// Carries the generation it superseded as well as the one it created, so the
+/// caller can reconcile index namespaces against the right predecessor. Asking
+/// for the current generation separately, before issuing the command, would
+/// race a concurrent evolution and diff against the wrong one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionOutcome {
+    pub previous_vid: SchemaVid,
+    pub new_vid: SchemaVid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EvolveSchemaError {
+    SchemaDoesNotExist,
+    TransformRequired(String),
+    Illegal(String),
     NotifyError(NotifyError),
     PostProcessError(String),
 }
@@ -1054,6 +1226,33 @@ impl LocalSchemasMap {
     /// removing. Trusting the event's idea of the old name instead would
     /// leave a stale binding behind on any node that had missed an earlier
     /// rename.
+    /// Apply an evolution the state machine has already committed.
+    ///
+    /// Installs the new generation and supersedes whatever this node currently
+    /// believes is current, in that order: a moment with no current generation
+    /// would make every write to the family fail to resolve.
+    fn evolve_schema(&self, evolved: Schema) {
+        let uid = evolved.uid;
+        let new_vid = evolved.vid;
+        let previous = self.handles.get(&uid);
+        self.new_schema(evolved);
+        if let Some(previous_vid) = previous {
+            if previous_vid != new_vid {
+                if let Some(old) = self.schema_map.get(&previous_vid) {
+                    let mut superseded = (*old).clone();
+                    superseded.status = SchemaVersionStatus::Stale {
+                        superseded_by: new_vid,
+                    };
+                    self.schema_map.insert(previous_vid, Arc::new(superseded));
+                }
+            }
+        }
+        info!(
+            "Local schema family {} evolved to generation at {}",
+            uid, new_vid
+        );
+    }
+
     fn rename_schema(&self, uid: SchemaUid, new_name: &str) {
         let Some(current_vid) = self.handles.get(&uid) else {
             debug!(
@@ -1122,6 +1321,132 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     fn deref(&self) -> &T {
         unsafe { &*self.reference }
     }
+}
+
+/// The index namespaces a schema needs standing up, as (field, index) pairs.
+///
+/// Only the kinds that own a durable structure of their own: a `Vector` or
+/// `Embedding` index has to be created and destroyed explicitly, while ranged,
+/// hashed and full-text entries are written per cell and need no namespace
+/// lifecycle.
+fn managed_index_namespaces(schema: &Schema) -> Vec<(u64, IndexType)> {
+    let mut out = Vec::new();
+    for (field, indices) in &schema.index_fields {
+        for index in indices {
+            if matches!(index, IndexType::Vector(_) | IndexType::Embedding(_)) {
+                out.push((*field, index.clone()));
+            }
+        }
+    }
+    for (compound_id, compound) in &schema.compound_index_fields {
+        for index in &compound.indices {
+            if matches!(index, IndexType::Vector(_) | IndexType::Embedding(_)) {
+                out.push((*compound_id, index.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Reconcile index namespaces across an evolution.
+///
+/// A family keeps its uid, and index namespaces are keyed by uid, so the
+/// namespaces of an evolved schema are the SAME namespaces -- they must not be
+/// recreated. Recreating a vector index would throw away everything already
+/// indexed under it; deleting one that both generations declare would do the
+/// same. So this creates only what the new generation adds and destroys only
+/// what it drops, and leaves everything they agree on untouched.
+pub async fn post_schema_evolve(
+    previous: &Schema,
+    evolved: &Schema,
+    database_runtime: &Arc<DatabaseRuntime>,
+) -> Result<(), String> {
+    debug_assert_eq!(
+        previous.uid, evolved.uid,
+        "an evolution stays inside one family"
+    );
+    let before = managed_index_namespaces(previous);
+    let after = managed_index_namespaces(evolved);
+
+    let added: Vec<_> = after
+        .iter()
+        .filter(|entry| !before.contains(entry))
+        .cloned()
+        .collect();
+    let dropped: Vec<_> = before
+        .iter()
+        .filter(|entry| !after.contains(entry))
+        .cloned()
+        .collect();
+
+    if added.is_empty() && dropped.is_empty() {
+        return Ok(());
+    }
+    info!(
+        "Schema family {} evolution: {} index namespace(s) added, {} dropped, {} unchanged",
+        evolved.uid,
+        added.len(),
+        dropped.len(),
+        after.len() - added.len()
+    );
+    apply_index_namespaces(evolved.uid, &added, &dropped, database_runtime).await
+}
+
+async fn apply_index_namespaces(
+    schema_id: SchemaUid,
+    added: &[(u64, IndexType)],
+    dropped: &[(u64, IndexType)],
+    database_runtime: &Arc<DatabaseRuntime>,
+) -> Result<(), String> {
+    for (field_id, index) in added {
+        let Some(indexer) = database_runtime.indexer() else {
+            return Err("Indexing not enabled".to_owned());
+        };
+        match index {
+            IndexType::Vector(config) => {
+                indexer
+                    .clients
+                    .vector_client
+                    .new_index_with_config(schema_id, *field_id, *config)
+                    .await
+                    .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+            }
+            IndexType::Embedding(config) => {
+                indexer
+                    .clients
+                    .embedding_client
+                    .new_index(schema_id, *field_id, &config.model, config.vector)
+                    .await
+                    .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
+            }
+            _ => {}
+        }
+    }
+    for (field_id, index) in dropped {
+        let Some(indexer) = database_runtime.indexer() else {
+            return Err("Indexing not enabled".to_owned());
+        };
+        match index {
+            IndexType::Vector(_) => {
+                indexer
+                    .clients
+                    .vector_client
+                    .delete_index(schema_id, *field_id)
+                    .await
+                    .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+            }
+            IndexType::Embedding(_) => {
+                indexer
+                    .clients
+                    .embedding_client
+                    .delete_index(schema_id, *field_id)
+                    .await
+                    .map_err(|e| format!("Error deleting embedding index: {:?}", e))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub async fn post_schema_add(
@@ -1286,6 +1611,161 @@ mod tests {
     use dovahkiin::types::Type;
     use futures::{future::BoxFuture, FutureExt};
     use std::sync::{Arc, Mutex};
+
+    fn schema_of(fields: Vec<Field>) -> Schema {
+        Schema::new_with_id(1, "s", None, Field::new_schema(fields), false, false)
+    }
+
+    fn keyed_schema_of(key: &str, fields: Vec<Field>) -> Schema {
+        Schema::new_with_id(
+            1,
+            "s",
+            Some(vec![key.to_owned()]),
+            Field::new_schema(fields),
+            false,
+            false,
+        )
+    }
+
+    fn base_fields() -> Vec<Field> {
+        vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("b", Type::String),
+        ]
+    }
+
+    #[test]
+    fn adding_a_nullable_field_needs_no_transform() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(Field::new_unindexed_nullable("c", Type::U64));
+        assert_eq!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::Identity
+        );
+    }
+
+    #[test]
+    fn adding_a_non_nullable_field_needs_a_transform() {
+        let before = schema_of(base_fields());
+        let mut fields = base_fields();
+        fields.push(Field::new_unindexed("c", Type::U64));
+        assert!(matches!(
+            before.classify_evolution(&schema_of(fields)),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
+    fn dropping_a_field_needs_no_transform() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    /// On a dynamic schema an undeclared field is not dropped -- it falls
+    /// through to the dynamic region and gets re-encoded, which is the
+    /// opposite of what removing it from the schema asked for.
+    #[test]
+    fn dropping_a_field_from_a_dynamic_schema_needs_a_transform() {
+        let mut before = schema_of(base_fields());
+        before.is_dynamic = true;
+        let mut after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        after.is_dynamic = true;
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
+    fn an_index_only_change_needs_no_transform() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_indexed("a", Type::U32, vec![IndexType::Ranged]),
+            Field::new_unindexed("b", Type::String),
+        ]);
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn a_scannable_or_blob_flag_change_needs_no_transform() {
+        let before = schema_of(base_fields());
+        let mut after = schema_of(base_fields());
+        after.is_scannable = !before.is_scannable;
+        after.blobs = !before.blobs;
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn widening_a_number_needs_a_transform() {
+        let before = schema_of(base_fields());
+        let after = schema_of(vec![
+            Field::new_unindexed("a", Type::U64),
+            Field::new_unindexed("b", Type::String),
+        ]);
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    /// Cells already holding null have nothing to encode for a field that has
+    /// stopped accepting it.
+    #[test]
+    fn making_a_field_non_nullable_needs_a_transform() {
+        let before = schema_of(vec![Field::new_unindexed_nullable("a", Type::U32)]);
+        let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::NeedsTransform(_)
+        ));
+    }
+
+    #[test]
+    fn making_a_field_nullable_needs_no_transform() {
+        let before = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        let after = schema_of(vec![Field::new_unindexed_nullable("a", Type::U32)]);
+        assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn changing_the_key_field_is_illegal() {
+        let before = keyed_schema_of("a", base_fields());
+        let after = keyed_schema_of("b", base_fields());
+        assert!(matches!(
+            before.classify_evolution(&after),
+            EvolutionKind::Illegal(_)
+        ));
+    }
+
+    #[test]
+    fn a_nested_field_change_is_seen() {
+        let before = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U32)],
+        )]);
+        let after = schema_of(vec![Field::new_map(
+            "m",
+            vec![Field::new_unindexed("inner", Type::U64)],
+        )]);
+        assert!(
+            matches!(
+                before.classify_evolution(&after),
+                EvolutionKind::NeedsTransform(_)
+            ),
+            "a type change buried in a sub-map is still a type change"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_schema_needs_no_transform() {
+        let before = schema_of(base_fields());
+        assert_eq!(
+            before.classify_evolution(&schema_of(base_fields())),
+            EvolutionKind::Identity
+        );
+    }
 
     fn cache_test_schema(id: u32, name: &str) -> Schema {
         Schema::new_with_id(
@@ -1532,6 +2012,168 @@ mod tests {
             "the persisted header must name the current generation, or the redirect never happened"
         );
         assert_eq!(read.data["v"].u32(), Some(&7));
+    }
+
+    /// The whole feature, end to end: a schema gains a nullable field, cells
+    /// written before the change still read (the new field comes back null),
+    /// and new writes land in the new generation.
+    #[test]
+    fn cells_survive_an_evolution_and_new_writes_use_the_new_generation() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("v", Type::U32),
+                Field::new_unindexed_nullable("added", Type::U64),
+            ]),
+            false,
+            false,
+        );
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "adding a nullable field must need no transform"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        // A cell written under generation 0.
+        let mut old_value = OwnedMap::new();
+        old_value.insert("v", OwnedValue::U32(7));
+        let mut old_cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(old_value));
+        chunks.write_cell(&mut old_cell).unwrap();
+        let old_id = old_cell.id();
+
+        meta.schemas.apply_evolution(gen1.clone());
+
+        // The old cell is untouched on disk and still decodes, through the
+        // generation that encoded it.
+        //
+        // Scoped deliberately: `read_cell` hands back a guard-holding
+        // `SharedCell`, so reading the same cell again while one is still
+        // alive waits on a lock this thread already owns.
+        {
+            let read_old = chunks
+                .read_cell(&old_id)
+                .expect("a cell written before the evolution must still read");
+            assert_eq!(read_old.header.schema, SchemaVid(1));
+            assert_eq!(read_old.data["v"].u32(), Some(&7));
+            assert!(
+                read_old.data["added"].u64().is_none(),
+                "a field the cell was written without comes back absent, not corrupt"
+            );
+        }
+
+        // A new write by name lands in generation 1.
+        let mut new_value = OwnedMap::new();
+        new_value.insert("v", OwnedValue::U32(9));
+        new_value.insert("added", OwnedValue::U64(42));
+        let target = meta.schemas.name_to_id("person").unwrap();
+        assert_eq!(target, SchemaVid(900));
+        let mut new_cell =
+            OwnedCell::new_with_id(target, &Id::from_parts(1, 2), OwnedValue::Map(new_value));
+        chunks.write_cell(&mut new_cell).unwrap();
+
+        {
+            let read_new = chunks.read_cell(&new_cell.id()).unwrap();
+            assert_eq!(read_new.header.schema, SchemaVid(900));
+            assert_eq!(read_new.data["added"].u64(), Some(&42));
+        }
+
+        // Both generations are readable through one store, which is what keeps
+        // the query layer generation-agnostic.
+        assert_eq!(chunks.read_cell(&old_id).unwrap().data["v"].u32(), Some(&7));
+    }
+
+    /// An ordinary update to a cell in a superseded generation IS a migration:
+    /// it decodes under the old layout and re-encodes under the current one,
+    /// keeping its id and bumping its version.
+    #[test]
+    fn updating_a_stale_cell_migrates_it_to_the_current_generation() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("v", Type::U32),
+                Field::new_unindexed_nullable("added", Type::U64),
+            ]),
+            false,
+            false,
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("v", OwnedValue::U32(7));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+        let version_before = chunks.read_cell(&id).unwrap().header.version;
+
+        meta.schemas.apply_evolution(gen1);
+
+        // Update it exactly as any client would, still naming the old vid.
+        let mut updated_value = OwnedMap::new();
+        updated_value.insert("v", OwnedValue::U32(8));
+        let mut updated = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(updated_value));
+        chunks.update_cell(&mut updated).unwrap();
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(
+            read.header.schema,
+            SchemaVid(900),
+            "an update to a stale cell must land it in the current generation"
+        );
+        assert_eq!(read.id(), id, "migration preserves the cell's identity");
+        assert!(
+            read.header.version > version_before,
+            "a migration is a new version of the cell"
+        );
+        assert_eq!(read.data["v"].u32(), Some(&8));
     }
 
     /// The point of the whole exercise: a cell written before a rename is

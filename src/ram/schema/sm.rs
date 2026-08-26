@@ -64,10 +64,12 @@ raft_state_machine! {
     def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
+    def cmd evolve_schema(name: String, schema: Schema) -> Result<EvolutionOutcome, EvolveSchemaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
     def sub on_schema_renamed() -> (SchemaUid, String);
+    def sub on_schema_evolved() -> Schema;
 }
 
 impl StateMachineCmds for SchemasSM {
@@ -159,24 +161,50 @@ impl StateMachineCmds for SchemasSM {
         .boxed()
     }
     fn next_id(&mut self) -> BoxFuture<'_, u32> {
-        // Always start from max existing ID to handle WAL replay scenarios
-        // where schemas were added with explicit IDs
-        let max_existing = self
-            .map
-            .schema_map
-            .keys()
-            .map(|vid| vid.get())
-            .max()
-            .unwrap_or(0);
-        if self.id_count < max_existing {
-            self.id_count = max_existing;
-        }
+        future::ready(self.allocate_id()).boxed()
+    }
 
-        self.id_count += 1;
-        while self.map.schema_map.contains_key(&SchemaVid(self.id_count)) {
-            self.id_count += 1;
+    fn evolve_schema(
+        &mut self,
+        name: String,
+        schema: Schema,
+    ) -> BoxFuture<'_, Result<EvolutionOutcome, EvolveSchemaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
+        async move {
+            let current = self
+                .map
+                .current_schema_of_name(&name)
+                .ok_or(EvolveSchemaError::SchemaDoesNotExist)?;
+            match current.classify_evolution(&schema) {
+                EvolutionKind::Identity => {}
+                EvolutionKind::NeedsTransform(why) => {
+                    return Err(EvolveSchemaError::TransformRequired(why))
+                }
+                EvolutionKind::Illegal(why) => return Err(EvolveSchemaError::Illegal(why)),
+            }
+            // Allocated from the SAME counter new schemas draw from, so a
+            // number is never both a live family and some unrelated schema's
+            // generation.
+            let new_vid = SchemaVid(self.allocate_id());
+            let (evolved, previous_vid) = self.map.install_evolution(&name, schema, new_vid)?;
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_evolved::new(), evolved)
+                    .await
+                    .map_err(|e| EvolveSchemaError::NotifyError(e))?;
+            } else {
+                trace!(
+                    "Skipping on_schema_evolved callback during recovery for {} -> {}",
+                    name,
+                    new_vid
+                );
+            }
+            Ok(EvolutionOutcome {
+                previous_vid,
+                new_vid,
+            })
         }
-        future::ready(self.id_count).boxed()
+        .boxed()
     }
 }
 
@@ -302,6 +330,30 @@ impl SchemasSM {
     pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
         Self::new_with_recovery_flag(group, group, raft_service, Arc::new(AtomicBool::new(false)))
             .await
+    }
+}
+
+impl SchemasSM {
+    /// The next unused generation id.
+    ///
+    /// Starts from the highest id in use, because WAL replay can install
+    /// schemas with explicit ids, and then skips anything already taken.
+    fn allocate_id(&mut self) -> u32 {
+        let max_existing = self
+            .map
+            .schema_map
+            .keys()
+            .map(|vid| vid.get())
+            .max()
+            .unwrap_or(0);
+        if self.id_count < max_existing {
+            self.id_count = max_existing;
+        }
+        self.id_count += 1;
+        while self.map.schema_map.contains_key(&SchemaVid(self.id_count)) {
+            self.id_count += 1;
+        }
+        self.id_count
     }
 }
 
@@ -477,6 +529,58 @@ impl SchemasMap {
             uid, old_name, new_name, current_vid
         );
         Ok(uid)
+    }
+
+    fn current_schema_of_name(&self, name: &str) -> Option<&Schema> {
+        let uid = self.uid_of_name(name)?;
+        let handle = self.handles.get(&uid)?;
+        self.schema_map.get(&handle.current_vid)
+    }
+
+    /// Install `proposed` as the family's next generation and supersede the
+    /// current one.
+    ///
+    /// The caller's record supplies field content only. Identity is assigned
+    /// here -- family carried over, generation incremented, the name taken
+    /// from the handle rather than the request, so an evolution can never
+    /// smuggle in a rename.
+    fn install_evolution(
+        &mut self,
+        name: &str,
+        mut proposed: Schema,
+        new_vid: SchemaVid,
+    ) -> Result<(Schema, SchemaVid), EvolveSchemaError> {
+        let uid = self
+            .uid_of_name(name)
+            .ok_or(EvolveSchemaError::SchemaDoesNotExist)?;
+        let handle = self
+            .handles
+            .get_mut(&uid)
+            .ok_or(EvolveSchemaError::SchemaDoesNotExist)?;
+        let previous_vid = handle.current_vid;
+
+        proposed.uid = uid;
+        proposed.vid = new_vid;
+        proposed.generation = handle.generation + 1;
+        proposed.status = SchemaVersionStatus::Current;
+        proposed.name = handle.current_name.clone();
+
+        handle.current_vid = new_vid;
+        handle.generation = proposed.generation;
+
+        // Supersede AFTER the successor is settled: a window with no current
+        // generation would make every write to this family fail to resolve.
+        if let Some(previous) = self.schema_map.get_mut(&previous_vid) {
+            previous.status = SchemaVersionStatus::Stale {
+                superseded_by: new_vid,
+            };
+        }
+        self.schema_map.insert(new_vid, proposed.clone());
+        info!(
+            "Schema family {} ({}) evolved: generation {} at {} supersedes {}",
+            uid, proposed.name, proposed.generation, new_vid, previous_vid
+        );
+        Ok((proposed, previous_vid))
     }
 
     fn id_of_name(&self, name: &str) -> Option<SchemaVid> {
@@ -774,6 +878,144 @@ mod tests {
             "thing",
             "a superseded generation keeps the name it was created under"
         );
+    }
+
+    fn schema_with(name: &str, fields: Vec<Field>) -> Schema {
+        Schema::new_with_id(1, name, None, Field::new_schema(fields), false, false)
+    }
+
+    fn two_fields() -> Vec<Field> {
+        vec![
+            Field::new_unindexed("a", Type::U32),
+            Field::new_unindexed("b", Type::String),
+        ]
+    }
+
+    /// Drive an evolution through the map the way the command does, without
+    /// needing a RaftService for the callback.
+    fn evolve(map: &mut SchemasMap, name: &str, proposed: Schema, new_vid: u32) -> Schema {
+        let current = map.current_schema_of_name(name).unwrap().clone();
+        assert_eq!(
+            current.classify_evolution(&proposed),
+            EvolutionKind::Identity,
+            "this helper is for evolutions that need no transform"
+        );
+        map.install_evolution(name, proposed, SchemaVid(new_vid))
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn an_evolution_creates_a_generation_and_supersedes_the_previous_one() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+
+        let mut next = two_fields();
+        next.push(Field::new_unindexed_nullable("c", Type::U64));
+        let evolved = evolve(&mut map, "person", schema_with("person", next), 900);
+
+        assert_eq!(evolved.uid, SchemaUid(1), "the family is carried over");
+        assert_eq!(evolved.vid, SchemaVid(900));
+        assert_eq!(evolved.generation, 1);
+        assert_eq!(evolved.status, SchemaVersionStatus::Current);
+        assert_eq!(
+            map.schema_map.get(&SchemaVid(1)).unwrap().status,
+            SchemaVersionStatus::Stale {
+                superseded_by: SchemaVid(900)
+            }
+        );
+        assert_eq!(map.id_of_name("person"), Some(SchemaVid(900)));
+    }
+
+    /// The property that keeps the read path working: an evolution adds a
+    /// record, it never replaces one.
+    #[test]
+    fn an_evolution_leaves_the_previous_generation_in_place() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+        let before = map.schema_map.get(&SchemaVid(1)).unwrap().fields.clone();
+
+        let mut next = two_fields();
+        next.push(Field::new_unindexed_nullable("c", Type::U64));
+        evolve(&mut map, "person", schema_with("person", next), 900);
+
+        let after = map.schema_map.get(&SchemaVid(1)).unwrap();
+        assert_eq!(
+            after.fields, before,
+            "a superseded generation's layout must not change: cells still decode with it"
+        );
+    }
+
+    #[test]
+    fn evolving_twice_resolves_the_oldest_generation_to_the_newest() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+        evolve(&mut map, "person", schema_with("person", two_fields()), 900);
+        evolve(&mut map, "person", schema_with("person", two_fields()), 901);
+
+        assert_eq!(map.id_of_name("person"), Some(SchemaVid(901)));
+        assert_eq!(map.schema_map.len(), 3, "every generation is retained");
+        assert_eq!(
+            map.handles.get(&SchemaUid(1)).unwrap().generation,
+            2,
+            "generations count up"
+        );
+    }
+
+    /// An evolution takes its name from the family, not the request, so it
+    /// cannot smuggle in a rename.
+    #[test]
+    fn an_evolution_cannot_rename_the_schema() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+        let evolved = evolve(
+            &mut map,
+            "person",
+            schema_with("something_else", two_fields()),
+            900,
+        );
+        assert_eq!(evolved.name, "person");
+        assert_eq!(map.uid_of_name("something_else"), None);
+        assert_eq!(map.uid_of_name("person"), Some(SchemaUid(1)));
+    }
+
+    #[test]
+    fn an_evolution_survives_a_snapshot_round_trip() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+        evolve(&mut map, "person", schema_with("person", two_fields()), 900);
+
+        let snapshot = utils::serde::serialize(&map.get_all());
+        let mut restored = SchemasMap::new();
+        restored.load_from_list(decode_snapshot(&snapshot));
+
+        assert_eq!(restored.id_of_name("person"), Some(SchemaVid(900)));
+        assert_eq!(restored.schema_map.len(), 2);
+        assert_eq!(
+            restored.schema_map.get(&SchemaVid(1)).unwrap().status,
+            SchemaVersionStatus::Stale {
+                superseded_by: SchemaVid(900)
+            }
+        );
+    }
+
+    #[test]
+    fn evolving_an_unknown_schema_is_refused() {
+        let mut map = SchemasMap::new();
+        assert!(map.current_schema_of_name("ghost").is_none());
+    }
+
+    /// Deleting an evolved family takes every generation with it.
+    #[test]
+    fn deleting_an_evolved_family_removes_all_of_its_generations() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_with("person", two_fields())).unwrap();
+        evolve(&mut map, "person", schema_with("person", two_fields()), 900);
+        evolve(&mut map, "person", schema_with("person", two_fields()), 901);
+
+        map.del_schema("person").unwrap();
+        assert!(map.schema_map.is_empty());
+        assert!(map.handles.is_empty());
     }
 
     #[test]

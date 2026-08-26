@@ -195,25 +195,25 @@ always logical, so there is nothing to resolve.
 - Modify: `src/ram/schema/sm.rs` (`SchemasMap`, `SchemasSM`)
 - Modify: `src/ram/schema/mod.rs` (`LocalSchemasMap`, `LocalSchemasCache`)
 
-- [ ] Add `SchemaHandle { uid, current_name, current_vid, generation }`.
-- [ ] `SchemasMap` gains `handles: HashMap<SchemaUid, SchemaHandle>`, populated
+- [x] Add `SchemaHandle { uid, current_name, current_vid, generation }`.
+- [x] `SchemasMap` gains `handles: HashMap<SchemaUid, SchemaHandle>`, populated
       by `new_schema` and `load_from_list`, removed by `del_schema`.
-- [ ] `SchemasMap::name_map` maps `String -> SchemaUid`.
-- [ ] `SchemasMap::del_schema(name)` resolves name -> uid, then removes the
+- [x] `SchemasMap::name_map` maps `String -> SchemaUid`.
+- [x] `SchemasMap::del_schema(name)` resolves name -> uid, then removes the
       handle, the name binding, and **every** record in `schema_map` whose
       `uid` matches -- not just the current vid.
-- [ ] `LocalSchemasMap` gains `handles: LFHashMap<SchemaUid, SchemaVid>`.
+- [x] `LocalSchemasMap` gains `handles: LFHashMap<SchemaUid, SchemaVid>`.
       Add `uid_of_name` and `current_vid_of_uid`.
-- [ ] Confirm the local cache's name-collision guard
+- [x] Confirm the local cache's name-collision guard
       (`src/ram/schema/mod.rs:812`) is still correct now that the name binds to
       a uid. Add a test that re-delivering the same schema through the
       `on_schema_added` subscription is an idempotent upsert, as the
       subscribe-then-read comment above `new_for_database` requires.
-- [ ] Tests: two schemas get distinct uids; `del_schema` on a uid with two
+- [x] Tests: two schemas get distinct uids; `del_schema` on a uid with two
       generations removes both records (build the second by hand --
       `evolve_schema` does not exist yet).
-- [ ] `cargo fmt`, build, focused tests.
-- [ ] Commit: `feat(schema): index schema records by family as well as by generation`.
+- [x] `cargo fmt`, build, focused tests.
+- [x] Commit: `feat(schema): index schema records by family as well as by generation`.
 
 ## Task 5: Rename
 
@@ -223,24 +223,24 @@ always logical, so there is nothing to resolve.
 - Modify: `src/ram/schema/mod.rs` (subscription wiring)
 - Modify: `src/client/mod.rs`
 
-- [ ] Add `def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>`
+- [x] Add `def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>`
       and `def sub on_schema_renamed() -> (SchemaUid, String)`.
-- [ ] `RenameSchemaError`: `SchemaDoesNotExist`, `NameExists(String)`,
+- [x] `RenameSchemaError`: `SchemaDoesNotExist`, `NameExists(String)`,
       `NotifyError(NotifyError)`.
-- [ ] SM behaviour: resolve old name -> uid; refuse if the new name is bound;
+- [x] SM behaviour: resolve old name -> uid; refuse if the new name is bound;
       rebind `name_map`; update `handles[uid].current_name`. Touch no record in
       `schema_map`, no cell, no index. Suppress the callback during recovery,
       matching `new_schema`/`del_schema`.
-- [ ] Subscribe the local cache to `on_schema_renamed` **inside the existing
+- [x] Subscribe the local cache to `on_schema_renamed` **inside the existing
       subscribe-before-read block** in `new_for_database`, so it is ordered
       with the others.
-- [ ] Add `NebClient::rename_schema(old, new)`.
-- [ ] Tests: rename then look up by the new name; the old name resolves to
+- [x] Add `NebClient::rename_schema(old, new)`.
+- [x] Tests: rename then look up by the new name; the old name resolves to
       nothing; the vid is unchanged and its record reports the new name; a
       rename onto an occupied name is refused; cells written before the rename
       still read back afterwards.
-- [ ] `cargo fmt`, build, focused tests.
-- [ ] Commit: `feat(schema): rename a schema without touching a single cell`.
+- [x] `cargo fmt`, build, focused tests.
+- [x] Commit: `feat(schema): rename a schema without touching a single cell`.
 
 ## Task 6: Write resolution chokepoint
 
@@ -249,23 +249,46 @@ always logical, so there is nothing to resolve.
 - Modify: `src/ram/schema/mod.rs` (`LocalSchemasCache`)
 - Modify: `src/ram/cell.rs` (`plan_write`, `write_to_addr`)
 
-- [ ] Add `LocalSchemasCache::resolve_for_write(&self, vid: SchemaVid) -> Option<SchemaRef>`:
+- [x] Add `LocalSchemasCache::resolve_for_write(&self, vid: SchemaVid) -> Option<SchemaRef>`:
       look up the record; if `status == Current` return it; otherwise look up
       `handles[record.uid]` and return that vid's record. `None` if either
       lookup misses, so `plan_write` keeps returning
       `WriteError::SchemaDoesNotExisted`.
-- [ ] `OwnedCell::plan_write` resolves through `resolve_for_write` instead of
+- [x] `OwnedCell::plan_write` resolves through `resolve_for_write` instead of
       `chunk.meta.schemas.get`.
-- [ ] `OwnedCell::write_to_addr` writes `write_plan.schema.vid` into the header
+- [x] `OwnedCell::write_to_addr` writes `write_plan.schema.vid` into the header
       rather than `self.header.schema`, and the returned `CellHeader` reports
       the resolved vid.
-- [ ] Test: construct a stale record by hand (a `Current` schema plus a second
+- [x] Test: construct a stale record by hand (a `Current` schema plus a second
       record marked `Stale { superseded_by }` under the same uid), write a cell
       naming the stale vid, assert the persisted header names the current vid.
-- [ ] Test: a write naming `SchemaVid(uid.get())` -- the generation-0 vid --
+- [x] Test: a write naming `SchemaVid(uid.get())` -- the generation-0 vid --
       lands in the current generation once generation 0 is stale.
-- [ ] Full suite locally at `--test-threads=8`.
-- [ ] Commit: `feat(schema): every write resolves to the current generation`.
+- [x] Full suite locally at `--test-threads=8`.
+- [x] Commit: `feat(schema): every write resolves to the current generation`.
+
+## Progress note, Tasks 4-6 (2026-08-25)
+
+Two designed-in departures from the plan text, both for the same reason:
+
+- **Handles are DERIVED from the records, not stored beside them.** The plan
+  had them populated alongside; making them a projection means the snapshot
+  stays `Vec<Schema>` and a handle cannot disagree with the records after a
+  restart.
+- **Rename therefore updates one record** -- the current generation's -- rather
+  than touching none. With derived handles, a rename that updated only the
+  handle would be silently undone by the next `rebuild_handles`. It still
+  rewrites no cell, moves no index entry, and leaves every superseded
+  generation alone, which is all the properties that made rename cheap.
+
+Two invariants came out of that and are enforced in `rebuild_handles`:
+only the CURRENT generation binds a name (or a renamed family answers to its
+old name after a restart), and exactly one generation of a family is current
+(or "which layout do new writes use?" depends on hash order).
+
+`WriteToChunkResult` gained `new_schema`, synced at the eight sites that
+already sync version and timestamp, so a caller returning `cell.header` reports
+where the cell actually landed rather than where it asked to go.
 
 ## Task 7: Evolution, identity-transform tier
 

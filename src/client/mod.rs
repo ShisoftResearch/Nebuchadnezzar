@@ -18,7 +18,9 @@ use std::sync::Arc;
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
-use crate::ram::schema::{DelSchemaError, NewSchemaError, RenameSchemaError, Schema};
+use crate::ram::schema::{
+    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+};
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
 use crate::server::database::{
@@ -895,6 +897,57 @@ impl AsyncClient {
             .await
             .map(|r| r.map(|_| schema_id))
     }
+    /// Evolve a schema into a new generation.
+    ///
+    /// The proposed record supplies field content only; its identity is
+    /// assigned by the cluster, and its name is taken from the family rather
+    /// than the request, so an evolution cannot smuggle in a rename.
+    ///
+    /// Existing cells are not rewritten. They stay readable through the
+    /// generation that encoded them, and drain into the new one as they are
+    /// updated.
+    pub async fn evolve_schema(
+        &self,
+        name: String,
+        schema: Schema,
+    ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
+        if let Err(err) = schema.validate_for_registration() {
+            return Ok(Err(EvolveSchemaError::Illegal(format!("{:?}", err))));
+        }
+        let res = self.schema_client.evolve_schema(&name, &schema).await;
+        if let Ok(Ok(outcome)) = &res {
+            // Reconcile index namespaces against the generation this one
+            // supersedes, so an index both generations declare is left alone
+            // rather than recreated empty.
+            if let Some(server_id) = self.conshash.rand_server_id() {
+                match self.client_by_server_id(server_id).await {
+                    Ok(client) => {
+                        if let Err(e) = client
+                            .post_schema_evolve(outcome.previous_vid.get(), outcome.new_vid.get())
+                            .await
+                        {
+                            return Ok(Err(EvolveSchemaError::PostProcessError(format!(
+                                "Post process error: {:?}",
+                                e
+                            ))));
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(Err(EvolveSchemaError::PostProcessError(format!(
+                            "Connecting error for post process: {:?}",
+                            e
+                        ))))
+                    }
+                }
+            } else {
+                return Ok(Err(EvolveSchemaError::PostProcessError(
+                    "Cannot find server for post process".to_string(),
+                )));
+            }
+        }
+        res
+    }
+
     /// Rename a schema.
     ///
     /// Metadata only: no cell is rewritten and no index entry moves, because
