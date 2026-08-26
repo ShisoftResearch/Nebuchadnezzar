@@ -724,6 +724,7 @@ impl LocalSchemasCache {
         let map = Arc::new(LocalSchemasMap::new());
         let m1 = map.clone();
         let m2 = map.clone();
+        let m3 = map.clone();
         let sm =
             sm::client::SMClient::new(sm::generate_scoped_sm_id(group, database_name), raft_client);
         // SUBSCRIBE FIRST, THEN READ. The order is the correctness.
@@ -761,6 +762,12 @@ impl LocalSchemasCache {
         let _ = sm
             .on_schema_deleted(move |schema| {
                 m2.del_schema(&schema);
+                future::ready(()).boxed()
+            })
+            .await?;
+        let _ = sm
+            .on_schema_renamed(move |(uid, new_name)| {
+                m3.rename_schema(uid, &new_name);
                 future::ready(()).boxed()
             })
             .await?;
@@ -807,6 +814,11 @@ impl LocalSchemasCache {
     pub fn register_internal_schema(&self, schema: Schema) {
         let m = &self.map;
         m.new_schema(schema)
+    }
+    /// Apply a committed rename locally. Normally driven by the
+    /// `on_schema_renamed` subscription.
+    pub fn apply_rename(&self, uid: SchemaUid, new_name: &str) {
+        self.map.rename_schema(uid, new_name)
     }
     pub fn cache_schema_from_cluster(&self, schema: Schema) {
         let m = &self.map;
@@ -871,6 +883,13 @@ pub enum NewSchemaError {
     InvalidSchema(String),
     NotifyError(NotifyError),
     PostProcessError(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RenameSchemaError {
+    SchemaDoesNotExist,
+    NameExists(String),
+    NotifyError(NotifyError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -993,6 +1012,43 @@ impl LocalSchemasMap {
                 (&*s_ref).clone()
             })
             .collect::<Vec<_>>()
+    }
+
+    /// Apply a rename that the state machine has already committed.
+    ///
+    /// Takes the family and the new name only: the old name is whatever this
+    /// node currently has bound, which is the binding that actually needs
+    /// removing. Trusting the event's idea of the old name instead would
+    /// leave a stale binding behind on any node that had missed an earlier
+    /// rename.
+    fn rename_schema(&self, uid: SchemaUid, new_name: &str) {
+        let Some(current_vid) = self.handles.get(&uid) else {
+            debug!(
+                "Ignoring rename of unknown schema family {} to {}",
+                uid, new_name
+            );
+            return;
+        };
+        let Some(existing) = self.schema_map.get(&current_vid) else {
+            debug!(
+                "Ignoring rename of family {}: generation {} is not cached",
+                uid, current_vid
+            );
+            return;
+        };
+        let old_name = existing.name.clone();
+        if old_name == new_name {
+            return;
+        }
+        let mut renamed = (*existing).clone();
+        renamed.name = new_name.to_owned();
+        self.schema_map.insert(current_vid, Arc::new(renamed));
+        self.name_map.remove(&old_name);
+        self.name_map.insert(new_name.to_owned(), uid);
+        info!(
+            "Local schema family {} renamed {} -> {}",
+            uid, old_name, new_name
+        );
     }
 
     fn del_schema(&self, name: &str) {
@@ -1272,6 +1328,92 @@ mod tests {
             cache.current_vid_of_uid(&SchemaUid(1)),
             Some(SchemaVid(900))
         );
+    }
+
+    #[test]
+    fn a_local_rename_rebinds_the_name_and_keeps_the_generation() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.cache_schema_from_cluster(cache_test_schema(1, "old"));
+
+        cache.apply_rename(SchemaUid(1), "new");
+
+        assert_eq!(cache.uid_of_name("new"), Some(SchemaUid(1)));
+        assert_eq!(cache.uid_of_name("old"), None);
+        assert_eq!(cache.name_to_id("new"), Some(SchemaVid(1)));
+        assert_eq!(
+            cache.get(&SchemaVid(1)).unwrap().name,
+            "new",
+            "the cached record must report the new name"
+        );
+    }
+
+    /// A node that missed an earlier rename still has the right binding
+    /// removed, because the handler uses its OWN idea of the current name
+    /// rather than trusting one carried in the event.
+    #[test]
+    fn a_local_rename_removes_whatever_binding_this_node_actually_had() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.cache_schema_from_cluster(cache_test_schema(1, "first"));
+        cache.apply_rename(SchemaUid(1), "second");
+        cache.apply_rename(SchemaUid(1), "third");
+
+        assert_eq!(cache.uid_of_name("third"), Some(SchemaUid(1)));
+        assert_eq!(cache.uid_of_name("second"), None);
+        assert_eq!(cache.uid_of_name("first"), None);
+        assert_eq!(cache.count(), 1, "renaming must not multiply records");
+    }
+
+    #[test]
+    fn renaming_an_unknown_family_locally_is_ignored() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.apply_rename(SchemaUid(404), "ghost");
+        assert_eq!(cache.uid_of_name("ghost"), None);
+        assert_eq!(cache.count(), 0);
+    }
+
+    /// The point of the whole exercise: a cell written before a rename is
+    /// still readable after it. Nothing about a cell has ever mentioned a
+    /// schema NAME -- its header names a generation -- so a rename cannot
+    /// reach it.
+    #[test]
+    fn cells_written_before_a_rename_still_read_afterwards() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let schema = Schema::new_with_id(
+            1,
+            "before",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(schema.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("v", OwnedValue::U32(7));
+        let mut cell =
+            OwnedCell::new_with_id(schema.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+
+        meta.schemas.apply_rename(SchemaUid(1), "after");
+        assert_eq!(meta.schemas.uid_of_name("after"), Some(SchemaUid(1)));
+        assert_eq!(
+            meta.schemas.uid_of_name("before"),
+            None,
+            "the old name must stop resolving"
+        );
+
+        let read = chunks.read_cell(&id).expect("a cell must survive a rename");
+        assert_eq!(read.data["v"].u32(), Some(&7));
     }
 
     fn post_schema_hook_server_options() -> ServerOptions {

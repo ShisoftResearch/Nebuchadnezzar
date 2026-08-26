@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
-use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
+use crate::ram::schema::{DelSchemaError, NewSchemaError, RenameSchemaError, Schema};
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
 use crate::server::database::{
@@ -895,6 +895,19 @@ impl AsyncClient {
             .await
             .map(|r| r.map(|_| schema_id))
     }
+    /// Rename a schema.
+    ///
+    /// Metadata only: no cell is rewritten and no index entry moves, because
+    /// neither has ever been keyed by the name -- cells name a generation and
+    /// index entries name a family, and a rename changes neither.
+    pub async fn rename_schema(
+        &self,
+        old_name: String,
+        new_name: String,
+    ) -> Result<Result<(), RenameSchemaError>, ExecError> {
+        self.schema_client.rename_schema(&old_name, &new_name).await
+    }
+
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         let schema = self.schema_client.get_by_name(&name).await?;
         let has_index_fields;

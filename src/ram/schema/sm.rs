@@ -63,9 +63,11 @@ raft_state_machine! {
     def qry id_of_name(name: String) -> Option<u32>;
     def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
+    def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
+    def sub on_schema_renamed() -> (SchemaUid, String);
 }
 
 impl StateMachineCmds for SchemasSM {
@@ -126,6 +128,30 @@ impl StateMachineCmds for SchemasSM {
                 trace!(
                     "Skipping on_schema_deleted callback during recovery for schema: {}",
                     name
+                );
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn rename_schema(
+        &mut self,
+        old_name: String,
+        new_name: String,
+    ) -> BoxFuture<'_, Result<(), RenameSchemaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
+        async move {
+            let uid = self.map.rename_schema(&old_name, &new_name)?;
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_renamed::new(), (uid, new_name.clone()))
+                    .await
+                    .map_err(|e| RenameSchemaError::NotifyError(e))?;
+            } else {
+                trace!(
+                    "Skipping on_schema_renamed callback during recovery for {} -> {}",
+                    old_name,
+                    new_name
                 );
             }
             Ok(())
@@ -409,6 +435,50 @@ impl SchemasMap {
         }
     }
 
+    /// Rebind a family to a new name.
+    ///
+    /// Renames the CURRENT generation's record as well as the handle and the
+    /// name map. That is a deliberate departure from "rename touches no
+    /// record": handles are derived from records (see [`SchemaHandle`]), so a
+    /// rename that left the record alone would be undone by the next restart,
+    /// when `rebuild_handles` recomputed `current_name` from the stale record.
+    ///
+    /// It still touches no cell, no index, and no superseded generation --
+    /// which is what makes rename cheap. Superseded records keep the name they
+    /// were created under, and those names do not resolve.
+    fn rename_schema(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<SchemaUid, RenameSchemaError> {
+        let Some(uid) = self.uid_of_name(old_name) else {
+            return Err(RenameSchemaError::SchemaDoesNotExist);
+        };
+        if old_name == new_name {
+            return Ok(uid);
+        }
+        if self.name_map.contains_key(new_name) {
+            return Err(RenameSchemaError::NameExists(new_name.to_owned()));
+        }
+        let Some(handle) = self.handles.get_mut(&uid) else {
+            // A name bound to a family with no current generation. The rebuild
+            // reports this, and there is nothing coherent to rename.
+            return Err(RenameSchemaError::SchemaDoesNotExist);
+        };
+        let current_vid = handle.current_vid;
+        handle.current_name = new_name.to_owned();
+        if let Some(record) = self.schema_map.get_mut(&current_vid) {
+            record.name = new_name.to_owned();
+        }
+        self.name_map.remove(old_name);
+        self.name_map.insert(new_name.to_owned(), uid);
+        info!(
+            "Schema family {} renamed {} -> {} (generation {} untouched)",
+            uid, old_name, new_name, current_vid
+        );
+        Ok(uid)
+    }
+
     fn id_of_name(&self, name: &str) -> Option<SchemaVid> {
         self.uid_of_name(name)
             .and_then(|uid| self.handles.get(&uid))
@@ -602,6 +672,107 @@ mod tests {
         assert!(
             map.new_schema(clash).is_err(),
             "two schemas sharing a family would share an index namespace and a keyed-cell id space"
+        );
+    }
+
+    #[test]
+    fn a_rename_rebinds_the_name_and_leaves_the_generation_alone() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "old")).unwrap();
+
+        map.rename_schema("old", "new").unwrap();
+
+        assert_eq!(map.uid_of_name("new"), Some(SchemaUid(1)));
+        assert_eq!(
+            map.uid_of_name("old"),
+            None,
+            "the old name must stop resolving"
+        );
+        assert_eq!(
+            map.id_of_name("new"),
+            Some(SchemaVid(1)),
+            "the generation is unchanged: no cell was rewritten"
+        );
+        assert_eq!(
+            map.schema_map.get(&SchemaVid(1)).unwrap().name,
+            "new",
+            "the current record carries the new name, or a restart would undo the rename"
+        );
+    }
+
+    /// A rename must survive a restart. It would not if the rename updated
+    /// only the handle, because handles are rebuilt from the records.
+    #[test]
+    fn a_rename_survives_a_snapshot_round_trip() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "old")).unwrap();
+        map.rename_schema("old", "new").unwrap();
+
+        let snapshot = utils::serde::serialize(&map.get_all());
+        let mut restored = SchemasMap::new();
+        restored.load_from_list(decode_snapshot(&snapshot));
+
+        assert_eq!(restored.uid_of_name("new"), Some(SchemaUid(1)));
+        assert_eq!(restored.uid_of_name("old"), None);
+    }
+
+    #[test]
+    fn a_rename_onto_an_occupied_name_is_refused() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "a")).unwrap();
+        map.new_schema(schema_named(2, "b")).unwrap();
+
+        assert!(matches!(
+            map.rename_schema("a", "b"),
+            Err(RenameSchemaError::NameExists(_))
+        ));
+        assert_eq!(
+            map.uid_of_name("a"),
+            Some(SchemaUid(1)),
+            "the refusal changes nothing"
+        );
+        assert_eq!(map.uid_of_name("b"), Some(SchemaUid(2)));
+    }
+
+    #[test]
+    fn renaming_an_unknown_schema_is_refused() {
+        let mut map = SchemasMap::new();
+        assert!(matches!(
+            map.rename_schema("ghost", "whatever"),
+            Err(RenameSchemaError::SchemaDoesNotExist)
+        ));
+    }
+
+    #[test]
+    fn renaming_a_schema_to_its_own_name_is_a_no_op() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "same")).unwrap();
+        assert!(map.rename_schema("same", "same").is_ok());
+        assert_eq!(map.uid_of_name("same"), Some(SchemaUid(1)));
+    }
+
+    /// Renaming a family that has already been evolved must rebind the name
+    /// without disturbing the superseded generation that cells still name.
+    #[test]
+    fn a_rename_after_an_evolution_leaves_the_superseded_generation_readable() {
+        let mut map = SchemasMap::new();
+        let mut gen0 = schema_named(1, "thing");
+        let gen1 = superseded_by(&mut gen0, 900);
+        map.schema_map.insert(gen0.vid, gen0);
+        map.schema_map.insert(gen1.vid, gen1);
+        map.rebuild_handles();
+
+        map.rename_schema("thing", "renamed").unwrap();
+
+        assert_eq!(map.id_of_name("renamed"), Some(SchemaVid(900)));
+        assert!(
+            map.schema_map.contains_key(&SchemaVid(1)),
+            "cells written under generation 0 must still decode after a rename"
+        );
+        assert_eq!(
+            map.schema_map.get(&SchemaVid(1)).unwrap().name,
+            "thing",
+            "a superseded generation keeps the name it was created under"
         );
     }
 
