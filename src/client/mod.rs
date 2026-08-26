@@ -973,9 +973,42 @@ impl AsyncClient {
         name: &str,
         edit: SchemaEdit,
     ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
+        self.evolve_schema_if(name, edit, None).await
+    }
+
+    /// Evolve, refusing if the family has moved on from `expected_base`.
+    ///
+    /// The caller supplies the generation its edit was reasoned against -- one
+    /// it read earlier, perhaps in a different request -- and the state machine
+    /// refuses if that is no longer current. This is the whole point of taking
+    /// it as a parameter rather than reading it here: an edit applied to a base
+    /// the caller never saw can quietly undo whatever moved in between, and a
+    /// precondition computed inside this function would only ever describe a
+    /// window this function controls.
+    ///
+    /// `None` keeps the simple behaviour: read the current generation, apply,
+    /// and use what was read as the precondition. Still safe -- it just closes
+    /// a shorter window.
+    pub async fn evolve_schema_if(
+        &self,
+        name: &str,
+        edit: SchemaEdit,
+        expected_base: Option<SchemaVid>,
+    ) -> Result<Result<EvolutionOutcome, EvolveSchemaError>, ExecError> {
         let Some(base) = self.schema_by_name(&name.to_owned()).await? else {
             return Ok(Err(EvolveSchemaError::SchemaDoesNotExist));
         };
+        // Checked here as well as in the state machine so a caller learns its
+        // base is stale before the edit is even applied -- `apply` against the
+        // wrong base can fail for reasons that would only confuse.
+        if let Some(expected) = expected_base {
+            if base.vid != expected {
+                return Ok(Err(EvolveSchemaError::StaleBase {
+                    expected,
+                    actual: base.vid,
+                }));
+            }
+        }
         let evolved = match edit.apply(&base) {
             Ok(schema) => schema,
             Err(e) => return Ok(Err(EvolveSchemaError::BadEdit(format!("{:?}", e)))),
@@ -1034,7 +1067,32 @@ impl AsyncClient {
         // Need to do the post processing before deleting the schema from the schema client
         return self.schema_client.del_schema(&name).await;
     }
+    /// Every schema, one row per FAMILY.
+    ///
+    /// The state machine stores one record per GENERATION, because a stale
+    /// generation is still needed to decode the cells that were written under
+    /// it. That is the right thing for a snapshot and the wrong thing for a
+    /// listing: without this filter, one family appears N times after N
+    /// evolutions, in every list route, in search, and in anything that walks
+    /// "all schemas" to do something once per schema.
+    ///
+    /// Use [`Self::get_all_schema_generations`] where every generation is
+    /// genuinely wanted.
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
+        Ok(self
+            .schema_client
+            .get_all()
+            .await?
+            .into_iter()
+            .filter(|schema| schema.status.is_current())
+            .collect())
+    }
+
+    /// Every schema GENERATION, stale ones included.
+    ///
+    /// For callers that must see superseded layouts -- diagnostics, migration
+    /// tooling, anything decoding cells written before an evolution.
+    pub async fn get_all_schema_generations(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await
     }
 

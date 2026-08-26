@@ -1208,6 +1208,13 @@ impl LocalSchemasCache {
         self.map.uid_of_name(name)
     }
 
+    /// The family a generation belongs to. A cell header carries a vid; anything
+    /// that means "which schema is this?" -- graph type, index namespace, a
+    /// durable reference -- wants the family this returns, not the generation.
+    pub fn uid_of_vid(&self, vid: &SchemaVid) -> Option<SchemaUid> {
+        self.map.uid_of_vid(vid)
+    }
+
     /// The generation a family currently writes into.
     pub fn current_vid_of_uid(&self, uid: &SchemaUid) -> Option<SchemaVid> {
         self.map.current_vid_of_uid(uid)
@@ -1217,8 +1224,22 @@ impl LocalSchemasCache {
         debug!("Counted schema length {}", len);
         len
     }
+    /// Every GENERATION this node knows, stale ones included.
+    ///
+    /// A stale generation is still needed to decode cells written under it, so
+    /// this must not filter. Anything presenting a LIST to a caller wants one
+    /// row per family instead -- see [`Self::get_all_current`].
     pub fn get_all(&self) -> Vec<Schema> {
         self.map.get_all()
+    }
+
+    /// One row per FAMILY: the generation each family currently writes into.
+    pub fn get_all_current(&self) -> Vec<Schema> {
+        self.map
+            .get_all()
+            .into_iter()
+            .filter(|schema| schema.status.is_current())
+            .collect()
     }
     pub fn fields_size(&self, schema_id: &SchemaVid, fields: &[u64]) -> Option<usize> {
         const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
@@ -1320,6 +1341,19 @@ pub enum EditError {
     FieldExists(String),
     /// Only top-level fields can be edited this way.
     NotATopLevelField(String),
+    /// The edit sets a default whose type the field cannot hold.
+    ///
+    /// A default is the one value the write path takes on trust: unlike a
+    /// supplied value it is NOT passed through `coerce_value`, so whatever is
+    /// admitted here reaches the encoder as-is and is sized by the field's
+    /// DECLARED type. `get_vsize` panics on that mismatch, so admitting a
+    /// mistyped default arms a writer panic that fires later, on some
+    /// unrelated write that happens to leave the field null.
+    DefaultTypeMismatch {
+        field: String,
+        expected: Type,
+        got: Type,
+    },
 }
 
 impl SchemaEdit {
@@ -1467,7 +1501,14 @@ impl SchemaEdit {
                     if position(&fields, &field.name).is_some() {
                         return Err(EditError::FieldExists(field.name.clone()));
                     }
-                    fields.push(field.clone());
+                    // A field arrives carrying its own default, so this is the
+                    // other door onto the same hazard as SetDefault.
+                    let mut field = field.clone();
+                    if let Some(default) = &field.default {
+                        field.default =
+                            Some(admissible_default(&field.name, default, field.data_type)?);
+                    }
+                    fields.push(field);
                 }
                 EditOp::DropField(name) => {
                     let Some(at) = position(&fields, name) else {
@@ -1508,7 +1549,8 @@ impl SchemaEdit {
                     let Some(at) = position(&fields, name) else {
                         return Err(EditError::NoSuchField(name.clone()));
                     };
-                    fields[at].default = Some(default.clone());
+                    let want = fields[at].data_type;
+                    fields[at].default = Some(admissible_default(name, default, want)?);
                 }
                 EditOp::SetNullable { name, nullable } => {
                     let Some(at) = position(&fields, name) else {
@@ -1589,6 +1631,36 @@ impl SchemaEdit {
 /// Float targets are limited by mantissa width, not by byte size: `f32` holds
 /// integers exactly only to 2^24, so `u32`/`i32` widen to `f64` but not to
 /// `f32`. Getting that backwards would silently round large ids.
+/// The form of `default` that `want` can actually hold, or an error.
+///
+/// A default is the one value the write path takes on trust: unlike a supplied
+/// value it is NOT run through `coerce_value` at write time
+/// (`ram/io/writer.rs`), so whatever is admitted reaches the encoder as-is and
+/// is sized by the field's DECLARED type. `get_vsize` panics on that mismatch.
+/// Admitting a mistyped default therefore arms a writer panic that fires later,
+/// on some unrelated write that happens to leave the field null -- which is
+/// exactly the class of thing refuse-at-admission exists to stop.
+///
+/// Widening is accepted and stored ALREADY COERCED, so the encoder is handed a
+/// value of the declared type no matter which form the caller supplied.
+fn admissible_default(
+    field: &str,
+    default: &OwnedValue,
+    want: Type,
+) -> Result<OwnedValue, EditError> {
+    if default.base_type() == want {
+        return Ok(default.clone());
+    }
+    if let Some(widened) = coerce_value(default, want) {
+        return Ok(widened);
+    }
+    Err(EditError::DefaultTypeMismatch {
+        field: field.to_owned(),
+        expected: want,
+        got: default.base_type(),
+    })
+}
+
 pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
     use OwnedValue::*;
     if value.base_type() == target {
@@ -1744,6 +1816,13 @@ impl LocalSchemasMap {
 
     pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
         self.name_map.get(&name.to_string())
+    }
+
+    /// The family a generation belongs to. Read straight off the record: a vid
+    /// names one layout, and that layout knows its own family. Never chase
+    /// `superseded_by` to get here -- resolution is one hop by construction.
+    pub fn uid_of_vid(&self, vid: &SchemaVid) -> Option<SchemaUid> {
+        self.schema_map.get(vid).map(|s| s.uid)
     }
 
     /// The generation a family currently writes into, if this node has heard
@@ -2409,6 +2488,27 @@ mod tests {
 
     /// A blobs change was expressible through the whole-shape form and became
     /// unreachable when that went private. This is the op that closes it.
+    /// A caller reasoning against a generation that has since moved on must be
+    /// told, not rebased onto whatever became current -- an edit applied to a
+    /// base the caller never saw can quietly undo what moved in between.
+    #[test]
+    fn a_stale_base_is_detectable_before_the_edit_is_applied() {
+        let base = edit_base();
+        // The check `evolve_schema_if` performs, in the form the client sees.
+        let stale = SchemaVid(7);
+        assert_ne!(base.vid, stale);
+        assert!(
+            matches!(
+                EvolveSchemaError::StaleBase {
+                    expected: stale,
+                    actual: base.vid,
+                },
+                EvolveSchemaError::StaleBase { .. }
+            ),
+            "the error must carry both vids so a caller can refetch and reapply"
+        );
+    }
+
     #[test]
     fn an_edit_can_change_the_blobs_flag() {
         let base = edit_base();
@@ -3168,6 +3268,155 @@ mod tests {
             superseded_by: gen1.vid,
         };
         (gen0, gen1)
+    }
+
+    fn schema_with_u32_count() -> Schema {
+        let mut base = cache_test_schema(1, "person");
+        base.fields = Field::new_schema(vec![Field::new_unindexed_nullable("count", Type::U32)]);
+        base
+    }
+
+    #[test]
+    fn a_mistyped_default_is_refused_at_admission() {
+        // Not a taste question: a default is NOT coerced at write time, so an
+        // admitted String on a U32 field reaches get_vsize, which panics. The
+        // refusal has to happen here or it happens in the writer, later, on an
+        // unrelated write.
+        let err = SchemaEdit::new()
+            .set_default("count", OwnedValue::String("banana".to_owned()))
+            .apply(&schema_with_u32_count())
+            .expect_err("a String default on a U32 field must be refused");
+
+        match err {
+            EditError::DefaultTypeMismatch {
+                field,
+                expected,
+                got,
+            } => {
+                assert_eq!(field, "count");
+                assert_eq!(expected, Type::U32);
+                assert_eq!(got, Type::String);
+            }
+            other => panic!("expected DefaultTypeMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_widening_default_is_admitted_already_coerced() {
+        // U8 widens into U32, so the edit is allowed -- but what gets STORED
+        // must be the U32 form. Storing the U8 as given would leave the same
+        // panic armed for a field declared U32.
+        let evolved = SchemaEdit::new()
+            .set_default("count", OwnedValue::U8(7))
+            .apply(&schema_with_u32_count())
+            .expect("a U8 default widens into a U32 field");
+
+        let field = evolved
+            .fields
+            .sub_fields
+            .as_ref()
+            .and_then(|f| f.iter().find(|f| f.name == "count"))
+            .expect("count survives the edit");
+        assert_eq!(
+            field.default,
+            Some(OwnedValue::U32(7)),
+            "the stored default must be the declared type, not the supplied one"
+        );
+    }
+
+    #[test]
+    fn an_added_field_cannot_smuggle_a_mistyped_default() {
+        // The other door onto the same hazard: a Field arrives carrying its
+        // own default, so add() has to police it exactly as set_default does.
+        let err = SchemaEdit::new()
+            .add(
+                Field::new_unindexed_nullable("rank", Type::U64)
+                    .with_default(OwnedValue::String("high".to_owned())),
+            )
+            .apply(&schema_with_u32_count())
+            .expect_err("a String default on a U64 field must be refused");
+        assert!(
+            matches!(err, EditError::DefaultTypeMismatch { .. }),
+            "got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_listing_shows_one_row_per_family_not_one_per_generation() {
+        // The state machine keeps one record per generation because a stale
+        // layout still has to decode its own cells. A listing must not inherit
+        // that: without the filter one family appears once per evolution, in
+        // every list route, in search, and in anything that walks "all
+        // schemas" to act once per schema.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(1, "person", 900);
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        assert_eq!(
+            cache.get_all().len(),
+            2,
+            "both generations stay reachable for decoding"
+        );
+
+        let listed = cache.get_all_current();
+        assert_eq!(listed.len(), 1, "the family lists once");
+        assert_eq!(listed[0].vid, SchemaVid(900), "and it is the current one");
+    }
+
+    #[test]
+    fn every_generation_of_a_family_resolves_back_to_that_family() {
+        // The first hop of the resolution rule. A cell header carries a vid;
+        // anything that means "which schema is this?" -- graph type, index
+        // namespace, a durable reference -- has to get from that vid to the
+        // family, and must land on the SAME family for both generations.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(1, "person", 900);
+        let (uid, old_vid, new_vid) = (gen0.uid, gen0.vid, gen1.vid);
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        assert_eq!(
+            cache.uid_of_vid(&old_vid),
+            Some(uid),
+            "a superseded generation still belongs to its family"
+        );
+        assert_eq!(
+            cache.uid_of_vid(&new_vid),
+            Some(uid),
+            "the current generation belongs to the same family"
+        );
+    }
+
+    #[test]
+    fn an_unknown_generation_has_no_family() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.cache_schema_from_cluster(cache_test_schema(1, "person"));
+        assert_eq!(cache.uid_of_vid(&SchemaVid(4242)), None);
+    }
+
+    #[test]
+    fn a_family_is_not_reachable_by_reading_its_uid_as_a_generation() {
+        // uid and vid are drawn from one counter, so a family id is never also
+        // some other schema's live generation. Evolving moves the family onto a
+        // new vid and leaves the old number naming only the old layout -- the
+        // uid itself is not a generation you can look up once they diverge.
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(7, "person", 901);
+        let uid = gen0.uid;
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        let current = cache
+            .current_vid_of_uid(&uid)
+            .expect("the family has a current generation");
+        assert_ne!(
+            current,
+            SchemaVid(uid.get()),
+            "after an evolution the family no longer writes into the vid that \
+             happens to share its number"
+        );
     }
 
     #[test]

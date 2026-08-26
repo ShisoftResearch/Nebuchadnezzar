@@ -164,3 +164,47 @@ half does have a test
 (`a_silent_peer_holds_the_transaction_open_but_not_forever`).
 
 Worth a test if someone touches that path.
+
+---
+
+## 7. `tests/storage_lock_process` has been dead since 2026-04-08
+
+**Status: broken, cause known, not fixed.** `tests/storage_lock_process.rs`
+and `src/bin/neb_storage_lock_probe.rs`.
+
+Both tests in this binary fail, and have since 2026-04-08. Confirmed still
+failing on `.239` on 2026-08-26.
+
+**The defect.** The test spawns the probe with EIGHT arguments
+(`tests/storage_lock_process.rs:48-56`):
+
+```
+server_addr, group, database, backup, wal, undo, raft, HOLD_SECS
+```
+
+The probe parses SEVEN (`src/bin/neb_storage_lock_probe.rs:21-39`):
+
+```
+server_addr, group_name, database_name, backup_storage, wal_storage,
+raft_storage, hold_secs
+```
+
+There is no `undo` parameter on the probe side. So the probe reads
+`paths.undo` as its `raft_storage`, then reads `paths.raft` -- a path -- where
+`hold_secs` expects an integer, and exits before signalling ready. Both tests
+then fail at `wait_ready()`, at
+`storage_lock_process.rs:134:44` and `:171:44`.
+
+**Why it stayed invisible for four months.** It is an integration binary.
+`cargo test --lib` -- the gate this project actually runs -- never builds or
+runs `tests/`, so a green lib suite says nothing about it. It is only visible
+to `cargo test` with no target filter, or `--test storage_lock_process`.
+
+**What would close it.** Decide which side is right. Either add an `undo`
+parameter to the probe in the correct position, or drop `.arg(&paths.undo)`
+from the spawn. The probe's own storage setup will say which one the storage
+lock actually needs; do not guess from the argument names.
+
+**Worth knowing generally:** whatever gate this project runs should include
+the integration binaries, or the next one to rot will also take months to
+notice.
