@@ -691,8 +691,13 @@ impl SchemaCompressionPlan {
 }
 
 pub struct LocalSchemasMap {
+    /// Every generation this node knows about, by its own vid. Reads resolve
+    /// here, with the vid out of the cell header.
     schema_map: LFHashMap<SchemaVid, SchemaRef>,
-    name_map: LFHashMap<String, SchemaVid>,
+    /// Name -> family. Only the current generation's name is bound.
+    name_map: LFHashMap<String, SchemaUid>,
+    /// Family -> the generation new writes belong in.
+    handles: LFHashMap<SchemaUid, SchemaVid>,
 }
 
 pub struct LocalSchemasCache {
@@ -807,9 +812,21 @@ impl LocalSchemasCache {
         let m = &self.map;
         m.new_schema(schema)
     }
+    /// The generation a name currently writes into.
     pub fn name_to_id(&self, name: &str) -> Option<SchemaVid> {
         let m = &self.map;
         m.name_to_id(name)
+    }
+
+    /// The family a name belongs to. This is what a durable reference should
+    /// keep: it survives both rename and evolution.
+    pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
+        self.map.uid_of_name(name)
+    }
+
+    /// The generation a family currently writes into.
+    pub fn current_vid_of_uid(&self, uid: &SchemaUid) -> Option<SchemaVid> {
+        self.map.current_vid_of_uid(uid)
     }
     pub fn count(&self) -> usize {
         let len = self.map.schema_map.len();
@@ -866,7 +883,10 @@ pub enum DelSchemaError {
 impl LocalSchemasMap {
     /// Resident bytes of the two schema lookup maps.
     pub fn resident_bytes(&self) -> usize {
-        (self.schema_map.resident_pages() + self.name_map.resident_pages()) * 4096
+        (self.schema_map.resident_pages()
+            + self.name_map.resident_pages()
+            + self.handles.resident_pages())
+            * 4096
     }
 
     pub fn new() -> Self {
@@ -874,14 +894,26 @@ impl LocalSchemasMap {
         Self {
             schema_map: LFHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
+            handles: LFHashMap::with_capacity(32),
         }
     }
 
+    /// The generation a name currently writes into.
     pub fn get_by_name(&self, name: &str) -> Option<SchemaRef> {
         if let Some(id) = self.name_to_id(name) {
             return self.get(&id);
         }
         return None;
+    }
+
+    pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
+        self.name_map.get(&name.to_string())
+    }
+
+    /// The generation a family currently writes into, if this node has heard
+    /// of the family at all.
+    pub fn current_vid_of_uid(&self, uid: &SchemaUid) -> Option<SchemaVid> {
+        self.handles.get(uid)
     }
 
     pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
@@ -894,33 +926,56 @@ impl LocalSchemasMap {
         return res;
     }
 
+    /// Resolve a name to the generation new writes belong in: name -> family
+    /// -> current generation. Two hops, because a name outlives any one
+    /// layout.
     pub fn name_to_id(&self, name: &str) -> Option<SchemaVid> {
-        self.name_map.get(&name.to_string())
+        self.uid_of_name(name)
+            .and_then(|uid| self.current_vid_of_uid(&uid))
     }
 
     fn new_schema(&self, mut schema: Schema) {
         let name = schema.name.clone();
         let vid = schema.vid;
+        let uid = schema.uid;
+        let is_current = schema.status.is_current();
         schema.refresh_compression_plan();
 
-        // Check if schema already exists (could happen during subscription race)
-        if let Some(existing_vid) = self.name_map.get(&name) {
-            if existing_vid != vid {
+        // The same schema legitimately arrives twice: `new_for_database`
+        // subscribes before it reads, so anything created around that point
+        // shows up in the `get_all` answer AND as an event. That overlap must
+        // be an idempotent upsert.
+        //
+        // The guard compares FAMILIES now, not generations. A name binds to a
+        // family for as long as the family lives, so a second generation of an
+        // already-known schema is a redelivery to accept, not a collision --
+        // whereas two different families claiming one name is still a real
+        // conflict and still refused.
+        if let Some(existing_uid) = self.name_map.get(&name) {
+            if existing_uid != uid {
                 error!(
-                    "Schema name collision: name '{}' already mapped to ID {} but new schema has ID {}",
-                    name, existing_vid, vid
+                    "Schema name collision: name '{}' already belongs to family {}                      but an incoming schema claims it for family {}; keeping the existing binding",
+                    name, existing_uid, uid
                 );
-                // Don't overwrite - keep the existing mapping
                 return;
-            } else {
-                // Same ID, just update the schema (may have been modified)
-                debug!("Updating existing schema {} ({})", vid, name);
             }
+            debug!("Updating known schema family {} ({}) at {}", uid, name, vid);
         }
 
-        self.name_map.insert(name.clone(), vid);
+        // A superseded generation is still installed -- cells written under it
+        // must stay readable -- but it must not claim the name or become what
+        // new writes resolve to.
         self.schema_map.insert(vid, Arc::new(schema));
-        info!("Added schema to local cache: {} ({})", vid, name);
+        if is_current {
+            self.name_map.insert(name.clone(), uid);
+            self.handles.insert(uid, vid);
+            info!("Added schema to local cache: {} ({}) at {}", uid, name, vid);
+        } else {
+            debug!(
+                "Cached superseded schema generation {} of family {} ({}), readable but not writable",
+                vid, uid, name
+            );
+        }
     }
 
     fn get_all(&self) -> Vec<Schema> {
@@ -941,10 +996,27 @@ impl LocalSchemasMap {
     }
 
     fn del_schema(&self, name: &str) {
-        if let Some(vid) = self.name_map.remove(&(name.to_owned())) {
-            self.schema_map.remove(&vid);
-            debug!("Deleted local schema {} with vid {}", name, vid);
+        let Some(uid) = self.name_map.remove(&(name.to_owned())) else {
+            return;
+        };
+        self.handles.remove(&uid);
+        // Every generation of the family, matching the state machine.
+        let doomed: Vec<SchemaVid> = self
+            .schema_map
+            .entries()
+            .into_iter()
+            .filter(|(_, schema)| schema.uid == uid)
+            .map(|(vid, _)| vid)
+            .collect();
+        for vid in &doomed {
+            self.schema_map.remove(vid);
         }
+        debug!(
+            "Deleted local schema family {} ({}), {} generation(s)",
+            uid,
+            name,
+            doomed.len()
+        );
     }
 }
 
@@ -1125,6 +1197,82 @@ mod tests {
     use dovahkiin::types::Type;
     use futures::{future::BoxFuture, FutureExt};
     use std::sync::{Arc, Mutex};
+
+    fn cache_test_schema(id: u32, name: &str) -> Schema {
+        Schema::new_with_id(
+            id,
+            name,
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        )
+    }
+
+    /// `new_for_database` subscribes BEFORE it reads, so a schema created
+    /// around that moment arrives twice -- once in the `get_all` answer and
+    /// once as an `on_schema_added` event. That overlap has to be a harmless
+    /// upsert, because the alternative (read first) loses schemas forever on a
+    /// joining member.
+    #[test]
+    fn redelivering_a_schema_is_an_idempotent_upsert() {
+        let cache = LocalSchemasCache::new_local("");
+        let schema = cache_test_schema(1, "person");
+
+        cache.cache_schema_from_cluster(schema.clone());
+        cache.cache_schema_from_cluster(schema.clone());
+
+        assert_eq!(cache.count(), 1);
+        assert_eq!(cache.uid_of_name("person"), Some(SchemaUid(1)));
+        assert_eq!(cache.name_to_id("person"), Some(SchemaVid(1)));
+    }
+
+    /// Two different families claiming one name is a real conflict, and the
+    /// binding that is already installed wins.
+    #[test]
+    fn a_name_claimed_by_a_second_family_is_refused() {
+        let cache = LocalSchemasCache::new_local("");
+        cache.cache_schema_from_cluster(cache_test_schema(1, "person"));
+        cache.cache_schema_from_cluster(cache_test_schema(2, "person"));
+
+        assert_eq!(
+            cache.uid_of_name("person"),
+            Some(SchemaUid(1)),
+            "the established binding must survive a colliding one"
+        );
+    }
+
+    /// A superseded generation still has to be cached -- cells written under
+    /// it name it, and a read decodes with the exact vid in the header -- but
+    /// it must not be what a write by name resolves to.
+    #[test]
+    fn a_superseded_generation_is_readable_but_not_writable() {
+        let cache = LocalSchemasCache::new_local("");
+        let mut gen0 = cache_test_schema(1, "person");
+        let mut gen1 = gen0.clone();
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+        gen0.status = SchemaVersionStatus::Stale {
+            superseded_by: gen1.vid,
+        };
+
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        assert!(
+            cache.get(&SchemaVid(1)).is_some(),
+            "a cell written under generation 0 must still decode"
+        );
+        assert_eq!(
+            cache.name_to_id("person"),
+            Some(SchemaVid(900)),
+            "a write by name belongs in the current generation"
+        );
+        assert_eq!(
+            cache.current_vid_of_uid(&SchemaUid(1)),
+            Some(SchemaVid(900))
+        );
+    }
 
     fn post_schema_hook_server_options() -> ServerOptions {
         ServerOptions {
