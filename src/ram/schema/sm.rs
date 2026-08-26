@@ -565,6 +565,21 @@ impl SchemasMap {
         proposed.status = SchemaVersionStatus::Current;
         proposed.name = handle.current_name.clone();
 
+        // Drops accumulate across the family. Migration takes ONE hop --
+        // generation 0 straight to generation 3 -- so a generation that only
+        // knew its own drops would resurrect everything the generations before
+        // it removed.
+        let inherited: Vec<u64> = self
+            .schema_map
+            .get(&previous_vid)
+            .map(|previous| previous.transform.dynamic_drops.clone())
+            .unwrap_or_default();
+        for id in inherited {
+            if !proposed.transform.dynamic_drops.contains(&id) {
+                proposed.transform.dynamic_drops.push(id);
+            }
+        }
+
         handle.current_vid = new_vid;
         handle.generation = proposed.generation;
 

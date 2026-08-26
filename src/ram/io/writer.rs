@@ -294,14 +294,18 @@ pub fn plan_write_dynamic_fields<'a>(
     field: &Field,
     value: &'a OwnedValue,
     ins: &mut WriteInstructions<'a>,
+    dropped: &[u64],
 ) -> Result<(), WriteError> {
     *offset = align_ptr_addr(*offset);
     if let (OwnedValue::Map(data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();
+        // Undeclared AND not deliberately dropped. Without the second test,
+        // removing a field from a dynamic schema does not remove it: it stops
+        // being declared, falls in here, and is written straight back out.
         let dynamic_map: HashMap<_, _> = data_all
             .map
             .iter()
-            .filter(|(k, _v)| !schema_keys.contains(k))
+            .filter(|(k, _v)| !schema_keys.contains(k) && !dropped.contains(k))
             .map(|(k, v)| (*k, v))
             .collect();
         let dynamic_names: Vec<_> = data_all

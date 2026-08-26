@@ -78,6 +78,24 @@ impl std::fmt::Display for SchemaVid {
     }
 }
 
+/// How a generation was produced from the one it superseded.
+///
+/// Empty for a generation-0 record, which superseded nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaTransform {
+    /// Field names to purge from a DYNAMIC schema's dynamic region.
+    ///
+    /// Cumulative: each generation carries every name its family has ever
+    /// dropped, not just the ones it dropped itself. That is what lets a
+    /// generation-0 cell migrate straight to generation 3 -- the single hop
+    /// resolution deliberately takes -- without replaying the generations in
+    /// between to discover what they removed.
+    ///
+    /// A name that is later re-declared stops being a drop in practice: a
+    /// declared field never reaches the dynamic region at all.
+    pub dynamic_drops: Vec<u64>,
+}
+
 /// Where a generation sits in its family's history.
 ///
 /// Exactly one generation of a [`SchemaUid`] is `Current` at any instant; it is
@@ -110,6 +128,9 @@ pub struct Schema {
     pub generation: u32,
     /// Whether new writes may still land in this generation.
     pub status: SchemaVersionStatus,
+    /// How this generation was produced from its predecessor.
+    #[serde(default)]
+    pub transform: SchemaTransform,
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
@@ -212,6 +233,7 @@ impl Schema {
             uid: SchemaUid(0),
             generation: 0,
             status: SchemaVersionStatus::Current,
+            transform: SchemaTransform::default(),
             name: name.to_string(),
             key_field: match key_field {
                 None => None,
@@ -257,6 +279,22 @@ impl Schema {
         self.uid = SchemaUid(id);
         self.generation = 0;
         self.status = SchemaVersionStatus::Current;
+    }
+
+    /// Declare that these field names are being removed from a dynamic
+    /// schema's dynamic region rather than merely undeclared.
+    ///
+    /// Needed because on an `is_dynamic` schema an undeclared field is not
+    /// dropped -- it falls through to the dynamic region and is re-encoded, so
+    /// removing it from the schema alone preserves it forever.
+    pub fn with_dynamic_drops(mut self, names: &[&str]) -> Schema {
+        for name in names {
+            let id = types::key_hash(name);
+            if !self.transform.dynamic_drops.contains(&id) {
+                self.transform.dynamic_drops.push(id);
+            }
+        }
+        self
     }
 
     pub fn with_blobs(mut self, blobs: bool) -> Schema {
@@ -314,10 +352,13 @@ impl Schema {
                     // the schema is dynamic, in which case an undeclared field
                     // falls through to the dynamic region and is re-encoded
                     // rather than dropped, which is not what dropping means.
-                    if proposed.is_dynamic {
+                    if proposed.is_dynamic
+                        && !proposed.transform.dynamic_drops.contains(&before.name_id)
+                    {
                         return EvolutionKind::NeedsTransform(format!(
                             "dropping `{}` from a dynamic schema would re-encode it into the \
-                             dynamic region instead of removing it",
+                             dynamic region instead of removing it; list it in the schema's \
+                             dynamic drops to remove it for real",
                             before.name
                         ));
                     }
@@ -1834,6 +1875,97 @@ mod tests {
         let before = schema_of(base_fields());
         let after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
         assert_eq!(before.classify_evolution(&after), EvolutionKind::Identity);
+    }
+
+    #[test]
+    fn a_declared_dynamic_drop_is_admitted() {
+        let mut before = schema_of(base_fields());
+        before.is_dynamic = true;
+        let mut after = schema_of(vec![Field::new_unindexed("a", Type::U32)]);
+        after.is_dynamic = true;
+        let after = after.with_dynamic_drops(&["b"]);
+        assert_eq!(
+            before.classify_evolution(&after),
+            EvolutionKind::Identity,
+            "saying so explicitly is what makes the removal real"
+        );
+    }
+
+    /// The point of the whole increment: a value in the dynamic region is
+    /// written back out unless it is on the drop list.
+    #[test]
+    fn a_dropped_dynamic_field_is_not_re_encoded() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let mut gen0 = Schema::new_with_id(
+            1,
+            "dyn",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("keep", Type::U32),
+                Field::new_unindexed("bulky", Type::U64),
+            ]),
+            true,
+            false,
+        );
+        gen0.is_dynamic = true;
+        // Generation 1 stops declaring `bulky` AND says to drop it.
+        let mut gen1 = Schema::new_with_id(
+            1,
+            "dyn",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("keep", Type::U32)]),
+            true,
+            false,
+        );
+        gen1.is_dynamic = true;
+        let mut gen1 = gen1.with_dynamic_drops(&["bulky"]);
+        assert_eq!(
+            gen0.classify_evolution(&gen1),
+            EvolutionKind::Identity,
+            "a declared drop must be admissible"
+        );
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("keep", OwnedValue::U32(1));
+        value.insert("bulky", OwnedValue::U64(2));
+        let mut cell =
+            OwnedCell::new_with_id(gen0.vid, &Id::from_parts(1, 1), OwnedValue::Map(value));
+        chunks.write_cell(&mut cell).unwrap();
+        let id = cell.id();
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().data["bulky"].u64(),
+            Some(&2),
+            "generation 0 declared it, so it must be there to begin with"
+        );
+
+        meta.schemas.apply_evolution(gen1);
+
+        let mut touched = OwnedMap::new();
+        touched.insert("keep", OwnedValue::U32(9));
+        touched.insert("bulky", OwnedValue::U64(2));
+        let mut update = OwnedCell::new_with_id(SchemaVid(1), &id, OwnedValue::Map(touched));
+        chunks.update_cell(&mut update).unwrap();
+
+        let read = chunks.read_cell(&id).unwrap();
+        assert_eq!(read.header.schema, SchemaVid(900));
+        assert_eq!(read.data["keep"].u32(), Some(&9));
+        assert!(
+            read.data["bulky"].u64().is_none(),
+            "a dropped field must be gone, not preserved in the dynamic region"
+        );
     }
 
     /// On a dynamic schema an undeclared field is not dropped -- it falls
