@@ -2652,6 +2652,7 @@ impl Chunk {
         WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
+        cell.header.schema = write_result.new_schema;
         Ok(cell.header)
     }
 
@@ -2696,6 +2697,7 @@ impl Chunk {
             drop(write_plan);
             cell.header.version = write_result.new_version;
             cell.header.timestamp = write_result.new_timestamp;
+            cell.header.schema = write_result.new_schema;
         } else {
             // Optimistic update will remove the new inserted one
             let write_result =
@@ -2865,6 +2867,7 @@ impl Chunk {
                 let mut header = cells[j].header;
                 header.version = write_result.new_version;
                 header.timestamp = write_result.new_timestamp;
+                header.schema = write_result.new_schema;
                 results.push(Ok(header));
                 WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
             }
@@ -2931,6 +2934,7 @@ impl Chunk {
                 drop(write_plan);
                 cell.header.version = write_result.new_version;
                 cell.header.timestamp = write_result.new_timestamp;
+                cell.header.schema = write_result.new_schema;
             } else {
                 let t_index = std::time::Instant::now();
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
@@ -2970,6 +2974,7 @@ impl Chunk {
                     drop(write_plan);
                     cell.header.version = write_result.new_version;
                     cell.header.timestamp = write_result.new_timestamp;
+                    cell.header.schema = write_result.new_schema;
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -3035,6 +3040,7 @@ impl Chunk {
                         drop(write_plan);
                         new_cell.header.version = write_result.new_version;
                         new_cell.header.timestamp = write_result.new_timestamp;
+                        new_cell.header.schema = write_result.new_schema;
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
@@ -5236,6 +5242,7 @@ impl<'a> CellGuard<'a> {
         drop(write_plan);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
+        cell.header.schema = write_result.new_schema;
         Ok(cell.header)
     }
 
@@ -5276,6 +5283,7 @@ impl<'a> CellGuard<'a> {
         drop(write_plan);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
+        cell.header.schema = write_result.new_schema;
 
         self.chunk.refresh_statistics_for_schema(schema_id);
         Ok(cell.header)

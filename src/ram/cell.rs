@@ -43,6 +43,10 @@ pub struct CellHeader {
 pub struct WriteToChunkResult {
     pub new_timestamp: u32,
     pub new_version: u64,
+    /// The generation the cell was actually encoded under, which is not
+    /// necessarily the one the caller named. Callers sync their in-memory
+    /// header from this, the same way they sync version and timestamp.
+    pub new_schema: SchemaVid,
     pub addr: usize,
     /// The entry's content length as written -- the same measure the
     /// dead-space accounting and the per-slot live-bytes counter use, handed
@@ -233,7 +237,11 @@ impl OwnedCell {
 
     pub fn plan_write(&self, chunk: &Chunk) -> Result<WritePlan, WriteError> {
         let schema_id = self.header.schema;
-        let schema = if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
+        // Resolve, do not just look up: if this vid has been superseded the
+        // write belongs in whatever generation its family writes now. Every
+        // write path in the server reaches the encoder through here, so this
+        // one call is what makes the redirect universal.
+        let schema = if let Some(schema) = chunk.meta.schemas.resolve_for_write(schema_id) {
             schema
         } else {
             return Err(WriteError::SchemaDoesNotExisted(schema_id.get()));
@@ -312,7 +320,12 @@ impl OwnedCell {
                 let mut cursor = addr_to_header_cursor(content_addr);
                 cursor.write_u64::<Endian>(new_version).unwrap();
                 cursor.write_u32::<Endian>(new_timestamp).unwrap();
-                cursor.write_u32::<Endian>(header.schema.get()).unwrap();
+                // The RESOLVED generation, not the one the caller asked for.
+                // These bytes are what a later read decodes with, so they have
+                // to name the layout that actually encoded them.
+                cursor
+                    .write_u32::<Endian>(write_plan.schema.vid.get())
+                    .unwrap();
                 cursor.write_u64::<Endian>(header.id.bits()).unwrap();
                 release_cursor(cursor);
                 let data_base_addr = content_addr + CELL_HEADER_SIZE;
@@ -335,6 +348,7 @@ impl OwnedCell {
             write_plan.total_size()
         );
         return Ok(WriteToChunkResult {
+            new_schema: write_plan.schema.vid,
             new_timestamp,
             new_version,
             addr,

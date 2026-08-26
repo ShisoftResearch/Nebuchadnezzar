@@ -830,6 +830,39 @@ impl LocalSchemasCache {
         m.name_to_id(name)
     }
 
+    /// The generation a write naming `vid` must actually land in.
+    ///
+    /// The single place a write is redirected. A caller can be holding a vid
+    /// that has since been superseded -- a long-lived client, a replayed
+    /// batch, a migration re-applying a cell -- and persisting under it would
+    /// keep producing cells in a layout that is supposed to be draining.
+    ///
+    /// Resolution is `vid -> family -> current generation`: one hop, whatever
+    /// the generation depth, because the record carries its own family rather
+    /// than a chain of `superseded_by` links.
+    ///
+    /// Returns `None` when the vid is unknown, or when its family has no
+    /// current generation, so the caller keeps reporting
+    /// `SchemaDoesNotExisted` exactly as before.
+    pub fn resolve_for_write(&self, vid: SchemaVid) -> Option<SchemaRef> {
+        let named = self.get(&vid)?;
+        if named.status.is_current() {
+            return Some(named);
+        }
+        let current_vid = self.current_vid_of_uid(&named.uid)?;
+        if current_vid == vid {
+            // The handle disagrees with the record's own status. Trust the
+            // record and refuse, rather than write into a layout something has
+            // already marked superseded.
+            error!(
+                "Schema family {} names {} as current, but that record is marked superseded",
+                named.uid, vid
+            );
+            return None;
+        }
+        self.get(&current_vid)
+    }
+
     /// The family a name belongs to. This is what a durable reference should
     /// keep: it survives both rename and evolution.
     pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
@@ -1369,6 +1402,136 @@ mod tests {
         cache.apply_rename(SchemaUid(404), "ghost");
         assert_eq!(cache.uid_of_name("ghost"), None);
         assert_eq!(cache.count(), 0);
+    }
+
+    /// Build a superseded generation-0 record and its current successor.
+    fn evolved_pair(uid: u32, name: &str, new_vid: u32) -> (Schema, Schema) {
+        let mut gen0 = cache_test_schema(uid, name);
+        let mut gen1 = gen0.clone();
+        gen1.vid = SchemaVid(new_vid);
+        gen1.generation = 1;
+        gen0.status = SchemaVersionStatus::Stale {
+            superseded_by: gen1.vid,
+        };
+        (gen0, gen1)
+    }
+
+    #[test]
+    fn a_write_naming_a_superseded_generation_resolves_to_the_current_one() {
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, gen1) = evolved_pair(1, "person", 900);
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+
+        let resolved = cache.resolve_for_write(SchemaVid(1)).expect("must resolve");
+        assert_eq!(resolved.vid, SchemaVid(900));
+        assert_eq!(
+            cache.resolve_for_write(SchemaVid(900)).unwrap().vid,
+            SchemaVid(900),
+            "a current generation resolves to itself"
+        );
+    }
+
+    /// Resolution is one hop however deep the history, because a record names
+    /// its own family rather than chaining through `superseded_by`.
+    #[test]
+    fn resolution_does_not_chain_through_generations() {
+        let cache = LocalSchemasCache::new_local("");
+        let mut gen0 = cache_test_schema(1, "person");
+        let mut gen1 = gen0.clone();
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+        let mut gen2 = gen0.clone();
+        gen2.vid = SchemaVid(901);
+        gen2.generation = 2;
+        gen0.status = SchemaVersionStatus::Stale {
+            superseded_by: gen1.vid,
+        };
+        gen1.status = SchemaVersionStatus::Stale {
+            superseded_by: gen2.vid,
+        };
+        cache.cache_schema_from_cluster(gen0);
+        cache.cache_schema_from_cluster(gen1);
+        cache.cache_schema_from_cluster(gen2);
+
+        assert_eq!(
+            cache.resolve_for_write(SchemaVid(1)).unwrap().vid,
+            SchemaVid(901),
+            "the oldest generation must reach the newest in one hop"
+        );
+    }
+
+    #[test]
+    fn an_unknown_generation_does_not_resolve() {
+        let cache = LocalSchemasCache::new_local("");
+        assert!(cache.resolve_for_write(SchemaVid(404)).is_none());
+    }
+
+    /// A superseded record whose family has been deleted must not resolve to
+    /// anything: there is no current layout to write into.
+    #[test]
+    fn a_superseded_generation_with_no_current_sibling_does_not_resolve() {
+        let cache = LocalSchemasCache::new_local("");
+        let (gen0, _gen1) = evolved_pair(1, "person", 900);
+        cache.cache_schema_from_cluster(gen0);
+        assert!(
+            cache.resolve_for_write(SchemaVid(1)).is_none(),
+            "writing into a superseded layout because the current one is missing would be worse than refusing"
+        );
+    }
+
+    /// The redirect has to reach the DURABLE bytes, not just the in-memory
+    /// header: a later read decodes with whatever the header on disk says.
+    #[test]
+    fn a_redirected_write_persists_the_current_generation_in_the_cell_header() {
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::types::{Map as _, OwnedMap, OwnedValue};
+        use crate::server::ServerMeta;
+        use dovahkiin::types::Id;
+
+        let mut gen0 = Schema::new_with_id(
+            1,
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("v", Type::U32)]),
+            false,
+            false,
+        );
+        let mut gen1 = gen0.clone();
+        gen1.vid = SchemaVid(900);
+        gen1.generation = 1;
+        gen0.status = SchemaVersionStatus::Stale {
+            superseded_by: gen1.vid,
+        };
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.register_internal_schema(gen0.clone());
+        schemas.register_internal_schema(gen1.clone());
+        let meta = Arc::new(ServerMeta { schemas });
+        let chunks = Chunks::new(1, SEGMENT_SIZE, meta.clone(), None, None, None, None);
+
+        let mut value = OwnedMap::new();
+        value.insert("v", OwnedValue::U32(7));
+        // Deliberately name the SUPERSEDED generation, the way a long-lived
+        // client or a replayed batch would.
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(1), &Id::from_parts(1, 1), OwnedValue::Map(value));
+        let header = chunks.write_cell(&mut cell).unwrap();
+
+        assert_eq!(
+            header.schema,
+            SchemaVid(900),
+            "the returned header must report where the cell actually landed"
+        );
+        let read = chunks.read_cell(&cell.id()).unwrap();
+        assert_eq!(
+            read.header.schema,
+            SchemaVid(900),
+            "the persisted header must name the current generation, or the redirect never happened"
+        );
+        assert_eq!(read.data["v"].u32(), Some(&7));
     }
 
     /// The point of the whole exercise: a cell written before a rename is
