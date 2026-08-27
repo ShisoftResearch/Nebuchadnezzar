@@ -93,6 +93,22 @@ pub enum WriteError {
         owner: u64,
         applied_index: u64,
     },
+    /// The cell IS written and durable, but at least one of its index entries
+    /// could not be applied, so queries through that index will not find it.
+    ///
+    /// Deliberately NOT one of the "nothing was written" errors above, and
+    /// deliberately not retryable as a write: retrying re-writes a cell that is
+    /// already there. The caller's real choices are to re-assert the index or
+    /// to surface the gap; what it must not do is read this as success.
+    ///
+    /// This exists because the alternative was worse in both directions. The
+    /// index result was previously logged and discarded, so a write whose index
+    /// entry was dropped still reported success -- and a store then answered
+    /// queries with data silently missing (measured: 688,045 dropped entries
+    /// across one import that reported zero errors). Returning a plain write
+    /// error instead would lie the other way, telling a caller nothing was
+    /// stored when the cell is right there.
+    IndexIncomplete(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
