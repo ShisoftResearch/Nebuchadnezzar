@@ -143,6 +143,13 @@ impl IndexerClients {
     pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
         let hash_index_schema = hash_index_schema();
         let _ = neb_client.new_schema_with_id(hash_index_schema).await;
+        // Not an index, but registered on the same startup path for the same
+        // reason: a dictionary cell must be writable before the first cell
+        // that encodes against it, and its id is fixed and hash-derived so
+        // every node registers an identical schema without consensus.
+        let _ = neb_client
+            .new_schema_with_id(crate::ram::dictionary::dictionary_schema())
+            .await;
         let _ = neb_client.new_schema_with_id(inverted_index_schema()).await;
         let _ = neb_client.new_schema_with_id(inverted_stats_schema()).await;
         let _ = neb_client.new_schema_with_id(inverted_doc_schema()).await;

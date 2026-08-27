@@ -11,6 +11,7 @@ use crate::{
     query::{
         cost::planner::{
             distinct_estimate_from_stats, estimate_clause_plan_cost, estimate_hashed_eq_rows,
+            ClauseEstimate,
             estimate_ranged_rows, indexed_clause_priority, PlanCost,
         },
         statistics::SchemaStatistics,
@@ -429,17 +430,29 @@ fn score_candidates(
     let mut scored = candidates
         .into_iter()
         .map(|candidate| {
-            let estimated_rows = estimate_candidate_rows(&candidate, schema_stats);
+            let estimate = estimate_candidate_rows(&candidate, schema_stats);
+            let estimate_reason = estimate.map(|e| e.reason);
+            let estimated_rows = estimate.map(|e| e.estimated_rows);
             let order_aligned = is_order_aligned(&candidate, order_by_field);
             let cost = estimated_rows
                 .map(|rows| candidate_plan_cost(&candidate, rows, limit, order_aligned));
             let effective_rows =
                 estimated_rows.map(|rows| limit.map(|l| rows.min(l.max(1))).unwrap_or(rows.max(1)));
             let reason = if cost.is_some() {
-                if order_aligned && limit.is_some() {
-                    "cost-model-limit-order"
-                } else {
-                    "cost-model"
+                // A cost-model plan built on a fallback estimate is not the
+                // same thing as one built on a histogram, and the difference
+                // is exactly what a reader needs. Name the estimate when it
+                // came from anything other than real statistics.
+                match estimate_reason {
+                    Some("histogram") | Some("distinct-estimate") | Some("empty-schema") => {
+                        if order_aligned && limit.is_some() {
+                            "cost-model-limit-order"
+                        } else {
+                            "cost-model"
+                        }
+                    }
+                    Some(weak) => weak,
+                    None => "cost-model",
                 }
             } else {
                 "heuristic"
@@ -614,33 +627,61 @@ fn candidate_plan_cost_for_or(
     }
 }
 
+/// Estimate a clause's rows, KEEPING the estimator's own account of how it
+/// got there.
+///
+/// The reason is not decoration. `estimate_ranged_rows` reports
+/// "histogram-missing" and drops to `row_count / 2` when a field has no
+/// histogram, and that fallback is indistinguishable from a real estimate
+/// once the reason is thrown away -- a predicate matching 80 of 139,255 rows
+/// estimated 69,627, and the only way to tell a bad estimate from a bad
+/// selectivity was to read the estimator's source. Worse, that number then
+/// propagates: it is what made the sparse compose route decline.
 fn estimate_candidate_rows(
     candidate: &IndexedClausePlan,
     schema_stats: Option<&SchemaStatistics>,
-) -> Option<usize> {
+) -> Option<ClauseEstimate> {
     let stats = schema_stats?;
     if stats.count == 0 {
-        return Some(0);
+        return Some(ClauseEstimate {
+            estimated_rows: 0,
+            confidence: 1.0,
+            reason: "empty-schema",
+        });
     }
     match candidate {
         IndexedClausePlan::HashedEq { field_id, .. } => {
             let distinct = distinct_estimate_from_stats(stats, *field_id);
-            Some(estimate_hashed_eq_rows(stats.count, distinct).estimated_rows)
+            Some(estimate_hashed_eq_rows(stats.count, distinct))
         }
         IndexedClausePlan::NullPresence { field_id } => {
             let distinct = distinct_estimate_from_stats(stats, *field_id);
-            Some(estimate_hashed_eq_rows(stats.count, distinct).estimated_rows)
+            Some(estimate_hashed_eq_rows(stats.count, distinct))
         }
         IndexedClausePlan::Ranged { field_id, range } => {
             let histogram = stats.histogram.get(field_id).map(|h| h.as_slice());
-            Some(
-                estimate_ranged_rows(stats.count, histogram, &range.start, &range.end)
-                    .estimated_rows,
-            )
+            Some(estimate_ranged_rows(
+                stats.count,
+                histogram,
+                &range.start,
+                &range.end,
+            ))
         }
-        IndexedClausePlan::VectorSimilarity { .. } => Some((stats.count / 12).max(1)),
-        IndexedClausePlan::EmbeddingSimilarity { .. } => Some((stats.count / 10).max(1)),
-        IndexedClausePlan::FullTextMatch { .. } => Some((stats.count / 8).max(1)),
+        IndexedClausePlan::VectorSimilarity { .. } => Some(ClauseEstimate {
+            estimated_rows: (stats.count / 12).max(1),
+            confidence: 0.3,
+            reason: "vector-heuristic",
+        }),
+        IndexedClausePlan::EmbeddingSimilarity { .. } => Some(ClauseEstimate {
+            estimated_rows: (stats.count / 10).max(1),
+            confidence: 0.3,
+            reason: "embedding-heuristic",
+        }),
+        IndexedClausePlan::FullTextMatch { .. } => Some(ClauseEstimate {
+            estimated_rows: (stats.count / 8).max(1),
+            confidence: 0.3,
+            reason: "fulltext-heuristic",
+        }),
     }
 }
 

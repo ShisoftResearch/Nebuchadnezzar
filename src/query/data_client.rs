@@ -694,6 +694,18 @@ impl IndexedDataClient {
         .await
     }
 
+    /// The statistics the planner will see for a schema, merged across chunks.
+    ///
+    /// Public so an operator can check what the planner is reasoning from:
+    /// an estimate that reads "histogram-missing" in an explain is only
+    /// diagnosable by looking at exactly this.
+    pub fn schema_statistics(
+        &self,
+        schema: SchemaUid,
+    ) -> Option<Arc<crate::query::statistics::SchemaStatistics>> {
+        self.index_clients.overall_schema_statistics(schema.get())
+    }
+
     /// Read cells by id, unfiltered and unprojected.
     ///
     /// Public so join operators outside this module can materialise only the
