@@ -45,6 +45,16 @@ pub struct ChunkStatistics {
     pub schemas: PtrHashMap<SchemaUid, Arc<SchemaStatistics>>,
 }
 
+/// What the last gather actually saw, process-wide. A refresh that yields
+/// the right `count` but no histograms is otherwise silent -- the read
+/// succeeded, the schema resolved, and every value was skipped -- so the
+/// only way to tell "no indexed fields" from "all values null" from "no
+/// cells" is to count.
+pub static STATS_CELLS_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STATS_FEATURES_PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STATS_NULLS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STATS_CELLS_WITHOUT_INDEXED_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 100;
 #[cfg(test)]
@@ -210,11 +220,20 @@ impl ChunkStatistics {
             .map(|partitation| build_partitation_statistics(partitation, chunk))
             .collect();
         debug!("Total of {} partitations", partitations.len());
+        // A SET, not `dedup()`. `dedup` removes only ADJACENT repeats, and
+        // this iterator is the concatenation of every partition's key set in
+        // hash order, so a schema present in many partitions recurred many
+        // times. The loop below then visited it again: `remove` had already
+        // taken its histogram, `unwrap_or_default` handed back an EMPTY one,
+        // and the second insert overwrote the first with the right count and
+        // no histogram. Every planner estimate on a chunk with more than one
+        // partition fell back to row_count / 2 -- silently, because the count
+        // looked fine. Any chunk past 1,024 cells was affected.
         let schema_ids: Vec<_> = partitations
             .iter()
-            .map(|(sizes, _, _, _)| sizes.keys())
-            .flatten()
-            .dedup()
+            .flat_map(|(sizes, _, _, _)| sizes.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
         let total_size = schema_ids
             .iter()
@@ -303,6 +322,14 @@ impl ChunkStatistics {
             self.schemas.insert(*schema_id, Arc::new(statistics));
         }
         self.timestamp.store(now, Ordering::Relaxed);
+        info!(
+            "statistics refreshed chunk {}: cells_scanned={} features_pushed={} nulls_skipped={} cells_without_indexed_fields={} (process-wide running totals)",
+            chunk.id,
+            STATS_CELLS_SCANNED.load(Ordering::Relaxed),
+            STATS_FEATURES_PUSHED.load(Ordering::Relaxed),
+            STATS_NULLS_SKIPPED.load(Ordering::Relaxed),
+            STATS_CELLS_WITHOUT_INDEXED_FIELDS.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -387,6 +414,10 @@ fn build_partitation_statistics(
                         })
                         .map(|(field_id, _)| *field_id)
                         .collect();
+                    STATS_CELLS_SCANNED.fetch_add(1, Ordering::Relaxed);
+                    if fields.is_empty() {
+                        STATS_CELLS_WITHOUT_INDEXED_FIELDS.fetch_add(1, Ordering::Relaxed);
+                    }
                     if !fields.is_empty() {
                         trace!("Schema {} has fields {:?}", schema_id, fields);
                         if let Ok((partial_cell, _)) =
@@ -401,8 +432,10 @@ fn build_partitation_statistics(
                             };
                             for (i, val) in field_array.into_iter().enumerate() {
                                 if val == SharedValue::Null || val == SharedValue::NA {
+                                    STATS_NULLS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
+                                STATS_FEATURES_PUSHED.fetch_add(1, Ordering::Relaxed);
                                 let field_id = fields[i];
                                 exact_accumlators
                                     .entry(schema_uid)
@@ -839,6 +872,108 @@ mod tests {
     }
 
     const CHUNK_TEST_SIZE: usize = REFRESH_CHANGES_THRESHOLD as usize * 16;
+    /// Reproduction of the connectome symptom: a vertex-shaped schema -- a
+    /// hashed String key, hashed Id link fields, and NULLABLE u16 Ranged label
+    /// columns -- reported the right `count` but no histogram for any field,
+    /// so every equality estimate fell back to row_count / 2. This pins that a
+    /// SINGLE refresh yields the histograms; the existing test only checks
+    /// them after a second one.
+    #[test]
+    fn nullable_u16_ranged_fields_get_a_histogram_on_first_refresh() {
+        let _ = env_logger::try_init();
+        use crate::ram::schema::{Field, IndexType};
+        use dovahkiin::types::Type;
+        let fields = Field::new_schema(vec![
+            Field::new_indexed("root_id", Type::String, vec![IndexType::Hashed]),
+            Field::new_indexed("_outbound", Type::Id, vec![IndexType::Hashed]),
+            Field::new_indexed_nullable("super_class_id", Type::U16, vec![IndexType::Ranged]),
+            Field::new_indexed_nullable("side_id", Type::U16, vec![IndexType::Ranged]),
+            Field::new_unindexed_nullable("top_nt_conf", Type::F32),
+        ]);
+        // Distinct explicit ids: `Schema::new` does not hand out unique ids,
+        // and two schemas sharing one would register over each other.
+        let schema = Schema::new_with_id(9101, "vertexish", None, fields, false, false);
+        // A second schema interleaved with the first so partitions' key sets
+        // come out in differing orders -- the condition under which a
+        // non-adjacent duplicate schema id used to wipe the histogram.
+        let other = Schema::new_with_id(
+            9102,
+            "otherish",
+            None,
+            Field::new_schema(vec![Field::new_indexed("k", Type::I64, vec![IndexType::Ranged])]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        schemas.debug_only_new_schema(other.clone());
+        let schema_vid = schema.vid;
+        let schema_uid = schema.uid;
+        let chunks = Chunks::new(
+            1,
+            SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        // Well past one partition (HISTOGRAM_PARTITATION_SIZE cells), so the
+        // gather has to merge many partitions per schema.
+        let total = HISTOGRAM_PARTITATION_SIZE * 6 + 7;
+        // Skewed like the real column: value 6 for 56%, a long tail otherwise,
+        // and some rows with the label absent entirely.
+        for i in 0..total {
+            if i % 3 == 0 {
+                let mut m = OwnedMap::new();
+                m.insert(&"k".to_string(), OwnedValue::I64(i as i64));
+                let header = CellHeader::new(other.vid, &Id::rand());
+                let mut cell = OwnedCell { data: OwnedValue::Map(m), header };
+                chunks.write_cell(&mut cell).unwrap();
+            }
+            let mut m = OwnedMap::new();
+            m.insert(&"root_id".to_string(), OwnedValue::String(format!("N{i}")));
+            m.insert(&"_outbound".to_string(), OwnedValue::Id(Id::rand()));
+            let class: u16 = if i % 100 < 56 { 6 } else { (i % 7) as u16 + 1 };
+            m.insert(&"super_class_id".to_string(), OwnedValue::U16(class));
+            if i % 10 != 0 {
+                m.insert(&"side_id".to_string(), OwnedValue::U16((i % 2) as u16 + 1));
+            }
+            m.insert(&"top_nt_conf".to_string(), OwnedValue::F32(0.5));
+            let header = CellHeader::new(schema_vid, &Id::rand());
+            let mut cell = OwnedCell { data: OwnedValue::Map(m), header };
+            chunks.write_cell(&mut cell).unwrap();
+        }
+        chunks.ensure_statistics();
+        let stats = chunks.all_chunk_statistics(schema_uid);
+        let stat = stats[0].as_ref().expect("statistics for the schema");
+        assert_eq!(stat.count, total, "count must be exact");
+        info!("fields with histograms: {:?}", stat.histogram.keys());
+        let class_key = key_hash("super_class_id");
+        let side_key = key_hash("side_id");
+        assert!(
+            stat.histogram.contains_key(&class_key),
+            "u16 Ranged field must have a histogram after ONE refresh; have {:?}",
+            stat.histogram.keys()
+        );
+        assert!(
+            stat.histogram.contains_key(&side_key),
+            "a nullable field with some nulls must still get a histogram"
+        );
+        // And the histogram must reflect the skew: value 6 should occupy
+        // roughly 56 of the ~100 keys.
+        let h = stat.histogram[&class_key];
+        let six = OwnedValue::U16(6).feature();
+        let distinct: std::collections::BTreeSet<_> = h.iter().copied().collect();
+        info!("u16 feature of 6 = {:?}; histogram distinct keys = {:?}", six, distinct);
+        assert_ne!(six, 6u64.to_be_bytes(), "if these match, the encoding note below is stale");
+        let sixes = h.iter().filter(|k| **k == six).count();
+        assert!(
+            (45..=70).contains(&sixes),
+            "expected ~56 keys equal to 6 in an equi-depth histogram, got {sixes}"
+        );
+    }
+
     #[test]
     fn chunk_statistics() {
         let _ = env_logger::try_init();
