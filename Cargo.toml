@@ -25,6 +25,7 @@ bincode = "2"
 bincode_derive = "2"
 byteorder = "*"
 parking_lot = "*"
+async-trait = "0.1"
 rand = { version = "*", features = ["small_rng"] }
 itertools = "0.14"
 smallvec = { version = "*", features = ["serde", "union"] }

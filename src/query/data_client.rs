@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod aggregate;
-mod cursor;
+pub mod cursor;
 mod execute;
 mod ids;
 mod plan;
@@ -692,6 +692,15 @@ impl IndexedDataClient {
             offset,
         )
         .await
+    }
+
+    /// Read cells by id, unfiltered and unprojected.
+    ///
+    /// Public so join operators outside this module can materialise only the
+    /// rows an index probe actually matched, rather than a whole side.
+    pub async fn read_cells(&self, ids: &[Id]) -> Vec<crate::ram::cell::OwnedCell> {
+        self.read_cells_from_ids(ids, &vec![], &Expr::nothing(), &Expr::nothing())
+            .await
     }
 
     pub fn hashed_index_id(schema: SchemaUid, field: u64, value: &OwnedValue) -> Id {
