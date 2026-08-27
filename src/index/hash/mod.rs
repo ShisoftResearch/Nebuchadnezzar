@@ -1,4 +1,4 @@
-use crate::ram::cell::{ReadError, WriteError};
+use crate::ram::cell::{ReadError, WriteError, MAX_CELL_SIZE};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket-size accounting for the hashed index.
@@ -10,7 +10,10 @@ use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
 use bifrost_hasher::hash_str;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 use super::Feature;
 
@@ -18,14 +21,90 @@ const MAX_CAS_RETRIES: u32 = 1000;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
+/// Link to the rest of a bucket that has outgrown one cell.
+const HASH_NEXT_FIELD: &'static str = "NEXT";
+
+/// Runaway guard when walking a bucket chain. A well-formed chain is
+/// `bucket_len / BUCKET_CAPACITY` cells; anything beyond this is a cycle or
+/// corruption, and walking it forever would hang a query.
+const MAX_CHAIN_HOPS: usize = 1_000_000;
 
 lazy_static! {
     pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
+    pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
+    /// Ids one bucket cell holds before the bucket spills into a chain.
+    ///
+    /// A cell is capped at `MAX_CELL_SIZE`, so before chaining a bucket could
+    /// hold ~131k ids and every insert past that failed `CellIsTooLarge` --
+    /// silently, because a failed index task was only logged. Chaining removes
+    /// the ceiling; this bound decides how much gets rewritten per append.
+    ///
+    /// It is a HARD SAFETY CAP, not a tuning hint, and it is deliberately not
+    /// derived from `Type::Id.size()`. The encoded cost per id exceeds the
+    /// nominal one, so arithmetic from the nominal figure puts the cap ABOVE
+    /// what actually fits -- precisely the failure the cap exists to prevent.
+    /// It is anchored to a measurement instead, and divided down. The env
+    /// override can only lower it.
+    ///
+    /// Smaller means cheaper appends and longer chains; a walk is one read per
+    /// cell and a query re-reads every member anyway.
+    pub static ref BUCKET_CAPACITY: usize = {
+        /// Most ids a single cell was ever observed to hold before the store
+        /// refused the next append -- that refusal reported
+        /// `CellIsTooLarge(1252352)` against a 1 MiB limit, so the true
+        /// encoded cost is ~9.55 B/id rather than the nominal 8.
+        const OBSERVED_MAX_IDS_PER_CELL: usize = 131_066;
+        // A QUARTER of a cell measured full, and the divisor is set by churn
+        // rather than by the size limit. Segment size is what an append
+        // rewrites, so it decides how fast dead versions pile into the one
+        // chunk holding a hot bucket. Halving the observed max clears
+        // CellIsTooLarge but doubles that churn, and on a 2.79M-edge import
+        // over 16 values that was enough to exhaust a chunk again:
+        //
+        //   cap 65,533  ->  89,132 entries lost, 791 alloc failures,  72K/s
+        //   cap 32,768  ->  0 lost,              0 alloc failures,   112K/s
+        //
+        // Quartering is both correct and faster. Do not raise this to "as
+        // much as fits" -- what fits is not the binding constraint.
+        let ceiling = OBSERVED_MAX_IDS_PER_CELL / 4;
+        std::env::var("NEB_HASH_BUCKET_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(ceiling)
+            .min(ceiling)
+            .max(1)
+    };
+}
+
+/// Id of the cell a bucket's contents are frozen into when the head spills.
+///
+/// Keyed by the head version the contents were read at, so two writers racing
+/// to spill the same head write DIFFERENT cells and neither can publish the
+/// other's contents under the winning pointer.
+fn spilled_cell_id(index_id: &Id, version: u64) -> Id {
+    Id::from_obj(&(*index_id, version, "HASH_BUCKET_SPILL"))
+}
+
+/// Coalescing state for one hash bucket.
+///
+/// `pending` is guarded by a plain mutex and is only ever held for an insert
+/// or a drain, never across an await; `apply` is the async latch that makes
+/// one caller the applier for the whole queue.
+#[derive(Default)]
+struct Bucket {
+    pending: Mutex<HashSet<Id>>,
+    apply: TokioMutex<()>,
 }
 
 pub struct HashIndexer {
     neb_client: Arc<AsyncClient>,
+    /// Per-bucket coalescing slots. Deliberately per-indexer rather than
+    /// process-wide: bucket ids derive from (schema, field, value) and so can
+    /// repeat across databases, and folding two databases' inserts into one
+    /// apply would write them through the wrong client.
+    buckets: Mutex<HashMap<Id, Arc<Bucket>>>,
 }
 
 impl HashIndexer {
@@ -51,16 +130,195 @@ impl HashIndexer {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         HashIndexer {
             neb_client: neb_client.clone(),
+            buckets: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Coalescing slot for one bucket, created on demand.
+    fn bucket(&self, index_id: &Id) -> Arc<Bucket> {
+        self.buckets
+            .lock()
+            .entry(*index_id)
+            .or_insert_with(|| Arc::new(Bucket::default()))
+            .clone()
+    }
+
+    /// Drop a bucket's slot once nothing is queued on it, so the map does not
+    /// accumulate an entry per distinct indexed value -- which, for the
+    /// near-unique fields this index is built for, would be one per cell.
+    /// Call only after releasing your own handle: a strong count of 1 then
+    /// means the map is the last owner. Racing a newcomer is harmless -- it
+    /// gets a fresh slot, coalesces with nobody, and its CAS still applies.
+    fn release_bucket(&self, index_id: &Id) {
+        let mut buckets = self.buckets.lock();
+        let drop_it = buckets
+            .get(index_id)
+            .is_some_and(|b| Arc::strong_count(b) == 1 && b.pending.lock().is_empty());
+        if drop_it {
+            buckets.remove(index_id);
+        }
+    }
+
+    /// Add `cell_id` to the bucket at `index_id`.
+    ///
+    /// Concurrent inserts into the SAME bucket are coalesced: a burst folds
+    /// into one read-modify-CAS carrying every queued id, instead of one
+    /// rewrite per id.
+    ///
+    /// Why that matters. A bucket is a single cell holding a flat array which
+    /// is read, scanned and written whole on every update, so appending N ids
+    /// one at a time rewrites ~N^2/2 ids. That is invisible while the design
+    /// assumption below holds -- indexed values near-unique, so buckets are
+    /// singletons -- and catastrophic when it does not: a low-cardinality
+    /// indexed field (a region id, a status enum) funnels millions of updates
+    /// into a handful of cells, and the dead versions saturate the segment
+    /// table of the one chunk that holds each of them. Allocation then fails
+    /// `CannotAllocateSpace` and the index write is DROPPED, losing the entry
+    /// silently. Measured before this coalescing, on a 2.79M-row import over
+    /// 16 distinct values at 64-way concurrency: 145,099 entries lost.
+    /// Batching divides the quadratic term by the batch size, and the batch
+    /// grows with exactly the contention that causes the problem.
+    ///
+    /// Coalescing is an optimisation only -- correctness never depends on two
+    /// callers finding the same slot, because the apply is the same CAS loop
+    /// it always was. The caller's contract is unchanged: this returns only
+    /// once `cell_id` is durably in the bucket, so a write's index entry is
+    /// still visible by the time the write completes. That is why this is a
+    /// combining latch and not a timed buffer -- a buffer would have to
+    /// either break that guarantee or block on a flush timer.
     pub async fn add_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
         debug!(
             "Attempting to add index for cell_id: {:?}, index_id: {:?}",
             cell_id, index_id
         );
 
-        // Retry loop for compare-and-swap
+        let bucket = self.bucket(index_id);
+        bucket.pending.lock().insert(*cell_id);
+
+        let result = {
+            // One applier at a time per bucket; everyone else queues here and
+            // their ids ride the batch of whoever is already inside.
+            let _apply = bucket.apply.lock().await;
+
+            // Take whatever accumulated while we waited. If our own id is
+            // gone, an earlier applier committed it -- a failing applier puts
+            // its batch back before releasing this lock, so "absent" can only
+            // mean "applied".
+            let batch: Vec<Id> = {
+                let mut pending = bucket.pending.lock();
+                if pending.contains(cell_id) {
+                    pending.drain().collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            if batch.is_empty() {
+                Ok(())
+            } else {
+                let applied = self.apply_batch(index_id, &batch).await;
+                if applied.is_err() {
+                    // Hand the batch back so the callers queued behind us
+                    // retry it instead of inheriting our failure.
+                    bucket.pending.lock().extend(batch);
+                }
+                applied
+            }
+        };
+
+        drop(bucket);
+        self.release_bucket(index_id);
+        result
+    }
+
+    /// Fold a batch of ids into the bucket cell in one read-modify-CAS.
+    ///
+    /// `batch` must be free of duplicates; `add_index` drains it from a set.
+    /// Ids held directly in one bucket cell.
+    fn cell_ids(cell: &OwnedCell) -> Option<&Vec<Id>> {
+        match &cell[*HASH_INDEX_FIELD_ID] {
+            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => Some(ids),
+            _ => None,
+        }
+    }
+
+    /// Next cell in the bucket chain, if this one has spilled. Null, NA and a
+    /// missing field all mean "end of chain" -- the last covers cells written
+    /// before the link field existed.
+    fn cell_next(cell: &OwnedCell) -> Option<Id> {
+        match &cell[*HASH_NEXT_FIELD_ID] {
+            OwnedValue::Id(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn bucket_cell(index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
+        let mut map = OwnedMap::new();
+        map.insert_key_id(
+            *HASH_INDEX_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)),
+        );
+        map.insert_key_id(
+            *HASH_NEXT_FIELD_ID,
+            match next {
+                Some(id) => OwnedValue::Id(id),
+                None => OwnedValue::Null,
+            },
+        );
+        OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map))
+    }
+
+    /// Read one segment of a bucket chain: its ids, and the link to the next.
+    ///
+    /// The unit of a chain walk is deliberately ONE segment. A whole bucket is
+    /// unbounded -- that is the entire point of chaining it -- so a caller
+    /// that materialised every segment before doing anything would put the
+    /// bucket back into memory in one piece, which is the shape chaining
+    /// exists to avoid.
+    async fn read_segment(
+        &self,
+        segment_id: Id,
+    ) -> Result<Result<Option<(Vec<Id>, Option<Id>)>, ReadError>, RPCError> {
+        match self.neb_client.read_cell(segment_id).await {
+            Ok(Ok(mut cell)) => {
+                let next = Self::cell_next(&cell);
+                let ids = match &mut cell[*HASH_INDEX_FIELD_ID] {
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => std::mem::take(ids),
+                    _ => Vec::new(),
+                };
+                Ok(Ok(Some((ids, next))))
+            }
+            Ok(Err(ReadError::CellDoesNotExisted)) => Ok(Ok(None)),
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fold a batch of ids into the bucket, spilling into a chain as needed.
+    ///
+    /// `batch` must be free of duplicates; `add_index` drains it from a set.
+    async fn apply_batch(&self, index_id: &Id, batch: &[Id]) -> Result<(), WriteError> {
+        // A batch bigger than one cell is split, so a chunk can always fit a
+        // freshly spilled head. Concurrency-sized batches never reach this.
+        for chunk in batch.chunks(*BUCKET_CAPACITY) {
+            self.apply_chunk(index_id, chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply at most `BUCKET_CAPACITY` ids to the bucket head.
+    ///
+    /// Inserts always touch the HEAD only, so an append stays O(1) reads no
+    /// matter how long the chain is. When the head is full its contents are
+    /// frozen into a new cell and the head is reset to just the incoming ids,
+    /// pointing at the frozen one -- so the chain grows behind the head and
+    /// nothing has to walk it to write.
+    async fn apply_chunk(&self, index_id: &Id, batch: &[Id]) -> Result<(), WriteError> {
+        let cap = *BUCKET_CAPACITY;
+        // Set when a supposedly-fitting append is refused for size. The cap is
+        // an estimate of what fits, and an estimate that is ever wrong must
+        // degrade into a spill rather than into a lost index entry.
+        let mut force_spill = false;
         for retry in 0..MAX_CAS_RETRIES {
             // Try to create the bucket before reading it.
             //
@@ -73,13 +331,7 @@ impl HashIndexer {
             // rejected create and falls through to the merge below, which the
             // measurement says is the rare path.
             if retry == 0 {
-                let mut map = OwnedMap::new();
-                map.insert_key_id(
-                    *HASH_INDEX_FIELD_ID,
-                    OwnedValue::PrimArray(OwnedPrimArray::Id(vec![*cell_id])),
-                );
-                let cell =
-                    OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map));
+                let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
                 match self.neb_client.write_cell(cell).await {
                     Ok(Ok(_)) => return Ok(()),
                     // Bucket already there: fall through and merge into it.
@@ -96,59 +348,84 @@ impl HashIndexer {
                 }
             }
 
-            // Read the current cell
             match self.neb_client.read_cell(*index_id).await {
                 Ok(Ok(mut cell)) => {
-                    // Cell exists - update it with CAS
                     let version = cell.header.version;
-                    let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];
-
-                    if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
-                        // Bucket size drives the cost of this path: it is
-                        // read, scanned, and written whole on every insert. If
-                        // buckets stay small the cost is the round trip and
-                        // segmenting them would buy nothing, so measure before
-                        // restructuring.
-                        HASH_BUCKET_LEN_SUM.fetch_add(ids.len() as u64, Ordering::Relaxed);
-                        HASH_BUCKET_SAMPLES.fetch_add(1, Ordering::Relaxed);
-                        HASH_BUCKET_MAX.fetch_max(ids.len() as u64, Ordering::Relaxed);
-
-                        // Check if cell_id is already in the array
-                        if ids.contains(cell_id) {
-                            debug!("Cell {:?} already in index {:?}", cell_id, index_id);
-                            return Ok(());
+                    let next = Self::cell_next(&cell);
+                    // Take the head's ids out rather than copying them: the
+                    // cell is dropped as soon as the write is issued, so a
+                    // clone bought nothing and cost a copy of the whole head.
+                    let head: Vec<Id> = match &mut cell[*HASH_INDEX_FIELD_ID] {
+                        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => std::mem::take(ids),
+                        other => {
+                            return Err(WriteError::DataMismatchSchema(
+                                Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
+                                other.clone(),
+                            ))
                         }
+                    };
 
-                        // Add the cell_id to the array
-                        ids.push(*cell_id);
-                        // Move the list out rather than copying it. The cell is
-                        // dropped as soon as the write is issued, so the clone
-                        // bought nothing and cost an allocation and a copy of
-                        // the whole bucket on every insert -- and buckets grow
-                        // without bound, so that copy grows with them.
-                        let new_value =
-                            OwnedValue::PrimArray(OwnedPrimArray::Id(std::mem::take(ids)));
+                    // Head size drives the cost of this path: it is read,
+                    // scanned and written whole on every append.
+                    HASH_BUCKET_LEN_SUM.fetch_add(head.len() as u64, Ordering::Relaxed);
+                    HASH_BUCKET_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                    HASH_BUCKET_MAX.fetch_max(head.len() as u64, Ordering::Relaxed);
 
-                        // Use compare-and-swap to update the field atomically
+                    // Membership resolved once for the whole batch, against
+                    // the head only -- see `collect_bucket` for why that is
+                    // sufficient. The single-id case keeps the linear scan: it
+                    // is the common one, and hashing the whole head to place
+                    // one id would cost more than it saves.
+                    let fresh: Vec<Id> = if batch.len() == 1 {
+                        if head.contains(&batch[0]) {
+                            Vec::new()
+                        } else {
+                            vec![batch[0]]
+                        }
+                    } else {
+                        let existing: HashSet<Id> = head.iter().copied().collect();
+                        batch
+                            .iter()
+                            .copied()
+                            .filter(|id| !existing.contains(id))
+                            .collect()
+                    };
+                    if fresh.is_empty() {
+                        debug!("All of batch already in head of index {:?}", index_id);
+                        return Ok(());
+                    }
+
+                    if !force_spill && head.len() + fresh.len() <= cap {
+                        let mut ids = head;
+                        ids.extend(fresh);
                         match self
                             .neb_client
                             .compare_version_and_set_field(
                                 *index_id,
                                 version,
                                 *HASH_INDEX_FIELD_ID,
-                                new_value,
+                                OwnedValue::PrimArray(OwnedPrimArray::Id(ids)),
                             )
                             .await
                         {
-                            Ok(Ok(_)) => {
-                                debug!(
-                                    "Successfully added cell {:?} to index {:?}",
-                                    cell_id, index_id
+                            Ok(Ok(_)) => return Ok(()),
+                            // The cap said this fits and the store disagrees.
+                            // The store is right: spill instead, and say so --
+                            // reaching here means BUCKET_CAPACITY is sized too
+                            // close to the limit and wants lowering.
+                            Ok(Err(WriteError::CellIsTooLarge(size))) => {
+                                warn!(
+                                    "hash bucket {:?} refused a {}-id append at {} bytes despite a \
+                                     capacity of {}; spilling. Lower NEB_HASH_BUCKET_CAPACITY.",
+                                    index_id,
+                                    batch.len(),
+                                    size,
+                                    cap
                                 );
-                                return Ok(());
+                                force_spill = true;
+                                continue;
                             }
                             Ok(Err(e)) if Self::retryable_write_error(&e) => {
-                                debug!("CAS retry {} for add_index", retry + 1);
                                 tokio::task::yield_now().await;
                                 continue;
                             }
@@ -158,38 +435,64 @@ impl HashIndexer {
                                 continue;
                             }
                         }
-                    } else {
-                        return Err(WriteError::DataMismatchSchema(
-                            Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-                            ids_val.clone(),
-                        ));
+                    }
+
+                    // ---- spill ----
+                    // Freeze the head's contents into a version-keyed cell
+                    // that nothing points at yet, then swing the head onto it
+                    // in one CAS. The CAS is the sole publish point: a racing
+                    // writer bumps the version, we lose, and the frozen cell
+                    // was never reachable. Two racing spillers key their
+                    // frozen cells by the same version they both read, so the
+                    // contents are identical by construction.
+                    let frozen_id = spilled_cell_id(index_id, version);
+                    let frozen = Self::bucket_cell(&frozen_id, head, next);
+                    match self.neb_client.write_cell(frozen).await {
+                        Ok(Ok(_)) | Ok(Err(WriteError::CellAlreadyExisted)) => {}
+                        Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                    }
+
+                    let new_head = Self::bucket_cell(index_id, fresh, Some(frozen_id));
+                    match self
+                        .neb_client
+                        .compare_version_and_update_cell(*index_id, version, new_head)
+                        .await
+                    {
+                        Ok(Ok(_)) => {
+                            debug!("Bucket {:?} spilled into {:?}", index_id, frozen_id);
+                            return Ok(());
+                        }
+                        Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            // Our frozen cell was never reachable; drop it and
+                            // re-derive from whatever the head is now.
+                            let _ = self.neb_client.remove_cell(frozen_id).await;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            let _ = self.neb_client.remove_cell(frozen_id).await;
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            let _ = self.neb_client.remove_cell(frozen_id).await;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
                     }
                 }
                 Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    // Cell doesn't exist - create it
-                    let mut map = OwnedMap::new();
-                    map.insert_key_id(
-                        *HASH_INDEX_FIELD_ID,
-                        OwnedValue::PrimArray(OwnedPrimArray::Id(vec![*cell_id])),
-                    );
-                    let cell = OwnedCell::new_with_id(
-                        *HASH_INDEX_SCHEMA_ID,
-                        index_id,
-                        OwnedValue::Map(map),
-                    );
-
+                    let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
                     match self.neb_client.write_cell(cell).await {
-                        Ok(Ok(_)) => {
-                            debug!(
-                                "Created new index cell {:?} with cell_id {:?}",
-                                index_id, cell_id
-                            );
-                            return Ok(());
-                        }
-                        Ok(Err(WriteError::CellAlreadyExisted)) => {
-                            debug!("Cell was created concurrently, retrying");
-                            continue; // Someone else created it, retry
-                        }
+                        Ok(Ok(_)) => return Ok(()),
+                        Ok(Err(WriteError::CellAlreadyExisted)) => continue,
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
                             tokio::task::yield_now().await;
                             continue;
@@ -214,115 +517,91 @@ impl HashIndexer {
         }
 
         warn!(
-            "Max CAS retries exceeded for add_index({:?}, {:?})",
-            cell_id, index_id
+            "Max CAS retries exceeded for add_index batch of {} into {:?}",
+            batch.len(),
+            index_id
         );
         Err(WriteError::CellVersionMismatch)
     }
 
+    /// Remove `cell_id` from whichever cell of the bucket chain holds it.
+    ///
+    /// An emptied segment is left linked rather than unlinked: unlinking means
+    /// updating its predecessor, which races with a concurrent spill onto that
+    /// same predecessor. An empty segment costs one small cell and one read on
+    /// the walk, which is cheaper than getting that race wrong.
     pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
         debug!(
             "Attempting to remove index for cell_id: {:?}, index_id: {:?}",
             cell_id, index_id
         );
 
-        // Retry loop for compare-and-swap
         for retry in 0..MAX_CAS_RETRIES {
-            // Read the current cell
-            match self.neb_client.read_cell(*index_id).await {
-                Ok(Ok(mut cell)) => {
-                    // Cell exists - update or remove it with CAS
-                    let version = cell.header.version;
-                    let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];
-
-                    if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
-                        // Check if cell_id is in the array
-                        if !ids.contains(cell_id) {
-                            debug!(
-                                "Cell {:?} not in index {:?}, nothing to remove",
-                                cell_id, index_id
-                            );
-                            return Ok(());
-                        }
-
-                        // Remove the cell_id from the array
-                        ids.retain(|id| *id != *cell_id);
-
-                        if ids.is_empty() {
-                            let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(Vec::new()));
-                            match self
-                                .neb_client
-                                .compare_version_and_set_field(
-                                    *index_id,
-                                    version,
-                                    *HASH_INDEX_FIELD_ID,
-                                    new_value,
-                                )
-                                .await
-                            {
-                                Ok(Ok(_)) => return Ok(()),
-                                Ok(Err(e)) if Self::retryable_write_error(&e) => {
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // Update the field with the new array (without the removed cell_id)
-                            let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(ids.clone()));
-
-                            match self
-                                .neb_client
-                                .compare_version_and_set_field(
-                                    *index_id,
-                                    version,
-                                    *HASH_INDEX_FIELD_ID,
-                                    new_value,
-                                )
-                                .await
-                            {
-                                Ok(Ok(_)) => {
-                                    debug!(
-                                        "Successfully removed cell {:?} from index {:?}",
-                                        cell_id, index_id
-                                    );
-                                    return Ok(());
-                                }
-                                Ok(Err(e)) if Self::retryable_write_error(&e) => {
-                                    debug!("CAS retry {} for remove_index", retry + 1);
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    tokio::task::yield_now().await;
-                                    continue;
-                                }
+            // Locate the segment holding it.
+            let mut cursor = Some(*index_id);
+            let mut hops = 0usize;
+            let mut holder: Option<(Id, u64, Vec<Id>)> = None;
+            loop {
+                let Some(cid) = cursor else { break };
+                match self.neb_client.read_cell(cid).await {
+                    Ok(Ok(cell)) => {
+                        let version = cell.header.version;
+                        if let Some(ids) = Self::cell_ids(&cell) {
+                            if ids.contains(cell_id) {
+                                holder = Some((cid, version, ids.clone()));
+                                break;
                             }
                         }
-                    } else {
-                        return Err(WriteError::DataMismatchSchema(
-                            Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-                            ids_val.clone(),
-                        ));
+                        cursor = Self::cell_next(&cell);
+                    }
+                    Ok(Err(ReadError::CellDoesNotExisted)) => break,
+                    Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                        tokio::task::yield_now().await;
+                        cursor = None;
+                        holder = None;
+                        break;
+                    }
+                    Ok(Err(e)) => return Err(WriteError::ReadError(e)),
+                    Err(_) => {
+                        tokio::task::yield_now().await;
+                        cursor = None;
+                        holder = None;
+                        break;
                     }
                 }
-                Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    debug!(
-                        "Index cell {:?} does not exist, nothing to remove",
-                        index_id
-                    );
+                hops += 1;
+                if hops > MAX_CHAIN_HOPS {
+                    error!("hash bucket {:?} chain exceeded {} hops during remove", index_id, MAX_CHAIN_HOPS);
+                    break;
+                }
+            }
+
+            let Some((seg_id, version, mut ids)) = holder else {
+                debug!("Cell {:?} not in index {:?}, nothing to remove", cell_id, index_id);
+                return Ok(());
+            };
+            ids.retain(|id| id != cell_id);
+
+            match self
+                .neb_client
+                .compare_version_and_set_field(
+                    seg_id,
+                    version,
+                    *HASH_INDEX_FIELD_ID,
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(ids)),
+                )
+                .await
+            {
+                Ok(Ok(_)) => {
+                    debug!("Successfully removed cell {:?} from index {:?}", cell_id, index_id);
                     return Ok(());
                 }
-                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                    debug!("CAS retry {} for remove_index", retry + 1);
                     tokio::task::yield_now().await;
                     continue;
                 }
-                Ok(Err(e)) => return Err(WriteError::ReadError(e)),
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     tokio::task::yield_now().await;
                     continue;
@@ -337,50 +616,88 @@ impl HashIndexer {
         Err(WriteError::CellVersionMismatch)
     }
 
+    /// Cells whose `field_id` equals `value`, walking the bucket chain.
+    ///
+    /// Streams: one segment is held at a time, its members are verified and
+    /// emitted, and only then is the next segment read. Peak memory is one
+    /// segment plus the matches, not the whole bucket -- which for a
+    /// low-cardinality indexed value is the difference between half a megabyte
+    /// and however large that value's population has grown.
+    ///
+    /// De-duplication is against what has already been EMITTED rather than
+    /// against every candidate seen. That is both sufficient -- the contract
+    /// is a result without duplicates -- and free, since the result is
+    /// materialised anyway, whereas a candidate-side set would be as large as
+    /// the bucket. Duplicates are possible at all because write-side dedup
+    /// checks only the head segment: scanning the chain on every insert would
+    /// put a chain-length read on the write path.
     pub async fn query(
         &self,
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        let read_res = self.neb_client.read_cell(index_id).await;
         let mut result = Vec::new();
-        match read_res {
-            Ok(Ok(cell)) => {
-                let cell_ids_val = &cell[*HASH_INDEX_FIELD_ID];
-                if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = cell_ids_val {
-                    for id in ids {
-                        // Now we need to check each of the cell id that they have
-                        // a field matching the field id and have exact the same value
-                        let cell_res = self
-                            .neb_client
-                            .read_cell_select(*id, &vec![field_id], false)
-                            .await;
-                        if let Ok(Ok(cell)) = &cell_res {
-                            let field_val = &cell[0usize];
-                            if values_semantically_equal(field_val, value) {
-                                result.push(*id);
-                            } else {
-                                debug!(
-                                    "Cell {:?} has field {:?} with value {:?}, but expected {:?}",
-                                    id, field_id, field_val, value
-                                );
-                            }
-                        }
+        let mut emitted = HashSet::new();
+        let mut cursor = Some(index_id);
+        let mut hops = 0usize;
+
+        while let Some(cid) = cursor {
+            let segment = match self.read_segment(cid).await {
+                Ok(Ok(Some(segment))) => segment,
+                // A missing HEAD is an empty bucket. A missing LINK is a
+                // broken chain: say so rather than quietly returning a short
+                // answer that reads like a complete one.
+                Ok(Ok(None)) => {
+                    if cid != index_id {
+                        error!(
+                            "hash bucket {:?} links to missing cell {:?}; entries after it are unreachable",
+                            index_id, cid
+                        );
+                    }
+                    break;
+                }
+                Ok(Err(e)) => return Ok(Err(e)),
+                Err(e) => return Err(e),
+            };
+            let (ids, next) = segment;
+            cursor = next;
+
+            for id in ids {
+                if emitted.contains(&id) {
+                    continue;
+                }
+                // Each candidate is re-read and checked: a bucket is keyed by
+                // a hash, so it holds collisions as well as matches.
+                let cell_res = self
+                    .neb_client
+                    .read_cell_select(id, &vec![field_id], false)
+                    .await;
+                if let Ok(Ok(cell)) = &cell_res {
+                    let field_val = &cell[0usize];
+                    if values_semantically_equal(field_val, value) {
+                        emitted.insert(id);
+                        result.push(id);
+                    } else {
+                        debug!(
+                            "Cell {:?} has field {:?} with value {:?}, but expected {:?}",
+                            id, field_id, field_val, value
+                        );
                     }
                 }
-                return Ok(Ok(result));
             }
-            Ok(Err(ReadError::CellDoesNotExisted)) => {
-                return Ok(Ok(vec![]));
-            }
-            Ok(Err(e)) => {
-                return Ok(Err(e));
-            }
-            Err(e) => {
-                return Err(e);
+
+            hops += 1;
+            if hops > MAX_CHAIN_HOPS {
+                error!(
+                    "hash bucket {:?} chain exceeded {} hops; truncating walk",
+                    index_id, MAX_CHAIN_HOPS
+                );
+                break;
             }
         }
+
+        Ok(Ok(result))
     }
 }
 
@@ -389,7 +706,12 @@ pub fn hash_index_schema() -> Schema {
         HASH_INDEX_SCHEMA_ID.get(),
         &HASH_SCHEMA.to_string(),
         None,
-        Field::new_schema(vec![Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id)]),
+        Field::new_schema(vec![
+            Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
+            // Nullable: a bucket that never outgrew one cell has no link, and
+            // so does a bucket written before chaining existed.
+            Field::new_unindexed_nullable(HASH_NEXT_FIELD, Type::Id),
+        ]),
         false,
         false,
     )
@@ -695,6 +1017,88 @@ mod tests {
             }
         } else {
             panic!("Expected Id array, got {:?}", ids);
+        }
+    }
+
+    /// A bucket that outgrows one cell must chain, and must read back whole.
+    ///
+    /// This is the silent-truncation case. Before chaining, the head hit
+    /// `MAX_CELL_SIZE`, every further insert failed `CellIsTooLarge`, and the
+    /// bucket then answered with whatever had happened to fit -- a 174,166-id
+    /// bucket returning 131,066. Sized just past one segment so the spill path
+    /// runs without paying for a full-size bucket, and driven concurrently so
+    /// it also covers spilling under contention.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_chains_past_one_segment() {
+        // Shrink the segment so the spill path runs against the 16 MiB test
+        // store. The isolated runner gives each test its own process, so this
+        // is read before anything else touches the index; the assert makes it
+        // fail loudly rather than silently testing nothing if that changes.
+        std::env::set_var("NEB_HASH_BUCKET_CAPACITY", "64");
+        let (_server, client) = create_test_server("bucket_chain").await;
+        let indexer = Arc::new(HashIndexer::new(&client));
+        let index_id = Id::rand();
+
+        assert!(
+            *BUCKET_CAPACITY <= 64,
+            "BUCKET_CAPACITY already initialised to {}; this test needs its own process",
+            *BUCKET_CAPACITY
+        );
+        let total = *BUCKET_CAPACITY + 500;
+        let cell_ids: Vec<Id> = (0..total as u64).map(|i| Id::from_parts(7, i + 1)).collect();
+
+        let mut tasks = JoinSet::new();
+        for chunk in cell_ids.chunks(total.div_ceil(32)) {
+            let indexer = indexer.clone();
+            let chunk: Vec<Id> = chunk.to_vec();
+            tasks.spawn(async move {
+                for cell_id in chunk {
+                    indexer.add_index(&cell_id, &index_id).await?;
+                }
+                Ok::<(), WriteError>(())
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.expect("task panicked").expect("add_index failed");
+        }
+
+        // Walk the chain the way a reader does.
+        let mut seen = std::collections::HashSet::new();
+        let mut segments = 0usize;
+        let mut cursor = Some(index_id);
+        while let Some(cid) = cursor {
+            let cell = client.read_cell(cid).await.unwrap().unwrap();
+            match &cell[*HASH_INDEX_FIELD_ID] {
+                OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => {
+                    assert!(
+                        ids.len() <= *BUCKET_CAPACITY,
+                        "segment {:?} holds {} ids, over the {} cap",
+                        cid,
+                        ids.len(),
+                        *BUCKET_CAPACITY
+                    );
+                    seen.extend(ids.iter().copied());
+                }
+                other => panic!("segment {:?} has no id array: {:?}", cid, other),
+            }
+            cursor = match &cell[*HASH_NEXT_FIELD_ID] {
+                OwnedValue::Id(id) => Some(*id),
+                _ => None,
+            };
+            segments += 1;
+            assert!(segments < 1000, "chain did not terminate");
+        }
+
+        assert!(
+            segments > 1,
+            "a bucket of {} past a {} cap must spill, but stayed in {} segment(s)",
+            total,
+            *BUCKET_CAPACITY,
+            segments
+        );
+        assert_eq!(seen.len(), total, "every id must survive the spill");
+        for cell_id in &cell_ids {
+            assert!(seen.contains(cell_id), "id {:?} lost across the chain", cell_id);
         }
     }
 

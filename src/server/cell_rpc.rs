@@ -1,3 +1,4 @@
+use std::sync::atomic::{self, AtomicU64};
 use crate::index::scrub::{scrub_ranged_index, ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
@@ -19,6 +20,31 @@ use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use bifrost_plugins::hash_ident;
+
+/// Index task failures that were surfaced to a caller. Paired with the
+/// unscoped-failure counter in the index builder: together they say how much
+/// index work was lost and how much of it anyone was told about.
+pub static INDEX_TASK_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// A write outcome that can be failed after the fact by its own index work.
+///
+/// `with_indices_ensured` is generic over what the write returns, so folding
+/// an index failure into that value needs a hook rather than a match.
+pub trait IndexOutcome {
+    fn fail_with_index_error(self, detail: String) -> Self;
+}
+
+impl<T> IndexOutcome for Result<T, WriteError> {
+    fn fail_with_index_error(self, detail: String) -> Self {
+        match self {
+            // The cell is already durable, so this reports a partial success,
+            // not a rejected write -- see WriteError::IndexIncomplete. An
+            // error already present is kept: it is more specific than this.
+            Ok(_) => Err(WriteError::IndexIncomplete(detail)),
+            err => err,
+        }
+    }
+}
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
@@ -110,6 +136,27 @@ pub struct NebRPCService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_failure_turns_a_successful_write_into_index_incomplete() {
+        // The cell is written; only its index entry is missing. Reporting
+        // success here is what let 688,045 dropped entries pass for a clean
+        // import, so a success MUST NOT survive a failed index task.
+        let ok: Result<u8, WriteError> = Ok(1);
+        assert!(matches!(
+            ok.fail_with_index_error("boom".into()),
+            Err(WriteError::IndexIncomplete(_))
+        ));
+    }
+
+    #[test]
+    fn index_failure_keeps_a_more_specific_existing_error() {
+        let err: Result<u8, WriteError> = Err(WriteError::CellAlreadyExisted);
+        assert!(matches!(
+            err.fail_with_index_error("boom".into()),
+            Err(WriteError::CellAlreadyExisted)
+        ));
+    }
 
     #[test]
     fn scoped_cell_service_ids_differ_between_databases() {
@@ -1053,7 +1100,7 @@ impl NebRPCService {
 
     fn with_indices_ensured<'a, R, F>(&'a self, op: F) -> BoxFuture<'a, R>
     where
-        R: Send + 'a,
+        R: Send + IndexOutcome + 'a,
         F: FnOnce() -> R + Send + 'a,
     {
         if self.database_runtime.indexer().is_some() {
@@ -1066,19 +1113,40 @@ impl NebRPCService {
                 // await_all_indices at shutdown).
                 let (res, request_results) = IndexBuilder::with_request_index_scope(op).await;
 
+                // The scope has already awaited these, so the outcome of this
+                // write's index work is in hand right here. It used to be
+                // logged and dropped, which meant a write whose index entry
+                // failed still returned success and the store answered later
+                // queries with that row missing. Report it instead: the first
+                // failure names the cause, and the count says how much of the
+                // request's index work was lost.
+                let mut failed = 0usize;
+                let mut first: Option<String> = None;
                 for result in request_results.into_iter() {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             warn!("Index task failed during request: {:?}", e);
+                            failed += 1;
+                            first.get_or_insert_with(|| format!("{:?}", e));
                         }
                         Err(e) => {
                             warn!("Index task join failed during request: {:?}", e);
+                            failed += 1;
+                            first.get_or_insert_with(|| format!("index task join: {e}"));
                         }
                     }
                 }
 
-                res
+                match first {
+                    Some(detail) => {
+                        INDEX_TASK_FAILURES.fetch_add(failed as u64, atomic::Ordering::Relaxed);
+                        res.fail_with_index_error(format!(
+                            "{failed} index task(s) failed, first: {detail}"
+                        ))
+                    }
+                    None => res,
+                }
             }
             .boxed()
         } else {
