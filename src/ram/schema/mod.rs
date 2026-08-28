@@ -4,6 +4,7 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
 use dovahkiin::types::{OwnedValue, Type};
+use crate::ram::types::Id;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -665,6 +666,35 @@ pub struct Field {
     /// field is refused rather than admitted and then stranded.
     #[serde(default)]
     pub default: Option<OwnedValue>,
+    /// Set when this column stores dictionary CODES instead of the values
+    /// themselves, naming where the vocabulary lives so a reader can turn a
+    /// code back into what it means.
+    #[serde(default)]
+    pub dictionary: Option<DictionaryEncoding>,
+}
+
+/// Where to find the vocabulary a dictionary-encoded column's codes index
+/// into.
+///
+/// The vocabulary is addressed as a CELL rather than derived from the field,
+/// because the columns that most want this already have vocabularies
+/// somewhere: several columns can share one, and an existing dataset can
+/// declare where its own registry already lives instead of being re-imported
+/// into a canonical location. [`crate::ram::dictionary::dictionary_cell_id`]
+/// supplies the canonical id for a column that has no opinion.
+///
+/// The referenced cell holds an ordered string array under `values_field`;
+/// position `i` is code `i + 1`, and code `0` is "no value".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DictionaryEncoding {
+    pub cell: Id,
+    pub values_field: u64,
+}
+
+impl DictionaryEncoding {
+    pub fn new(cell: Id, values_field: u64) -> Self {
+        Self { cell, values_field }
+    }
 }
 
 impl Field {
@@ -696,7 +726,15 @@ impl Field {
             vector_size: None,
             compression: None,
             default: None,
+            dictionary: None,
         }
+    }
+
+    /// Declare that this column stores codes into the vocabulary held by
+    /// `cell` under `values_field`.
+    pub fn with_dictionary(mut self, cell: Id, values_field: u64) -> Self {
+        self.dictionary = Some(DictionaryEncoding::new(cell, values_field));
+        self
     }
 
     /// Give this field a value to fall back on when a cell has none.
@@ -887,6 +925,7 @@ impl Field {
             offset: None,
             compression: None,
             default: None,
+            dictionary: None,
         }
     }
     fn assign_offsets(
