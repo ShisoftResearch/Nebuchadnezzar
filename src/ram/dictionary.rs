@@ -37,7 +37,7 @@
 
 use crate::client::AsyncClient;
 use crate::ram::cell::{OwnedCell, ReadError, WriteError};
-use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
+use crate::ram::schema::{DictionaryEncoding, Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::*;
 use bifrost::rpc::RPCError;
 use bifrost_hasher::hash_str;
@@ -156,8 +156,13 @@ impl Dictionary {
 
     pub fn to_cell(&self, id: &Id) -> OwnedCell {
         let mut map = OwnedMap::new();
-        map.insert_key_id(
-            *DICTIONARY_VALUES_FIELD_ID,
+        // `insert`, not `insert_key_id`: the latter fills the id map but
+        // leaves `fields` empty, and a cell whose map has no field names does
+        // not survive a write -- it comes back as `Map({})`, an empty
+        // vocabulary, which would silently renumber every code written
+        // against it.
+        map.insert(
+            DICTIONARY_VALUES_FIELD,
             OwnedValue::Array(
                 self.values
                     .iter()
@@ -174,25 +179,69 @@ impl Dictionary {
     /// in how arrays are represented cannot silently yield an empty vocabulary
     /// — which would renumber every subsequent code.
     pub fn from_cell(cell: &OwnedCell) -> Self {
-        let raw = &cell[*DICTIONARY_VALUES_FIELD_ID];
-        let items: Vec<&OwnedValue> = match raw {
-            OwnedValue::Array(items) => items.iter().collect(),
-            OwnedValue::Map(map) => match map.get_by_key_id(*DICTIONARY_VALUES_FIELD_ID) {
-                OwnedValue::Array(items) => items.iter().collect(),
-                _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        Self::from_values(
+        dictionary_from_cell_field(cell, *DICTIONARY_VALUES_FIELD_ID)
+    }
+}
+
+/// Pull an ordered list of strings out of a value that may be either a
+/// generic array or a primitive one.
+///
+/// The store normalises a homogeneous `String` array into
+/// `OwnedValue::PrimArray(OwnedPrimArray::String(..))`, so a vocabulary READ
+/// BACK from storage never arrives as `OwnedValue::Array` -- only one built
+/// in memory does. Matching just `Array` therefore looked correct in a
+/// to_cell/from_cell unit test and returned an EMPTY vocabulary against a
+/// real store. That is the worst possible failure for this type: an empty
+/// vocabulary silently renumbers every code written against it, which is
+/// precisely what the append-only contract exists to prevent.
+fn strings_from_value(value: &OwnedValue) -> Option<Vec<String>> {
+    match value {
+        OwnedValue::PrimArray(OwnedPrimArray::String(values)) => Some(values.clone()),
+        OwnedValue::Array(items) => Some(
             items
-                .into_iter()
+                .iter()
                 .filter_map(|v| match v {
                     OwnedValue::String(s) => Some(s.clone()),
                     _ => None,
                 })
                 .collect(),
-        )
+        ),
+        _ => None,
     }
+}
+
+/// Read the vocabulary a [`DictionaryEncoding`] points at.
+///
+/// Independent of `DictionaryColumn` on purpose: a reader (a query decoding a
+/// projection, an operator inspecting a column) wants the vocabulary as it is
+/// on disk, not a writer that also knows how to extend it. Accepts the same
+/// shapes `Dictionary::from_cell` does, and reads the values from whichever
+/// field the encoding names -- an existing dataset can keep its own registry
+/// layout instead of being re-imported into the canonical one.
+pub async fn read_dictionary(
+    client: &AsyncClient,
+    encoding: &DictionaryEncoding,
+) -> Result<Dictionary, ReadError> {
+    match client.read_cell(encoding.cell).await {
+        Ok(Ok(cell)) => Ok(dictionary_from_cell_field(&cell, encoding.values_field)),
+        // A column can be declared dictionary-encoded before anything is
+        // written to it; an absent vocabulary is empty, not an error.
+        Ok(Err(ReadError::CellDoesNotExisted)) => Ok(Dictionary::default()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ReadError::NetworkingError),
+    }
+}
+
+/// Pull an ordered string array out of `cell` at `values_field`.
+pub fn dictionary_from_cell_field(cell: &OwnedCell, values_field: u64) -> Dictionary {
+    let raw = &cell[values_field];
+    let values = strings_from_value(raw)
+        .or_else(|| match raw {
+            OwnedValue::Map(map) => strings_from_value(map.get_by_key_id(values_field)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    Dictionary::from_values(values)
 }
 
 /// A durable, shared dictionary for one column.
@@ -360,6 +409,33 @@ mod tests {
             OwnedValue::Map(OwnedMap::new()),
         );
         assert!(Dictionary::from_cell(&cell).is_empty());
+    }
+
+    /// A vocabulary read back the way STORAGE returns it, not the way it was
+    /// built.
+    ///
+    /// The store normalises a homogeneous string array to `PrimArray`, so a
+    /// cell that has been through a write/read cycle never arrives as
+    /// `OwnedValue::Array`. Reading only `Array` therefore passed every
+    /// to_cell/from_cell test while returning an EMPTY vocabulary from a real
+    /// store -- and an empty vocabulary is the one thing this type must never
+    /// produce, since `extend_and_encode` reads before writing and would have
+    /// renumbered every existing code.
+    #[test]
+    fn a_vocabulary_stored_as_a_primitive_array_still_reads_back() {
+        let values = vec!["optic".to_string(), "central".to_string()];
+        let mut map = OwnedMap::new();
+        map.insert(
+            DICTIONARY_VALUES_FIELD,
+            OwnedValue::PrimArray(OwnedPrimArray::String(values.clone())),
+        );
+        let id = dictionary_cell_id(SchemaUid(7), 9);
+        let cell = OwnedCell::new_with_id(*DICTIONARY_SCHEMA_ID, &id, OwnedValue::Map(map));
+
+        let dictionary = Dictionary::from_cell(&cell);
+        assert_eq!(dictionary.values(), values.as_slice());
+        assert_eq!(dictionary.encode("central"), 2);
+        assert_eq!(dictionary.decode(1), Some("optic"));
     }
 
     #[test]
