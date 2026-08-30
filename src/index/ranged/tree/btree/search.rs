@@ -19,6 +19,10 @@ where
     let mut node;
     let mut node_ref = node_ref;
     let backoff = crossbeam::utils::Backoff::new();
+    // A node that never resolves -- write-locked by a task cancelled
+    // mid-write, say -- used to spin here silently forever, pinning the
+    // thread. Say so, periodically, so the hang has a name.
+    let mut spins: u64 = 0;
     loop {
         // The closure must stay free of side effects: read_node re-runs it when
         // the node version changes under a concurrent writer.
@@ -131,6 +135,13 @@ where
             Err(e) => {
                 node = e;
                 node_ref = &node;
+                spins += 1;
+                if spins.is_power_of_two() && spins >= 1 << 20 {
+                    warn!(
+                        "search_node has retried {} times for key {:?}: a node is not resolving",
+                        spins, key
+                    );
+                }
                 backoff.spin();
             }
         }
