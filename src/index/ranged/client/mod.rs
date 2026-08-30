@@ -1,6 +1,6 @@
 use super::sm::client::SMClient;
 use super::tree::service::*;
-use super::{sm::TreePlacement, tree::btree::Ordering};
+use super::{sm::TreePlacement, tree::btree::Ordering, trees::min_entry_key};
 use crate::index::EntryKey;
 use crate::ram::types::Id;
 use bifrost::raft::client::AsRaftPlaneClient;
@@ -211,22 +211,45 @@ impl RangedIndexerClient {
         .await
     }
 
+    /// Statistics for every tree in the index, walked from the state machine's
+    /// placements. The client's own placement cache only knows the trees it
+    /// has touched, so a cache walk reported one tree for an index that had
+    /// split into several.
     pub async fn tree_stats(&self) -> Result<Vec<TreeStat>, RPCError> {
+        let exec_err = |e: ExecError| {
+            RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Cannot walk tree placements: {:?}", e),
+            ))
+        };
         let mut res = vec![];
-        for tree_placement in self.placement.read().values().map(|(id, _)| id) {
-            let tree_id = tree_placement.id;
+        let Some((mut lower, mut placement, _)) = self
+            .refresh_key_mapping(&min_entry_key())
+            .await
+            .map_err(exec_err)?
+        else {
+            return Ok(res);
+        };
+        loop {
             let tree_client = locate_tree_server_from_conshash(
-                &tree_id,
+                &placement.id,
                 &self.conshash,
                 &self.group_name,
                 &self.database_name,
             )
             .await?;
-            match tree_client.stat(tree_id).await? {
+            match tree_client.stat(placement.id).await? {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
                 }
                 _ => unreachable!(),
+            }
+            match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
+                NextTree::Found(next_lower, next_placement) => {
+                    lower = next_lower;
+                    placement = next_placement;
+                }
+                NextTree::End | NextTree::Unresolved(_) => break,
             }
         }
         Ok(res)

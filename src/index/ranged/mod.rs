@@ -316,6 +316,177 @@ mod tests {
         .await;
     }
 
+    /// A field entry: schema 11, field 1, the value as the feature, one id.
+    fn field_entry(value: u64, id: &Id) -> EntryKey {
+        let mut key =
+            EntryKey::for_schema_field_feature(SchemaUid(11), 1, &value.to_be_bytes());
+        key.set_id(id);
+        key
+    }
+
+    async fn collect(mut cursor: client::cursor::ClientCursor) -> Vec<Id> {
+        let mut ids = Vec::new();
+        while let Some(id) = cursor.next().await.unwrap() {
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// An equality scan on one field value used to come back with the first
+    /// block of every tree after the one holding the value: the client
+    /// cursor refilled from the next tree with an unbounded range once the
+    /// value's own entries ran out. Here 64 values of one field are followed
+    /// by enough entries of a later schema to split the index into several
+    /// trees, and every scan must return its value's ids and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_ends_at_its_range_even_when_trees_follow() {
+        let _ = env_logger::try_init();
+        let server_group = "ranged_index_range_end_test";
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 32 * 1024 * 1024 * 1024,
+                db_size: 32 * 1024 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr.to_string()],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        let meta_plane_client = server
+            .raft_client
+            .plane(crate::server::database_meta_plane_id(
+                server_group,
+                server_group,
+            ));
+        let index_client = Arc::new(client::RangedIndexerClient::new_for_database(
+            &server.consh,
+            &meta_plane_client,
+            server_group,
+            server_group,
+        ));
+        client.new_schema_with_id(schema()).await.unwrap().unwrap();
+
+        // Small trees, so the filler splits the index into several of them.
+        btree::set_tree_depth(2);
+        let filler = btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 3;
+
+        const VALUES: u64 = 64;
+        const IDS_PER_VALUE: u64 = 32;
+        let mut expected: Vec<Vec<Id>> = Vec::new();
+        let mut futs = FuturesUnordered::new();
+        for value in 0..VALUES {
+            let mut ids = Vec::new();
+            for n in 0..IDS_PER_VALUE {
+                let id = Id::from_parts(1, value * IDS_PER_VALUE + n);
+                ids.push(id);
+                let index_client = index_client.clone();
+                futs.push(async move { index_client.insert(&field_entry(value, &id)).await });
+            }
+            expected.push(ids);
+        }
+        while let Some(result) = futs.next().await {
+            assert!(result.unwrap(), "insertion returned false");
+        }
+        // Entries of a later schema sort after every field entry above.
+        let mut futs = FuturesUnordered::new();
+        for n in 0..filler {
+            let index_client = index_client.clone();
+            futs.push(async move {
+                let id = Id::from_parts(2, n as u64);
+                let mut key =
+                    EntryKey::for_schema_field_feature(SchemaUid(12), 1, &(n as u64).to_be_bytes());
+                key.set_id(&id);
+                index_client.insert(&key).await
+            });
+        }
+        while let Some(result) = futs.next().await {
+            assert!(result.unwrap(), "insertion returned false");
+        }
+        // The split is found by a 500 ms checker and then migrated; wait for
+        // the state machine to place a tree after the one holding the field
+        // entries, which is exactly what the cursor consults when it refills.
+        let first_field_key = field_entry(0, &Id::from_parts(1, 0));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let trees = loop {
+            let next = index_client
+                .next_tree(&first_field_key, Ordering::Forward)
+                .await
+                .unwrap();
+            if matches!(next, client::NextTree::Found(..)) {
+                break 2;
+            }
+            if Instant::now() > deadline {
+                break 1;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        storage::wait_until_updated().await;
+        assert!(trees > 1, "the fixture needs a tree after the field entries");
+        let stats = index_client.tree_stats().await.unwrap().len();
+        assert!(stats >= 2, "tree_stats walks every placement, saw {stats}");
+
+        // Inclusive bounds the way the planner builds them: the start key
+        // carries the unit id, the end key the max id, so every id of the
+        // boundary value lies inside.
+        let prefix = |value: u64| EntryKey::for_schema_field_feature(SchemaUid(11), 1, &value.to_be_bytes());
+        let prefix_end =
+            |value: u64| EntryKey::from_props(&Id::max_id(), &value.to_be_bytes(), 1, SchemaUid(11));
+        for value in [0, 31, VALUES - 1] {
+            for ordering in [Ordering::Forward, Ordering::Backward] {
+                let range = Range {
+                    start: crate::index::ranged::tree::service::RangeTerm::Inclusive(prefix(value)),
+                    end: crate::index::ranged::tree::service::RangeTerm::Inclusive(prefix_end(value)),
+                    ordering,
+                };
+                let cursor = client::RangedIndexerClient::seek(&index_client, range, 64, None)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("value {value} scanned {ordering:?} found nothing"));
+                let mut got = collect(cursor).await;
+                got.sort();
+                assert_eq!(
+                    got, expected[value as usize],
+                    "value {value} scanned {ordering:?} across {trees} trees"
+                );
+            }
+        }
+        // A bounded range over several values, likewise.
+        let range = Range {
+            start: crate::index::ranged::tree::service::RangeTerm::Inclusive(prefix(10)),
+            end: crate::index::ranged::tree::service::RangeTerm::Inclusive(prefix_end(20)),
+            ordering: Ordering::Forward,
+        };
+        let cursor = client::RangedIndexerClient::seek(&index_client, range, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut got = collect(cursor).await;
+        got.sort();
+        let mut want: Vec<Id> = expected[10..=20].concat();
+        want.sort();
+        assert_eq!(got, want, "values 10..=20 across {trees} trees");
+    }
+
     fn schema() -> Schema {
         Schema::new_with_id(
             11,

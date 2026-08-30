@@ -84,6 +84,44 @@ pub struct ClientCursor {
 }
 
 impl ClientCursor {
+    /// Whether `key` lies beyond the far end of this cursor's range: past
+    /// `end` scanning forward, before `start` scanning backward. A key that
+    /// does is the end of the scan -- whatever tree it happens to be in.
+    fn past_end(&self, key: &EntryKey) -> bool {
+        match self.range.ordering {
+            Ordering::Forward => match &self.range.end {
+                RangeTerm::Inclusive(k) => key.prefix_gt(k),
+                RangeTerm::Exclusive(k) => key.prefix_ge(k),
+                RangeTerm::Open => false,
+            },
+            Ordering::Backward => match &self.range.start {
+                RangeTerm::Inclusive(k) => key.prefix_lt(k),
+                RangeTerm::Exclusive(k) => key.prefix_le(k),
+                RangeTerm::Open => false,
+            },
+        }
+    }
+
+    /// The range to seek a *following* tree with: open on the near side
+    /// (the tree's own boundary bounds it) and this cursor's own bound on
+    /// the far side. Seeking `[min, max]` there was how a scan for one
+    /// field's value came back with the first block of every tree after
+    /// it: the service only enforces the far bound it is handed.
+    fn range_for_next_tree(&self) -> Range {
+        match self.range.ordering {
+            Ordering::Forward => Range {
+                start: RangeTerm::Inclusive(min_entry_key()),
+                end: self.range.end.clone(),
+                ordering: self.range.ordering,
+            },
+            Ordering::Backward => Range {
+                start: self.range.start.clone(),
+                end: RangeTerm::Inclusive(max_entry_key()),
+                ordering: self.range.ordering,
+            },
+        }
+    }
+
     pub async fn new(
         block: ServBlock,
         range: Range,
@@ -178,6 +216,16 @@ impl ClientCursor {
             self.pos = 0;
             return Ok(res);
         };
+        if self.past_end(&next_key) {
+            // The tree handed back the key after the last hit, and it is
+            // already outside the range: nothing in this tree or any tree
+            // after it can match. Refilling from the next tree here is how
+            // unrelated entries leaked into equality matches.
+            self.ids.clear();
+            self.pos = 0;
+            self.next = None;
+            return Ok(res);
+        }
         trace!(
             "Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}",
             next_key,
@@ -306,6 +354,18 @@ impl ClientCursor {
                         self.ids.last().copied()
                     );
                 }
+                if self.past_end(&tree_key) {
+                    // The next tree begins beyond the range: the scan is
+                    // over even though trees remain.
+                    debug!(
+                        "Next tree for {:?} starts at {:?}, past the range end; scan complete",
+                        current_key, tree_key
+                    );
+                    self.ids.clear();
+                    self.pos = 0;
+                    self.next = None;
+                    return Ok(());
+                }
                 let tree_client = locate_tree_server_from_conshash(
                     &tree.id,
                     &self.query_client.conshash,
@@ -313,11 +373,7 @@ impl ClientCursor {
                     &self.query_client.database_name,
                 )
                 .await?;
-                let range = Range {
-                    start: RangeTerm::Inclusive(min_entry_key()),
-                    end: RangeTerm::Inclusive(max_entry_key()),
-                    ordering: self.range.ordering,
-                };
+                let range = self.range_for_next_tree();
                 let seek_res = tree_client
                     .seek(tree.id, range, &self.pattern, self.buffer_size, tree.epoch)
                     .await?;
