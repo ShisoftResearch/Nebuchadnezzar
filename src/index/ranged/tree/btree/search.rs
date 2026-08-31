@@ -136,13 +136,17 @@ where
                 node = e;
                 node_ref = &node;
                 spins += 1;
-                if spins.is_power_of_two() && spins >= 1 << 20 {
+                if spins.is_power_of_two() && spins >= node::STUCK_LATCH_WARN_SPINS {
                     warn!(
                         "search_node has retried {} times for key {:?}: a node is not resolving",
                         spins, key
                     );
                 }
-                backoff.spin();
+                if spins >= node::STUCK_LATCH_YIELD_SPINS {
+                    backoff.snooze();
+                } else {
+                    backoff.spin();
+                }
             }
         }
     }
@@ -161,6 +165,9 @@ where
     let mut other_ref;
     let mut node_ref = node_ref;
     let backoff = crossbeam::utils::Backoff::new();
+    // Same discipline as search_node: a condemned pointer that never heals
+    // must not become a silent forever-spin.
+    let mut spins: u64 = 0;
     loop {
         match read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::Internal(ref n) => {
@@ -187,7 +194,18 @@ where
             Err(e) => {
                 other_ref = e;
                 node_ref = &other_ref;
-                backoff.spin();
+                spins += 1;
+                if spins.is_power_of_two() && spins >= node::STUCK_LATCH_WARN_SPINS {
+                    warn!(
+                        "mut_search has retried {} times for key {:?}: a node is not resolving",
+                        spins, key
+                    );
+                }
+                if spins >= node::STUCK_LATCH_YIELD_SPINS {
+                    backoff.snooze();
+                } else {
+                    backoff.spin();
+                }
             }
         }
     }

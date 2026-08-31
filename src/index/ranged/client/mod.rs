@@ -495,7 +495,25 @@ impl RangedIndexerClient {
         &self,
         key: &EntryKey,
     ) -> Result<Option<(EntryKey, TreePlacement, EntryKey)>, ExecError> {
-        let Some((lower, placement, upper)) = self.sm.locate_key(key).await? else {
+        let located = match self.sm.locate_key(key).await {
+            Ok(located) => located,
+            Err(ExecError::SmNotFound(sm_id)) => {
+                // The placement state machine is not registered on the
+                // serving member yet -- registration races the first
+                // queries at startup, and bifrost buffers commands for
+                // exactly this window. The key is not unlocatable, the
+                // member is not ready: same answer as "no tree yet", and
+                // the caller's bounded retry loop.
+                warn!(
+                    "Placement SM {} not yet registered while locating {:?}; \
+                     treating as no placement yet",
+                    sm_id, key
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some((lower, placement, upper)) = located else {
             return Ok(None);
         };
         debug_assert!(

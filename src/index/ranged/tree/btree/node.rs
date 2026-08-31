@@ -440,6 +440,7 @@ where
     let node_deref = node.deref();
     let cc = &node_deref.cc;
     let backoff = crossbeam::utils::Backoff::new();
+    let mut spins: u64 = 0;
     loop {
         let cc_num = cc.load(Acquire);
         let expected = cc_num & (!LATCH_FLAG);
@@ -459,9 +460,28 @@ where
                 node_ref: node.clone(),
             };
         }
-        backoff.spin();
+        // A latch abandoned by its writer turns this loop into a silent
+        // 100%-CPU hang. Name it, and yield rather than burn the core.
+        spins += 1;
+        if spins.is_power_of_two() && spins >= STUCK_LATCH_WARN_SPINS {
+            warn!(
+                "write_node has waited {} rounds for the latch on {:?} (cc {:#x}): holder is not releasing",
+                spins, node, cc_num
+            );
+        }
+        if spins >= STUCK_LATCH_YIELD_SPINS {
+            backoff.snooze();
+        } else {
+            backoff.spin();
+        }
     }
 }
+
+/// Retry rounds before an unbounded latch/retry loop names its hang; the
+/// warning repeats at each further power of two.
+pub(crate) const STUCK_LATCH_WARN_SPINS: u64 = 1 << 20;
+/// Retry rounds after which the loop stops spinning the core and yields.
+pub(crate) const STUCK_LATCH_YIELD_SPINS: u64 = 1 << 22;
 
 pub fn is_node_locked<KS, PS>(node: &NodeCellRef) -> bool
 where
@@ -506,11 +526,26 @@ where
     }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
+    // This loop inlines into every search: latched forever means readers
+    // spin here at 100% CPU with no outer counter ever advancing (the
+    // 2026-08-30 sidecar-import hang). Count, warn, then yield -- while
+    // pinned, an eternal spin also stalls epoch reclamation for everyone.
+    let mut spins: u64 = 0;
     loop {
         let cc_num = cc.load(Acquire);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
-            // trace!("read have a latch, retry {:b}", cc_num);
-            backoff.spin();
+            spins += 1;
+            if spins.is_power_of_two() && spins >= STUCK_LATCH_WARN_SPINS {
+                warn!(
+                    "read_node has waited {} rounds for the latch on {:?} (cc {:#x}): holder is not releasing",
+                    spins, node, cc_num
+                );
+            }
+            if spins >= STUCK_LATCH_YIELD_SPINS {
+                backoff.snooze();
+            } else {
+                backoff.spin();
+            }
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
