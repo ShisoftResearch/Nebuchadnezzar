@@ -306,3 +306,22 @@ correctly.
 - `stat`'s client-side `_ => unreachable!()` in `tree_stats` will panic
   the caller if a stat races a tree unload (noticed while reading, not
   hit).
+
+## Performance profile of the fix batch (release, 1M keys, 2 rounds each)
+
+Baseline = develop a1b9336d, Fixed = this branch. Same machine, quiet,
+sequential runs.
+
+| bench | BASE avg ops/s | FIXED avg ops/s | delta |
+|---|---|---|---|
+| insert_sequential | 5.62M | 5.66M | +0.7% (noise) |
+| insert_random | 3.05M | 3.14M | +2.9% |
+| insert_parallel_rand | 6.15M | 5.99M | -2.6% (round noise; r1 was above base) |
+| point_seek (the changed descent) | 2.97M | 3.02M | +1.6% |
+| scan_full | 165.8M | 165.9M | 0% |
+| scan_ids | 158.7M | 176.0M | **+10.9%** (both rounds) |
+| split (spine) | 0.36ms/1M | 0.39ms/1M | noise |
+
+End-to-end: the reader+writer stress test moves 131K verified inserts +
+3 structural splits + continuous scans in 3.9s (debug build, whole
+server stack) where the pre-fix code wedged forever.
