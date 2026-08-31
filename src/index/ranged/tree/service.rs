@@ -1089,8 +1089,14 @@ impl TreeService {
                     return true;
                 }
 
-                info!(
-                    "Recovering missing active tree {:?} for entry {:?} with boundary [{:?}, {:?}), epoch={}",
+                // WARN, deliberately: a mid-run disk reload of a tree the
+                // placement calls current means the in-memory copy was lost
+                // somewhere, and the reload silently discards every
+                // un-persisted tombstone in its range (the deletion set is
+                // memory-only). Legitimate only on genuine recovery; in a
+                // healthy running server this line is an alarm.
+                warn!(
+                    "Recovering missing active tree {:?} FROM DISK for entry {:?} with boundary [{:?}, {:?}), epoch={}; un-persisted tombstones in this range are lost",
                     id,
                     entry.id(),
                     lower,
@@ -1808,7 +1814,26 @@ impl TreeService {
                                 dist_tree.id, e
                             );
                         }
-                        pending_migrations.remove(&migration_target_id);
+                        // Retire the pending entry ONLY once the target is
+                        // known promoted into the active map. When the load
+                        // RPC failed (a store-full storm makes that routine),
+                        // this remove used to run anyway -- dropping the ONLY
+                        // in-memory copy of a committed split's target. The
+                        // next operation on its range then hydrated the tree
+                        // FROM DISK with a fresh, empty deletion set: pages as
+                        // of the seam barrier, tombstones (which are never
+                        // persisted) gone -- every deleted-but-uncompacted key
+                        // in the moved range came back to life. The 3h soak
+                        // caught it as a PERSISTENT resurrection with
+                        // contains=true and no delete miss, ~90 seconds into
+                        // the allocation-failure storm, three runs in a row.
+                        // The pending entry costs nothing to keep: promotion
+                        // through load_tree or hydrate_missing_tree removes it
+                        // and shares the live deletion set, which is the
+                        // whole point of the pending map.
+                        if target_loaded {
+                            pending_migrations.remove(&migration_target_id);
+                        }
                         debug!(
                             "LSM tree migration from {:?} to {:?} succeed in {:?}",
                             dist_tree.id,
