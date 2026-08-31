@@ -189,7 +189,7 @@ where
                 };
                 // One emptiness check per page instead of one hash lookup
                 // per key when nothing is tombstoned (the common case).
-                let filtering = filter_deleted && deletion.len() > 0;
+                let filtering = filter_deleted && !deletion.is_empty();
                 let keys = if filtering {
                     SnapKeys::Full(
                         n.keys
@@ -272,7 +272,7 @@ where
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
                 &NodeData::External(ref n) => {
-                    let filtering = self.filter_deleted && self.deletion.len() > 0;
+                    let filtering = self.filter_deleted && !self.deletion.is_empty();
                     let snap = |range: std::ops::Range<usize>| -> SnapKeys {
                         if filtering {
                             SnapKeys::Full(

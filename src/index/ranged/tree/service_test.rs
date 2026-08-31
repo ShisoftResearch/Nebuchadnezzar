@@ -223,11 +223,11 @@ mod test {
         use crate::index::ranged::tree::btree::Ordering;
         use crate::index::ranged::tree::service::{Range, RangeTerm};
         use crate::index::ranged::trees::Cursor;
-        use lightning::map::HashSet;
+        use crate::index::ranged::tree::tree::DeletionSet;
         use std::sync::Arc;
 
-        fn deletion_set() -> Arc<HashSet<EntryKey>> {
-            Arc::new(HashSet::with_capacity(16))
+        fn deletion_set() -> Arc<DeletionSet> {
+            Arc::new(DeletionSet::with_capacity(16))
         }
 
         let tree = LevelBPlusTree::new(&deletion_set());

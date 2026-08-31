@@ -10,7 +10,71 @@ use std::mem;
 use std::sync::Arc;
 
 // DeletionSet hides deleted keys immediately and lets page writeback compact them.
-pub type DeletionSet = LFHashSet<EntryKey>;
+//
+// A lock-free set plus a PRECISE size gauge. The scan paths skip tombstone
+// filtering entirely when the set is empty (the hot-path win that keeps
+// packed, non-materializing snapshots), and that emptiness answer is a
+// CORRECTNESS decision: lightning's own len() sums sharded per-thread
+// counters with relaxed loads, so with inserts landing on writer threads
+// and removes on write-back threads its sum transiently reads zero (or
+// negative) while tombstones remain -- and one such misread during a page
+// snapshot yields a deleted key back to a scan. The 3h soak caught exactly
+// that at audit #593, during a store-full compaction storm that kept the
+// set oscillating around empty ("scan yields v=N but expected v=N+1", the
+// yielded key long-deleted and verified invisible). The gauge counts only
+// CONFIRMED mutations, after the set call returns: any acknowledged delete
+// is therefore counted before its caller proceeds, and the in-flight
+// window only ever OVER-reports (a remove decrements after the key is
+// already gone), which is the safe direction for a filter gate.
+pub struct DeletionSet {
+    set: LFHashSet<EntryKey>,
+    tombstones: std::sync::atomic::AtomicIsize,
+}
+
+impl DeletionSet {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            set: LFHashSet::with_capacity(capacity),
+            tombstones: std::sync::atomic::AtomicIsize::new(0),
+        }
+    }
+
+    pub fn insert(&self, key: EntryKey) -> bool {
+        let inserted = self.set.insert(key);
+        if inserted {
+            self.tombstones
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        inserted
+    }
+
+    pub fn remove(&self, key: &EntryKey) -> bool {
+        let removed = self.set.remove(key);
+        if removed {
+            self.tombstones
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        removed
+    }
+
+    pub fn contains(&self, key: &EntryKey) -> bool {
+        self.set.contains(key)
+    }
+
+    /// Precise emptiness for the filter gates. `true` means every tombstone
+    /// whose delete has been acknowledged is gone; an unacknowledged insert
+    /// racing this read may be missed, which orders the reading scan before
+    /// that delete -- legal.
+    pub fn is_empty(&self) -> bool {
+        self.tombstones.load(std::sync::atomic::Ordering::Acquire) <= 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.tombstones
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(0) as usize
+    }
+}
 
 pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
 pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
@@ -88,7 +152,7 @@ impl std::fmt::Display for TreeRecoverError {
 impl RangedTree {
     /// Create a new ranged tree
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
-        let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
+        let deletion_set = Arc::new(DeletionSet::with_capacity(0));
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
 
@@ -119,7 +183,7 @@ impl RangedTree {
                                     id, error
                                 );
                                 let deletion_set =
-                                    Arc::new(lightning::map::HashSet::with_capacity(0));
+                                    Arc::new(DeletionSet::with_capacity(0));
                                 Self {
                                     tree: DiskTree::new(&deletion_set),
                                 }
@@ -166,7 +230,7 @@ impl RangedTree {
     ) -> Result<Self, TreeRecoverError> {
         info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
-        let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
+        let deletion_set = Arc::new(DeletionSet::with_capacity(0));
 
         let cell = match neb_client.read_cell(*tree_id).await {
             Ok(Ok(cell)) => {
@@ -537,7 +601,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_tree() -> RangedTree {
-        let ds = Arc::new(LFHashSet::<EntryKey>::with_capacity(0));
+        let ds = Arc::new(DeletionSet::with_capacity(0));
         RangedTree {
             tree: DiskTree::new(&ds),
         }

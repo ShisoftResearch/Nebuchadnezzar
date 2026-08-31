@@ -105,7 +105,7 @@ where
                         Some(idx) => Ok(RTCursor::from_lazy(
                             n.keys.key_at(idx),
                             filter_deleted
-                                && deletion.len() > 0
+                                && !deletion.is_empty()
                                 && deletion.contains(&n.keys.key_at(idx)),
                             node_ref.clone(),
                             ordering,

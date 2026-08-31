@@ -60,7 +60,7 @@ fn node_size() {
 }
 
 fn deletion_set() -> Arc<DeletionSet> {
-    Arc::new(HashSet::with_capacity(16))
+    Arc::new(DeletionSet::with_capacity(16))
 }
 
 #[test]

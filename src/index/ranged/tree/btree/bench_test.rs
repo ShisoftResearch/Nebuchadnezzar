@@ -19,7 +19,7 @@ type BenchPtrSlice = [NodeCellRef; BTREE_NODE_SIZE + 1];
 type BenchTree = BPlusTree<BenchKeySlice, BenchPtrSlice>;
 
 fn deletion_set() -> Arc<DeletionSet> {
-    Arc::new(HashSet::with_capacity(16))
+    Arc::new(DeletionSet::with_capacity(16))
 }
 
 fn key_of(n: u64) -> EntryKey {

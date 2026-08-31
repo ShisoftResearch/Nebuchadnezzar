@@ -564,7 +564,7 @@ mod test {
                 .unwrap();
             last_id = new_id;
         }
-        let deletion = Arc::new(HashSet::with_capacity(8));
+        let deletion = Arc::new(DeletionSet::with_capacity(8));
         let tree = Arc::new(
             LevelBPlusTree::from_head_id(&Id::from_parts(1, 1), &client, &deletion, 0, None)
                 .await
