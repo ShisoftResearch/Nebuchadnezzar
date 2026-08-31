@@ -317,6 +317,14 @@ impl RangedTree {
     pub fn insert(&self, entry: &EntryKey) -> bool {
         debug!("Inserting entry: {:?}", entry);
         if self.tree.deletion.remove(entry) {
+            // The un-delete path: this insert targets a key that carries a
+            // tombstone, so the tombstone is consumed and, if the physical
+            // copy still exists, revived in place. Legitimate ONLY for a
+            // caller that intends to re-insert a deleted key. Any OTHER
+            // caller reaching here has resurrected a key by accident --
+            // exactly the shape the soak audits kept catching -- so say so
+            // loudly enough to correlate with whatever storm is running.
+            warn!("UNDELETE consumed a tombstone for {:?}", entry.id());
             let cursor = self.tree.seek_raw(entry, Ordering::Forward);
             if cursor.current() == Some(entry) {
                 if let Some(page) = cursor.page.as_ref() {

@@ -1326,16 +1326,39 @@ impl TreeService {
         // debug).
         let restored_upper = { moved.prop.read().boundary.upper.clone() };
         super::btree::split_off::reopen_right_edge(&dist_tree.tree.tree, &restored_upper);
-        let mut cursor = moved.tree.seek(&min_entry_key(), Ordering::Forward);
+        // A RAW, unfiltered walk and RAW inserts, both deliberately:
+        //
+        // - The filtered walk silently dropped every tombstoned moved key's
+        //   physical copy (skipped by the snapshot filter, discarded with
+        //   the target), leaving lingering tombstones -- survivable, but it
+        //   made rollback correctness depend on the filter being right.
+        // - RangedTree::insert would be worse: its un-delete path CONSUMES a
+        //   tombstone and revives the key -- one filter miss during the walk
+        //   and a deleted key comes back to life (the soak's resurrection
+        //   shape, four runs).
+        //
+        // Raw inserts make the end state independent of any set answer: a
+        // tombstoned key goes back in WITH its tombstone intact, stays
+        // logically deleted, and compacts away at the next flush -- exactly
+        // as if the split had never happened. The tombstoned count is logged
+        // so a storm's rollbacks leave an audit trail.
+        let mut cursor = moved
+            .tree
+            .tree
+            .seek_raw(&min_entry_key(), Ordering::Forward);
         let mut restored = 0usize;
+        let mut tombstoned = 0usize;
         while let Some(key) = cursor.next() {
-            if dist_tree.tree.insert(&key) {
+            if dist_tree.tree.tree.deletion.contains(&key) {
+                tombstoned += 1;
+            }
+            if dist_tree.tree.tree.insert(&key) {
                 restored += 1;
             }
         }
         info!(
-            "Rolled back split of {:?}: reabsorbed {} moved key(s) from target {:?}",
-            dist_tree.id, restored, target_id
+            "Rolled back split of {:?}: reabsorbed {} moved key(s) ({} tombstoned) from target {:?}",
+            dist_tree.id, restored, tombstoned, target_id
         );
         pending_migrations.remove(&target_id);
         // The target's metadata cell (if its publish got that far) must not
