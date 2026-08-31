@@ -160,7 +160,13 @@ where
     ) -> Self {
         BPlusTree {
             root: RwLock::new(root),
-            root_versioning: NodeCellRef::default(),
+            // A REAL node, exactly as `new()` builds: `write_node` on a
+            // default ref hands back a null guard that excludes nothing, so
+            // a default here voided the root-versioning latch -- concurrent
+            // top-level splits on any reconstructed or split-target tree
+            // (every tree a production server actually runs) could install
+            // racing roots unserialized.
+            root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
             height: AtomicUsize::new(height),
