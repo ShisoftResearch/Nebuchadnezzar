@@ -60,6 +60,15 @@ pub struct DistTree {
     id: Id,
     tree: RangedTree,
     prop: RwLock<DistProp>,
+    // Operations currently inside this tree (between the routing checks and
+    // the end of their tree call). The split balancer sets the migration
+    // marker and then waits for this to reach zero before touching the
+    // structure -- an operation that passed the checks before the marker
+    // landed is still counted, so no writer races split_off. A counter
+    // rather than holding the prop read guard across the call: a guard
+    // would let parking_lot's writer-fairness park every routing check
+    // behind a pending freeze.
+    in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl DistTree {
@@ -1067,11 +1076,35 @@ impl TreeService {
 
     async fn rollback_pending_split(
         dist_tree: &Arc<DistTree>,
+        moved: &Arc<DistTree>,
         target_id: Id,
         pending_migrations: &Arc<HashMap<Id, Arc<DistTree>>>,
         client: &Arc<AsyncClient>,
     ) {
+        // split_off already truncated the LIVE source tree, so clearing the
+        // markers alone orphans every moved key -- routing still sends their
+        // range to the source, which no longer holds them (2026-08-30: a
+        // full store failed the seam barrier and this "rollback" quietly
+        // dropped 5.7M of 8.4M keys in the stress test, and a handful of
+        // scannable keys per BANC bulk import). Reabsorb the moved half
+        // before dropping the target; a failed split must degrade into
+        // "split deferred", never into loss.
+        let mut cursor = moved.tree.seek(&min_entry_key(), Ordering::Forward);
+        let mut restored = 0usize;
+        while let Some(key) = cursor.next() {
+            if dist_tree.tree.insert(&key) {
+                restored += 1;
+            }
+        }
+        info!(
+            "Rolled back split of {:?}: reabsorbed {} moved key(s) from target {:?}",
+            dist_tree.id, restored, target_id
+        );
         pending_migrations.remove(&target_id);
+        // The target's metadata cell (if its publish got that far) must not
+        // survive to be recovered as a tree; its leaves now belong to the
+        // source again.
+        let _ = client.remove_cell(target_id).await;
         {
             let mut dist_prop = dist_tree.prop.write();
             dist_prop.migration = None;
@@ -1289,14 +1322,43 @@ impl TreeService {
                         let source_upper = { dist_tree.prop.read().boundary.upper.clone() };
                         // Freeze the source before touching its structure: with
                         // the marker set, apply_in_ranged_tree returns Migrating
-                        // and rejects writes, so no writer races the split
-                        // (docs/tla/StructuralSplit.tla).
+                        // and rejects writes (docs/tla/StructuralSplit.tla).
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
                                 pivot: pivot_key.clone(),
                                 target_id: migration_target_id,
                             });
+                        }
+                        // ... and then DRAIN: an operation that passed the
+                        // routing checks before the marker landed is still
+                        // inside the tree, counted in `in_flight`. Splitting
+                        // under it is how entries landed in leaves the split
+                        // truncated. New operations see the marker and back
+                        // out, so this converges quickly.
+                        {
+                            let drain_started = Instant::now();
+                            let mut drain_warned = false;
+                            while dist_tree
+                                .in_flight
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                > 0
+                            {
+                                if !drain_warned && drain_started.elapsed() > Duration::from_secs(10)
+                                {
+                                    warn!(
+                                        "Split of {:?} has waited {:?} for {} in-flight \
+                                         operation(s) to drain",
+                                        dist_tree.id,
+                                        drain_started.elapsed(),
+                                        dist_tree
+                                            .in_flight
+                                            .load(std::sync::atomic::Ordering::SeqCst)
+                                    );
+                                    drain_warned = true;
+                                }
+                                tokio::task::yield_now().await;
+                            }
                         }
                         debug!("Marking migration for tree {:?}", dist_tree.id);
                         if let Err(e) = tree
@@ -1362,19 +1424,18 @@ impl TreeService {
                                 "Failed to publish target tree {:?} before split from {:?}: {:?}",
                                 migration_target_id, dist_tree.id, e
                             );
-                            pending_migrations.remove(&migration_target_id);
-                            {
-                                let mut dist_prop = dist_tree.prop.write();
-                                dist_prop.migration = None;
-                            }
-                            if let Err(unmark_err) =
-                                tree.mark_migration(&dist_tree.id, None, &client).await
-                            {
-                                warn!(
-                                    "Failed to clear migration marker for tree {:?} after target publish failure: {:?}",
-                                    dist_tree.id, unmark_err
-                                );
-                            }
+                            Self::rollback_pending_split(
+                                &dist_tree,
+                                &migration_tree,
+                                migration_target_id,
+                                &pending_migrations,
+                                &client,
+                            )
+                            .await;
+                            split_backoff_until.insert(
+                                dist_tree.id,
+                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                            );
                             continue;
                         }
 
@@ -1392,19 +1453,18 @@ impl TreeService {
                                 "Seam barrier for split of {:?} NOT established; rolling back",
                                 dist_tree.id
                             );
-                            pending_migrations.remove(&migration_target_id);
-                            {
-                                let mut dist_prop = dist_tree.prop.write();
-                                dist_prop.migration = None;
-                            }
-                            if let Err(unmark_err) =
-                                tree.mark_migration(&dist_tree.id, None, &client).await
-                            {
-                                warn!(
-                                    "Failed to clear migration marker for tree {:?} after seam barrier failure: {:?}",
-                                    dist_tree.id, unmark_err
-                                );
-                            }
+                            Self::rollback_pending_split(
+                                &dist_tree,
+                                &migration_tree,
+                                migration_target_id,
+                                &pending_migrations,
+                                &client,
+                            )
+                            .await;
+                            split_backoff_until.insert(
+                                dist_tree.id,
+                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                            );
                             continue;
                         }
 
@@ -1465,6 +1525,7 @@ impl TreeService {
                                     );
                                     Self::rollback_pending_split(
                                         &dist_tree,
+                                        &migration_tree,
                                         migration_target_id,
                                         &pending_migrations,
                                         &client,
@@ -1548,20 +1609,44 @@ impl TreeService {
         async move {
             for attempt in 0..2 {
                 if let Some(tree) = self.trees.get(&id) {
-                    let tree_prop = tree.prop.read().clone();
-                    if epoch < tree_prop.epoch {
-                        return OpResult::EpochMissMatch(tree_prop.epoch, epoch);
+                    // Count this operation in BEFORE reading the migration
+                    // marker. The balancer freezes a tree for a structural
+                    // split by setting the marker and then draining
+                    // `in_flight` to zero; incrementing first means an
+                    // operation either sees the marker and backs out, or is
+                    // counted and the split waits for it. Checking-then-
+                    // running uncounted let an insert race split_off, landing
+                    // entries in leaves the split was truncating (2026-08-30:
+                    // ~190 scannable keys lost per bulk import, and one
+                    // corrupted-latch hang).
+                    struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+                    impl Drop for InFlight<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
-                    if tree_prop.boundary.in_boundary(&entry) {
-                        if tree_prop.migration.is_some() {
+                    tree.in_flight
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _counted = InFlight(&tree.in_flight);
+                    let routed = {
+                        let tree_prop = tree.prop.read();
+                        if epoch < tree_prop.epoch {
+                            Err(OpResult::EpochMissMatch(tree_prop.epoch, epoch))
+                        } else if !tree_prop.boundary.in_boundary(&entry) {
+                            Err(OpResult::OutOfBound)
+                        } else if tree_prop.migration.is_some() {
                             // Keep the source tree immutable while the split snapshot is copied and
                             // placement catches up. Clients retry against fresh placement once the
                             // migration window closes.
-                            return OpResult::Migrating;
+                            Err(OpResult::Migrating)
+                        } else {
+                            Ok(tree_prop.clone())
                         }
-                        return func(&entry, &tree.tree, &tree_prop);
-                    }
-                    return OpResult::OutOfBound;
+                    };
+                    return match routed {
+                        Ok(tree_prop) => func(&entry, &tree.tree, &tree_prop),
+                        Err(refusal) => refusal,
+                    };
                 }
 
                 if attempt == 0 && self.hydrate_missing_tree(id, &entry).await {
@@ -1590,7 +1675,12 @@ impl DistTree {
             migration,
             epoch,
         });
-        Self { id, tree, prop }
+        Self {
+            id,
+            tree,
+            prop,
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 }
 

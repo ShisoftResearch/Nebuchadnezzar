@@ -1467,7 +1467,19 @@ mod test {
             .unwrap()
             .unwrap();
 
-        let ranged_client = Arc::new(RangedIndexerClient::new(&server.consh, &server.raft_client));
+        // The placement SM lives on the database's meta plane; the pre-plane
+        // constructor queried the default plane and every locate came back
+        // SmNotFound (this test was written before planes and then ignored).
+        let meta_plane_client = server.raft_client.plane(crate::server::database_meta_plane_id(
+            server_group,
+            server_group,
+        ));
+        let ranged_client = Arc::new(RangedIndexerClient::new_for_database(
+            &server.consh,
+            &meta_plane_client,
+            server_group,
+            server_group,
+        ));
         let expected_total =
             btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 4;
         let mut shuffled = (0..expected_total).collect_vec();
@@ -1505,16 +1517,42 @@ mod test {
         .unwrap();
         assert_eq!(cursor.current(), Some(&start_id));
 
+        // On a miss, say which key, whether a point lookup still finds it,
+        // and how many keys the trees report -- that separates "the split
+        // lost entries" from "the scan broke at a boundary".
+        let diagnose = |stats: Vec<crate::index::ranged::tree::service::TreeStat>,
+                        value: usize,
+                        contains: bool,
+                        current: Option<Id>| {
+            let total: usize = stats.iter().map(|s| s.trees.iter().map(|t| t.count).sum::<usize>()).sum();
+            panic!(
+                "ordered scan broke at position {} of {} (cursor at {:?}): contains({}) = {}, \
+                 trees hold {} keys across {} trees -- {}",
+                value,
+                expected_total,
+                current,
+                value,
+                contains,
+                total,
+                stats.len(),
+                if total == expected_total {
+                    "nothing lost, the SCAN is wrong"
+                } else {
+                    "the index LOST entries"
+                }
+            );
+        };
         for value in 0..expected_total {
             let expected_id = Id::from_parts(1, value as u64);
-            let current = cursor
-                .current()
-                .expect("scan should cover every inserted key");
-            assert_eq!(
-                current, &expected_id,
-                "ordered scan should stay complete after split for position {}",
-                value
-            );
+            let current = cursor.current().cloned();
+            if current != Some(expected_id) {
+                let contains = ranged_client
+                    .contains(&EntryKey::from_id(&expected_id))
+                    .await
+                    .unwrap_or(false);
+                let stats = ranged_client.tree_stats().await.unwrap_or_default();
+                diagnose(stats, value, contains, current);
+            }
             let _ = cursor.next().await.unwrap();
         }
         assert!(
