@@ -1249,6 +1249,14 @@ impl TreeService {
         // scannable keys per BANC bulk import). Reabsorb the moved half
         // before dropping the target; a failed split must degrade into
         // "split deferred", never into loss.
+        //
+        // Reopen the source's right edge FIRST: the kept spine's
+        // right_bounds were truncated to the pivot, and reinserting keys at
+        // or past the pivot into that shape lands them beyond the rightmost
+        // leaf's bound (silent disorder in release, a pivot assert in
+        // debug).
+        let restored_upper = { moved.prop.read().boundary.upper.clone() };
+        super::btree::split_off::reopen_right_edge(&dist_tree.tree.tree, &restored_upper);
         let mut cursor = moved.tree.seek(&min_entry_key(), Ordering::Forward);
         let mut restored = 0usize;
         while let Some(key) = cursor.next() {

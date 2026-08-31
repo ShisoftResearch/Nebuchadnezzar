@@ -69,6 +69,54 @@ where
     })
 }
 
+/// Reopen a tree's right edge to `upper` after a failed split is rolled
+/// back. split_off truncates every right_bound on the kept rightmost spine
+/// to the pivot; reabsorbing the moved keys (all >= pivot) into that
+/// structure makes every one of them take write_targeted's end-of-level
+/// fallback into the rightmost leaf -- a leaf now holding keys at or past
+/// its own right_bound, whose next page split computes a pivot >= the
+/// bound (a debug assert in debug builds, silent structural disorder in
+/// release: the 222s stress failure of 2026-08-31). Restoring the spine's
+/// bounds first lets the reinserts route and split normally. The caller
+/// holds the tree frozen (migration marker, in_flight drained), same as
+/// the split itself.
+pub fn reopen_right_edge<KS, PS>(tree: &BPlusTree<KS, PS>, upper: &EntryKey)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut cur = tree.get_root();
+    loop {
+        let next = {
+            let mut guard = write_node::<KS, PS>(&cur);
+            if guard.is_ref_none() {
+                return;
+            }
+            match &mut *guard {
+                &mut NodeData::External(ref mut n) => {
+                    n.right_bound = upper.clone();
+                    None
+                }
+                &mut NodeData::Internal(ref mut n) => {
+                    n.right_bound = upper.clone();
+                    Some(n.ptrs.as_slice_immute()[n.len].clone())
+                }
+                &mut NodeData::Empty(ref e) => Some(e.right.clone()),
+                &mut NodeData::None => return,
+            }
+        };
+        match next {
+            Some(next_ref) => cur = next_ref,
+            None => {
+                // Only leaves persist; the widened boundary leaf must reach
+                // disk or a reload re-narrows the edge.
+                external::make_changed(&cur, tree);
+                return;
+            }
+        }
+    }
+}
+
 struct SplitCtx<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
