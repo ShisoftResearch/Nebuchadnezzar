@@ -690,9 +690,38 @@ impl Service for TreeService {
                     next = Some(boundary.lower.clone());
                 }
             }
-            // Skip next duplicates
+            // Skip next duplicates. advance_after re-seeks the tree, and a
+            // seek disturbed by concurrent level merges can hand back its
+            // anchor (or an earlier key) -- trusted blindly, this loop
+            // re-seeked the whole tree per iteration, silently, forever
+            // (2026-08-31: one worker pinned at 100% for hours under an
+            // ensure_scannable verification; the gdb dump landed exactly
+            // here). Require strict progress and bound the hops; on either
+            // failure hand the client the bumped anchor -- its own
+            // cross-block dedup makes resuming there correct.
+            const MAX_DUP_SKIP_HOPS: usize = 128;
+            let mut dup_hops = 0usize;
             while next.is_some() && next.as_ref().map(|k| k.id()).as_ref() == buffer.last() {
-                next = advance_after(next.as_ref().unwrap());
+                let anchor = next.clone().unwrap();
+                let candidate = advance_after(&anchor);
+                let progressed = match (&candidate, ordering) {
+                    (Some(c), Ordering::Forward) => c > &anchor,
+                    (Some(c), Ordering::Backward) => c < &anchor,
+                    (None, _) => true,
+                };
+                dup_hops += 1;
+                if !progressed || dup_hops > MAX_DUP_SKIP_HOPS {
+                    if dup_hops > MAX_DUP_SKIP_HOPS {
+                        warn!(
+                            "duplicate-skip gave up after {} hops at {:?}; resuming client at the bumped anchor",
+                            dup_hops,
+                            anchor.id()
+                        );
+                    }
+                    next = bump_entry_key(&anchor, ordering);
+                    break;
+                }
+                next = candidate;
                 if let Some(key) = &next {
                     if key_is_after_boundary(key) {
                         next = Some(boundary.upper.clone());
