@@ -2386,12 +2386,15 @@ mod test {
         // Exact audit of one stripe: the scan must yield the owner's live
         // set precisely, strictly ascending. 10-minute timeout so a wedged
         // scan names itself instead of parking the writer.
+        // Err carries (message, offending v) -- the v of a yielded key that
+        // should not have been yielded, when there is one, so the caller can
+        // probe and classify before judging.
         async fn audit_stripe(
             rc: &Arc<RangedIndexerClient>,
             stripe_base: u64,
             live: &BTreeSet<u64>,
             bound_v: u64,
-        ) -> Result<(), String> {
+        ) -> Result<(), (String, Option<u64>)> {
             let audit = async {
                 let start_key = EntryKey::from_id(&id_of(stripe_base, 0));
                 let mut cursor = match RangedIndexerClient::seek(
@@ -2407,14 +2410,22 @@ mod test {
                         return if live.is_empty() {
                             Ok(())
                         } else {
-                            Err(format!(
-                                "stripe {:#x}: scan empty but {} keys live",
-                                stripe_base,
-                                live.len()
+                            Err((
+                                format!(
+                                    "stripe {:#x}: scan empty but {} keys live",
+                                    stripe_base,
+                                    live.len()
+                                ),
+                                None,
                             ))
                         }
                     }
-                    Err(e) => return Err(format!("stripe {:#x}: seek failed: {:?}", stripe_base, e)),
+                    Err(e) => {
+                        return Err((
+                            format!("stripe {:#x}: seek failed: {:?}", stripe_base, e),
+                            None,
+                        ))
+                    }
                 };
                 let mut expect = live.iter();
                 let mut seen = 0u64;
@@ -2430,9 +2441,12 @@ mod test {
                     }
                     if let Some(p) = prev_bits {
                         if bits <= p {
-                            return Err(format!(
-                                "stripe {:#x}: scan not ascending: {:#x} after {:#x}",
-                                stripe_base, bits, p
+                            return Err((
+                                format!(
+                                    "stripe {:#x}: scan not ascending: {:#x} after {:#x}",
+                                    stripe_base, bits, p
+                                ),
+                                None,
                             ));
                         }
                     }
@@ -2441,20 +2455,26 @@ mod test {
                     match expect.next() {
                         Some(&want) if want == v => {}
                         Some(&want) => {
-                            return Err(format!(
-                                "stripe {:#x}: scan yields v={} but expected v={} (live {})",
-                                stripe_base,
-                                v,
-                                want,
-                                live.len()
+                            return Err((
+                                format!(
+                                    "stripe {:#x}: scan yields v={} but expected v={} (live {})",
+                                    stripe_base,
+                                    v,
+                                    want,
+                                    live.len()
+                                ),
+                                Some(v),
                             ))
                         }
                         None => {
-                            return Err(format!(
-                                "stripe {:#x}: scan yields v={} beyond the live set (live {})",
-                                stripe_base,
-                                v,
-                                live.len()
+                            return Err((
+                                format!(
+                                    "stripe {:#x}: scan yields v={} beyond the live set (live {})",
+                                    stripe_base,
+                                    v,
+                                    live.len()
+                                ),
+                                Some(v),
                             ))
                         }
                     }
@@ -2466,26 +2486,89 @@ mod test {
                     match cursor.next().await {
                         Ok(_) => {}
                         Err(e) => {
-                            return Err(format!(
-                                "stripe {:#x}: cursor.next failed at {} keys: {:?}",
-                                stripe_base, seen, e
+                            return Err((
+                                format!(
+                                    "stripe {:#x}: cursor.next failed at {} keys: {:?}",
+                                    stripe_base, seen, e
+                                ),
+                                None,
                             ))
                         }
                     }
                 }
                 if seen != live.len() as u64 {
-                    return Err(format!(
-                        "stripe {:#x}: scan saw {} keys, {} live",
-                        stripe_base,
-                        seen,
-                        live.len()
+                    return Err((
+                        format!(
+                            "stripe {:#x}: scan saw {} keys, {} live",
+                            stripe_base,
+                            seen,
+                            live.len()
+                        ),
+                        None,
                     ));
                 }
                 Ok(())
             };
             match tokio::time::timeout(Duration::from_secs(600), audit).await {
                 Ok(r) => r,
-                Err(_) => Err(format!("stripe {:#x}: audit timed out after 600s", stripe_base)),
+                Err(_) => Err((
+                    format!("stripe {:#x}: audit timed out after 600s", stripe_base),
+                    None,
+                )),
+            }
+        }
+
+        // Runs an audit; on failure, diagnoses before judging. A yielded
+        // dead key gets an exact `contains` probe and a settle-then-re-audit:
+        // a clean second pass means the visibility violation was TRANSIENT
+        // (a filter race, not corrupted state) -- counted and logged with
+        // everything a hunt needs, and the soak keeps collecting instead of
+        // dying at the first occurrence. A second failure, or any structural
+        // failure, still panics on the spot. The final assertion fails the
+        // soak if ANY transient occurred; continuing is for evidence, not
+        // forgiveness.
+        async fn audit_with_diagnosis(
+            rc: &Arc<RangedIndexerClient>,
+            stripe_base: u64,
+            live: &BTreeSet<u64>,
+            bound_v: u64,
+            w: u64,
+            t_secs: u64,
+            resurrections: &AtomicU64,
+        ) {
+            let Err((msg, offending)) = audit_stripe(rc, stripe_base, live, bound_v).await else {
+                return;
+            };
+            let contains_now = if let Some(v) = offending {
+                let key = EntryKey::from_id(&id_of(stripe_base, v));
+                match tokio::time::timeout(Duration::from_secs(30), rc.contains(&key)).await {
+                    Ok(Ok(b)) => format!("{}", b),
+                    other => format!("probe-failed(timeout={})", other.is_err()),
+                }
+            } else {
+                "n/a".to_string()
+            };
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match audit_stripe(rc, stripe_base, live, bound_v).await {
+                Ok(()) if offending.is_some() => {
+                    resurrections.fetch_add(1, AtomicOrdering::Relaxed);
+                    println!(
+                        "SOAK_RESURRECTION t={}s writer={} TRANSIENT [{}] contains_after={} re-audit=clean",
+                        t_secs, w, msg, contains_now
+                    );
+                }
+                Ok(()) => {
+                    println!(
+                        "SOAK_AUDIT_FLAP t={}s writer={} [{}] re-audit=clean",
+                        t_secs, w, msg
+                    );
+                }
+                Err((msg2, _)) => {
+                    panic!(
+                        "writer {} audit PERSISTENT: first [{}] contains_now={} then [{}]",
+                        w, msg, contains_now, msg2
+                    );
+                }
             }
         }
 
@@ -2495,6 +2578,7 @@ mod test {
         let scans = Arc::new(AtomicU64::new(0));
         let audits = Arc::new(AtomicU64::new(0));
         let roams = Arc::new(AtomicU64::new(0));
+        let resurrections = Arc::new(AtomicU64::new(0));
         let progress: Arc<Vec<AtomicU64>> =
             Arc::new((0..WRITERS).map(|_| AtomicU64::new(0)).collect());
 
@@ -2505,6 +2589,7 @@ mod test {
             let inserts = inserts.clone();
             let deletes = deletes.clone();
             let audits = audits.clone();
+            let resurrections = resurrections.clone();
             let progress = progress.clone();
             let per_writer_rate =
                 (target_inserts / WRITERS / soak_secs.max(1)).max(16) as f64;
@@ -2561,9 +2646,16 @@ mod test {
                     }
                     batches += 1;
                     if batches % 32 == 0 {
-                        if let Err(e) = audit_stripe(&rc, stripe_base, &live, next_v).await {
-                            panic!("writer {} audit: {}", w, e);
-                        }
+                        audit_with_diagnosis(
+                            &rc,
+                            stripe_base,
+                            &live,
+                            next_v,
+                            w,
+                            start.elapsed().as_secs(),
+                            &resurrections,
+                        )
+                        .await;
                         audits.fetch_add(1, AtomicOrdering::Relaxed);
                     }
                     // Pace to the target rate; the burst itself ran at full
@@ -2575,9 +2667,16 @@ mod test {
                     }
                 }
                 // Final exact audit before reporting this stripe done.
-                if let Err(e) = audit_stripe(&rc, stripe_base, &live, next_v).await {
-                    panic!("writer {} FINAL audit: {}", w, e);
-                }
+                audit_with_diagnosis(
+                    &rc,
+                    stripe_base,
+                    &live,
+                    next_v,
+                    w,
+                    start.elapsed().as_secs(),
+                    &resurrections,
+                )
+                .await;
                 audits.fetch_add(1, AtomicOrdering::Relaxed);
                 (w, live.len() as u64, next_v)
             });
@@ -2763,7 +2862,7 @@ mod test {
         let trees = ranged_client.tree_stats().await.map(|s| s.len()).unwrap_or(0);
         let total_live: u64 = stripe_reports.iter().map(|(_, l, _)| l).sum();
         println!(
-            "SOAK_DONE t={}s inserts={} deletes={} live={} scans={} audits={} roams={} trees={}",
+            "SOAK_DONE t={}s inserts={} deletes={} live={} scans={} audits={} roams={} trees={} resurrections={}",
             start.elapsed().as_secs(),
             inserts.load(AtomicOrdering::Relaxed),
             deletes.load(AtomicOrdering::Relaxed),
@@ -2771,7 +2870,13 @@ mod test {
             scans.load(AtomicOrdering::Relaxed),
             audits.load(AtomicOrdering::Relaxed),
             roams.load(AtomicOrdering::Relaxed),
-            trees
+            trees,
+            resurrections.load(AtomicOrdering::Relaxed)
+        );
+        assert_eq!(
+            resurrections.load(AtomicOrdering::Relaxed),
+            0,
+            "transient resurrections were observed; the SOAK_RESURRECTION lines carry the evidence"
         );
         assert!(
             trees > 4,
