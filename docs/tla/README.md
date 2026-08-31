@@ -73,3 +73,34 @@ Two lessons TLC taught while the model was being written, both real:
 2. **"Installed implies committed" is a separate invariant from "no
    partial install."** The watermark-gate bug installs transactions
    atomically — completely, and completely wrongly.
+
+## `BLinkSeek.tla` — the B-link seek's off-page positioning
+
+Covers the READ path of `src/index/ranged/tree/btree` (`search.rs
+search_node`, `node.rs key_at_right_node`, `cursor.rs initialize` /
+`load_following_page`) against concurrent leaf front-inserts and leaf
+splits, with the reader allowed to enter the leaf level left of its
+target (internal separator lag, which B-link readers must tolerate).
+
+Written for the 2026-08-31 "fresh root descent regressed" give-up storms
+(`docs/RANGED_INDEX_OPEN_ISSUES.md` Issue 1): seeks returning keys
+ordered BEFORE their seek key, 65 fresh descents in a row, ~8,700
+give-ups per import — including on a fresh store with ZERO structural
+splits, so plain insert+seek concurrency had to be sufficient. It is.
+
+The defect: when a search key lands past every key of a page
+(`pos == n.len`), the old code built an empty-snapshot cursor whose
+`initialize()` later yields the FIRST KEY OF THE NEXT PAGE, read at a
+later time and never compared against the seek key. A front-insert
+landing in the sibling between the (unvalidated, tearable) peek that
+decided "don't slide right" and that deferred read hands the seek a key
+below its target. The fix continues the descent at the sibling through
+the existing retry channel, so a key is only ever yielded by a validated
+lower-bound search on the node that answers.
+
+| config | semantics | result |
+|---|---|---|
+| `BLinkSeekBuggyOrganic.cfg` | old, honest peeks | **`SeekGE` violated, five states**: enter left of target, honest "sibling starts past K" peek, off-page, front-insert lands below K in the sibling, deferred follow read yields it. No tearing needed. |
+| `BLinkSeekBuggyTorn.cfg` | old, torn peeks | **`SeekGE` violated** (also without the racing insert). |
+| `BLinkSeekFixed.cfg` | new, torn peeks | **No error.** Exhaustive: 3,463 distinct states, depth 10, with torn peeks, concurrent inserts and splits all enabled. |
+| `BLinkSeekReach.cfg` | new | `OffPageUnreachable` violated **on purpose** — its counterexample walks the off-page path. If this one ever passes, the model has gone vacuous and the clean run above means nothing. |

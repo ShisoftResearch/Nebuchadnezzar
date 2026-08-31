@@ -109,34 +109,6 @@ where
         }
     }
 
-    // Build a cursor from a page snapshot taken by the caller inside a
-    // validated read. `index == usize::MAX` means there is no valid position
-    // in this snapshot and the cursor must move to the following page first;
-    // `initialize` settles that.
-    pub(super) fn from_snapshot(
-        keys: Vec<EntryKey>,
-        index: usize,
-        page: NodeCellRef,
-        follow: NodeCellRef,
-        ordering: Ordering,
-        deletion: Arc<DeletionSet>,
-        filter_deleted: bool,
-    ) -> Self {
-        RTCursor {
-            index,
-            ordering,
-            page: Some(page),
-            marker: PhantomData,
-            current: UnsafeCell::new(None),
-            deletion,
-            filter_deleted,
-            keys: SnapKeys::Full(keys),
-            follow,
-            lazy: false,
-            current_deleted: false,
-        }
-    }
-
     // Build a cursor that has captured only the key at the seek position;
     // the rest of the page is read on first advance.
     pub(super) fn from_lazy(

@@ -1563,6 +1563,436 @@ mod test {
         server.shutdown().await;
     }
 
+    /// The missing ingredient from
+    /// `test_concurrent_writes_during_split_remain_scannable`: readers
+    /// CONCURRENT with the inserts and the structural splits. The bulk import
+    /// always runs this shape -- every insert spawns an `ensure_scannable`
+    /// verification seek -- and that is where the "fresh root descent
+    /// regressed" storms lived (2026-08-31, `server_final4.log`: 8,700
+    /// give-ups on a fresh store with ZERO structural splits, so plain
+    /// insert+seek concurrency is sufficient).
+    ///
+    /// Three reader shapes run against the insert storm:
+    /// - every writer verifies its own insert immediately (the
+    ///   ensure_scannable shape: seek at the key, first element must be it);
+    /// - scanner tasks seek random already-plausible positions and assert
+    ///   every returned block is strictly ascending and starts at/after the
+    ///   seek key;
+    /// - the final full ordered scan of the original test.
+    ///
+    /// `NEB_SEEK_REGRESSION_PANIC` makes the service panic at the first
+    /// ordering violation with the tree id and both keys, instead of the
+    /// production restart guard papering over it. Depth 2 makes structural
+    /// splits fire early and often at this scale.
+    #[ignore = "stress test"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_seeks_during_inserts_and_splits_never_regress() {
+        use crate::client;
+        use crate::index::ranged::client::RangedIndexerClient;
+        use crate::index::ranged::tree::btree::{self, storage, Ordering};
+        use crate::index::ranged::trees::Range;
+        use crate::index::EntryKey;
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::types::Type;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use itertools::Itertools;
+        use rand::seq::SliceRandom;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let _ = env_logger::try_init();
+
+        // Before any seek can run: the hook is read once, lazily.
+        std::env::set_var("NEB_SEEK_REGRESSION_PANIC", "1");
+        btree::set_tree_depth(2);
+
+        // A hung stress test must die loudly, not sit at 100% on one core
+        // forever: abort the whole process after the deadline so a run under
+        // gdb hands over every thread's stack (the first pre-fix run of this
+        // test wedged a seek exactly like the production imports did, and
+        // ptrace_scope=1 made a live process undebuggable without root).
+        let watchdog_secs = std::env::var("NEB_TEST_ABORT_AFTER_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1200);
+
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "seek_insert_split_stress";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 128 * 1024 * 1024,
+                db_size: 128 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr.clone()],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                11,
+                &String::from("seek_stress"),
+                None,
+                Field::new_schema(vec![Field::new_unindexed("data", Type::U8)]),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let meta_plane_client = server.raft_client.plane(crate::server::database_meta_plane_id(
+            server_group,
+            server_group,
+        ));
+        let ranged_client = Arc::new(RangedIndexerClient::new_for_database(
+            &server.consh,
+            &meta_plane_client,
+            server_group,
+            server_group,
+        ));
+
+        // Depth 2: capacity ~32K keys per tree. Keys go in in WAVES of one
+        // capacity each with a short pause between, until at least two
+        // structural splits have fired: the balancer's split cycle (its
+        // snapshot write-back barrier plus the placement RPCs) takes seconds
+        // under load, so one continuous burst can finish before the first
+        // split even starts. The pause mirrors the bulk import's inter-batch
+        // gaps; the splits themselves then run under the NEXT wave's
+        // insert+verify storm and the scanners -- the shape that was never
+        // tested.
+        let wave_size = btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 2;
+        let max_waves = 24usize;
+
+        let writers_done = Arc::new(AtomicBool::new(false));
+        let scanned_blocks = Arc::new(AtomicUsize::new(0));
+        // Values below this are fully inserted; scanners sample below it.
+        let watermark = Arc::new(AtomicUsize::new(0));
+        // What the clients were told when an operation failed: the wedge
+        // diagnosis lives in these strings (`too_many_retry` carries the
+        // last refusal reason).
+        let error_reasons: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let note_reason = {
+            let error_reasons = error_reasons.clone();
+            move |e: String| {
+                let mut map = error_reasons.lock().unwrap();
+                let count = map.entry(e).or_insert(0);
+                *count += 1;
+            }
+        };
+        {
+            let error_reasons = error_reasons.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(watchdog_secs));
+                eprintln!(
+                    "watchdog: test still running after {}s; aborting for stacks. \
+                     client error reasons so far: {:?}",
+                    watchdog_secs,
+                    error_reasons.lock().unwrap()
+                );
+                std::process::abort();
+            });
+        }
+
+        // Scanners: random-position range seeks, asserting each block is
+        // strictly ascending and never starts before the seek key. They run
+        // for the whole life of the insert storm.
+        let mut scanners = JoinSet::new();
+        for scanner in 0..4u64 {
+            let ranged_client = ranged_client.clone();
+            let writers_done = writers_done.clone();
+            let scanned_blocks = scanned_blocks.clone();
+            let watermark = watermark.clone();
+            let note_reason = note_reason.clone();
+            scanners.spawn(async move {
+                // Cheap deterministic per-task RNG; thread_rng is not Send.
+                let mut state = 0x9E3779B97F4A7C15u64.wrapping_mul(scanner + 1);
+                let mut iterations = 0u64;
+                while !writers_done.load(AtomicOrdering::Acquire) {
+                    iterations += 1;
+                    if iterations % 256 == 0 {
+                        // Stay a storm, not a monopoly: an unyielding seek
+                        // loop can pin a worker for the whole run.
+                        tokio::task::yield_now().await;
+                    }
+                    if iterations % 100_000 == 0 {
+                        println!("scanner {} at {} iterations", scanner, iterations);
+                    }
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let bound = watermark.load(AtomicOrdering::Acquire).max(1);
+                    let start = (state >> 16) as usize % bound;
+                    let start_id = Id::from_parts(1, start as u64);
+                    let start_key = EntryKey::from_id(&start_id);
+                    let seek_res = match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        RangedIndexerClient::seek(
+                            &ranged_client,
+                            Range::new_inclusive_opened(start_key.clone(), Ordering::Forward),
+                            256,
+                            None,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => {
+                            note_reason("scanner seek TIMED OUT after 30s".to_string());
+                            continue;
+                        }
+                    };
+                    match seek_res {
+                        Ok(Some(cursor)) => {
+                            let block: &Vec<Id> = cursor.current_block();
+                            if let Some(first) = block.first() {
+                                assert!(
+                                    EntryKey::from_id(first) >= start_key,
+                                    "scan block starts BEFORE its seek key: sought {:?}, got {:?}",
+                                    start_id,
+                                    first
+                                );
+                            }
+                            for pair in block.windows(2) {
+                                assert!(
+                                    pair[0].bits() < pair[1].bits(),
+                                    "scan block not strictly ascending: {:?} then {:?} (seek {:?})",
+                                    pair[0],
+                                    pair[1],
+                                    start_id
+                                );
+                            }
+                            if !block.is_empty() {
+                                scanned_blocks.fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                        }
+                        Ok(None) => {}
+                        // Transient routing errors (mid-split placement moves)
+                        // are the client's to retry; the scanner backs off a
+                        // beat and moves on -- an immediate re-seek against a
+                        // wedged tree turns one stuck task into a pinned core.
+                        Err(e) => {
+                            note_reason(format!("scanner seek: {:?}", e));
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Writers: the ensure_scannable shape. Insert, then immediately seek
+        // the inserted key and require the first element to be exactly it --
+        // an element ordered BEFORE the key is the regression this test
+        // exists to catch (fail fast), one after it means the insert is not
+        // visible (retry, then fail loudly).
+        let mut inserted_end = 0usize;
+        let mut split_seen = false;
+        for _wave in 0..max_waves {
+            let mut shuffled = (inserted_end..inserted_end + wave_size).collect_vec();
+            shuffled.as_mut_slice().shuffle(&mut rand::thread_rng());
+            let mut writers = JoinSet::new();
+            for shard in shuffled.chunks(wave_size / 16 + 1) {
+                let shard = shard.to_vec();
+                let ranged_client = ranged_client.clone();
+                let note_reason = note_reason.clone();
+                writers.spawn(async move {
+                    for value in shard {
+                        let id = Id::from_parts(1, value as u64);
+                        let key = EntryKey::from_id(&id);
+                        // Timeout + retry so a single RPC whose answer never
+                        // arrives names itself instead of parking the writer
+                        // silently forever -- and so a retry distinguishes a
+                        // lost response (retry succeeds) from wedged state
+                        // (times out again).
+                        let mut inserted = None;
+                        for round in 0..10 {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                ranged_client.insert(&key),
+                            )
+                            .await
+                            {
+                                Ok(res) => {
+                                    inserted = Some(res.unwrap_or_else(|e| {
+                                        panic!("insert rpc failed for {:?}: {:?}", id, e)
+                                    }));
+                                    break;
+                                }
+                                Err(_) => {
+                                    note_reason(format!(
+                                        "insert TIMED OUT after 30s (round {})",
+                                        round
+                                    ));
+                                }
+                            }
+                        }
+                        assert!(
+                            inserted.unwrap_or_else(|| panic!(
+                                "insert for {:?} timed out 10 rounds; the RPC never answers",
+                                id
+                            )),
+                            "insertion returned false for {:?}",
+                            id
+                        );
+                        let mut visible = false;
+                        for _attempt in 0..240 {
+                            let seek_res = match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                RangedIndexerClient::seek(
+                                    &ranged_client,
+                                    Range::new_inclusive_opened(key.clone(), Ordering::Forward),
+                                    1,
+                                    None,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => {
+                                    note_reason("verify seek TIMED OUT after 30s".to_string());
+                                    continue;
+                                }
+                            };
+                            match seek_res {
+                                Ok(Some(cursor)) => match cursor.current_block().first() {
+                                    Some(first) if *first == id => {
+                                        visible = true;
+                                        break;
+                                    }
+                                    Some(first) => {
+                                        assert!(
+                                            EntryKey::from_id(first) >= key,
+                                            "verification seek positioned BEFORE its key: \
+                                             sought {:?}, got {:?}",
+                                            id,
+                                            first
+                                        );
+                                        // A later key first: the insert is not
+                                        // visible yet; retry.
+                                    }
+                                    None => {}
+                                },
+                                Ok(None) => {}
+                                Err(e) => {
+                                    note_reason(format!("verify seek: {:?}", e));
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                        assert!(visible, "inserted key never became visible: {:?}", id);
+                    }
+                });
+            }
+            while let Some(result) = writers.join_next().await {
+                result.unwrap();
+            }
+            inserted_end += wave_size;
+            watermark.store(inserted_end, AtomicOrdering::Release);
+            let mut trees = 1;
+            for round in 0..5 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    ranged_client.tree_stats(),
+                )
+                .await
+                {
+                    Ok(stats) => {
+                        trees = stats.map(|s| s.len()).unwrap_or(1);
+                        break;
+                    }
+                    Err(_) => {
+                        note_reason(format!("tree_stats TIMED OUT after 30s (round {})", round));
+                    }
+                }
+            }
+            println!(
+                "wave {} complete: {} keys inserted, {} tree(s), client errors so far: {:?}",
+                _wave,
+                inserted_end,
+                trees,
+                error_reasons.lock().unwrap()
+            );
+            if trees >= 3 {
+                // At least two structural splits happened, and they ran under
+                // this wave's insert+verify storm and the scanners.
+                split_seen = true;
+                break;
+            }
+            // Let the balancer get through its write-back barrier and start
+            // the split; the split then completes under the next wave's load.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        writers_done.store(true, AtomicOrdering::Release);
+        while let Some(result) = scanners.join_next().await {
+            result.unwrap();
+        }
+        // Guard against a vacuous pass on both reader and writer sides.
+        assert!(
+            scanned_blocks.load(AtomicOrdering::Relaxed) > 0,
+            "scanners never saw a non-empty block; the test exercised nothing"
+        );
+        assert!(
+            split_seen,
+            "no structural split completed within {} waves ({} keys); \
+             the split path was not exercised",
+            max_waves, inserted_end
+        );
+
+        storage::wait_until_updated().await;
+
+        // Final full ordered scan: every key, in order, nothing lost.
+        let start_id = Id::from_parts(1, 0);
+        let mut cursor = RangedIndexerClient::seek(
+            &ranged_client,
+            Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
+            256,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cursor.current(), Some(&start_id));
+        for value in 0..inserted_end {
+            let expected_id = Id::from_parts(1, value as u64);
+            let current = cursor.current().cloned();
+            if current != Some(expected_id) {
+                let contains = ranged_client
+                    .contains(&EntryKey::from_id(&expected_id))
+                    .await
+                    .unwrap_or(false);
+                panic!(
+                    "final scan broke at position {} of {} (cursor at {:?}): contains = {}",
+                    value, inserted_end, current, contains
+                );
+            }
+            let _ = cursor.next().await.unwrap();
+        }
+
+        server.shutdown().await;
+    }
+
     #[ignore = "stress test"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_cell_query_concurrent_writes_eventually_scan_all() {
