@@ -324,14 +324,34 @@ fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: SchemaUid,
     );
 }
 
-/// Test hook: when `NEB_SEEK_REGRESSION_PANIC` is set, a range seek that
-/// observes a key ordered before the seek position panics with the tree id
-/// and both keys instead of restarting from the root. The restart guard
-/// exists to keep production available; a stress test wants the opposite --
-/// the first inconsistency caught red-handed, not papered over.
-fn seek_regression_panics() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("NEB_SEEK_REGRESSION_PANIC").is_ok())
+/// Test hook: `NEB_SEEK_REGRESSION_PANIC` makes a range seek that observes
+/// a key ordered before the seek position fail loudly instead of recovering
+/// silently. Two strictnesses, because the system draws that line itself:
+///
+/// - any other value ("1"): panic on EVERYTHING, including mid-scan
+///   regressions the restart guard exists to absorb. For short stress runs
+///   that want the first inconsistency red-handed.
+/// - "initial": panic only when a fresh descent POSITIONS before its seek
+///   key -- the client-visible contract violation. A mid-scan regression is
+///   a designed-recoverable event (the guard re-descends and the client
+///   never sees it); in this mode it takes the production restart path but
+///   logs the tree and keys at the first restart, so an hours-long soak
+///   collects evidence instead of dying on a transient it is documented to
+///   survive.
+#[derive(Clone, Copy, PartialEq)]
+enum SeekRegressionMode {
+    Off,
+    Initial,
+    All,
+}
+
+fn seek_regression_mode() -> SeekRegressionMode {
+    static MODE: std::sync::OnceLock<SeekRegressionMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("NEB_SEEK_REGRESSION_PANIC") {
+        Err(_) => SeekRegressionMode::Off,
+        Ok(v) if v == "initial" => SeekRegressionMode::Initial,
+        Ok(_) => SeekRegressionMode::All,
+    })
 }
 
 fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
@@ -488,11 +508,13 @@ impl Service for TreeService {
             };
             let mut cursor = tree.seek(&entry, ordering);
             let mut current = cursor.current().cloned();
-            if seek_regression_panics() {
+            if seek_regression_mode() != SeekRegressionMode::Off {
                 if let Some(first) = &current {
                     // A fresh descent must never position before its seek key
                     // (after boundary clamping). Production skips such keys;
-                    // the stress hook wants the violation, not the recovery.
+                    // the test hook wants the violation, not the recovery --
+                    // in BOTH modes, because this is the client-visible
+                    // contract.
                     let violated = match ordering {
                         Ordering::Forward => first < entry && !key_is_before_boundary(first),
                         Ordering::Backward => first > entry && !key_is_after_boundary(first),
@@ -578,15 +600,29 @@ impl Service for TreeService {
                         Ordering::Backward => &key > prev,
                     };
                     if regressed {
-                        if seek_regression_panics() {
-                            panic!(
-                                "range seek regressed on tree {:?}: yielded {:?} ({:?}) after {:?} ({:?})",
-                                id,
-                                key.id(),
-                                key,
-                                prev.id(),
-                                prev
-                            );
+                        match seek_regression_mode() {
+                            SeekRegressionMode::All => {
+                                panic!(
+                                    "range seek regressed on tree {:?}: yielded {:?} ({:?}) after {:?} ({:?})",
+                                    id,
+                                    key.id(),
+                                    key,
+                                    prev.id(),
+                                    prev
+                                );
+                            }
+                            SeekRegressionMode::Initial if restarts == 0 => {
+                                // Evidence, not death: the restart below is
+                                // the designed recovery; a soak wants to see
+                                // every occurrence in the log.
+                                warn!(
+                                    "SEEK_RESTART tree {:?}: yielded {:?} after {:?}; re-descending",
+                                    id,
+                                    key.id(),
+                                    prev.id()
+                                );
+                            }
+                            _ => {}
                         }
                         restarts += 1;
                         if restarts > MAX_SEEK_RESTARTS {
