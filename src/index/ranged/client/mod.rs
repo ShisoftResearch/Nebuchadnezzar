@@ -107,6 +107,12 @@ impl RangedIndexerClient {
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         let trace_seek = log::log_enabled!(log::Level::Debug);
         let mut range = range;
+        // The follow-empty walk below has no bound and no sleep: a server
+        // that keeps answering "empty block, resume at <next>" keeps this
+        // loop issuing one full RPC per round, forever, without ever
+        // touching a timer -- an unyielding client-side spin. Count it and
+        // name it past a threshold, like every other spin on this path.
+        let mut follow_rounds = 0u64;
         loop {
             let key = range.key().clone();
             let block = self_ref
@@ -148,6 +154,16 @@ impl RangedIndexerClient {
                         Ordering::Backward => next_key < *range.key(),
                     };
                     if should_follow {
+                        follow_rounds += 1;
+                        if follow_rounds.is_power_of_two() && follow_rounds >= 1024 {
+                            warn!(
+                                "client seek has followed {} empty blocks (key {:?} -> next {:?}, ordering {:?}); the server keeps deferring this scan",
+                                follow_rounds,
+                                range.key().id(),
+                                next_key.id(),
+                                range.ordering
+                            );
+                        }
                         if trace_seek {
                             debug!(
                                 "MIGRATION_SEEK_FOLLOW_EMPTY request_key={:?} next_key={:?} ordering={:?}",
@@ -157,6 +173,14 @@ impl RangedIndexerClient {
                             );
                         }
                         range = range.move_to(next_key);
+                        // With the in-process RPC shortcut every await above
+                        // can be ready, so this loop never suspends on its
+                        // own. An unyielding task does worse than hog a
+                        // worker: with the runtime's driver seat empty, no
+                        // timer or I/O event fires process-wide (2026-08-31:
+                        // one such loop froze an 8-worker runtime; sleeps
+                        // parked forever, timeouts never fired).
+                        tokio::task::yield_now().await;
                         continue;
                     }
                 }
@@ -339,6 +363,11 @@ impl RangedIndexerClient {
                         key,
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
+                    // No sleep on this branch, and the in-process shortcut
+                    // makes every await ready: yield so a hot retry cycle
+                    // cannot become an unyielding poll that starves the
+                    // runtime's driver seat (timers die process-wide).
+                    tokio::task::yield_now().await;
                 }
                 OpResult::Migrating => {
                     if trace_seek {
@@ -383,6 +412,8 @@ impl RangedIndexerClient {
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
                     ensure_updated = true;
+                    // Sleepless retry branch: see the Successful arm.
+                    tokio::task::yield_now().await;
                 }
                 OpResult::NotFound => {
                     if trace_seek {
@@ -442,6 +473,8 @@ impl RangedIndexerClient {
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
                     ensure_updated = true;
+                    // Sleepless retry branch: see the Successful arm.
+                    tokio::task::yield_now().await;
                 }
             }
             retried += 1;

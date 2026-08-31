@@ -324,6 +324,16 @@ fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: SchemaUid,
     );
 }
 
+/// Test hook: when `NEB_SEEK_REGRESSION_PANIC` is set, a range seek that
+/// observes a key ordered before the seek position panics with the tree id
+/// and both keys instead of restarting from the root. The restart guard
+/// exists to keep production available; a stress test wants the opposite --
+/// the first inconsistency caught red-handed, not papered over.
+fn seek_regression_panics() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("NEB_SEEK_REGRESSION_PANIC").is_ok())
+}
+
 fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
     let mut next = key.clone();
     match ordering {
@@ -478,6 +488,27 @@ impl Service for TreeService {
             };
             let mut cursor = tree.seek(&entry, ordering);
             let mut current = cursor.current().cloned();
+            if seek_regression_panics() {
+                if let Some(first) = &current {
+                    // A fresh descent must never position before its seek key
+                    // (after boundary clamping). Production skips such keys;
+                    // the stress hook wants the violation, not the recovery.
+                    let violated = match ordering {
+                        Ordering::Forward => first < entry && !key_is_before_boundary(first),
+                        Ordering::Backward => first > entry && !key_is_after_boundary(first),
+                    };
+                    if violated {
+                        panic!(
+                            "range seek positioned before its key on tree {:?}: sought {:?} ({:?}), got {:?} ({:?})",
+                            id,
+                            entry.id(),
+                            entry,
+                            first.id(),
+                            first
+                        );
+                    }
+                }
+            }
             let mut last_key = None;
             // A scan's keys are strictly monotonic; a cursor that yields a
             // key not past the previous one is walking pages a concurrent
@@ -491,7 +522,43 @@ impl Service for TreeService {
             const MAX_SEEK_RESTARTS: usize = 64;
             let mut prev_key: Option<EntryKey> = None;
             let mut restarts = 0usize;
+            // The collection loop's continue-branches (equal replays,
+            // boundary skips, range-start skips, id dedups) each advance the
+            // cursor without collecting, and none of them alone was bounded.
+            // Under concurrent structural churn the cursor can feed such a
+            // branch indefinitely, and this loop was the LAST uncounted spin
+            // on the seek path: one RPC handler at 100% forever, no log line
+            // (2026-08-31, again). Bound the total rounds; on violation name
+            // the branch mix and return the partial block -- the client's
+            // cross-block dedup makes the bumped resume point correct.
+            let max_rounds = (buffer_size * 1024).max(1 << 20);
+            let mut rounds = 0usize;
+            let mut equal_replays = 0usize;
+            let mut boundary_skips = 0usize;
+            let mut start_skips = 0usize;
+            let mut dedup_drops = 0usize;
             while num_collected < buffer_size {
+                rounds += 1;
+                if rounds > max_rounds {
+                    warn!(
+                        "range seek collection loop spun {} rounds on tree {:?} without filling \
+                         a {}-slot block (collected {}, equal replays {}, boundary skips {}, \
+                         start skips {}, dedup drops {}, restarts {}, prev {:?}, current {:?}); \
+                         returning a partial block",
+                        rounds,
+                        id,
+                        buffer_size,
+                        num_collected,
+                        equal_replays,
+                        boundary_skips,
+                        start_skips,
+                        dedup_drops,
+                        restarts,
+                        prev_key.as_ref().map(|k| k.id()),
+                        current.as_ref().map(|k| k.id())
+                    );
+                    break;
+                }
                 let Some(key) = current.clone() else {
                     break;
                 };
@@ -502,6 +569,7 @@ impl Service for TreeService {
                     // STRICTLY behind the previous one means the chain under
                     // this cursor is broken.
                     if &key == prev {
+                        equal_replays += 1;
                         current = cursor.next();
                         continue;
                     }
@@ -510,6 +578,16 @@ impl Service for TreeService {
                         Ordering::Backward => &key > prev,
                     };
                     if regressed {
+                        if seek_regression_panics() {
+                            panic!(
+                                "range seek regressed on tree {:?}: yielded {:?} ({:?}) after {:?} ({:?})",
+                                id,
+                                key.id(),
+                                key,
+                                prev.id(),
+                                prev
+                            );
+                        }
                         restarts += 1;
                         if restarts > MAX_SEEK_RESTARTS {
                             warn!(
@@ -539,6 +617,7 @@ impl Service for TreeService {
                 match ordering {
                     Ordering::Forward => {
                         if key_is_before_boundary(&key) {
+                            boundary_skips += 1;
                             let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
@@ -556,6 +635,7 @@ impl Service for TreeService {
                         match &range.start {
                             RangeTerm::Inclusive(k) => {
                                 if key.prefix_lt(k) {
+                                    start_skips += 1;
                                     let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
@@ -570,6 +650,7 @@ impl Service for TreeService {
                             }
                             RangeTerm::Exclusive(k) => {
                                 if key.prefix_le(k) {
+                                    start_skips += 1;
                                     let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
@@ -600,6 +681,7 @@ impl Service for TreeService {
                     }
                     Ordering::Backward => {
                         if key_is_after_boundary(&key) {
+                            boundary_skips += 1;
                             let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
@@ -668,8 +750,11 @@ impl Service for TreeService {
                     if let Some(progress) = trace_progress.as_mut() {
                         progress.push(format!("push current={:?}", key.id()));
                     }
-                } else if let Some(progress) = trace_progress.as_mut() {
-                    progress.push(format!("dedup-drop current={:?}", key.id()));
+                } else {
+                    dedup_drops += 1;
+                    if let Some(progress) = trace_progress.as_mut() {
+                        progress.push(format!("dedup-drop current={:?}", key.id()));
+                    }
                 }
 
                 let next_candidate = cursor.next();
