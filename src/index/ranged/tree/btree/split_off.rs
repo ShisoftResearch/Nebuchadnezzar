@@ -117,6 +117,56 @@ where
     }
 }
 
+/// Drain every key out of `tree`, emptying each leaf UNDER ITS OWN LATCH as
+/// its keys are collected. For rolling back a failed split: the moved pages
+/// were dirty-queued on the write-back hub (often the very backlog that
+/// failed the seam barrier), and the queue holds owned refs -- so after the
+/// target is dropped, the flusher still processes those orphaned pages, and
+/// `remove_contains` there pairs a key's STALE copy with the live deletion
+/// set: a delete landing after the rollback gets its tombstone consumed
+/// against the orphan, resurrecting the reabsorbed copy (the 3h soak's
+/// persistent resurrections, five runs). Draining keeps a single copy of
+/// every key at every instant -- in the old page, or in the returned Vec,
+/// or reinserted -- never two, so the orphan flush finds nothing to
+/// mispair. The caller holds the tree frozen (migration marker).
+pub fn drain_all_keys<KS, PS>(tree: &BPlusTree<KS, PS>) -> Vec<EntryKey>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    // Descend to the leftmost leaf.
+    let mut cur = tree.get_root();
+    loop {
+        let next = match &*read_unchecked::<KS, PS>(&cur) {
+            &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
+            &NodeData::Empty(ref n) => Some(n.right.clone()),
+            _ => None,
+        };
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    // Walk the chain, emptying each leaf as it is read.
+    let mut keys = Vec::new();
+    while !cur.is_default() {
+        let next = {
+            let mut guard = write_node::<KS, PS>(&cur);
+            match &mut *guard {
+                &mut NodeData::External(ref mut n) => {
+                    keys.extend(n.keys.to_vec(0..n.len));
+                    n.len = 0;
+                    n.next.clone()
+                }
+                &mut NodeData::Empty(ref e) => e.right.clone(),
+                _ => break,
+            }
+        };
+        cur = next;
+    }
+    keys
+}
+
 struct SplitCtx<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,

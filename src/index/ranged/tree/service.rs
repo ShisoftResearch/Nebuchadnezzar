@@ -1342,23 +1342,34 @@ impl TreeService {
         // logically deleted, and compacts away at the next flush -- exactly
         // as if the split had never happened. The tombstoned count is logged
         // so a storm's rollbacks leave an audit trail.
-        let mut cursor = moved
-            .tree
-            .tree
-            .seek_raw(&min_entry_key(), Ordering::Forward);
+        // DRAIN the moved pages -- each leaf emptied under its own latch as
+        // its keys are collected -- then reinsert raw. The moved pages sit
+        // dirty-QUEUED on the write-back hub (usually the very backlog that
+        // failed the seam barrier), and the queue's owned refs outlive the
+        // dropped target: the flusher later compacts those orphaned pages
+        // against the LIVE shared deletion set, pairing a stale copy with a
+        // fresh tombstone and resurrecting the reabsorbed key (the soak's
+        // persistent resurrections, five runs in a row). Draining preserves
+        // a single copy of every key at every instant, so the orphan flush
+        // finds an empty page and consumes nothing.
+        let drained = super::btree::split_off::drain_all_keys(&moved.tree.tree);
         let mut restored = 0usize;
         let mut tombstoned = 0usize;
-        while let Some(key) = cursor.next() {
-            if dist_tree.tree.tree.deletion.contains(&key) {
+        for key in &drained {
+            if dist_tree.tree.tree.deletion.contains(key) {
                 tombstoned += 1;
             }
-            if dist_tree.tree.tree.insert(&key) {
+            if dist_tree.tree.tree.insert(key) {
                 restored += 1;
             }
         }
         info!(
-            "Rolled back split of {:?}: reabsorbed {} moved key(s) ({} tombstoned) from target {:?}",
-            dist_tree.id, restored, tombstoned, target_id
+            "Rolled back split of {:?}: drained {} moved key(s), reabsorbed {} ({} tombstoned) from target {:?}",
+            dist_tree.id,
+            drained.len(),
+            restored,
+            tombstoned,
+            target_id
         );
         pending_migrations.remove(&target_id);
         // The target's metadata cell (if its publish got that far) must not
