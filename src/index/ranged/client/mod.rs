@@ -577,24 +577,21 @@ impl RangedIndexerClient {
     ) -> Result<NextTree, ExecError> {
         // Next tree for cursor
         // This function must be able to detect tree changes and ensure consistency
-        let (origin_lower, origin_upper) = {
+        // Clone the cached hit OUT of the guarded scope before any await: an
+        // `if let` scrutinee temporary keeps the read guard inside the
+        // future's layout across the refresh await, which made this future
+        // !Send and un-spawnable (the guard was dynamically dead -- the
+        // explicit drop -- but the generator still carried its slot).
+        let cached_origin = {
             let placement = self.placement.read();
-            if let Some((lower, (_placement, upper))) =
-                placement.range(..=origin_key.clone()).last()
-            {
-                if origin_key >= lower && origin_key < upper {
-                    (lower.clone(), upper.clone())
-                } else {
-                    drop(placement);
-                    let Some((lower, _placement, upper)) =
-                        self.refresh_key_mapping(origin_key).await?
-                    else {
-                        return Ok(NextTree::Unresolved("no tree covers the current key"));
-                    };
-                    (lower, upper)
-                }
-            } else {
-                drop(placement);
+            placement
+                .range(..=origin_key.clone())
+                .last()
+                .map(|(lower, (_placement, upper))| (lower.clone(), upper.clone()))
+        };
+        let (origin_lower, _origin_upper) = match cached_origin {
+            Some((lower, upper)) if origin_key >= &lower && origin_key < &upper => (lower, upper),
+            _ => {
                 let Some((lower, _placement, upper)) = self.refresh_key_mapping(origin_key).await?
                 else {
                     return Ok(NextTree::Unresolved("no tree covers the current key"));

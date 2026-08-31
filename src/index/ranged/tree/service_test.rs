@@ -1993,6 +1993,631 @@ mod test {
         server.shutdown().await;
     }
 
+    /// Hours-long soak of the ranged index under the production workload
+    /// mix, on ONE long-lived server (a fresh process per run hides
+    /// everything that only accumulates):
+    ///
+    /// - writers own disjoint id stripes and burst mostly-ascending inserts
+    ///   with local disorder (the BANC arrival shape), verifying every
+    ///   insert ensure_scannable style;
+    /// - each writer deletes ~20% as it goes and verifies the tombstone
+    ///   (contains -> false), so compaction runs against the scans all soak;
+    /// - every 32 batches a writer audits its OWN stripe exactly: the scan
+    ///   must yield precisely its live set, strictly ascending -- only the
+    ///   owner mutates the stripe, so the audit has no tolerance;
+    /// - scanners hammer random positions asserting block monotonicity;
+    /// - a roamer walks the WHOLE index end to end every 5 minutes,
+    ///   asserting global ascending order across every tree boundary
+    ///   (the next_tree / refill paths, under live splits);
+    /// - depth 2 keeps structural splits firing for the entire duration;
+    /// - NEB_SEEK_REGRESSION_PANIC is armed, and a watchdog aborts a wedged
+    ///   process for stacks.
+    ///
+    /// Duration and scale come from NEB_SOAK_SECS (default 10800) and
+    /// NEB_SOAK_TARGET_KEYS (default 12M inserted over the run; writers pace
+    /// themselves to spread it). A minute reporter prints SOAK_MIN lines
+    /// (ops, trees, RSS, threads) so the log tells the whole story.
+    #[ignore = "soak test"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_soak_ranged_index() {
+        use crate::client;
+        use crate::index::ranged::client::RangedIndexerClient;
+        use crate::index::ranged::tree::btree::{self, Ordering};
+        use crate::index::ranged::trees::Range;
+        use crate::index::EntryKey;
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::types::Type;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::task::JoinSet;
+
+        let _ = env_logger::try_init();
+        std::env::set_var("NEB_SEEK_REGRESSION_PANIC", "1");
+        btree::set_tree_depth(2);
+
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        let soak_secs = env_u64("NEB_SOAK_SECS", 10800);
+        let target_inserts = env_u64("NEB_SOAK_TARGET_KEYS", 12_000_000);
+        const WRITERS: u64 = 8;
+        const SCANNERS: u64 = 3;
+        const BATCH: u64 = 512;
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(soak_secs);
+
+        fn proc_status(field: &str) -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with(field))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+
+        // Abort with stacks if the soak wedges past its deadline + margin.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(soak_secs + 900));
+            eprintln!(
+                "watchdog: soak still running {}s past its deadline; aborting for stacks",
+                900
+            );
+            std::process::abort();
+        });
+
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_soak";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 256 * 1024 * 1024,
+                db_size: 6 * 1024 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr.clone()],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                11,
+                &String::from("ranged_soak"),
+                None,
+                Field::new_schema(vec![Field::new_unindexed("data", Type::U8)]),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta_plane_client = server.raft_client.plane(crate::server::database_meta_plane_id(
+            server_group,
+            server_group,
+        ));
+        let ranged_client = Arc::new(RangedIndexerClient::new_for_database(
+            &server.consh,
+            &meta_plane_client,
+            server_group,
+            server_group,
+        ));
+
+        const STRIPE: u64 = 1 << 40;
+        fn id_of(stripe_base: u64, v: u64) -> Id {
+            Id::from_parts(1, stripe_base + v)
+        }
+
+        async fn insert_verified(
+            rc: &Arc<RangedIndexerClient>,
+            id: Id,
+            key: &EntryKey,
+        ) -> Result<(), String> {
+            let mut inserted = false;
+            for _round in 0..10 {
+                match tokio::time::timeout(Duration::from_secs(30), rc.insert(key)).await {
+                    Ok(Ok(_)) => {
+                        inserted = true;
+                        break;
+                    }
+                    Ok(Err(e)) => return Err(format!("insert {:?} failed: {:?}", id, e)),
+                    Err(_) => {}
+                }
+            }
+            if !inserted {
+                return Err(format!("insert {:?}: rpc never answered (10x30s)", id));
+            }
+            for _attempt in 0..240 {
+                match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    RangedIndexerClient::seek(
+                        rc,
+                        Range::new_inclusive_opened(key.clone(), Ordering::Forward),
+                        1,
+                        None,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(Some(cursor))) => match cursor.current_block().first() {
+                        Some(first) if *first == id => return Ok(()),
+                        Some(first) => {
+                            if EntryKey::from_id(first) < *key {
+                                return Err(format!(
+                                    "verify seek positioned BEFORE its key: sought {:?}, got {:?}",
+                                    id, first
+                                ));
+                            }
+                        }
+                        None => {}
+                    },
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(format!("insert {:?} never became visible", id))
+        }
+
+        async fn delete_verified(
+            rc: &Arc<RangedIndexerClient>,
+            id: Id,
+            key: &EntryKey,
+        ) -> Result<(), String> {
+            let mut acked = false;
+            for _round in 0..10 {
+                match tokio::time::timeout(Duration::from_secs(30), rc.delete(key)).await {
+                    // false: a previous timed-out attempt landed; the contains
+                    // check below is the real verdict either way.
+                    Ok(Ok(_)) => {
+                        acked = true;
+                        break;
+                    }
+                    Ok(Err(e)) => return Err(format!("delete {:?} failed: {:?}", id, e)),
+                    Err(_) => {}
+                }
+            }
+            if !acked {
+                return Err(format!("delete {:?}: rpc never answered (10x30s)", id));
+            }
+            for _attempt in 0..240 {
+                match tokio::time::timeout(Duration::from_secs(30), rc.contains(key)).await {
+                    Ok(Ok(false)) => return Ok(()),
+                    Ok(Ok(true)) => {}
+                    Ok(Err(_)) | Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(format!("delete {:?} never became invisible", id))
+        }
+
+        // Exact audit of one stripe: the scan must yield the owner's live
+        // set precisely, strictly ascending. 10-minute timeout so a wedged
+        // scan names itself instead of parking the writer.
+        async fn audit_stripe(
+            rc: &Arc<RangedIndexerClient>,
+            stripe_base: u64,
+            live: &BTreeSet<u64>,
+            bound_v: u64,
+        ) -> Result<(), String> {
+            let audit = async {
+                let start_key = EntryKey::from_id(&id_of(stripe_base, 0));
+                let mut cursor = match RangedIndexerClient::seek(
+                    rc,
+                    Range::new_inclusive_opened(start_key, Ordering::Forward),
+                    256,
+                    None,
+                )
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        return if live.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "stripe {:#x}: scan empty but {} keys live",
+                                stripe_base,
+                                live.len()
+                            ))
+                        }
+                    }
+                    Err(e) => return Err(format!("stripe {:#x}: seek failed: {:?}", stripe_base, e)),
+                };
+                let mut expect = live.iter();
+                let mut seen = 0u64;
+                let mut prev_bits: Option<u64> = None;
+                let mut steps = 0u64;
+                loop {
+                    let Some(cur) = cursor.current().copied() else { break };
+                    let bits = cur.bits();
+                    let base_bits = id_of(stripe_base, 0).bits();
+                    let bound_bits = id_of(stripe_base, bound_v).bits();
+                    if bits >= bound_bits || bits < base_bits {
+                        break;
+                    }
+                    if let Some(p) = prev_bits {
+                        if bits <= p {
+                            return Err(format!(
+                                "stripe {:#x}: scan not ascending: {:#x} after {:#x}",
+                                stripe_base, bits, p
+                            ));
+                        }
+                    }
+                    prev_bits = Some(bits);
+                    let v = bits - base_bits;
+                    match expect.next() {
+                        Some(&want) if want == v => {}
+                        Some(&want) => {
+                            return Err(format!(
+                                "stripe {:#x}: scan yields v={} but expected v={} (live {})",
+                                stripe_base,
+                                v,
+                                want,
+                                live.len()
+                            ))
+                        }
+                        None => {
+                            return Err(format!(
+                                "stripe {:#x}: scan yields v={} beyond the live set (live {})",
+                                stripe_base,
+                                v,
+                                live.len()
+                            ))
+                        }
+                    }
+                    seen += 1;
+                    steps += 1;
+                    if steps % 4096 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    match cursor.next().await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "stripe {:#x}: cursor.next failed at {} keys: {:?}",
+                                stripe_base, seen, e
+                            ))
+                        }
+                    }
+                }
+                if seen != live.len() as u64 {
+                    return Err(format!(
+                        "stripe {:#x}: scan saw {} keys, {} live",
+                        stripe_base,
+                        seen,
+                        live.len()
+                    ));
+                }
+                Ok(())
+            };
+            match tokio::time::timeout(Duration::from_secs(600), audit).await {
+                Ok(r) => r,
+                Err(_) => Err(format!("stripe {:#x}: audit timed out after 600s", stripe_base)),
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let inserts = Arc::new(AtomicU64::new(0));
+        let deletes = Arc::new(AtomicU64::new(0));
+        let scans = Arc::new(AtomicU64::new(0));
+        let audits = Arc::new(AtomicU64::new(0));
+        let roams = Arc::new(AtomicU64::new(0));
+        let progress: Arc<Vec<AtomicU64>> =
+            Arc::new((0..WRITERS).map(|_| AtomicU64::new(0)).collect());
+
+        // Writers.
+        let mut writers = JoinSet::new();
+        for w in 0..WRITERS {
+            let rc = ranged_client.clone();
+            let inserts = inserts.clone();
+            let deletes = deletes.clone();
+            let audits = audits.clone();
+            let progress = progress.clone();
+            let per_writer_rate =
+                (target_inserts / WRITERS / soak_secs.max(1)).max(16) as f64;
+            writers.spawn(async move {
+                let stripe_base = w * STRIPE;
+                let mut live: BTreeSet<u64> = BTreeSet::new();
+                let mut next_v: u64 = 0;
+                let mut batches: u64 = 0;
+                let mut state = 0x9E3779B97F4A7C15u64.wrapping_mul(w + 7);
+                while Instant::now() < deadline {
+                    let batch_started = Instant::now();
+                    // Mostly-ascending with local disorder, like a real
+                    // import's arrival order.
+                    let mut vals: Vec<u64> = (next_v..next_v + BATCH).collect();
+                    for i in (1..vals.len()).rev() {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let j = (state >> 16) as usize % (i + 1);
+                        vals.swap(i, j);
+                    }
+                    next_v += BATCH;
+                    for v in vals {
+                        let id = id_of(stripe_base, v);
+                        let key = EntryKey::from_id(&id);
+                        if let Err(e) = insert_verified(&rc, id, &key).await {
+                            panic!("writer {}: {}", w, e);
+                        }
+                        live.insert(v);
+                    }
+                    inserts.fetch_add(BATCH, AtomicOrdering::Relaxed);
+                    progress[w as usize].store(next_v, AtomicOrdering::Release);
+                    // Delete ~20% of the batch volume from anywhere in the
+                    // stripe's history, so tombstones land in old pages too.
+                    if live.len() > 2048 {
+                        for _ in 0..(BATCH / 5) {
+                            state = state
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            let probe = (state >> 8) % next_v;
+                            let Some(&victim) =
+                                live.range(probe..).next().or_else(|| live.iter().next())
+                            else {
+                                break;
+                            };
+                            let id = id_of(stripe_base, victim);
+                            let key = EntryKey::from_id(&id);
+                            if let Err(e) = delete_verified(&rc, id, &key).await {
+                                panic!("writer {}: {}", w, e);
+                            }
+                            live.remove(&victim);
+                            deletes.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    }
+                    batches += 1;
+                    if batches % 32 == 0 {
+                        if let Err(e) = audit_stripe(&rc, stripe_base, &live, next_v).await {
+                            panic!("writer {} audit: {}", w, e);
+                        }
+                        audits.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    // Pace to the target rate; the burst itself ran at full
+                    // speed.
+                    let target = Duration::from_secs_f64(BATCH as f64 / per_writer_rate);
+                    let elapsed = batch_started.elapsed();
+                    if elapsed < target {
+                        tokio::time::sleep(target - elapsed).await;
+                    }
+                }
+                // Final exact audit before reporting this stripe done.
+                if let Err(e) = audit_stripe(&rc, stripe_base, &live, next_v).await {
+                    panic!("writer {} FINAL audit: {}", w, e);
+                }
+                audits.fetch_add(1, AtomicOrdering::Relaxed);
+                (w, live.len() as u64, next_v)
+            });
+        }
+
+        // Scanners: random-position block seeks, monotonicity asserted.
+        let mut readers = JoinSet::new();
+        for s in 0..SCANNERS {
+            let rc = ranged_client.clone();
+            let stop = stop.clone();
+            let scans = scans.clone();
+            let progress = progress.clone();
+            readers.spawn(async move {
+                let mut state = 0xD1B54A32D192ED03u64.wrapping_mul(s + 3);
+                let mut iterations = 0u64;
+                while !stop.load(AtomicOrdering::Acquire) {
+                    iterations += 1;
+                    if iterations % 256 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let w = (state >> 33) % WRITERS;
+                    let prog = progress[w as usize].load(AtomicOrdering::Acquire);
+                    if prog == 0 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    let v = (state >> 13) % prog;
+                    let start_id = id_of(w * STRIPE, v);
+                    let start_key = EntryKey::from_id(&start_id);
+                    let res = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        RangedIndexerClient::seek(
+                            &rc,
+                            Range::new_inclusive_opened(start_key.clone(), Ordering::Forward),
+                            256,
+                            None,
+                        ),
+                    )
+                    .await;
+                    match res {
+                        Ok(Ok(Some(cursor))) => {
+                            let block: &Vec<Id> = cursor.current_block();
+                            if let Some(first) = block.first() {
+                                assert!(
+                                    EntryKey::from_id(first) >= start_key,
+                                    "scan block starts BEFORE its seek key: sought {:?}, got {:?}",
+                                    start_id,
+                                    first
+                                );
+                            }
+                            for pair in block.windows(2) {
+                                assert!(
+                                    pair[0].bits() < pair[1].bits(),
+                                    "scan block not ascending: {:?} then {:?}",
+                                    pair[0],
+                                    pair[1]
+                                );
+                            }
+                            scans.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(_)) | Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Roamer: the whole index end to end, global order asserted.
+        {
+            let rc = ranged_client.clone();
+            let stop = stop.clone();
+            let roams = roams.clone();
+            readers.spawn(async move {
+                while !stop.load(AtomicOrdering::Acquire) {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    if stop.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    let roam_started = Instant::now();
+                    let start_key = EntryKey::from_id(&Id::from_parts(1, 0));
+                    let mut cursor = match RangedIndexerClient::seek(
+                        &rc,
+                        Range::new_inclusive_opened(start_key, Ordering::Forward),
+                        256,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(Some(c)) => c,
+                        _ => continue,
+                    };
+                    let mut prev: Option<u64> = None;
+                    let mut count = 0u64;
+                    loop {
+                        let Some(cur) = cursor.current().copied() else { break };
+                        let bits = cur.bits();
+                        if let Some(p) = prev {
+                            assert!(
+                                bits > p,
+                                "ROAM: global scan not ascending: {:#x} after {:#x} at key {}",
+                                bits,
+                                p,
+                                count
+                            );
+                        }
+                        prev = Some(bits);
+                        count += 1;
+                        if count % 4096 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        if cursor.next().await.is_err() {
+                            break;
+                        }
+                    }
+                    roams.fetch_add(1, AtomicOrdering::Relaxed);
+                    println!(
+                        "SOAK_ROAM t={}s keys={} took={:.1}s",
+                        start.elapsed().as_secs(),
+                        count,
+                        roam_started.elapsed().as_secs_f64()
+                    );
+                }
+            });
+        }
+
+        // Minute reporter.
+        {
+            let rc = ranged_client.clone();
+            let stop = stop.clone();
+            let inserts = inserts.clone();
+            let deletes = deletes.clone();
+            let scans = scans.clone();
+            let audits = audits.clone();
+            readers.spawn(async move {
+                let mut minutes = 0u64;
+                while !stop.load(AtomicOrdering::Acquire) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    minutes += 1;
+                    let trees = match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        rc.tree_stats(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s.len() as i64,
+                        _ => -1,
+                    };
+                    let line = format!(
+                        "t={}s inserts={} deletes={} scans={} audits={} trees={} rss_mb={} threads={}",
+                        start.elapsed().as_secs(),
+                        inserts.load(AtomicOrdering::Relaxed),
+                        deletes.load(AtomicOrdering::Relaxed),
+                        scans.load(AtomicOrdering::Relaxed),
+                        audits.load(AtomicOrdering::Relaxed),
+                        trees,
+                        proc_status("VmRSS:") / 1024,
+                        proc_status("Threads:")
+                    );
+                    if minutes % 60 == 0 {
+                        println!("SOAK_HOUR {}", line);
+                    } else {
+                        println!("SOAK_MIN {}", line);
+                    }
+                }
+            });
+        }
+
+        // Run to the deadline.
+        let mut stripe_reports = Vec::new();
+        while let Some(res) = writers.join_next().await {
+            stripe_reports.push(res.unwrap());
+        }
+        stop.store(true, AtomicOrdering::Release);
+        while let Some(res) = readers.join_next().await {
+            res.unwrap();
+        }
+
+        let trees = ranged_client.tree_stats().await.map(|s| s.len()).unwrap_or(0);
+        let total_live: u64 = stripe_reports.iter().map(|(_, l, _)| l).sum();
+        println!(
+            "SOAK_DONE t={}s inserts={} deletes={} live={} scans={} audits={} roams={} trees={}",
+            start.elapsed().as_secs(),
+            inserts.load(AtomicOrdering::Relaxed),
+            deletes.load(AtomicOrdering::Relaxed),
+            total_live,
+            scans.load(AtomicOrdering::Relaxed),
+            audits.load(AtomicOrdering::Relaxed),
+            roams.load(AtomicOrdering::Relaxed),
+            trees
+        );
+        assert!(
+            trees > 4,
+            "soak ended with only {} tree(s); structural splits were not exercised",
+            trees
+        );
+        assert!(
+            audits.load(AtomicOrdering::Relaxed) >= WRITERS,
+            "soak ended with fewer audits than writers; the exact checks never ran"
+        );
+
+        server.shutdown().await;
+    }
+
     #[ignore = "stress test"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_cell_query_concurrent_writes_eventually_scan_all() {
