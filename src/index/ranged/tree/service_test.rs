@@ -1993,6 +1993,169 @@ mod test {
         server.shutdown().await;
     }
 
+    /// A range seek whose covering tree's remaining range has been deleted
+    /// out must CONTINUE into the neighboring tree, not report end-of-scan.
+    ///
+    /// The server answered an exhausted tree with an empty block and
+    /// next=None, which the client rightly reads as "the scan is over" --
+    /// so every key in later trees silently vanished from the scan. The 3h
+    /// soak's exact stripe audit caught it 37 minutes in: a seek returning
+    /// NOTHING with 498,968 keys live to the right of an emptied straddling
+    /// tree (deletes are the trigger, which is why the import-shaped tests
+    /// never saw it). The fix hands back the tree's boundary as the resume
+    /// point unless the tree is the last one in scan direction.
+    #[ignore = "stress test"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_seek_resumes_past_an_emptied_tree_range() {
+        use crate::client;
+        use crate::index::ranged::client::RangedIndexerClient;
+        use crate::index::ranged::tree::btree::{self, Ordering};
+        use crate::index::ranged::trees::Range;
+        use crate::index::EntryKey;
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::types::Type;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _ = env_logger::try_init();
+        std::env::set_var("NEB_SEEK_REGRESSION_PANIC", "1");
+        btree::set_tree_depth(2);
+
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "seek_resume_emptied_range";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 128 * 1024 * 1024,
+                db_size: 128 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr.clone()],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                11,
+                &String::from("seek_resume"),
+                None,
+                Field::new_schema(vec![Field::new_unindexed("data", Type::U8)]),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta_plane_client = server.raft_client.plane(crate::server::database_meta_plane_id(
+            server_group,
+            server_group,
+        ));
+        let ranged_client = Arc::new(RangedIndexerClient::new_for_database(
+            &server.consh,
+            &meta_plane_client,
+            server_group,
+            server_group,
+        ));
+
+        // Fill past capacity in waves until a structural split lands, so two
+        // trees partition the key space (pivot ~= n/2 for sequential fill).
+        let n: u64 = 65536;
+        for v in 0..n {
+            let key = EntryKey::from_id(&Id::from_parts(1, v));
+            assert!(ranged_client.insert(&key).await.unwrap());
+        }
+        let split_deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let trees = ranged_client.tree_stats().await.map(|s| s.len()).unwrap_or(1);
+            if trees >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < split_deadline,
+                "no structural split within 180s; cannot stage the two-tree shape"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Empty the straddle window: everything from n/4 up to well past any
+        // mid pivot. The first tree's remaining range [n/4, pivot) is now
+        // logically empty; the second tree keeps live keys from `first_live`.
+        let del_from = n / 4;
+        let first_live = (n * 65) / 100;
+        for v in del_from..first_live {
+            let key = EntryKey::from_id(&Id::from_parts(1, v));
+            ranged_client.delete(&key).await.unwrap();
+        }
+
+        // Forward: a seek at the emptied window's start must yield the first
+        // live key beyond it -- which lives in the SECOND tree.
+        let seek_key = EntryKey::from_id(&Id::from_parts(1, del_from));
+        let cursor = RangedIndexerClient::seek(
+            &ranged_client,
+            Range::new_inclusive_opened(seek_key, Ordering::Forward),
+            16,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "forward scan reported END with {} live keys beyond the emptied range",
+                n - first_live
+            )
+        });
+        assert_eq!(
+            cursor.current_block().first(),
+            Some(&Id::from_parts(1, first_live)),
+            "forward scan must resume at the first live key past the emptied range"
+        );
+
+        // Backward: a seek inside the second tree's emptied head must yield
+        // the last live key BELOW the window -- which lives in the FIRST tree.
+        let back_from = (n * 55) / 100;
+        let back_key = EntryKey::from_id(&Id::from_parts(1, back_from));
+        let cursor = RangedIndexerClient::seek(
+            &ranged_client,
+            Range::new_inclusive_opened(back_key, Ordering::Backward),
+            16,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "backward scan reported END with {} live keys below the emptied range",
+                del_from
+            )
+        });
+        assert_eq!(
+            cursor.current_block().first(),
+            Some(&Id::from_parts(1, del_from - 1)),
+            "backward scan must resume at the last live key below the emptied range"
+        );
+
+        server.shutdown().await;
+    }
+
     /// Hours-long soak of the ranged index under the production workload
     /// mix, on ONE long-lived server (a fresh process per run hides
     /// everything that only accumulates):

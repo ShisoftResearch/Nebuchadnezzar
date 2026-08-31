@@ -831,6 +831,33 @@ impl Service for TreeService {
                         }
                     }
                 }
+            } else if next.is_none() {
+                // A tree exhausted WITHOUT collecting anything must hand the
+                // client a resume point at its boundary, never "the scan is
+                // over": keys at or after the seek key can live in LATER
+                // trees. Empty-and-None told the client exactly that lie
+                // whenever the covering tree's remaining range had been
+                // deleted out -- the 3h soak's stripe audit found a scan
+                // returning NOTHING with 499K keys live two trees to the
+                // right (the next_tree three-way lesson, recurring on the
+                // seek-initial path; deletes are the trigger, which is why
+                // no import workload ever saw it). At the edge of the key
+                // space there is no later tree, and None stays the honest
+                // answer.
+                next = match ordering {
+                    Ordering::Forward => {
+                        (boundary.upper < *MAX_ENTRY_KEY).then(|| boundary.upper.clone())
+                    }
+                    // Backward resumes strictly BELOW this tree's inclusive
+                    // lower bound, or the client would route right back here.
+                    Ordering::Backward => {
+                        if boundary.lower > min_entry_key() {
+                            bump_entry_key(&boundary.lower, Ordering::Backward)
+                        } else {
+                            None
+                        }
+                    }
+                };
             }
             let result_block = ServBlock {
                 buffer,

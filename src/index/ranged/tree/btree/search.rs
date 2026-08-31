@@ -36,6 +36,25 @@ where
             if node.is_none() {
                 return Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted));
             }
+            // A Backward descent passes through empty pages LEFTWARD. Left
+            // alone, key_at_right_node bounces an empty page right
+            // unconditionally, and a Backward off-page continuation then
+            // ping-pongs empty -> right, non-empty -> prev forever (named by
+            // the retry counter within seconds: tombstone compaction leaves
+            // len==0 pages all over a deleted window). The cursor's page walk
+            // was always direction-aware here -- read_page follows prev for
+            // Backward -- and the descent continuation must be too. An empty
+            // node WITHOUT a left link falls through: that is the bypass
+            // shape (left None, right = the node it stands for), where
+            // following right is correct for both directions.
+            if ordering == Ordering::Backward && node.is_empty() {
+                if let Some(left) = node.left_ref() {
+                    let Some(follow) = left.try_clone_speculative() else {
+                        return Err(node_ref.clone());
+                    };
+                    return Err(follow);
+                }
+            }
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
                 // Pointer read from unlatched data: clone speculatively and
