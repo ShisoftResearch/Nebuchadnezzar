@@ -2544,6 +2544,8 @@ mod test {
         // forgiveness.
         async fn audit_with_diagnosis(
             rc: &Arc<RangedIndexerClient>,
+            consh: &Arc<bifrost::conshash::ConsistentHashing>,
+            group: &str,
             stripe_base: u64,
             live: &BTreeSet<u64>,
             bound_v: u64,
@@ -2579,6 +2581,49 @@ mod test {
                     );
                 }
                 Err((msg2, _)) => {
+                    // Name the holder before dying: ask EVERY tree whether it
+                    // answers for the key (epoch u64::MAX bypasses the epoch
+                    // gate; the boundary gate stays, which is itself
+                    // informative). Two holders = overlapping boundaries with
+                    // two physical copies; one holder names the tree whose
+                    // birth the split/rollback log can then be searched for.
+                    if let Some(v) = offending {
+                        let key = EntryKey::from_id(&id_of(stripe_base, v));
+                        let mut holders = Vec::new();
+                        let mut answered = 0usize;
+                        if let Ok(stats) = rc.tree_stats().await {
+                            for st in &stats {
+                                let Ok(tc) =
+                                    crate::index::ranged::tree::service::locate_tree_server_from_conshash(
+                                        &st.id, consh, group, group,
+                                    )
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                if let Ok(res) = tc.contains(st.id, key.clone(), u64::MAX).await {
+                                    if let crate::index::ranged::tree::service::OpResult::Successful(
+                                        held,
+                                    ) = res
+                                    {
+                                        answered += 1;
+                                        if held {
+                                            holders.push((st.id, format!("{:?}", st.prop)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        println!(
+                            "SOAK_HOLDERS t={}s writer={} v={} answered={} holding={} {:#?}",
+                            t_secs,
+                            w,
+                            v,
+                            answered,
+                            holders.len(),
+                            holders
+                        );
+                    }
                     panic!(
                         "writer {} audit PERSISTENT: first [{}] contains_now={} then [{}]",
                         w, msg, contains_now, msg2
@@ -2606,6 +2651,7 @@ mod test {
             let audits = audits.clone();
             let resurrections = resurrections.clone();
             let progress = progress.clone();
+            let consh = server.consh.clone();
             let per_writer_rate =
                 (target_inserts / WRITERS / soak_secs.max(1)).max(16) as f64;
             writers.spawn(async move {
@@ -2663,6 +2709,8 @@ mod test {
                     if batches % 32 == 0 {
                         audit_with_diagnosis(
                             &rc,
+                            &consh,
+                            server_group,
                             stripe_base,
                             &live,
                             next_v,
@@ -2684,6 +2732,8 @@ mod test {
                 // Final exact audit before reporting this stripe done.
                 audit_with_diagnosis(
                     &rc,
+                    &consh,
+                    server_group,
                     stripe_base,
                     &live,
                     next_v,
