@@ -479,10 +479,56 @@ impl Service for TreeService {
             let mut cursor = tree.seek(&entry, ordering);
             let mut current = cursor.current().cloned();
             let mut last_key = None;
+            // A scan's keys are strictly monotonic; a cursor that yields a
+            // key not past the previous one is walking pages a concurrent
+            // structural split has already relinked -- left alone it can
+            // cycle forever (2026-08-31: a sidecar-flush seek spun for hours
+            // after five back-to-back splits, its duplicates silently eaten
+            // by the id dedup below). On regression, re-descend from the
+            // root past the last yielded key; the fresh descent uses the
+            // post-split structure. Bounded so a pathological tree returns
+            // a partial block instead of never returning.
+            const MAX_SEEK_RESTARTS: usize = 64;
+            let mut prev_key: Option<EntryKey> = None;
+            let mut restarts = 0usize;
             while num_collected < buffer_size {
                 let Some(key) = current.clone() else {
                     break;
                 };
+                if let Some(prev) = &prev_key {
+                    // An EQUAL key is a benign replay -- an LSM level merge
+                    // moving the key between trees mid-scan -- and the id
+                    // dedup below already drops it; just advance. Only a key
+                    // STRICTLY behind the previous one means the chain under
+                    // this cursor is broken.
+                    if &key == prev {
+                        current = cursor.next();
+                        continue;
+                    }
+                    let regressed = match ordering {
+                        Ordering::Forward => &key < prev,
+                        Ordering::Backward => &key > prev,
+                    };
+                    if regressed {
+                        restarts += 1;
+                        if restarts > MAX_SEEK_RESTARTS {
+                            warn!(
+                                "range seek gave up after {} chain restarts at {:?}; \
+                                 returning a partial block",
+                                restarts,
+                                key.id()
+                            );
+                            break;
+                        }
+                        let Some(next_start) = bump_entry_key(prev, ordering) else {
+                            break;
+                        };
+                        cursor = tree.seek(&next_start, ordering);
+                        current = cursor.current().cloned();
+                        continue;
+                    }
+                }
+                prev_key = Some(key.clone());
 
                 if let Some((patt_key, patt_len)) = pattern {
                     if &key.as_slice()[..patt_len] != patt_key {
