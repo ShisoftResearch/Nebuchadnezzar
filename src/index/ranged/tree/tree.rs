@@ -634,6 +634,70 @@ mod tests {
         EntryKey::from_props(&id, &feature, field, schema_id)
     }
 
+    /// Prosecution exhibit for the soak's transient resurrections: can the
+    /// raw lock-free set answer `contains == false` for a key that is
+    /// PRESENT, while other threads churn inserts/removes (drives table
+    /// growth, shrink and migration)? Each thread probes its own stable key
+    /// -- inserted by itself, removed by nobody else -- between every churn
+    /// operation, including bulk phases that force resizes from the
+    /// capacity-0 start the production deletion set uses. A single
+    /// false-negative here indicts the set; thirty clean seconds acquit it
+    /// and send the hunt back to the pairing logic.
+    #[test]
+    #[ignore = "stress test"]
+    fn lf_set_contains_never_lies_under_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
+        let set = Arc::new(LFHashSet::<EntryKey>::with_capacity(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let set = set.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let base = t << 40;
+                let mut i = 0u64;
+                while !stop.load(AO::Acquire) {
+                    let stable = make_key(base + i % (1 << 20));
+                    assert!(set.insert(stable.clone()), "t{} i{}: stable insert refused", t, i);
+                    for j in 1..64u64 {
+                        let churn = make_key(base + (1 << 30) + j);
+                        set.insert(churn.clone());
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{} j{}: contains lost a present key after insert churn",
+                            t, i, j
+                        );
+                        set.remove(&churn);
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{} j{}: contains lost a present key after remove churn",
+                            t, i, j
+                        );
+                    }
+                    // Bulk phases: swell then drain, forcing growth and
+                    // migration around the probes.
+                    if i % 256 == 0 {
+                        for j in 0..4096u64 {
+                            set.insert(make_key(base + (1 << 31) + j));
+                        }
+                        assert!(set.contains(&stable), "t{} i{}: lost across bulk insert", t, i);
+                        for j in 0..4096u64 {
+                            set.remove(&make_key(base + (1 << 31) + j));
+                        }
+                        assert!(set.contains(&stable), "t{} i{}: lost across bulk drain", t, i);
+                    }
+                    assert!(set.remove(&stable), "t{} i{}: stable remove refused", t, i);
+                    i += 1;
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        stop.store(true, AO::Release);
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
     // ---- pivot_key correctness tests ----------------------------------------
 
     #[test]

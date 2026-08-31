@@ -1835,9 +1835,16 @@ mod test {
                             .await
                             {
                                 Ok(res) => {
-                                    inserted = Some(res.unwrap_or_else(|e| {
+                                    let landed = res.unwrap_or_else(|e| {
                                         panic!("insert rpc failed for {:?}: {:?}", id, e)
-                                    }));
+                                    });
+                                    // Every v is inserted exactly once by its
+                                    // owner: a first-round "already present"
+                                    // means the index held a ghost.
+                                    if !landed && round == 0 {
+                                        println!("SOAK_INSERT_DUP id={:?}", id);
+                                    }
+                                    inserted = Some(landed);
                                     break;
                                 }
                                 Err(_) => {
@@ -2357,11 +2364,19 @@ mod test {
             key: &EntryKey,
         ) -> Result<(), String> {
             let mut acked = false;
-            for _round in 0..10 {
+            for round in 0..10 {
                 match tokio::time::timeout(Duration::from_secs(30), rc.delete(key)).await {
-                    // false: a previous timed-out attempt landed; the contains
-                    // check below is the real verdict either way.
-                    Ok(Ok(_)) => {
+                    Ok(Ok(existed)) => {
+                        // Every victim is a live, single-owner key, so a
+                        // first-round "nothing to delete" means the delete's
+                        // internal seek MISSED a live key -- the exact shape
+                        // that would later read as a "resurrection" (no
+                        // tombstone was ever placed; the contains check below
+                        // can false-negative on the same misposition and
+                        // wave it through). Tripwire it loudly.
+                        if !existed && round == 0 {
+                            println!("SOAK_DELETE_MISS id={:?}", id);
+                        }
                         acked = true;
                         break;
                     }
