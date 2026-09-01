@@ -3303,7 +3303,7 @@ impl Chunk {
         let (cap_segs, free_segs, unbumped) = self.allocator.segment_accounting();
         let reserve = self.allocator.compaction_reserve();
         let retired = self.retired_segment_count();
-        let cause = if free_segs + unbumped <= reserve.max(1) && free_segs + unbumped > 0 {
+        let cause = if free_segs + unbumped <= reserve && free_segs + unbumped > 0 {
             // Not "give the store more room": capacity is per CHUNK
             // (chunk_size over the segment size; db_size only sets how many
             // chunks there are), and a cell routes to its chunk by its id's

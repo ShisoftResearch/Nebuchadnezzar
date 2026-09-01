@@ -3043,16 +3043,14 @@ impl SegmentAllocator {
     }
 
     /// Segments a writer may still take before `alloc_seg_for_writer`
-    /// refuses: what is grantable minus the compaction reserve, with at least
-    /// one segment always held back (the pre-reserve allocation path refused
-    /// the last segment of a chunk, and small chunks whose reserve rounds to
-    /// zero keep that). The chunk's allocation path keys its emergency
-    /// collection off this, so the two agree on where the wall is; measured
-    /// in live bytes they did not, and a chunk with a 3-segment reserve
-    /// refused writers before its emergency collection could arm.
+    /// refuses: what is grantable minus the compaction reserve. The chunk's
+    /// allocation path keys its emergency collection off this, so the two
+    /// agree on where the wall is; measured in live bytes they did not, and
+    /// a chunk with a 3-segment reserve refused writers before its emergency
+    /// collection could arm.
     pub fn writer_headroom(&self) -> usize {
         self.available_segments()
-            .saturating_sub(self.compaction_reserve().max(1))
+            .saturating_sub(self.compaction_reserve())
     }
 
     /// How many segment addresses have EVER been returned to this allocator.
