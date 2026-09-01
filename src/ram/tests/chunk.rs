@@ -1256,6 +1256,113 @@ fn test_multiple_segments_in_chunk() {
     info!("✓ Multiple segments test passed!");
 }
 
+/// A chunk whose dead space is reclaimable must not refuse a write while
+/// that dead space is still there to collect.
+///
+/// The writer-path allocator holds back a compaction reserve (3 segments
+/// from 48 up), and the allocation loop used to arm its emergency collection
+/// in live bytes, two segments below capacity. For a 3-segment reserve those
+/// never met: the allocator refused at 61 of 64 live segments and no
+/// collection was ever attempted. The import that found it overflowed one
+/// chunk at 12% store utilisation, with the failure line reading
+/// `live=61, capacity_segments=64, free_list=3, reserve=3: the chunk is FULL`.
+///
+/// No background cleaner runs here, so the emergency pass is the ONLY
+/// reclaim. A handful of cells rewritten over and over -- what an id-list
+/// root does under a bulk edge import -- must keep landing across several
+/// times the chunk's capacity in writes.
+#[test]
+fn emergency_gc_runs_before_the_compaction_reserve_refuses_a_writer() {
+    let _ = env_logger::try_init();
+    let fields = default_fields();
+    let schema = Schema::new("reserve_wall", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema.clone());
+
+    // 64 segments (512 MiB): the production shape, and one whose compaction
+    // reserve is 3 ((64 / 16).clamp(1, 3)), so the old byte gate never armed.
+    // `Chunks::new` rounds a chunk up to a power of two, so ask for exactly
+    // that and check.
+    const SEGMENTS: usize = 64;
+    let chunk_size = CHUNK_SIZE * SEGMENTS;
+    let chunks = Chunks::new(
+        1,
+        chunk_size,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+    let chunk = &chunks.list[0];
+    assert_eq!(chunk.capacity, chunk_size, "chunk size was rounded; adjust SEGMENTS");
+    assert_eq!(chunk.allocator.compaction_reserve(), 3);
+
+    const CELLS: usize = 8;
+    const PAYLOAD: usize = 60_000;
+    let make_cell = |id: &Id, i: usize, round: u64| -> OwnedCell {
+        let mut m = OwnedMap::new();
+        m.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        m.insert(&String::from("score"), OwnedValue::U64(round));
+        m.insert(&String::from("name"), OwnedValue::String("x".repeat(PAYLOAD)));
+        OwnedCell {
+            header: CellHeader::new(schema.vid, id),
+            data: OwnedValue::Map(m),
+        }
+    };
+    let ids: Vec<Id> = (0..CELLS).map(|i| Id::allocated(1, 0, i as u64 + 1)).collect();
+    for (i, id) in ids.iter().enumerate() {
+        chunks.write_cell(&mut make_cell(id, i, 0)).unwrap();
+    }
+
+    // Three times the chunk's capacity in rewrites; every one leaves the
+    // previous copy dead in this chunk.
+    let updates = chunk_size * 3 / PAYLOAD;
+    let mut max_live = 0usize;
+    for n in 0..updates {
+        let i = n % CELLS;
+        let round = (n / CELLS + 1) as u64;
+        chunks
+            .update_cell(&mut make_cell(&ids[i], i, round))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "update {} of {} refused with {:?} at {} live segments of {}: the \
+                     emergency collection did not run before the reserve refused the writer",
+                    n,
+                    updates,
+                    e,
+                    chunk.segs.len(),
+                    SEGMENTS
+                )
+            });
+        max_live = max_live.max(chunk.segs.len());
+    }
+
+    // The wall was approached (this exercised the gate, not just a chunk
+    // with room to spare) and never crossed.
+    assert!(
+        max_live >= SEGMENTS - 8,
+        "the test never came near the wall (peak {} live of {}); it proves nothing",
+        max_live,
+        SEGMENTS
+    );
+    assert!(
+        max_live < SEGMENTS,
+        "live segments reached capacity ({} of {})",
+        max_live,
+        SEGMENTS
+    );
+
+    // Every cell reads back as its last version: the collections relocated
+    // live cells without losing or reordering an update.
+    let rounds = updates / CELLS;
+    for (i, id) in ids.iter().enumerate() {
+        let expected = if i < updates % CELLS { rounds + 1 } else { rounds } as u64;
+        let cell = chunks.read_cell(id).unwrap().to_owned();
+        assert_eq!(cell["score"], OwnedValue::U64(expected), "cell {} lost its last update", i);
+    }
+}
+
 #[test]
 fn test_concurrent_segment_allocation_and_cleanup() {
     use crate::ram::cleaner::Cleaner;

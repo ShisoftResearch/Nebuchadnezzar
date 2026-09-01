@@ -161,6 +161,9 @@ static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
+/// How many in-progress GC passes an allocation at the wall will wait out
+/// before running its own emergency pass. Each wait is bounded by one pass.
+const MAX_EMERGENCY_GC_WAITS: usize = 4;
 
 /// Ceiling on one chunk's cell index, in slots. Only guards against a nonsense
 /// estimate; a legitimate 16 GB chunk of 8 MiB segments wants ~17 M.
@@ -1758,6 +1761,7 @@ impl Chunk {
             return Err(WriteError::ServerShuttingDown);
         }
         let mut tried_gc = false;
+        let mut gc_waits = 0usize;
         let mut queueing_since: Option<std::time::Instant> = None;
         let backoff = Backoff::new();
         let slots = self.head_slots(segment_class);
@@ -1918,13 +1922,31 @@ impl Chunk {
                 },
             };
 
-            let total_space = self.segs.len() * SEGMENT_SIZE;
-            // Trigger emergency cleaning one segment early: a moving combine
-            // needs at least one free segment as its destination, and hitting
-            // the exact wall leaves it nothing to relocate into. Allocation
-            // itself is refused only at the original wall, so usable capacity
-            // is unchanged.
-            let reserve_boundary = self.capacity.saturating_sub(2 * SEGMENT_SIZE);
+            // Where the wall is, in the ALLOCATOR's terms. The writer-path
+            // allocator refuses once the segments it can grant are down to
+            // the compaction reserve (3 for a 512 MiB chunk), and this loop
+            // used to measure the wall separately, in live bytes against
+            // capacity minus two segments. For any chunk whose reserve is 3
+            // the two never met: the allocator refused at 61 of 64 live
+            // segments, the emergency collection below was armed for 62, and
+            // a chunk full of reclaimable dead space failed the write with
+            // "the chunk is FULL" without one collection attempted. A
+            // 13.6M-edge import overflowed one chunk that way while the store
+            // as a whole was 12% used.
+            //
+            // Retired segments (unpublished, readers not yet drained) hold
+            // addresses the allocator cannot grant yet. Near the wall, give
+            // them back before judging: they are ours.
+            let mut headroom = self.allocator.writer_headroom();
+            if headroom <= 1 && self.drain_retired_segments() > 0 {
+                headroom = self.allocator.writer_headroom();
+            }
+            // Emergency cleaning arms one segment early: a moving combine
+            // needs a free segment as its destination, and hitting the exact
+            // wall leaves it nothing to relocate into. Allocation itself is
+            // refused only at zero, so usable capacity is unchanged.
+            let near_wall = headroom <= 1;
+            let at_wall = headroom == 0;
 
             // GROWTH IS OPTIONAL; a wait is not a failure. This allocation
             // fills an EMPTY slot when every live head was owned by someone
@@ -1956,7 +1978,7 @@ impl Chunk {
                     id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING
                 })
             };
-            if growing && total_space >= reserve_boundary && any_live_head() {
+            if growing && near_wall && any_live_head() {
                 if self.current_txn_holds_head_here(segment_class) {
                     error!(
                         "chunk {} is at capacity and the live head(s) this write would queue on \
@@ -1983,46 +2005,56 @@ impl Chunk {
                 backoff.spin();
                 continue;
             }
-            if total_space >= reserve_boundary && !tried_gc {
-                if full_gc {
-                    warn!("Chunk {} near capacity, emergency full GC", self.id);
-                    let _ = Cleaner::clean(self, true, true);
-                } else {
-                    warn!("Chunk {} near capacity, emergency best effort GC", self.id);
-                    let _ = Cleaner::clean(self, true, false);
+            if near_wall && !tried_gc {
+                // A pass already holding this chunk's GC lock IS the reclaim
+                // this write is waiting for. Without `full_gc` the emergency
+                // pass steps aside from it (try_lock) and would count that
+                // no-op as the one attempt; wait for the running pass to
+                // finish instead and re-judge the headroom. Bounded, in case
+                // passes come back to back under pressure.
+                if !full_gc && self.gc_lock.is_locked() && gc_waits < MAX_EMERGENCY_GC_WAITS {
+                    gc_waits += 1;
+                    debug!(
+                        "Chunk {} near capacity with a GC pass in progress; waiting for it ({}/{})",
+                        self.id, gc_waits, MAX_EMERGENCY_GC_WAITS
+                    );
+                    drop(self.gc_lock.lock());
+                    continue;
                 }
+                warn!(
+                    "Chunk {} near capacity ({} writer segment(s) left), emergency {} GC",
+                    self.id,
+                    headroom,
+                    if full_gc { "full" } else { "best effort" }
+                );
+                let _ = Cleaner::clean(self, true, full_gc);
                 tried_gc = true;
                 continue;
             }
-            if total_space >= self.capacity - SEGMENT_SIZE {
+            if at_wall {
                 if tried_gc {
                     debug!(
-                        "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
+                        "chunk-allocation-failure: chunk={}, live_bytes={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
                         self.id,
-                        total_space,
+                        self.segs.len() * SEGMENT_SIZE,
                         self.capacity,
                         head_slot.load(Ordering::Relaxed),
                         self.segs.len(),
                         full_gc,
                         segment_class
                     );
-                    error!("No space left for chunk {}, cannot allocate space", self.id);
+                    self.log_allocation_exhausted(segment_class);
                     ALLOCATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                     return Err(WriteError::CannotAllocateSpace);
-                } else if full_gc {
-                    warn!("No space left for chunk {}, emergency full GC", self.id);
-                    let _ = Cleaner::clean(self, true, true);
-                    tried_gc = true;
-                    continue;
-                } else {
-                    warn!(
-                        "No space left for chunk {}, emergency best effort GC",
-                        self.id
-                    );
-                    let _ = Cleaner::clean(self, true, false);
-                    tried_gc = true;
-                    continue;
                 }
+                warn!(
+                    "No space left for chunk {}, emergency {} GC",
+                    self.id,
+                    if full_gc { "full" } else { "best effort" }
+                );
+                let _ = Cleaner::clean(self, true, full_gc);
+                tried_gc = true;
+                continue;
             }
             if self.allocator.meet_gc_threshold() {
                 // Wake the background cleaner instead of running a partial GC
@@ -2100,43 +2132,7 @@ impl Chunk {
                     backoff.spin();
                     continue;
                 }
-                let (cap_segs, free_segs, unbumped) = self.allocator.segment_accounting();
-                let reserve = self.allocator.compaction_reserve();
-                // Name WHICH kind of "no space" this is. A chunk that is
-                // simply full, with its compaction reserve intact, is the
-                // design working; a chunk whose addresses have gone missing is
-                // a bug. Both used to print "the allocator has no segment left
-                // after GC", and reading a full store as a durability failure
-                // cost a day.
-                let cause = if free_segs + unbumped <= reserve && free_segs + unbumped > 0 {
-                    "the chunk is FULL and its remaining segments are the compaction reserve                      (working as intended -- give the store more room)"
-                } else if cap_segs
-                    > self.segs.len() + free_segs + unbumped + self.retired_segment_count()
-                {
-                    "addresses are UNACCOUNTED FOR -- neither live, free, retired nor unbumped.                      That is a leak, not a full store"
-                } else {
-                    "the chunk is genuinely out of segments"
-                };
-                error!(
-                    "chunk-allocation-failure: chunk={}, segment_class={:?}, live={}, \
-                     capacity_segments={}, free_list={}, never_bumped={}, retired_pending={}, \
-                     unaccounted={}, returned_ever={}, reserve={}: {}",
-                    self.id,
-                    segment_class,
-                    self.segs.len(),
-                    cap_segs,
-                    free_segs,
-                    unbumped,
-                    self.retired_segment_count(),
-                    cap_segs
-                        .saturating_sub(self.segs.len())
-                        .saturating_sub(free_segs)
-                        .saturating_sub(unbumped)
-                        .saturating_sub(self.retired_segment_count()),
-                    self.allocator.segments_returned(),
-                    reserve,
-                    cause,
-                );
+                self.log_allocation_exhausted(segment_class);
                 // COUNTED HERE TOO, and that omission cost a day.
                 //
                 // There are two ways to run out, and they are not the same
@@ -3297,6 +3293,56 @@ impl Chunk {
     }
 
     /// Segments unpublished but not yet reclaimed, for tests and diagnostics.
+    /// The accounting behind a refused allocation, on one line: where every
+    /// segment address of this chunk is, and WHICH kind of "no space" this is.
+    /// A chunk that is simply full, with its compaction reserve intact, is the
+    /// design working; a chunk whose addresses have gone missing is a bug.
+    /// Both used to print "the allocator has no segment left after GC", and
+    /// reading a full store as a durability failure cost a day.
+    fn log_allocation_exhausted(&self, segment_class: SegmentClass) {
+        let (cap_segs, free_segs, unbumped) = self.allocator.segment_accounting();
+        let reserve = self.allocator.compaction_reserve();
+        let retired = self.retired_segment_count();
+        let cause = if free_segs + unbumped <= reserve.max(1) && free_segs + unbumped > 0 {
+            // Not "give the store more room": capacity is per CHUNK
+            // (chunk_size over the segment size; db_size only sets how many
+            // chunks there are), and a cell routes to its chunk by its id's
+            // locality bits. A store that is mostly empty can still fill one
+            // chunk when a few localities take far more than their share, so
+            // the first question is how this chunk's live count compares
+            // with the others, not how big the store is.
+            "the chunk is FULL and its remaining segments are the compaction reserve. \
+             Capacity is per chunk and cells route by locality, so this is either a store \
+             that is too small or one chunk taking far more than its share: compare this \
+             chunk's live count with the others before adding db_size"
+        } else if cap_segs > self.segs.len() + free_segs + unbumped + retired {
+            "addresses are UNACCOUNTED FOR -- neither live, free, retired nor unbumped. \
+             That is a leak, not a full store"
+        } else {
+            "the chunk is genuinely out of segments"
+        };
+        error!(
+            "chunk-allocation-failure: chunk={}, segment_class={:?}, live={}, \
+             capacity_segments={}, free_list={}, never_bumped={}, retired_pending={}, \
+             unaccounted={}, returned_ever={}, reserve={}: {}",
+            self.id,
+            segment_class,
+            self.segs.len(),
+            cap_segs,
+            free_segs,
+            unbumped,
+            retired,
+            cap_segs
+                .saturating_sub(self.segs.len())
+                .saturating_sub(free_segs)
+                .saturating_sub(unbumped)
+                .saturating_sub(retired),
+            self.allocator.segments_returned(),
+            reserve,
+            cause,
+        );
+    }
+
     pub fn retired_segment_count(&self) -> usize {
         self.retired_segments.lock().len()
     }
