@@ -2920,11 +2920,12 @@ mod test {
                         audit_dups
                     );
                     println!(
-                        "SOAK_AUDIT_RAW t={}s keys={} duplicates={} tombstoned_present={}",
+                        "SOAK_AUDIT_RAW t={}s keys={} duplicates={} tombstoned_present={} scan_dedup_drops={}",
                         start.elapsed().as_secs(),
                         audit_keys,
                         audit_dups,
-                        audit_tombs
+                        audit_tombs,
+                        crate::index::ranged::client::cursor::scan_dedup_drops()
                     );
                     }
                     let line = format!(
@@ -2975,6 +2976,13 @@ mod test {
             resurrections.load(AtomicOrdering::Relaxed),
             0,
             "transient resurrections were observed; the SOAK_RESURRECTION lines carry the evidence"
+        );
+        // This workload deletes a key and never inserts it again, so the
+        // only in-tree path that can undo a delete must never have run.
+        assert_eq!(
+            crate::index::ranged::tree::tree::undeletes(),
+            0,
+            "an insert consumed a tombstone, but this workload never re-inserts a deleted key"
         );
         assert!(
             trees > 4,

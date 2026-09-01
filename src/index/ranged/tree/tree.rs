@@ -93,6 +93,15 @@ pub const INITIAL_TREE_EPOCH: u64 = 0;
 /// Journaled tombstones past which compaction is visibly losing to the
 /// delete rate. Not a limit -- the journal is written whole either way.
 const TOMBSTONE_JOURNAL_WARN: usize = 100_000;
+
+/// Inserts that consumed a tombstone (see `RangedTree::insert`). Exposed so
+/// a workload that never re-inserts deleted keys can assert it stays zero.
+pub static UNDELETES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tombstones consumed by re-insertion in this process.
+pub fn undeletes() -> u64 {
+    UNDELETES.load(std::sync::atomic::Ordering::Relaxed)
+}
 lazy_static! {
     pub static ref RANGED_TREE_SCHEMA_ID: SchemaVid =
         SchemaVid(key_hash(RANGED_TREE_SCHEMA_NAME) as u32);
@@ -358,12 +367,14 @@ impl RangedTree {
         if self.tree.deletion.remove(entry) {
             // The un-delete path: this insert targets a key that carries a
             // tombstone, so the tombstone is consumed and, if the physical
-            // copy still exists, revived in place. Legitimate ONLY for a
-            // caller that intends to re-insert a deleted key. Any OTHER
-            // caller reaching here has resurrected a key by accident --
-            // exactly the shape the soak audits kept catching -- so say so
-            // loudly enough to correlate with whatever storm is running.
-            warn!("UNDELETE consumed a tombstone for {:?}", entry.id());
+            // copy still exists, revived in place. Legitimate for a caller
+            // re-inserting a deleted key -- so this is DEBUG, not a warning
+            // -- but it is also the only in-tree path that can undo a
+            // delete, so it stays counted: a workload that never re-inserts
+            // deleted keys and still sees this counter move has found a
+            // resurrection at its source.
+            UNDELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("UNDELETE consumed a tombstone for {:?}", entry.id());
             let cursor = self.tree.seek_raw(entry, Ordering::Forward);
             if cursor.current() == Some(entry) {
                 if let Some(page) = cursor.page.as_ref() {
@@ -457,10 +468,24 @@ impl RangedTree {
         match client.update_cell(tree_cell.clone()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(WriteError::CellDoesNotExisted)) => {
-                warn!(
-                    "Ranged tree metadata cell {:?} missing during checkpoint/update; recreating",
-                    id
-                );
+                // Routine for a split's fresh target, whose first publish
+                // creates the cell -- and a real repair for an existing tree
+                // whose cell vanished. The upsert handles both; only say so
+                // loudly when there is something to be alarmed about, which
+                // a tree that already holds keys is.
+                if self.tree.len() > 0 {
+                    warn!(
+                        "Ranged tree metadata cell {:?} missing during checkpoint/update \
+                         though the tree holds {} keys; recreating",
+                        id,
+                        self.tree.len()
+                    );
+                } else {
+                    debug!(
+                        "Creating ranged tree metadata cell {:?} on first publish",
+                        id
+                    );
+                }
                 match client.upsert_cell(tree_cell).await {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(e)) => Err(format!(
