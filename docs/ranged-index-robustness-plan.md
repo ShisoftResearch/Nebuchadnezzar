@@ -196,3 +196,31 @@ back-pressure here: cap the retry lane and surface a hard "store full,
 shedding index persistence" state instead of converting overload into
 memory growth. Orthogonal to proposals 1-3; belongs with the
 crash-safety work.
+
+## Finding #10 (crash-churn, 2026-09-01)
+
+The fuzzer now probes both layers below the deleted prefix after every
+restart (`TOMBSTONES n probed below N: X stale index entries, Y
+both-layers present`). Two shapes seen, both explained:
+
+- **stale index entries** (cell gone, index entry present): the cell
+  delete was durable, the index's own tombstone was not. That window is
+  what proposal 3's journal bounds -- to the checkpoint interval, so a
+  kill inside it still loses tombstones. The scrub repairs these; the
+  query layer already tolerates ids whose cells are gone.
+- **both-layers present**: observed only in a contiguous band sitting AT
+  the previous cycle's prefix boundary (e.g. seqs 462-484 against a
+  prefix of 473), i.e. the kill's in-flight window. The harness's delete
+  cursor is an UPPER bound by construction -- intent published before
+  the remove, and a key skipped by a kill is never retried -- so the
+  prefix permanently contains never-deleted keys, and a probe finding
+  them measures the harness.
+
+The probe is therefore report-only. A sound hard check needs two things
+the harness does not have: an acked-delete watermark maintained by the
+delete lane, and a decision on whether a cell-removal ack implies
+durability under SIGKILL. Worth doing; not worth guessing.
+
+Watch the SHAPE across long runs instead: stale entries should track the
+scrub's repair count, and "both-layers" should stay inside the band and
+never grow with the prefix.
