@@ -17,6 +17,23 @@ boundary/marker layer), and nothing -- no type, no latch, no protocol
 Proposals are ordered by leverage. 1-3 are structural; 4-6 harden and
 verify. Each names what it retires.
 
+> **STATUS 2026-09-01: proposals 1-5 are implemented and 6 is running.**
+> 1 (copy splits, `a16fd84d`) passed a full 3-hour soak and the legacy
+> shared-leaf path is deleted (`c0595b56`, net -1,056 lines). 2 shipped
+> in its minimal form (`94959498`: one-way detach stamps; the full
+> owner-generation scheme is still the answer when migration work
+> touches page ownership again). 3 shipped (`d30cf5e5`: per-tree
+> tombstone journal on the existing checkpoint). 4 shipped
+> (`docs/tla/CopySplit.tla`) and immediately earned itself: it found a
+> LIVE bug in the copy split as first landed -- the copy sharing the
+> source's deletion set -- in six states (`bd6382d3`). 5 shipped
+> (`539dd292`: raw per-tree audit, run by the soak every 10 minutes).
+>
+> Two further defects fell out of doing the work: `retain` skipped
+> every leaf past a gap pivot (latent for years, load-bearing the
+> moment the copy split made retain its commit point), and `tree_stats`
+> panicked its caller on a racing unload.
+
 ---
 
 ## 1. Disjoint tree ownership: retire shared-leaf splits
