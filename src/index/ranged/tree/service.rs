@@ -1165,17 +1165,14 @@ impl TreeService {
             ack_started.elapsed()
         );
         for (tree_id, dist_tree) in self.trees.entries() {
-            let tree = &dist_tree.tree;
-            let disk_count = tree.count();
-            let mem_count = tree.mem_tree_count();
             info!(
-                "Flushing tree {:?} with {} items (disk) + {} items (mem)",
-                tree_id, disk_count, mem_count
+                "Flushing tree {:?} with {} keys",
+                tree_id,
+                dist_tree.tree.count()
             );
-
-            // Force merge regardless of whether oversized
-            tree.force_merge_levels().await;
         }
+        // The drain that used to hide inside a per-tree force_merge_levels
+        // no-op is taken ONCE, below, where its result is actually checked.
 
         // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
         // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
@@ -1429,28 +1426,18 @@ impl TreeService {
                     }
                 }
 
+                // No per-tree merge pass. `merge_levels` was an LSM-era
+                // no-op that always returned false -- so the whole
+                // post-merge publish below it was dead code -- but it still
+                // awaited a GLOBAL write-back drain, once PER TREE, on every
+                // 500ms pass. At soak scale that is ~450 sequential drain
+                // waits per pass, and under a real backlog each one blocks
+                // until the whole queue lands, which is why split cadence
+                // collapsed exactly when the store got busy. Checkpoints
+                // gate on their own barrier, taken once above.
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    let merged = tree.merge_levels().await;
-                    fast_mode = merged | fast_mode;
-
-                    // If merge happened, wait for external nodes to be written, then update the tree cell
-                    if merged {
-                        // Wait for all external B+tree nodes to be written to storage
-                        if storage::wait_until_updated().await {
-                            // Now update the cell with the new head IDs
-                            if let Err(e) = tree.publish_head(&dist_tree.id, &client).await
-                            {
-                                warn!("Failed to mark LSM tree migration after merge: {:?}", e);
-                            }
-                        } else {
-                            error!(
-                                "post-merge publish for {:?} skipped: write-back barrier \
-                                 NOT established",
-                                dist_tree.id
-                            );
-                        }
-                    } else if do_checkpoint && checkpoint_barrier {
+                    if do_checkpoint && checkpoint_barrier {
                         // Periodic checkpoint: update tree root cell to reflect current state
                         if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);

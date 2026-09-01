@@ -578,23 +578,6 @@ impl RangedTree {
 
     // Legacy methods for compatibility - these are no-ops in the simplified design
 
-    /// No-op: Single tree doesn't need level merging
-    pub async fn merge_levels(&self) -> bool {
-        // No levels to merge - storage is updated automatically
-        storage::wait_until_updated().await;
-        false
-    }
-
-    /// No-op: Single tree doesn't need forced merging
-    pub async fn force_merge_levels(&self) -> bool {
-        storage::wait_until_updated().await;
-        false
-    }
-
-    /// No-op: No separate memory tree
-    pub fn mem_tree_count(&self) -> usize {
-        0
-    }
 }
 
 /// Schema for ranged tree persistence

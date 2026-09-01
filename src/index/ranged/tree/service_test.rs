@@ -668,18 +668,17 @@ mod test {
             "Should have 91 items for range [10, 100]"
         );
 
-        // Force merge to persist to disk
-        println!("=== Forcing tree merge to persist data ===");
-        let merged = tree.merge_levels().await;
-        println!("Merge result: {}", merged);
-        println!("Tree count after merge: {}", tree.count());
+        // Persist to disk: one explicit drain, which is what the old
+        // per-tree merge no-op did anyway.
+        println!("=== Draining write-back to persist data ===");
+        storage::wait_until_updated().await;
+        println!("Tree count after drain: {}", tree.count());
 
-        // Give time for async writes to complete and merge multiple times to ensure all data is on disk
         for i in 0..5 {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            let merged_again = tree.merge_levels().await;
+            let merged_again = storage::wait_until_updated().await;
             println!(
-                "Additional merge {} result: {}, count: {}",
+                "Additional drain {} result: {}, count: {}",
                 i,
                 merged_again,
                 tree.count()
@@ -907,13 +906,13 @@ mod test {
         assert_eq!(results_2_before, expected);
 
         println!("=== Forcing tree merge and recovering ===");
-        tree.merge_levels().await;
+        storage::wait_until_updated().await;
         println!("Tree count after first merge: {}", tree.count());
 
         // Give time for async writes to complete and merge multiple times to ensure all data is on disk
         for _ in 0..5 {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            tree.merge_levels().await;
+            storage::wait_until_updated().await;
         }
         println!("Tree count after additional merges: {}", tree.count());
 
