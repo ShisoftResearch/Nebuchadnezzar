@@ -2894,6 +2894,34 @@ mod test {
                         Ok(Ok(s)) => s.len() as i64,
                         _ => -1,
                     };
+                    // The single-copy invariant, checked from the index side:
+                    // no scan can see a duplicate (cursors dedup ids), so this
+                    // raw audit is the only observation of it.
+                    let (audit_keys, audit_dups, audit_tombs) =
+                        match tokio::time::timeout(Duration::from_secs(60), rc.audit_trees()).await
+                        {
+                            Ok(Ok(v)) => v.iter().fold((0u64, 0u64, 0u64), |acc, a| {
+                                (
+                                    acc.0 + a.keys,
+                                    acc.1 + a.duplicates,
+                                    acc.2 + a.tombstoned_present,
+                                )
+                            }),
+                            _ => (0, 0, 0),
+                        };
+                    assert_eq!(
+                        audit_dups, 0,
+                        "RAW AUDIT: {} duplicate key copies across the index -- the \
+                         single-copy invariant is broken",
+                        audit_dups
+                    );
+                    println!(
+                        "SOAK_AUDIT_RAW t={}s keys={} duplicates={} tombstoned_present={}",
+                        start.elapsed().as_secs(),
+                        audit_keys,
+                        audit_dups,
+                        audit_tombs
+                    );
                     let line = format!(
                         "t={}s inserts={} deletes={} scans={} audits={} trees={} rss_mb={} threads={}",
                         start.elapsed().as_secs(),

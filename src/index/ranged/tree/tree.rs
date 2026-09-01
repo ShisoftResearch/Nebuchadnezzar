@@ -498,6 +498,36 @@ impl RangedTree {
         Some((RangedTree { tree: new_tree }, so.moved_len))
     }
 
+    /// Walk this tree's pages RAW (no tombstone filter, no id dedup) and
+    /// report what only a raw walk can see: physical copies of the same
+    /// key, and keys still physically present under a tombstone.
+    ///
+    /// The single-copy-per-key invariant is load-bearing -- every
+    /// resurrection this index has suffered needed a second copy to forge
+    /// one -- and it was, until now, unobservable: client cursors dedup ids
+    /// BY DESIGN, so a duplicate is invisible to every scan and every
+    /// existing test. `tombstoned` is not a fault (a tombstoned key stays
+    /// physically present until its page compacts); a large or growing
+    /// count is a compaction-lag signal.
+    pub fn audit_raw(&self) -> (u64, u64, u64) {
+        let mut cursor = self.tree.seek_raw(&min_entry_key(), Ordering::Forward);
+        let mut total = 0u64;
+        let mut duplicates = 0u64;
+        let mut tombstoned = 0u64;
+        let mut prev: Option<EntryKey> = None;
+        while let Some(key) = cursor.next() {
+            total += 1;
+            if prev.as_ref() == Some(&key) {
+                duplicates += 1;
+            }
+            if self.tree.deletion.contains(&key) {
+                tombstoned += 1;
+            }
+            prev = Some(key);
+        }
+        (total, duplicates, tombstoned)
+    }
+
     /// Get ideal capacity for this tree
     pub fn ideal_capacity(&self) -> usize {
         self.tree.ideal_capacity() * 2

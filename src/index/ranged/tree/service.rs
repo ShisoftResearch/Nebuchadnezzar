@@ -100,6 +100,19 @@ pub struct BTreeStat {
     pub oversized: bool,
 }
 
+/// What a RAW walk of one tree sees. See `RangedTree::audit_raw`: client
+/// cursors dedup ids by design, so physical duplicates are invisible to
+/// every ordinary scan -- this is the only way to observe the
+/// single-copy-per-key invariant that every resurrection bug has needed to
+/// break.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TreeAudit {
+    pub id: Id,
+    pub keys: u64,
+    pub duplicates: u64,
+    pub tombstoned_present: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TreeStat {
     pub id: Id,
@@ -130,6 +143,7 @@ service! {
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<TreeStat>;
+    rpc audit(id: Id) -> OpResult<TreeAudit>;
     rpc flush_all();
 }
 
@@ -949,6 +963,29 @@ impl Service for TreeService {
                     ideal_cap: tree.tree.ideal_capacity(),
                     oversized: tree.tree.oversized(),
                 }],
+            })
+        } else {
+            OpResult::NotFound
+        })
+        .boxed()
+    }
+
+    fn audit(&self, id: Id) -> BoxFuture<'_, OpResult<TreeAudit>> {
+        future::ready(if let Some(tree) = self.trees.get(&id) {
+            let (keys, duplicates, tombstoned_present) = tree.tree.audit_raw();
+            if duplicates > 0 {
+                error!(
+                    "INDEX AUDIT: tree {:?} holds {} duplicate key copies among {} keys; \
+                     the single-copy invariant is broken and a delete of such a key can be \
+                     undone by page compaction",
+                    id, duplicates, keys
+                );
+            }
+            OpResult::Successful(TreeAudit {
+                id,
+                keys,
+                duplicates,
+                tombstoned_present,
             })
         } else {
             OpResult::NotFound
