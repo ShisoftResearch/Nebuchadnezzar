@@ -307,7 +307,23 @@ impl RangedIndexerClient {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
                 }
-                _ => unreachable!(),
+                // NOT unreachable: a placement can name a tree this server
+                // has not loaded (or has just unloaded), and panicking the
+                // caller for asking about it turns a routine race into a
+                // dead task. Skip it -- stats are a report, not a contract.
+                other => {
+                    debug!(
+                        "Skipping stat for tree {:?}: {}",
+                        placement.id,
+                        match other {
+                            OpResult::NotFound => "not loaded here",
+                            OpResult::OutOfBound => "out of bound",
+                            OpResult::Migrating => "migrating",
+                            OpResult::EpochMissMatch(..) => "epoch mismatch",
+                            OpResult::Successful(_) => unreachable!(),
+                        }
+                    );
+                }
             }
             match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
                 NextTree::Found(next_lower, next_placement) => {

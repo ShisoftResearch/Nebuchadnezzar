@@ -378,6 +378,15 @@ fn shared_leaf_splits() -> bool {
     *FLAG.get_or_init(|| std::env::var("NEB_SPLIT_SHARED").is_ok())
 }
 
+/// Exponential per-tree backoff for repeatedly failing splits, capped.
+fn split_backoff_ms(streak: &mut StdHashMap<Id, u32>, tree: Id) -> u64 {
+    const BASE_MS: u64 = 2_000;
+    const MAX_MS: u64 = 60_000;
+    let n = streak.entry(tree).or_insert(0);
+    *n = (*n + 1).min(16);
+    BASE_MS.saturating_mul(1u64 << (*n - 1).min(5)).min(MAX_MS)
+}
+
 fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
     let mut next = key.clone();
     match ordering {
@@ -1575,7 +1584,12 @@ impl TreeService {
         }
         tokio::spawn(async move {
             let _running_guard = RunningGuard(running);
-            const SPLIT_RETRY_BACKOFF_MS: u64 = 2_000;
+            // Backoff doubles per consecutive failure per tree (see
+            // split_backoff_ms): during a store-full storm a split can fail
+            // its barrier for minutes, and re-copying every 2s is pure
+            // waste -- the soak logged 13,789 aborts in one storm where a
+            // few hundred would have carried the same information.
+            let mut split_retry_streak = StdHashMap::<Id, u32>::new();
             // Periodic checkpoint: flush B-tree pages and update tree root cells
             // every ~60 seconds to ensure durability even without explicit shutdown.
             const CHECKPOINT_INTERVAL_LOOPS: u32 = 120; // 120 * 500ms = 60s
@@ -1809,7 +1823,11 @@ impl TreeService {
                             .await;
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                             continue;
                         }
@@ -1838,7 +1856,11 @@ impl TreeService {
                             .await;
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                             continue;
                         }
@@ -1909,7 +1931,10 @@ impl TreeService {
                                     split_backoff_until.insert(
                                         dist_tree.id,
                                         Instant::now()
-                                            + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                            + Duration::from_millis(split_backoff_ms(
+                                                &mut split_retry_streak,
+                                                dist_tree.id,
+                                            )),
                                     );
                                     false
                                 }
@@ -1928,7 +1953,11 @@ impl TreeService {
                         if !target_loaded {
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                         } else {
                             split_backoff_until.remove(&dist_tree.id);
@@ -1981,6 +2010,7 @@ impl TreeService {
                         if target_loaded {
                             pending_migrations.remove(&migration_target_id);
                         }
+                        split_retry_streak.remove(&dist_tree.id);
                         debug!(
                             "LSM tree migration from {:?} to {:?} succeed in {:?}",
                             dist_tree.id,
