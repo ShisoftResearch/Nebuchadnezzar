@@ -325,3 +325,90 @@ sequential runs.
 End-to-end: the reader+writer stress test moves 131K verified inserts +
 3 structural splits + continuous scans in 3.9s (debug build, whole
 server stack) where the pre-fix code wedged forever.
+
+
+---
+
+# Campaign close (2026-09-01)
+
+Both original workarounds are answered, and the architecture underneath
+them was reworked so the failure classes cannot recur. Full detail in
+`docs/ranged-index-robustness-plan.md`; this is the short account.
+
+## The two issues
+
+**Issue 1 was misdiagnosed by this document.** The trees were not going
+out of order -- the SEEK's initial positioning was non-linearizable, and
+`server_final4.log` proves it needed no splits at all (fresh store,
+depth 4, zero splits, 8,700 give-ups). Fixed at the source
+(`e6ce7e54`), modeled in `docs/tla/BLinkSeek.tla`. **The
+`NEB_TREE_DEPTH=4` workaround can be retired once a depth-3 BANC import
+runs clean** -- that acceptance run is the one thing this campaign did
+not do, because it needs the bench machine and the real corpus.
+
+**Issue 2** is fixed as this document prescribed: `ensure_scannable`
+verifies with `contains()` and the write+verify path is bounded
+(`NEB_SCANNABLE_INFLIGHT`, default 64). The `--skip-sidecar` recipe
+should no longer be necessary; keep the flags, they are good tools.
+
+## What else was wrong
+
+Fourteen distinct defects, most of them delete- or storm-triggered --
+the dimension no import-shaped test ever exercised:
+
+1. seek off-page positioning (the give-up storms)
+2. a total tokio-runtime freeze from an unyielding poll orphaning the
+   IO/timer driver (this is almost certainly the silent whole-night
+   import wedge)
+3. `from_root` installed a NULL root-versioning latch on every
+   reconstructed and split-target tree
+4. rollback reabsorbed past the truncated right edge
+5. scan truncation past an emptied tree (delete-triggered)
+6. Backward descents ping-ponged through empty pages
+7. tombstone filtering gated on a statistical counter
+8. a committed split's unloaded target was dropped from pending,
+   forcing a disk reload that wiped memory-only tombstones
+9. orphaned write-back queue refs consumed live tombstones -- the
+   resurrection forge, five soak runs to corner
+10. the copy split shared the source's deletion set (found by TLA+
+    BEFORE any soak rolled it)
+11. `retain` skipped every leaf past a gap pivot (latent for years;
+    critical the moment copy-split made retain its commit)
+12. `tree_stats` panicked its caller on a racing tree unload
+13. the tombstone journal field was non-nullable, rejecting older cells
+14. the LSM-era `merge_levels` no-op drained write-back once per tree
+    per 500ms pass
+
+## The architecture now
+
+Splits COPY instead of sharing pages: the source is untouched until
+commit, so an abort is "drop the copy" and every page has exactly one
+owner. Detached pages refuse background work. Tombstones are journaled
+per tree at the checkpoint, so deletes survive reloads -- including on
+stores created before the field existed. The single-copy invariant is
+observable for the first time (raw per-tree audit + dedup telemetry).
+The whole shared-leaf era -- split machinery, rollback, bounded
+recovery, marker reconciliation, the durable marker -- is deleted:
+~1,450 lines net, no backward compatibility kept.
+
+## Evidence
+
+- Three full 3-hour soaks (the mixed workload with exact per-stripe
+  audits, whole-index roams and store-full storms). The last two are
+  the copy architecture; the best-recorded run did 23.9M verified
+  inserts, 4.76M verified deletes, 1.46B monotonicity-checked scans,
+  1,464 exact audits and 23,604 aborts with zero violations.
+- Full suite green throughout (790 outside `index::ranged`, ~70 within).
+- `docs/tla/CopySplit.tla` and `docs/tla/BLinkSeek.tla`, each with a
+  deliberately-violated config guarding against a vacuous pass.
+- Perf: parity on every steady-state path, `scan_ids` +11%; splits cost
+  ~30ns/insert amortized and are cheaper than the old path under storms.
+
+## Left for you
+
+- The depth-3 BANC acceptance run (retires `NEB_TREE_DEPTH=4`).
+- Merge timing; the branch is unpushed.
+- Write-back back-pressure (finding #9, now corrected -- most of the
+  apparent leak was retry churn, fixed).
+- A sound hard tombstone check in the crash fuzzer (finding #10).
+- The cargo-target wipe is still unexplained.
