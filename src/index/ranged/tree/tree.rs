@@ -457,6 +457,32 @@ impl RangedTree {
         Some((RangedTree { tree: new_tree }, so.moved_len))
     }
 
+    /// Copy-based split: build a new tree of COPIES of the live keys at or
+    /// past `pivot`, sharing no pages with this tree, which is not mutated
+    /// at all. The caller commits by flipping placement and then calling
+    /// [`Self::retain`], or aborts by draining and dropping the copy --
+    /// there is nothing to roll back. The deletion set stays shared
+    /// (disjoint ranges; a tombstone touches one tree's key), and the walk
+    /// is filtered so no tombstoned key ever exists in two trees. The
+    /// caller must hold this tree frozen for the whole copy-to-retain
+    /// window, exactly as for split_off.
+    pub fn copy_off(
+        &self,
+        pivot: &EntryKey,
+        client: &Arc<AsyncClient>,
+    ) -> Option<(RangedTree, usize)> {
+        let so = super::btree::split_off::copy_off(&self.tree, pivot)?;
+        let mut new_tree = DiskTree::from_root(
+            so.new_root,
+            so.new_head_id,
+            so.moved_len,
+            so.new_height,
+            &self.tree.deletion,
+        );
+        new_tree.set_writeback_client(client);
+        Some((RangedTree { tree: new_tree }, so.moved_len))
+    }
+
     /// Get ideal capacity for this tree
     pub fn ideal_capacity(&self) -> usize {
         self.tree.ideal_capacity() * 2
