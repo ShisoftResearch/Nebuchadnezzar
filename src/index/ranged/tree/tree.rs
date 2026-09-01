@@ -74,17 +74,31 @@ impl DeletionSet {
             .load(std::sync::atomic::Ordering::Acquire)
             .max(0) as usize
     }
+
+    /// Snapshot of the live tombstones, for the durable journal. Racy by
+    /// nature (a checkpoint of a concurrently mutating set); that is
+    /// exactly the checkpoint's contract -- a delete acknowledged after
+    /// this snapshot is covered by the next one, which is the bounded
+    /// durability window the journal exists to create.
+    pub fn snapshot(&self) -> std::collections::HashSet<EntryKey> {
+        self.set.items()
+    }
 }
 
 pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
 pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
 pub const RANGED_TREE_MIGRATION_NAME: &'static str = "migration";
+pub const RANGED_TREE_TOMBSTONES_NAME: &'static str = "tombstones";
 pub const INITIAL_TREE_EPOCH: u64 = 0;
+/// Journaled tombstones past which compaction is visibly losing to the
+/// delete rate. Not a limit -- the journal is written whole either way.
+const TOMBSTONE_JOURNAL_WARN: usize = 100_000;
 lazy_static! {
     pub static ref RANGED_TREE_SCHEMA_ID: SchemaVid =
         SchemaVid(key_hash(RANGED_TREE_SCHEMA_NAME) as u32);
     pub static ref RANGED_TREE_HEAD_HASH: u64 = key_hash(RANGED_TREE_HEAD_NAME);
     pub static ref RANGED_TREE_MIGRATION_HASH: u64 = key_hash(RANGED_TREE_MIGRATION_NAME);
+    pub static ref RANGED_TREE_TOMBSTONES_HASH: u64 = key_hash(RANGED_TREE_TOMBSTONES_NAME);
     pub static ref RANGED_TREE_SCHEMA: Schema = ranged_tree_schema();
 }
 
@@ -294,6 +308,31 @@ impl RangedTree {
                 });
             }
         };
+        // Re-arm the journaled tombstones. Without this a reload resurrects
+        // every delete that had not yet been compacted out of its page --
+        // silently, because a resurrected key is indistinguishable from one
+        // that was never deleted.
+        let journaled = cell.data[*RANGED_TREE_TOMBSTONES_HASH]
+            .prim_array()
+            .and_then(|arr| match arr {
+                OwnedPrimArray::SmallBytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut rearmed = 0usize;
+        for raw in journaled.iter() {
+            let key = EntryKey::from_slice(raw.as_slice());
+            if deletion_set.insert(key) {
+                rearmed += 1;
+            }
+        }
+        if rearmed > 0 {
+            info!(
+                "[TREE LOAD] Re-armed {} journaled tombstone(s) for {:?}; those keys stay \
+                 deleted across the reload",
+                rearmed, tree_id
+            );
+        }
         info!("[TREE LOAD] B-tree loaded with {} keys", tree.count());
 
         Ok(Self { tree })
@@ -404,7 +443,17 @@ impl RangedTree {
     ) -> Result<(), String> {
         use crate::ram::cell::WriteError;
 
-        let tree_cell = ranged_tree_cell(&self.tree.head_id(), id, migration);
+        let tombstones: Vec<EntryKey> = self.tree.deletion.snapshot().into_iter().collect();
+        if tombstones.len() > TOMBSTONE_JOURNAL_WARN {
+            warn!(
+                "Ranged tree {:?} journals {} tombstones; write-back compaction is falling \
+                 behind the delete rate",
+                id,
+                tombstones.len()
+            );
+        }
+        let tree_cell =
+            ranged_tree_cell_with_tombstones(&self.tree.head_id(), id, migration, &tombstones);
         match client.update_cell(tree_cell.clone()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(WriteError::CellDoesNotExisted)) => {
@@ -645,6 +694,7 @@ fn ranged_tree_schema() -> Schema {
         Field::new_schema(vec![
             Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
             Field::new_unindexed_nullable(RANGED_TREE_MIGRATION_NAME, Type::Id),
+            Field::new_unindexed_array(RANGED_TREE_TOMBSTONES_NAME, Type::SmallBytes),
         ]),
         false,
         false,
@@ -653,6 +703,26 @@ fn ranged_tree_schema() -> Schema {
 
 /// Create a cell for storing tree metadata
 fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
+    ranged_tree_cell_with_tombstones(head_id, id, migration, &[])
+}
+
+/// The metadata cell, with the tombstone journal.
+///
+/// Tombstones live only in memory otherwise: a delete hides its key
+/// immediately and the key's page drops it whenever write-back next
+/// compacts that page. Any reload before that compaction resurrects every
+/// uncompacted delete -- by design on a genuine restart, and reachable
+/// MID-RUN until `caf09d6d`. The journal closes it: the balancer's 60s
+/// checkpoint writes the live tombstones beside the head pointer, and a
+/// load re-arms them. Self-GCing, because compaction removes a tombstone
+/// from the set the moment its key physically leaves the page, so the next
+/// checkpoint simply does not write it.
+fn ranged_tree_cell_with_tombstones(
+    head_id: &Id,
+    id: &Id,
+    migration: Option<Id>,
+    tombstones: &[EntryKey],
+) -> OwnedCell {
     let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(*head_id));
     cell_map.insert_key_id(
@@ -660,6 +730,14 @@ fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
         migration
             .map(|id| OwnedValue::Id(id))
             .unwrap_or(OwnedValue::Null),
+    );
+    cell_map.insert_key_id(
+        *RANGED_TREE_TOMBSTONES_HASH,
+        tombstones
+            .iter()
+            .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
+            .collect::<Vec<_>>()
+            .value(),
     );
     OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }
@@ -1112,6 +1190,112 @@ mod tests {
             .expect("the tree should load back from storage");
         assert_eq!(recovered.count(), 2);
         assert_eq!(collect_visible(&recovered), vec![10, 12]);
+
+        server.shutdown().await;
+    }
+
+    /// An acknowledged delete survives a reload.
+    ///
+    /// Tombstones live only in memory: a delete hides its key immediately
+    /// and the key's page drops it whenever write-back next compacts that
+    /// page. Any reload before that compaction used to resurrect the key --
+    /// by design on a genuine restart, and reachable MID-RUN until
+    /// `caf09d6d`. This test does exactly that: delete, publish the
+    /// metadata (the balancer's checkpoint), reload WITHOUT letting
+    /// compaction run, and require the key to stay gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletes_survive_a_reload_through_the_tombstone_journal() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_tombstone_journal";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::from_parts(905, 905);
+        let field = 781;
+        let tree = RangedTree::create(&client, &tree_id).await;
+        for value in 0..300u64 {
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                field,
+                value,
+                Id::from_parts(9, value)
+            )));
+        }
+        // Persist the pages BEFORE deleting, so the tombstones are the only
+        // record of the deletes -- exactly the window the journal covers.
+        storage::wait_until_updated().await;
+        let deleted: Vec<EntryKey> = (0..300u64)
+            .step_by(7)
+            .map(|v| make_field_key(SchemaUid(1), field, v, Id::from_parts(9, v)))
+            .collect();
+        for key in &deleted {
+            assert!(tree.delete(key), "delete should land for {:?}", key.id());
+        }
+        // The checkpoint the balancer runs every 60s: publish head + journal.
+        tree.mark_migration(&tree_id, None, &client)
+            .await
+            .expect("checkpoint should publish the tombstone journal");
+        let live_before = tree.count();
+        drop(tree);
+
+        let reloaded = RangedTree::recover(&client, &tree_id)
+            .await
+            .expect("the tree should reload");
+        for key in &deleted {
+            assert!(
+                !reloaded.contains(key),
+                "RESURRECTION: {:?} was deleted before the reload and is visible again",
+                key.id()
+            );
+        }
+        let mut cursor = reloaded.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut visible = 0usize;
+        while cursor.next().is_some() {
+            visible += 1;
+        }
+        assert_eq!(
+            visible, live_before,
+            "the reloaded tree must serve exactly the keys that survived the deletes"
+        );
 
         server.shutdown().await;
     }
