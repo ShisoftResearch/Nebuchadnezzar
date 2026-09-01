@@ -25,11 +25,17 @@ where
         clear_by_node::<KS, PS>(&child_ref);
     }
 
-    // Now clear this node and its right siblings
+    // Now clear this node and its right siblings. Detach each BEFORE
+    // emptying it: background holders of owned refs (the write-back queue)
+    // must refuse the page from the first moment it stops belonging to a
+    // tree, or their compaction consumes live tombstones against its stale
+    // copies.
+    node_ref.deref::<KS, PS>().detach();
     let mut node = write_node::<KS, PS>(&node_ref);
     let mut next_ref = mem::take(node.right_ref_mut().unwrap());
     *node = NodeData::Empty(Box::new(Default::default()));
     while !next_ref.is_default() {
+        next_ref.deref::<KS, PS>().detach();
         let mut node = write_node::<KS, PS>(&next_ref);
         next_ref = mem::take(node.right_ref_mut().unwrap());
         *node = NodeData::Empty(Box::new(Default::default()));

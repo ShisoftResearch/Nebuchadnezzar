@@ -71,6 +71,23 @@ fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
     }
 }
 
+/// Ids a scan dropped because it had already yielded them.
+///
+/// Cross-block dedup is load-bearing for correctness -- a block boundary
+/// can legitimately replay its anchor -- but it is ALSO what makes a
+/// duplicate physical key invisible: the client silently swallows the
+/// second copy, so a broken single-copy invariant produces perfect scan
+/// results and no complaint anywhere. In a steady state (no splits, no
+/// merges) this counter should barely move; a climbing rate is the alarm
+/// for duplicates that `RangedTree::audit_raw` then localizes.
+pub static SCAN_DEDUP_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total dedup drops observed by scans in this process.
+pub fn scan_dedup_drops() -> u64 {
+    SCAN_DEDUP_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct ClientCursor {
     pub ids: Vec<Id>,
     next: Option<EntryKey>,
@@ -156,11 +173,16 @@ impl ClientCursor {
         let next = block.next;
         let last_key = block.last_key;
         let mut seen_ids: HashSet<Id> = HashSet::new();
+        let before_dedup = block.buffer.len();
         let ids: Vec<Id> = block
             .buffer
             .into_iter()
             .filter(|id| seen_ids.insert(*id))
             .collect();
+        SCAN_DEDUP_DROPS.fetch_add(
+            (before_dedup - ids.len()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if trace_cursor {
             let gap = cursor_trace_gap(&ids);
             if gap.is_some() {
@@ -263,7 +285,12 @@ impl ClientCursor {
                 );
             }
             let mut seen = std::mem::take(&mut self.seen_ids);
+            let before_dedup = cursor.ids.len();
             cursor.ids.retain(|id| seen.insert(*id));
+            SCAN_DEDUP_DROPS.fetch_add(
+                (before_dedup - cursor.ids.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             cursor.seen_ids = seen;
             *self = cursor;
         } else {

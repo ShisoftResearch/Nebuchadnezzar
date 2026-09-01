@@ -10,17 +10,102 @@ use std::mem;
 use std::sync::Arc;
 
 // DeletionSet hides deleted keys immediately and lets page writeback compact them.
-pub type DeletionSet = LFHashSet<EntryKey>;
+//
+// A lock-free set plus a PRECISE size gauge. The scan paths skip tombstone
+// filtering entirely when the set is empty (the hot-path win that keeps
+// packed, non-materializing snapshots), and that emptiness answer is a
+// CORRECTNESS decision: lightning's own len() sums sharded per-thread
+// counters with relaxed loads, so with inserts landing on writer threads
+// and removes on write-back threads its sum transiently reads zero (or
+// negative) while tombstones remain -- and one such misread during a page
+// snapshot yields a deleted key back to a scan. The 3h soak caught exactly
+// that at audit #593, during a store-full compaction storm that kept the
+// set oscillating around empty ("scan yields v=N but expected v=N+1", the
+// yielded key long-deleted and verified invisible). The gauge counts only
+// CONFIRMED mutations, after the set call returns: any acknowledged delete
+// is therefore counted before its caller proceeds, and the in-flight
+// window only ever OVER-reports (a remove decrements after the key is
+// already gone), which is the safe direction for a filter gate.
+pub struct DeletionSet {
+    set: LFHashSet<EntryKey>,
+    tombstones: std::sync::atomic::AtomicIsize,
+}
+
+impl DeletionSet {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            set: LFHashSet::with_capacity(capacity),
+            tombstones: std::sync::atomic::AtomicIsize::new(0),
+        }
+    }
+
+    pub fn insert(&self, key: EntryKey) -> bool {
+        let inserted = self.set.insert(key);
+        if inserted {
+            self.tombstones
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        inserted
+    }
+
+    pub fn remove(&self, key: &EntryKey) -> bool {
+        let removed = self.set.remove(key);
+        if removed {
+            self.tombstones
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        removed
+    }
+
+    pub fn contains(&self, key: &EntryKey) -> bool {
+        self.set.contains(key)
+    }
+
+    /// Precise emptiness for the filter gates. `true` means every tombstone
+    /// whose delete has been acknowledged is gone; an unacknowledged insert
+    /// racing this read may be missed, which orders the reading scan before
+    /// that delete -- legal.
+    pub fn is_empty(&self) -> bool {
+        self.tombstones.load(std::sync::atomic::Ordering::Acquire) <= 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.tombstones
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(0) as usize
+    }
+
+    /// Snapshot of the live tombstones, for the durable journal. Racy by
+    /// nature (a checkpoint of a concurrently mutating set); that is
+    /// exactly the checkpoint's contract -- a delete acknowledged after
+    /// this snapshot is covered by the next one, which is the bounded
+    /// durability window the journal exists to create.
+    pub fn snapshot(&self) -> std::collections::HashSet<EntryKey> {
+        self.set.items()
+    }
+}
 
 pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
 pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
-pub const RANGED_TREE_MIGRATION_NAME: &'static str = "migration";
+pub const RANGED_TREE_TOMBSTONES_NAME: &'static str = "tombstones";
 pub const INITIAL_TREE_EPOCH: u64 = 0;
+/// Journaled tombstones past which compaction is visibly losing to the
+/// delete rate. Not a limit -- the journal is written whole either way.
+const TOMBSTONE_JOURNAL_WARN: usize = 100_000;
+
+/// Inserts that consumed a tombstone (see `RangedTree::insert`). Exposed so
+/// a workload that never re-inserts deleted keys can assert it stays zero.
+pub static UNDELETES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tombstones consumed by re-insertion in this process.
+pub fn undeletes() -> u64 {
+    UNDELETES.load(std::sync::atomic::Ordering::Relaxed)
+}
 lazy_static! {
     pub static ref RANGED_TREE_SCHEMA_ID: SchemaVid =
         SchemaVid(key_hash(RANGED_TREE_SCHEMA_NAME) as u32);
     pub static ref RANGED_TREE_HEAD_HASH: u64 = key_hash(RANGED_TREE_HEAD_NAME);
-    pub static ref RANGED_TREE_MIGRATION_HASH: u64 = key_hash(RANGED_TREE_MIGRATION_NAME);
+    pub static ref RANGED_TREE_TOMBSTONES_HASH: u64 = key_hash(RANGED_TREE_TOMBSTONES_NAME);
     pub static ref RANGED_TREE_SCHEMA: Schema = ranged_tree_schema();
 }
 
@@ -88,11 +173,11 @@ impl std::fmt::Display for TreeRecoverError {
 impl RangedTree {
     /// Create a new ranged tree
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
-        let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
+        let deletion_set = Arc::new(DeletionSet::with_capacity(0));
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
 
-        let tree_cell = ranged_tree_cell(&tree.head_id(), id, None);
+        let tree_cell = ranged_tree_cell(&tree.head_id(), id);
         match neb_client.write_cell(tree_cell).await {
             Ok(Ok(_)) => {
                 info!("Created new ranged tree {:?}", id);
@@ -119,7 +204,7 @@ impl RangedTree {
                                     id, error
                                 );
                                 let deletion_set =
-                                    Arc::new(lightning::map::HashSet::with_capacity(0));
+                                    Arc::new(DeletionSet::with_capacity(0));
                                 Self {
                                     tree: DiskTree::new(&deletion_set),
                                 }
@@ -151,22 +236,9 @@ impl RangedTree {
         neb_client: &Arc<AsyncClient>,
         tree_id: &Id,
     ) -> Result<Self, TreeRecoverError> {
-        Self::recover_bounded(neb_client, tree_id, None).await
-    }
-
-    /// Like [`Self::recover`], but with the tree's placement upper bound.
-    /// A bounded tree may carry a stale chain link into pages a split-off
-    /// moved to a sibling; the bound lets reconstruction stop at the
-    /// boundary (or truncate a dangling link beyond it) instead of refusing
-    /// to load a tree whose own range is fully readable.
-    pub async fn recover_bounded(
-        neb_client: &Arc<AsyncClient>,
-        tree_id: &Id,
-        upper_bound: Option<&EntryKey>,
-    ) -> Result<Self, TreeRecoverError> {
         info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
-        let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
+        let deletion_set = Arc::new(DeletionSet::with_capacity(0));
 
         let cell = match neb_client.read_cell(*tree_id).await {
             Ok(Ok(cell)) => {
@@ -209,9 +281,7 @@ impl RangedTree {
         };
         info!("[TREE LOAD] Loading B-tree from head {:?}", head_id);
 
-        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0, upper_bound)
-            .await
-        {
+        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await {
             Ok(mut tree) => {
                 tree.set_writeback_client(neb_client);
                 tree
@@ -230,6 +300,31 @@ impl RangedTree {
                 });
             }
         };
+        // Re-arm the journaled tombstones. Without this a reload resurrects
+        // every delete that had not yet been compacted out of its page --
+        // silently, because a resurrected key is indistinguishable from one
+        // that was never deleted.
+        let journaled = cell.data[*RANGED_TREE_TOMBSTONES_HASH]
+            .prim_array()
+            .and_then(|arr| match arr {
+                OwnedPrimArray::SmallBytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut rearmed = 0usize;
+        for raw in journaled.iter() {
+            let key = EntryKey::from_slice(raw.as_slice());
+            if deletion_set.insert(key) {
+                rearmed += 1;
+            }
+        }
+        if rearmed > 0 {
+            info!(
+                "[TREE LOAD] Re-armed {} journaled tombstone(s) for {:?}; those keys stay \
+                 deleted across the reload",
+                rearmed, tree_id
+            );
+        }
         info!("[TREE LOAD] B-tree loaded with {} keys", tree.count());
 
         Ok(Self { tree })
@@ -253,6 +348,16 @@ impl RangedTree {
     pub fn insert(&self, entry: &EntryKey) -> bool {
         debug!("Inserting entry: {:?}", entry);
         if self.tree.deletion.remove(entry) {
+            // The un-delete path: this insert targets a key that carries a
+            // tombstone, so the tombstone is consumed and, if the physical
+            // copy still exists, revived in place. Legitimate for a caller
+            // re-inserting a deleted key -- so this is DEBUG, not a warning
+            // -- but it is also the only in-tree path that can undo a
+            // delete, so it stays counted: a workload that never re-inserts
+            // deleted keys and still sees this counter move has found a
+            // resurrection at its source.
+            UNDELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("UNDELETE consumed a tombstone for {:?}", entry.id());
             let cursor = self.tree.seek_raw(entry, Ordering::Forward);
             if cursor.current() == Some(entry) {
                 if let Some(page) = cursor.page.as_ref() {
@@ -323,23 +428,46 @@ impl RangedTree {
         info!("Retain completed");
     }
 
-    /// Mark tree as migrating
-    pub async fn mark_migration(
-        &self,
-        id: &Id,
-        migration: Option<Id>,
-        client: &Arc<AsyncClient>,
-    ) -> Result<(), String> {
+    /// Publish this tree's head pointer and tombstone journal -- the
+    /// checkpoint. Named for what it does: the durable migration marker it
+    /// used to carry is gone with the shared-leaf split, whose chain
+    /// surgery was the only thing that needed to know a split had been
+    /// interrupted. A copy split never cuts the source chain, so there is
+    /// nothing to reconcile at load.
+    pub async fn publish_head(&self, id: &Id, client: &Arc<AsyncClient>) -> Result<(), String> {
         use crate::ram::cell::WriteError;
 
-        let tree_cell = ranged_tree_cell(&self.tree.head_id(), id, migration);
+        let tombstones: Vec<EntryKey> = self.tree.deletion.snapshot().into_iter().collect();
+        if tombstones.len() > TOMBSTONE_JOURNAL_WARN {
+            warn!(
+                "Ranged tree {:?} journals {} tombstones; write-back compaction is falling \
+                 behind the delete rate",
+                id,
+                tombstones.len()
+            );
+        }
+        let tree_cell = ranged_tree_cell_with_tombstones(&self.tree.head_id(), id, &tombstones);
         match client.update_cell(tree_cell.clone()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(WriteError::CellDoesNotExisted)) => {
-                warn!(
-                    "Ranged tree metadata cell {:?} missing during checkpoint/update; recreating",
-                    id
-                );
+                // Routine for a split's fresh target, whose first publish
+                // creates the cell -- and a real repair for an existing tree
+                // whose cell vanished. The upsert handles both; only say so
+                // loudly when there is something to be alarmed about, which
+                // a tree that already holds keys is.
+                if self.tree.len() > 0 {
+                    warn!(
+                        "Ranged tree metadata cell {:?} missing during checkpoint/update \
+                         though the tree holds {} keys; recreating",
+                        id,
+                        self.tree.len()
+                    );
+                } else {
+                    debug!(
+                        "Creating ranged tree metadata cell {:?} on first publish",
+                        id
+                    );
+                }
                 match client.upsert_cell(tree_cell).await {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(e)) => Err(format!(
@@ -362,27 +490,75 @@ impl RangedTree {
         self.tree.merge_with_keys(keys);
     }
 
-    /// Structurally split off keys `>= pivot` into a new tree that shares this
-    /// tree's leaf nodes — O(leaves) instead of copying every key. The caller
-    /// must hold this tree frozen (migration marker) so no writer races the
-    /// split. Returns the new tree and how many keys moved, or None if nothing
-    /// moves. The new tree shares this tree's deletion set: the key ranges are
-    /// disjoint, so a tombstone only affects the one tree that holds its key.
-    pub fn split_off(
+    /// Copy-based split: build a new tree of COPIES of the live keys at or
+    /// past `pivot`, sharing no pages with this tree, which is not mutated
+    /// at all. The caller commits by flipping placement and then calling
+    /// [`Self::retain`], or aborts by draining and dropping the copy --
+    /// there is nothing to roll back. The caller must hold this tree frozen
+    /// for the whole copy-to-retain window, exactly as for split_off.
+    ///
+    /// The copy gets its OWN deletion set. Sharing one was inherited from
+    /// the shared-leaf design, where shared PAGES made a shared set
+    /// mandatory; with disjoint pages it is not just unnecessary but wrong.
+    /// docs/tla/CopySplit.tla (`CopySplitShared.cfg`) finds the trace in
+    /// six states: after the placement flip the copy serves the moved range
+    /// and is NOT frozen, so a delete lands there and tombstones the SHARED
+    /// set -- and the source, which still physically holds that key until
+    /// retain, flushes a page, pairs the key against the shared tombstone
+    /// in `remove_contains`, and consumes it. The copy's key is visible
+    /// again. Disjoint sets make the pairing impossible: a tombstone can
+    /// only ever meet the pages of the tree that owns the key.
+    ///
+    /// Correct without seeding: the copy walk is FILTERED, so a key
+    /// tombstoned before the split is never copied -- its physical copy
+    /// dies with the source's retain and its tombstone stays behind,
+    /// inert, in the source's set.
+    pub fn copy_off(
         &self,
         pivot: &EntryKey,
         client: &Arc<AsyncClient>,
     ) -> Option<(RangedTree, usize)> {
-        let so = super::btree::split_off::split_off_spine(&self.tree, pivot)?;
+        let so = super::btree::split_off::copy_off(&self.tree, pivot)?;
+        let deletion = Arc::new(DeletionSet::with_capacity(0));
         let mut new_tree = DiskTree::from_root(
             so.new_root,
             so.new_head_id,
             so.moved_len,
             so.new_height,
-            &self.tree.deletion,
+            &deletion,
         );
         new_tree.set_writeback_client(client);
         Some((RangedTree { tree: new_tree }, so.moved_len))
+    }
+
+    /// Walk this tree's pages RAW (no tombstone filter, no id dedup) and
+    /// report what only a raw walk can see: physical copies of the same
+    /// key, and keys still physically present under a tombstone.
+    ///
+    /// The single-copy-per-key invariant is load-bearing -- every
+    /// resurrection this index has suffered needed a second copy to forge
+    /// one -- and it was, until now, unobservable: client cursors dedup ids
+    /// BY DESIGN, so a duplicate is invisible to every scan and every
+    /// existing test. `tombstoned` is not a fault (a tombstoned key stays
+    /// physically present until its page compacts); a large or growing
+    /// count is a compaction-lag signal.
+    pub fn audit_raw(&self) -> (u64, u64, u64) {
+        let mut cursor = self.tree.seek_raw(&min_entry_key(), Ordering::Forward);
+        let mut total = 0u64;
+        let mut duplicates = 0u64;
+        let mut tombstoned = 0u64;
+        let mut prev: Option<EntryKey> = None;
+        while let Some(key) = cursor.next() {
+            total += 1;
+            if prev.as_ref() == Some(&key) {
+                duplicates += 1;
+            }
+            if self.tree.deletion.contains(&key) {
+                tombstoned += 1;
+            }
+            prev = Some(key);
+        }
+        (total, duplicates, tombstoned)
     }
 
     /// Get ideal capacity for this tree
@@ -402,95 +578,6 @@ impl RangedTree {
 
     // Legacy methods for compatibility - these are no-ops in the simplified design
 
-    /// No-op: Single tree doesn't need level merging
-    pub async fn merge_levels(&self) -> bool {
-        // No levels to merge - storage is updated automatically
-        storage::wait_until_updated().await;
-        false
-    }
-
-    /// No-op: Single tree doesn't need forced merging
-    pub async fn force_merge_levels(&self) -> bool {
-        storage::wait_until_updated().await;
-        false
-    }
-
-    /// No-op: No separate memory tree
-    pub fn mem_tree_count(&self) -> usize {
-        0
-    }
-}
-
-/// Read a tree's metadata cell: (head id, migration marker). None when the
-/// cell is missing or unreadable.
-pub async fn read_tree_metadata(
-    client: &Arc<AsyncClient>,
-    tree_id: &Id,
-) -> Option<(Id, Option<Id>)> {
-    let cell = client.read_cell(*tree_id).await.ok()?.ok()?;
-    let head = *cell.data[*RANGED_TREE_HEAD_HASH].id()?;
-    let migration = cell.data[*RANGED_TREE_MIGRATION_HASH].id().copied();
-    Some((head, migration))
-}
-
-/// Clear a tree's durable migration marker without touching its head
-/// pointer. Used by split reconciliation at load time, before the tree
-/// itself is reconstructed.
-pub async fn clear_migration_marker(client: &Arc<AsyncClient>, tree_id: &Id) {
-    let Some((head, _)) = read_tree_metadata(client, tree_id).await else {
-        return;
-    };
-    let cell = ranged_tree_cell(&head, tree_id, None);
-    if let Err(e) = client.upsert_cell(cell).await {
-        warn!(
-            "Failed to clear migration marker on tree {:?}: {:?}",
-            tree_id, e
-        );
-    }
-}
-
-/// Walk a persisted page chain from `head`, returning the page ids in
-/// order. Stops at the first unreadable page (the ids read so far are
-/// returned) — reconciliation uses the shape of the walk, not its
-/// completeness.
-pub async fn walk_chain_page_ids(client: &Arc<AsyncClient>, head: Id) -> Vec<Id> {
-    use super::btree::NEXT_PAGE_KEY_HASH;
-    let mut ids = Vec::new();
-    let mut current = head;
-    let mut seen = std::collections::HashSet::new();
-    while !current.is_unit_id() && seen.insert(current) {
-        let Ok(Ok(cell)) = client.read_cell(current).await else {
-            break;
-        };
-        ids.push(current);
-        let Some(next) = cell.data[*NEXT_PAGE_KEY_HASH].id().copied() else {
-            break;
-        };
-        current = next;
-    }
-    ids
-}
-
-/// Point `page`'s persisted next pointer at `next`: the cell-level relink
-/// used when rolling back an uncommitted split (the severed chain is
-/// rejoined to the orphaned target's head).
-pub async fn relink_page_next(client: &Arc<AsyncClient>, page: Id, next: Id) -> Result<(), String> {
-    use super::btree::NEXT_PAGE_KEY_HASH;
-    let mut cell = client
-        .read_cell(page)
-        .await
-        .map_err(|e| format!("rpc reading page {:?}: {:?}", page, e))?
-        .map_err(|e| format!("reading page {:?}: {:?}", page, e))?;
-    if let OwnedValue::Map(ref mut map) = cell.data {
-        map.insert_key_id(*NEXT_PAGE_KEY_HASH, OwnedValue::Id(next));
-    } else {
-        return Err(format!("page {:?} does not hold a map body", page));
-    }
-    match client.upsert_cell(cell).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("relinking page {:?}: {:?}", page, e)),
-        Err(e) => Err(format!("rpc relinking page {:?}: {:?}", page, e)),
-    }
 }
 
 /// Schema for ranged tree persistence
@@ -501,7 +588,12 @@ fn ranged_tree_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
-            Field::new_unindexed_nullable(RANGED_TREE_MIGRATION_NAME, Type::Id),
+            // NULLABLE: every ranged-tree cell written before this field
+            // existed carries no value for it, and a non-nullable array
+            // rejects exactly those cells -- caught by
+            // ram::tests::chunk::ranged_tree_metadata_updates_do_not_refresh_chunk_statistics,
+            // which builds the metadata cell by hand the way older code did.
+            Field::new_unindexed_array_nullable(RANGED_TREE_TOMBSTONES_NAME, Type::SmallBytes),
         ]),
         false,
         false,
@@ -509,14 +601,35 @@ fn ranged_tree_schema() -> Schema {
 }
 
 /// Create a cell for storing tree metadata
-fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
+fn ranged_tree_cell(head_id: &Id, id: &Id) -> OwnedCell {
+    ranged_tree_cell_with_tombstones(head_id, id, &[])
+}
+
+/// The metadata cell, with the tombstone journal.
+///
+/// Tombstones live only in memory otherwise: a delete hides its key
+/// immediately and the key's page drops it whenever write-back next
+/// compacts that page. Any reload before that compaction resurrects every
+/// uncompacted delete -- by design on a genuine restart, and reachable
+/// MID-RUN until `caf09d6d`. The journal closes it: the balancer's 60s
+/// checkpoint writes the live tombstones beside the head pointer, and a
+/// load re-arms them. Self-GCing, because compaction removes a tombstone
+/// from the set the moment its key physically leaves the page, so the next
+/// checkpoint simply does not write it.
+fn ranged_tree_cell_with_tombstones(
+    head_id: &Id,
+    id: &Id,
+    tombstones: &[EntryKey],
+) -> OwnedCell {
     let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(*head_id));
     cell_map.insert_key_id(
-        *RANGED_TREE_MIGRATION_HASH,
-        migration
-            .map(|id| OwnedValue::Id(id))
-            .unwrap_or(OwnedValue::Null),
+        *RANGED_TREE_TOMBSTONES_HASH,
+        tombstones
+            .iter()
+            .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
+            .collect::<Vec<_>>()
+            .value(),
     );
     OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }
@@ -537,7 +650,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_tree() -> RangedTree {
-        let ds = Arc::new(LFHashSet::<EntryKey>::with_capacity(0));
+        let ds = Arc::new(DeletionSet::with_capacity(0));
         RangedTree {
             tree: DiskTree::new(&ds),
         }
@@ -568,6 +681,70 @@ mod tests {
     fn make_field_key(schema_id: SchemaUid, field: u64, n: u64, id: Id) -> EntryKey {
         let feature = make_feature(n);
         EntryKey::from_props(&id, &feature, field, schema_id)
+    }
+
+    /// Prosecution exhibit for the soak's transient resurrections: can the
+    /// raw lock-free set answer `contains == false` for a key that is
+    /// PRESENT, while other threads churn inserts/removes (drives table
+    /// growth, shrink and migration)? Each thread probes its own stable key
+    /// -- inserted by itself, removed by nobody else -- between every churn
+    /// operation, including bulk phases that force resizes from the
+    /// capacity-0 start the production deletion set uses. A single
+    /// false-negative here indicts the set; thirty clean seconds acquit it
+    /// and send the hunt back to the pairing logic.
+    #[test]
+    #[ignore = "stress test"]
+    fn lf_set_contains_never_lies_under_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
+        let set = Arc::new(LFHashSet::<EntryKey>::with_capacity(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let set = set.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let base = t << 40;
+                let mut i = 0u64;
+                while !stop.load(AO::Acquire) {
+                    let stable = make_key(base + i % (1 << 20));
+                    assert!(set.insert(stable.clone()), "t{} i{}: stable insert refused", t, i);
+                    for j in 1..64u64 {
+                        let churn = make_key(base + (1 << 30) + j);
+                        set.insert(churn.clone());
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{} j{}: contains lost a present key after insert churn",
+                            t, i, j
+                        );
+                        set.remove(&churn);
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{} j{}: contains lost a present key after remove churn",
+                            t, i, j
+                        );
+                    }
+                    // Bulk phases: swell then drain, forcing growth and
+                    // migration around the probes.
+                    if i % 256 == 0 {
+                        for j in 0..4096u64 {
+                            set.insert(make_key(base + (1 << 31) + j));
+                        }
+                        assert!(set.contains(&stable), "t{} i{}: lost across bulk insert", t, i);
+                        for j in 0..4096u64 {
+                            set.remove(&make_key(base + (1 << 31) + j));
+                        }
+                        assert!(set.contains(&stable), "t{} i{}: lost across bulk drain", t, i);
+                    }
+                    assert!(set.remove(&stable), "t{} i{}: stable remove refused", t, i);
+                    i += 1;
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        stop.store(true, AO::Release);
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     // ---- pivot_key correctness tests ----------------------------------------
@@ -909,6 +1086,231 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// An acknowledged delete survives a reload.
+    ///
+    /// Tombstones live only in memory: a delete hides its key immediately
+    /// and the key's page drops it whenever write-back next compacts that
+    /// page. Any reload before that compaction used to resurrect the key --
+    /// by design on a genuine restart, and reachable MID-RUN until
+    /// `caf09d6d`. This test does exactly that: delete, publish the
+    /// metadata (the balancer's checkpoint), reload WITHOUT letting
+    /// compaction run, and require the key to stay gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletes_survive_a_reload_through_the_tombstone_journal() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_tombstone_journal";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::from_parts(905, 905);
+        let field = 781;
+        let tree = RangedTree::create(&client, &tree_id).await;
+        for value in 0..300u64 {
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                field,
+                value,
+                Id::from_parts(9, value)
+            )));
+        }
+        // Persist the pages BEFORE deleting, so the tombstones are the only
+        // record of the deletes -- exactly the window the journal covers.
+        storage::wait_until_updated().await;
+        let deleted: Vec<EntryKey> = (0..300u64)
+            .step_by(7)
+            .map(|v| make_field_key(SchemaUid(1), field, v, Id::from_parts(9, v)))
+            .collect();
+        for key in &deleted {
+            assert!(tree.delete(key), "delete should land for {:?}", key.id());
+        }
+        // The checkpoint the balancer runs every 60s: publish head + journal.
+        tree.publish_head(&tree_id, &client)
+            .await
+            .expect("checkpoint should publish the tombstone journal");
+        let live_before = tree.count();
+        drop(tree);
+
+        let reloaded = RangedTree::recover(&client, &tree_id)
+            .await
+            .expect("the tree should reload");
+        for key in &deleted {
+            assert!(
+                !reloaded.contains(key),
+                "RESURRECTION: {:?} was deleted before the reload and is visible again",
+                key.id()
+            );
+        }
+        let mut cursor = reloaded.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut visible = 0usize;
+        while cursor.next().is_some() {
+            visible += 1;
+        }
+        assert_eq!(
+            visible, live_before,
+            "the reloaded tree must serve exactly the keys that survived the deletes"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// UPGRADE: a store whose RANGED_TREE schema predates the tombstone
+    /// journal must keep working.
+    ///
+    /// Schema registration is fire-and-forget on every start (`let _ =` on
+    /// new_schema_with_id, with a standing TODO), so an existing store keeps
+    /// the definition it was created with -- WITHOUT the tombstones field
+    /// this session added. The checkpoint then writes a cell carrying a
+    /// field the stored schema does not define. If that write FAILED, the
+    /// upgrade would be far worse than the bug it fixes: mark_migration is
+    /// the head-pointer publish, so every checkpoint would stop and the
+    /// store would lose its recovery point. This test pins the outcome.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_with_the_pre_journal_schema_still_checkpoints() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_pre_journal_schema";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+        // The OLD definition: head + migration, no tombstones. Exactly what
+        // a store created before this session holds.
+        let pre_journal = Schema::new_with_id(
+            RANGED_TREE_SCHEMA_ID.get(),
+            &String::from(RANGED_TREE_SCHEMA_NAME),
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
+                ]),
+            false,
+            false,
+        );
+        client.new_schema_with_id(pre_journal).await.unwrap().unwrap();
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::from_parts(906, 906);
+        let tree = RangedTree::create(&client, &tree_id).await;
+        for value in 0..200u64 {
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                782,
+                value,
+                Id::from_parts(10, value)
+            )));
+        }
+        let deleted = make_field_key(SchemaUid(1), 782, 5, Id::from_parts(10, 5));
+        assert!(tree.delete(&deleted));
+        storage::wait_until_updated().await;
+
+        // THE point: the checkpoint must still succeed and still publish a
+        // usable head pointer on the old schema.
+        tree.publish_head(&tree_id, &client)
+            .await
+            .expect("checkpoint must survive a store whose schema predates the journal");
+        let head_before = tree.head_id();
+        drop(tree);
+
+        let reloaded = RangedTree::recover(&client, &tree_id)
+            .await
+            .expect("the tree must reload on the old schema");
+        assert_eq!(
+            reloaded.head_id(),
+            head_before,
+            "the checkpoint published a different head than the tree had"
+        );
+        assert!(
+            reloaded.count() >= 199,
+            "the reloaded tree lost keys: {}",
+            reloaded.count()
+        );
+
+        // And the part worth pinning: the journal is ACTIVE even here. A
+        // cell's map is stored by key hash, and the schema constrains
+        // indexing rather than which unindexed fields a cell may carry, so
+        // the tombstones field round-trips through a schema that never
+        // declared it. Existing stores therefore get proposal 3's
+        // protection from the binary alone -- no schema migration, no
+        // operator step. Asserted rather than assumed, because the opposite
+        // (an inert journal on every pre-existing store) would have been a
+        // silent no-op exactly where the deletes are.
+        assert!(
+            !reloaded.contains(&deleted),
+            "the tombstone journal did NOT survive on a pre-journal schema: an existing \
+             store would need a schema migration before deletes are durable"
+        );
+
+        server.shutdown().await;
+    }
+
     /// A tree whose pages cannot be read must keep pointing at them.
     ///
     /// Recovery used to answer an unreadable page chain by persisting a fresh
@@ -1022,7 +1424,7 @@ mod tests {
     /// are readable and provably foreign (their first key sits at or beyond
     /// the bound), so the walk excludes them instead of double-serving.
     #[tokio::test(flavor = "multi_thread")]
-    async fn bounded_tree_refuses_missing_page_but_stops_at_boundary() {
+    async fn a_tree_refuses_to_load_over_a_missing_page() {
         use crate::client;
         use crate::index::ranged::tree::btree::{page_schema, storage, NEXT_PAGE_KEY_HASH};
         use crate::server::{NebServer, ServerOptions, Service};
@@ -1030,7 +1432,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let server_addr = crate::utils::test_port::unique_localhost_addr();
-        let server_group = "ranged_tree_bounded_truncate";
+        let server_group = "ranged_tree_missing_page";
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -1119,26 +1521,6 @@ mod tests {
             page_ids.len()
         );
 
-        // Half 2 setup runs FIRST while every page is readable: a bounded
-        // load whose upper bound equals the last page's first key must stop
-        // before that page — it is provably foreign — and serve the rest.
-        let keys_before_last_page = 128 * (page_ids.len() as u64 - 1);
-        let upper = make_field_key(
-            SchemaUid(schema_id),
-            field,
-            keys_before_last_page,
-            Id::from_parts(7, keys_before_last_page),
-        );
-        let bounded = RangedTree::recover_bounded(&client, &tree_id, Some(&upper))
-            .await
-            .expect("a bounded tree must stop at a readable foreign page and load");
-        assert_eq!(
-            bounded.count() as u64,
-            keys_before_last_page,
-            "the bounded tree must serve exactly the keys below its boundary"
-        );
-        drop(bounded);
-
         // Half 1: delete the LAST page's cell. The chain now references an
         // unreadable page, and BOTH load modes must refuse — truncating here
         // would hide the hole.
@@ -1148,125 +1530,7 @@ mod tests {
         let outcome = RangedTree::recover(&client, &tree_id).await;
         assert!(
             outcome.is_err(),
-            "an unbounded tree with an unreadable page must refuse to load"
-        );
-        let outcome = RangedTree::recover_bounded(&client, &tree_id, Some(&upper)).await;
-        assert!(
-            outcome.is_err(),
-            "a bounded tree with an unreadable page inside its range must refuse to load"
-        );
-
-        server.shutdown().await;
-    }
-
-    /// The split-rollback mechanics: a chain severed by an uncommitted
-    /// split (durable seam cut, orphaned target head) loads short; after
-    /// `relink_page_next` rejoins the severed tail, a fresh load serves
-    /// every key again. This is what `reconcile_split_marker` performs when
-    /// the placement flip never happened.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn severed_chain_relinks_and_recovers_fully() {
-        use crate::client;
-        use crate::index::ranged::tree::btree::{page_schema, storage, NEXT_PAGE_KEY_HASH};
-        use crate::server::{NebServer, ServerOptions, Service};
-
-        let _ = env_logger::try_init();
-
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
-        let server_group = "ranged_tree_split_relink";
-        let server = NebServer::new_from_opts(
-            &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
-                db_size: 64 * 1024 * 1024,
-                tiered_config: None,
-                backup_storage: None,
-                wal_storage: None,
-                raft_storage: None,
-                index_enabled: false,
-                services: vec![Service::Cell],
-                disable_storage_locks: true,
-                enable_recovery: false,
-            },
-            &server_addr,
-            &server_group,
-            async |_| {},
-        )
-        .await
-        .unwrap();
-        let client = Arc::new(
-            client::AsyncClient::new(
-                &server.rpc,
-                &server.membership,
-                &vec![server_addr],
-                server_group,
-            )
-            .await
-            .unwrap(),
-        );
-        client
-            .new_schema_with_id(page_schema())
-            .await
-            .unwrap()
-            .unwrap();
-        client
-            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        storage::start_external_nodes_write_back(&client);
-
-        let tree_id = Id::from_parts(904, 904);
-        let schema_id = 1;
-        let field = 780;
-        let tree = RangedTree::create(&client, &tree_id).await;
-        let n = 300u64;
-        for value in 0..n {
-            assert!(tree.insert(&make_field_key(
-                SchemaUid(schema_id),
-                field,
-                value,
-                Id::from_parts(8, value)
-            )));
-        }
-        storage::wait_until_updated().await;
-        drop(tree);
-
-        let head_id = client.read_cell(tree_id).await.unwrap().unwrap().data
-            [*RANGED_TREE_HEAD_HASH]
-            .id()
-            .copied()
-            .unwrap();
-        let chain = walk_chain_page_ids(&client, head_id).await;
-        assert!(chain.len() >= 3);
-        let severed_at = chain[chain.len() - 2];
-        let orphan_head = *chain.last().unwrap();
-
-        // Durable seam cut with no committed placement: the tail dangles.
-        relink_page_next(&client, severed_at, Id::unit_id())
-            .await
-            .expect("severing must be expressible as a relink to unit");
-
-        let short = RangedTree::recover(&client, &tree_id)
-            .await
-            .expect("a cleanly severed chain still loads");
-        assert!(
-            (short.count() as u64) < n,
-            "the severed tree must load short, got {}",
-            short.count()
-        );
-        drop(short);
-
-        // Rollback: rejoin the severed tail, reload, and every key returns.
-        relink_page_next(&client, severed_at, orphan_head)
-            .await
-            .expect("the rollback relink must succeed");
-        let whole = RangedTree::recover(&client, &tree_id)
-            .await
-            .expect("the rejoined chain must load");
-        assert_eq!(
-            whole.count() as u64,
-            n,
-            "the rolled-back tree must serve every key"
+            "a tree with an unreadable page must refuse to load"
         );
 
         server.shutdown().await;
@@ -1331,7 +1595,7 @@ mod tests {
         let head_id = tree.head_id();
 
         client.remove_cell(tree_id).await.unwrap().unwrap();
-        tree.mark_migration(&tree_id, None, &client)
+        tree.publish_head(&tree_id, &client)
             .await
             .expect("mark_migration should recreate a missing tree metadata cell");
 

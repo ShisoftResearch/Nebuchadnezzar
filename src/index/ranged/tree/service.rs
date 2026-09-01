@@ -100,6 +100,19 @@ pub struct BTreeStat {
     pub oversized: bool,
 }
 
+/// What a RAW walk of one tree sees. See `RangedTree::audit_raw`: client
+/// cursors dedup ids by design, so physical duplicates are invisible to
+/// every ordinary scan -- this is the only way to observe the
+/// single-copy-per-key invariant that every resurrection bug has needed to
+/// break.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TreeAudit {
+    pub id: Id,
+    pub keys: u64,
+    pub duplicates: u64,
+    pub tombstoned_present: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TreeStat {
     pub id: Id,
@@ -130,6 +143,7 @@ service! {
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<TreeStat>;
+    rpc audit(id: Id) -> OpResult<TreeAudit>;
     rpc flush_all();
 }
 
@@ -324,6 +338,45 @@ fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: SchemaUid,
     );
 }
 
+/// Test hook: `NEB_SEEK_REGRESSION_PANIC` makes a range seek that observes
+/// a key ordered before the seek position fail loudly instead of recovering
+/// silently. Two strictnesses, because the system draws that line itself:
+///
+/// - any other value ("1"): panic on EVERYTHING, including mid-scan
+///   regressions the restart guard exists to absorb. For short stress runs
+///   that want the first inconsistency red-handed.
+/// - "initial": panic only when a fresh descent POSITIONS before its seek
+///   key -- the client-visible contract violation. A mid-scan regression is
+///   a designed-recoverable event (the guard re-descends and the client
+///   never sees it); in this mode it takes the production restart path but
+///   logs the tree and keys at the first restart, so an hours-long soak
+///   collects evidence instead of dying on a transient it is documented to
+///   survive.
+#[derive(Clone, Copy, PartialEq)]
+enum SeekRegressionMode {
+    Off,
+    Initial,
+    All,
+}
+
+fn seek_regression_mode() -> SeekRegressionMode {
+    static MODE: std::sync::OnceLock<SeekRegressionMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("NEB_SEEK_REGRESSION_PANIC") {
+        Err(_) => SeekRegressionMode::Off,
+        Ok(v) if v == "initial" => SeekRegressionMode::Initial,
+        Ok(_) => SeekRegressionMode::All,
+    })
+}
+
+/// Exponential per-tree backoff for repeatedly failing splits, capped.
+fn split_backoff_ms(streak: &mut StdHashMap<Id, u32>, tree: Id) -> u64 {
+    const BASE_MS: u64 = 2_000;
+    const MAX_MS: u64 = 60_000;
+    let n = streak.entry(tree).or_insert(0);
+    *n = (*n + 1).min(16);
+    BASE_MS.saturating_mul(1u64 << (*n - 1).min(5)).min(MAX_MS)
+}
+
 fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
     let mut next = key.clone();
     match ordering {
@@ -384,9 +437,8 @@ impl Service for TreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
-            self.reconcile_split_marker(&id, &boundary).await;
             let tree =
-                match RangedTree::recover_bounded(&self.client, &id, Some(&boundary.upper)).await {
+                match RangedTree::recover(&self.client, &id).await {
                     Ok(tree) => tree,
                     Err(error) => {
                         // Leave it absent rather than installing an empty tree.
@@ -478,6 +530,29 @@ impl Service for TreeService {
             };
             let mut cursor = tree.seek(&entry, ordering);
             let mut current = cursor.current().cloned();
+            if seek_regression_mode() != SeekRegressionMode::Off {
+                if let Some(first) = &current {
+                    // A fresh descent must never position before its seek key
+                    // (after boundary clamping). Production skips such keys;
+                    // the test hook wants the violation, not the recovery --
+                    // in BOTH modes, because this is the client-visible
+                    // contract.
+                    let violated = match ordering {
+                        Ordering::Forward => first < entry && !key_is_before_boundary(first),
+                        Ordering::Backward => first > entry && !key_is_after_boundary(first),
+                    };
+                    if violated {
+                        panic!(
+                            "range seek positioned before its key on tree {:?}: sought {:?} ({:?}), got {:?} ({:?})",
+                            id,
+                            entry.id(),
+                            entry,
+                            first.id(),
+                            first
+                        );
+                    }
+                }
+            }
             let mut last_key = None;
             // A scan's keys are strictly monotonic; a cursor that yields a
             // key not past the previous one is walking pages a concurrent
@@ -491,7 +566,43 @@ impl Service for TreeService {
             const MAX_SEEK_RESTARTS: usize = 64;
             let mut prev_key: Option<EntryKey> = None;
             let mut restarts = 0usize;
+            // The collection loop's continue-branches (equal replays,
+            // boundary skips, range-start skips, id dedups) each advance the
+            // cursor without collecting, and none of them alone was bounded.
+            // Under concurrent structural churn the cursor can feed such a
+            // branch indefinitely, and this loop was the LAST uncounted spin
+            // on the seek path: one RPC handler at 100% forever, no log line
+            // (2026-08-31, again). Bound the total rounds; on violation name
+            // the branch mix and return the partial block -- the client's
+            // cross-block dedup makes the bumped resume point correct.
+            let max_rounds = (buffer_size * 1024).max(1 << 20);
+            let mut rounds = 0usize;
+            let mut equal_replays = 0usize;
+            let mut boundary_skips = 0usize;
+            let mut start_skips = 0usize;
+            let mut dedup_drops = 0usize;
             while num_collected < buffer_size {
+                rounds += 1;
+                if rounds > max_rounds {
+                    warn!(
+                        "range seek collection loop spun {} rounds on tree {:?} without filling \
+                         a {}-slot block (collected {}, equal replays {}, boundary skips {}, \
+                         start skips {}, dedup drops {}, restarts {}, prev {:?}, current {:?}); \
+                         returning a partial block",
+                        rounds,
+                        id,
+                        buffer_size,
+                        num_collected,
+                        equal_replays,
+                        boundary_skips,
+                        start_skips,
+                        dedup_drops,
+                        restarts,
+                        prev_key.as_ref().map(|k| k.id()),
+                        current.as_ref().map(|k| k.id())
+                    );
+                    break;
+                }
                 let Some(key) = current.clone() else {
                     break;
                 };
@@ -502,6 +613,7 @@ impl Service for TreeService {
                     // STRICTLY behind the previous one means the chain under
                     // this cursor is broken.
                     if &key == prev {
+                        equal_replays += 1;
                         current = cursor.next();
                         continue;
                     }
@@ -510,6 +622,30 @@ impl Service for TreeService {
                         Ordering::Backward => &key > prev,
                     };
                     if regressed {
+                        match seek_regression_mode() {
+                            SeekRegressionMode::All => {
+                                panic!(
+                                    "range seek regressed on tree {:?}: yielded {:?} ({:?}) after {:?} ({:?})",
+                                    id,
+                                    key.id(),
+                                    key,
+                                    prev.id(),
+                                    prev
+                                );
+                            }
+                            SeekRegressionMode::Initial if restarts == 0 => {
+                                // Evidence, not death: the restart below is
+                                // the designed recovery; a soak wants to see
+                                // every occurrence in the log.
+                                warn!(
+                                    "SEEK_RESTART tree {:?}: yielded {:?} after {:?}; re-descending",
+                                    id,
+                                    key.id(),
+                                    prev.id()
+                                );
+                            }
+                            _ => {}
+                        }
                         restarts += 1;
                         if restarts > MAX_SEEK_RESTARTS {
                             warn!(
@@ -539,6 +675,7 @@ impl Service for TreeService {
                 match ordering {
                     Ordering::Forward => {
                         if key_is_before_boundary(&key) {
+                            boundary_skips += 1;
                             let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
@@ -556,6 +693,7 @@ impl Service for TreeService {
                         match &range.start {
                             RangeTerm::Inclusive(k) => {
                                 if key.prefix_lt(k) {
+                                    start_skips += 1;
                                     let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
@@ -570,6 +708,7 @@ impl Service for TreeService {
                             }
                             RangeTerm::Exclusive(k) => {
                                 if key.prefix_le(k) {
+                                    start_skips += 1;
                                     let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
@@ -600,6 +739,7 @@ impl Service for TreeService {
                     }
                     Ordering::Backward => {
                         if key_is_after_boundary(&key) {
+                            boundary_skips += 1;
                             let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
@@ -668,8 +808,11 @@ impl Service for TreeService {
                     if let Some(progress) = trace_progress.as_mut() {
                         progress.push(format!("push current={:?}", key.id()));
                     }
-                } else if let Some(progress) = trace_progress.as_mut() {
-                    progress.push(format!("dedup-drop current={:?}", key.id()));
+                } else {
+                    dedup_drops += 1;
+                    if let Some(progress) = trace_progress.as_mut() {
+                        progress.push(format!("dedup-drop current={:?}", key.id()));
+                    }
                 }
 
                 let next_candidate = cursor.next();
@@ -746,6 +889,33 @@ impl Service for TreeService {
                         }
                     }
                 }
+            } else if next.is_none() {
+                // A tree exhausted WITHOUT collecting anything must hand the
+                // client a resume point at its boundary, never "the scan is
+                // over": keys at or after the seek key can live in LATER
+                // trees. Empty-and-None told the client exactly that lie
+                // whenever the covering tree's remaining range had been
+                // deleted out -- the 3h soak's stripe audit found a scan
+                // returning NOTHING with 499K keys live two trees to the
+                // right (the next_tree three-way lesson, recurring on the
+                // seek-initial path; deletes are the trigger, which is why
+                // no import workload ever saw it). At the edge of the key
+                // space there is no later tree, and None stays the honest
+                // answer.
+                next = match ordering {
+                    Ordering::Forward => {
+                        (boundary.upper < *MAX_ENTRY_KEY).then(|| boundary.upper.clone())
+                    }
+                    // Backward resumes strictly BELOW this tree's inclusive
+                    // lower bound, or the client would route right back here.
+                    Ordering::Backward => {
+                        if boundary.lower > min_entry_key() {
+                            bump_entry_key(&boundary.lower, Ordering::Backward)
+                        } else {
+                            None
+                        }
+                    }
+                };
             }
             let result_block = ServBlock {
                 buffer,
@@ -791,6 +961,29 @@ impl Service for TreeService {
                     ideal_cap: tree.tree.ideal_capacity(),
                     oversized: tree.tree.oversized(),
                 }],
+            })
+        } else {
+            OpResult::NotFound
+        })
+        .boxed()
+    }
+
+    fn audit(&self, id: Id) -> BoxFuture<'_, OpResult<TreeAudit>> {
+        future::ready(if let Some(tree) = self.trees.get(&id) {
+            let (keys, duplicates, tombstoned_present) = tree.tree.audit_raw();
+            if duplicates > 0 {
+                error!(
+                    "INDEX AUDIT: tree {:?} holds {} duplicate key copies among {} keys; \
+                     the single-copy invariant is broken and a delete of such a key can be \
+                     undone by page compaction",
+                    id, duplicates, keys
+                );
+            }
+            OpResult::Successful(TreeAudit {
+                id,
+                keys,
+                duplicates,
+                tombstoned_present,
             })
         } else {
             OpResult::NotFound
@@ -844,80 +1037,6 @@ impl TreeService {
         }
     }
 
-    /// Reconcile a durable split marker before loading `id`. A crash after
-    /// the seam barrier but before the placement flip leaves the source's
-    /// chain cut with an orphaned target tree; a crash before the barrier
-    /// leaves the chain intact with a stale marker. Committed splits (the
-    /// placement map knows the target) just shed the marker. The decision
-    /// key: whoever owns the key at this tree's placement upper bound.
-    async fn reconcile_split_marker(&self, id: &Id, boundary: &Boundary) {
-        let Some((head, Some(target))) = super::tree::read_tree_metadata(&self.client, id).await
-        else {
-            return;
-        };
-        let committed = match self.sm_client.locate_key(&boundary.upper).await {
-            Ok(Some((_, placement, _))) => placement.id == target,
-            Ok(None) => {
-                warn!(
-                    "Cannot reconcile split marker on {:?} (target {:?}): no placement \
-                     covers the boundary yet; leaving the marker for the next load",
-                    id, target
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "Cannot reconcile split marker on {:?} (target {:?}): placement \
-                     lookup failed: {:?}; leaving the marker for the next load",
-                    id, target, e
-                );
-                return;
-            }
-        };
-        if committed {
-            info!(
-                "Tree {:?} carries a committed split marker for {:?}; clearing it",
-                id, target
-            );
-            super::tree::clear_migration_marker(&self.client, id).await;
-            return;
-        }
-        // Uncommitted: the placement never flipped, so this tree still owns
-        // the whole range and the split must be undone.
-        if let Some((target_head, _)) = super::tree::read_tree_metadata(&self.client, &target).await
-        {
-            let chain = super::tree::walk_chain_page_ids(&self.client, head).await;
-            if chain.contains(&target_head) {
-                debug!(
-                    "Uncommitted split of {:?}: chain still reaches the moved head; \
-                     no relink needed",
-                    id
-                );
-            } else if let Some(last) = chain.last() {
-                match super::tree::relink_page_next(&self.client, *last, target_head).await {
-                    Ok(()) => info!(
-                        "Uncommitted split of {:?}: rejoined severed chain at {:?} -> {:?}",
-                        id, last, target_head
-                    ),
-                    Err(e) => {
-                        error!(
-                            "Uncommitted split of {:?}: failed to rejoin chain: {}; \
-                             leaving marker so the next load retries",
-                            id, e
-                        );
-                        return;
-                    }
-                }
-            }
-            let _ = self.client.remove_cell(target).await;
-        }
-        super::tree::clear_migration_marker(&self.client, id).await;
-        info!(
-            "Rolled back uncommitted split of {:?} (orphaned target {:?})",
-            id, target
-        );
-    }
-
     async fn hydrate_missing_tree(&self, id: Id, entry: &EntryKey) -> bool {
         if self.trees.contains_key(&id) {
             return true;
@@ -941,18 +1060,21 @@ impl TreeService {
                     return true;
                 }
 
-                info!(
-                    "Recovering missing active tree {:?} for entry {:?} with boundary [{:?}, {:?}), epoch={}",
+                // WARN, deliberately: a mid-run disk reload of a tree the
+                // placement calls current means the in-memory copy was lost
+                // somewhere, and the reload silently discards every
+                // un-persisted tombstone in its range (the deletion set is
+                // memory-only). Legitimate only on genuine recovery; in a
+                // healthy running server this line is an alarm.
+                warn!(
+                    "Recovering missing active tree {:?} FROM DISK for entry {:?} with boundary [{:?}, {:?}), epoch={}; un-persisted tombstones in this range are lost",
                     id,
                     entry.id(),
                     lower,
                     upper,
                     placement.epoch
                 );
-                self.reconcile_split_marker(&id, &Boundary::new(lower.clone(), upper.clone()))
-                    .await;
-                let tree = match RangedTree::recover_bounded(&self.client, &id, Some(&upper)).await
-                {
+                let tree = match RangedTree::recover(&self.client, &id).await {
                     Ok(tree) => tree,
                     Err(error) => {
                         // Same reasoning as the load path: an unreadable tree
@@ -1043,17 +1165,14 @@ impl TreeService {
             ack_started.elapsed()
         );
         for (tree_id, dist_tree) in self.trees.entries() {
-            let tree = &dist_tree.tree;
-            let disk_count = tree.count();
-            let mem_count = tree.mem_tree_count();
             info!(
-                "Flushing tree {:?} with {} items (disk) + {} items (mem)",
-                tree_id, disk_count, mem_count
+                "Flushing tree {:?} with {} keys",
+                tree_id,
+                dist_tree.tree.count()
             );
-
-            // Force merge regardless of whether oversized
-            tree.force_merge_levels().await;
         }
+        // The drain that used to hide inside a per-tree force_merge_levels
+        // no-op is taken ONCE, below, where its result is actually checked.
 
         // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
         // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
@@ -1064,7 +1183,7 @@ impl TreeService {
             // Now it's safe to update the LSM tree cells with the new head IDs
             for (tree_id, dist_tree) in self.trees.entries() {
                 let tree = &dist_tree.tree;
-                if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
+                if let Err(e) = tree.publish_head(&tree_id, &self.client).await {
                     warn!(
                         "Failed to mark LSM tree migration after flush for tree {:?}: {:?}",
                         tree_id, e
@@ -1149,50 +1268,31 @@ impl TreeService {
         false
     }
 
-    async fn rollback_pending_split(
+    /// Abort a COPY-based split: nothing was taken from the source, so
+    /// there is nothing to restore. Drain the copy's fresh pages first --
+    /// they sit dirty-queued on the write-back hub with owned refs, and an
+    /// orphaned page flushing later would pair its stale copies against
+    /// tombstones from deletes that land after the freeze lifts (the exact
+    /// forge the drain fix closed for the shared-leaf rollback).
+    async fn abort_copy_split(
         dist_tree: &Arc<DistTree>,
-        moved: &Arc<DistTree>,
+        copied: &Arc<DistTree>,
         target_id: Id,
         pending_migrations: &Arc<HashMap<Id, Arc<DistTree>>>,
         client: &Arc<AsyncClient>,
     ) {
-        // split_off already truncated the LIVE source tree, so clearing the
-        // markers alone orphans every moved key -- routing still sends their
-        // range to the source, which no longer holds them (2026-08-30: a
-        // full store failed the seam barrier and this "rollback" quietly
-        // dropped 5.7M of 8.4M keys in the stress test, and a handful of
-        // scannable keys per BANC bulk import). Reabsorb the moved half
-        // before dropping the target; a failed split must degrade into
-        // "split deferred", never into loss.
-        let mut cursor = moved.tree.seek(&min_entry_key(), Ordering::Forward);
-        let mut restored = 0usize;
-        while let Some(key) = cursor.next() {
-            if dist_tree.tree.insert(&key) {
-                restored += 1;
-            }
-        }
+        let discarded = super::btree::split_off::drain_all_keys(&copied.tree.tree);
         info!(
-            "Rolled back split of {:?}: reabsorbed {} moved key(s) from target {:?}",
-            dist_tree.id, restored, target_id
+            "Aborted copy-split of {:?}: drained and dropped {} copied key(s), target {:?}",
+            dist_tree.id,
+            discarded.len(),
+            target_id
         );
         pending_migrations.remove(&target_id);
-        // The target's metadata cell (if its publish got that far) must not
-        // survive to be recovered as a tree; its leaves now belong to the
-        // source again.
         let _ = client.remove_cell(target_id).await;
         {
             let mut dist_prop = dist_tree.prop.write();
             dist_prop.migration = None;
-        }
-        if let Err(unmark_err) = dist_tree
-            .tree
-            .mark_migration(&dist_tree.id, None, client)
-            .await
-        {
-            warn!(
-                "Failed to clear migration marker for tree {:?} after split rollback: {:?}",
-                dist_tree.id, unmark_err
-            );
         }
     }
 
@@ -1288,7 +1388,12 @@ impl TreeService {
         }
         tokio::spawn(async move {
             let _running_guard = RunningGuard(running);
-            const SPLIT_RETRY_BACKOFF_MS: u64 = 2_000;
+            // Backoff doubles per consecutive failure per tree (see
+            // split_backoff_ms): during a store-full storm a split can fail
+            // its barrier for minutes, and re-copying every 2s is pure
+            // waste -- the soak logged 13,789 aborts in one storm where a
+            // few hundred would have carried the same information.
+            let mut split_retry_streak = StdHashMap::<Id, u32>::new();
             // Periodic checkpoint: flush B-tree pages and update tree root cells
             // every ~60 seconds to ensure durability even without explicit shutdown.
             const CHECKPOINT_INTERVAL_LOOPS: u32 = 120; // 120 * 500ms = 60s
@@ -1321,30 +1426,20 @@ impl TreeService {
                     }
                 }
 
+                // No per-tree merge pass. `merge_levels` was an LSM-era
+                // no-op that always returned false -- so the whole
+                // post-merge publish below it was dead code -- but it still
+                // awaited a GLOBAL write-back drain, once PER TREE, on every
+                // 500ms pass. At soak scale that is ~450 sequential drain
+                // waits per pass, and under a real backlog each one blocks
+                // until the whole queue lands, which is why split cadence
+                // collapsed exactly when the store got busy. Checkpoints
+                // gate on their own barrier, taken once above.
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    let merged = tree.merge_levels().await;
-                    fast_mode = merged | fast_mode;
-
-                    // If merge happened, wait for external nodes to be written, then update the tree cell
-                    if merged {
-                        // Wait for all external B+tree nodes to be written to storage
-                        if storage::wait_until_updated().await {
-                            // Now update the cell with the new head IDs
-                            if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await
-                            {
-                                warn!("Failed to mark LSM tree migration after merge: {:?}", e);
-                            }
-                        } else {
-                            error!(
-                                "post-merge publish for {:?} skipped: write-back barrier \
-                                 NOT established",
-                                dist_tree.id
-                            );
-                        }
-                    } else if do_checkpoint && checkpoint_barrier {
+                    if do_checkpoint && checkpoint_barrier {
                         // Periodic checkpoint: update tree root cell to reflect current state
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                        if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
                         }
                     }
@@ -1435,16 +1530,13 @@ impl TreeService {
                                 tokio::task::yield_now().await;
                             }
                         }
-                        debug!("Marking migration for tree {:?}", dist_tree.id);
-                        if let Err(e) = tree
-                            .mark_migration(&dist_tree.id, Some(migration_target_id), &client)
-                            .await
-                        {
-                            warn!(
-                                "Failed to mark LSM tree migration for oversized tree {:?}: {:?}",
-                                dist_tree.id, e
-                            );
-                        }
+                        // No durable migration marker: a copy split never
+                        // cuts the source chain, so a crash needs no
+                        // reconciliation surgery. Pre-flip it leaves an
+                        // unreferenced target cell (scrub fodder); post-flip
+                        // the source's boundary clamps its untrimmed tail
+                        // until the next retain. The marker READER stays for
+                        // stores written by the old shared-leaf splitter.
                         // Structural split: re-parent the leaves >= pivot into a
                         // new tree sharing the source's leaf nodes — O(leaves)
                         // instead of copying every key. This also truncates the
@@ -1453,7 +1545,7 @@ impl TreeService {
                             "Structurally splitting {:?} at {:?} into {:?}",
                             dist_tree.id, pivot_key, migration_target_id
                         );
-                        let Some((moved_tree, moved_len)) = tree.split_off(&pivot_key, &client)
+                        let Some((moved_tree, moved_len)) = tree.copy_off(&pivot_key, &client)
                         else {
                             // Nothing moved (pivot past every key); undo the
                             // marker and try again later.
@@ -1465,7 +1557,7 @@ impl TreeService {
                                 let mut dist_prop = dist_tree.prop.write();
                                 dist_prop.migration = None;
                             }
-                            let _ = tree.mark_migration(&dist_tree.id, None, &client).await;
+                            let _ = tree.publish_head(&dist_tree.id, &client).await;
                             continue;
                         };
                         debug!("Structural split moved {} keys", moved_len);
@@ -1492,14 +1584,14 @@ impl TreeService {
                         );
                         if let Err(e) = migration_tree
                             .tree
-                            .mark_migration(&migration_target_id, None, &client)
+                            .publish_head(&migration_target_id, &client)
                             .await
                         {
                             warn!(
                                 "Failed to publish target tree {:?} before split from {:?}: {:?}",
                                 migration_target_id, dist_tree.id, e
                             );
-                            Self::rollback_pending_split(
+                            Self::abort_copy_split(
                                 &dist_tree,
                                 &migration_tree,
                                 migration_target_id,
@@ -1509,7 +1601,11 @@ impl TreeService {
                             .await;
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                             continue;
                         }
@@ -1528,7 +1624,7 @@ impl TreeService {
                                 "Seam barrier for split of {:?} NOT established; rolling back",
                                 dist_tree.id
                             );
-                            Self::rollback_pending_split(
+                            Self::abort_copy_split(
                                 &dist_tree,
                                 &migration_tree,
                                 migration_target_id,
@@ -1538,7 +1634,11 @@ impl TreeService {
                             .await;
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                             continue;
                         }
@@ -1598,7 +1698,7 @@ impl TreeService {
                                         pivot_key,
                                         split_started.elapsed()
                                     );
-                                    Self::rollback_pending_split(
+                                    Self::abort_copy_split(
                                         &dist_tree,
                                         &migration_tree,
                                         migration_target_id,
@@ -1609,7 +1709,10 @@ impl TreeService {
                                     split_backoff_until.insert(
                                         dist_tree.id,
                                         Instant::now()
-                                            + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                            + Duration::from_millis(split_backoff_ms(
+                                                &mut split_retry_streak,
+                                                dist_tree.id,
+                                            )),
                                     );
                                     false
                                 }
@@ -1628,7 +1731,11 @@ impl TreeService {
                         if !target_loaded {
                             split_backoff_until.insert(
                                 dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                Instant::now()
+                                    + Duration::from_millis(split_backoff_ms(
+                                        &mut split_retry_streak,
+                                        dist_tree.id,
+                                    )),
                             );
                         } else {
                             split_backoff_until.remove(&dist_tree.id);
@@ -1640,19 +1747,45 @@ impl TreeService {
                         // below and the seam-pointer changes persist async, so
                         // the serial balancer is not stalled on the whole
                         // write-back backlog after every migration.
+                        // COMMIT on the source: the placement flip made the
+                        // copy authoritative for [pivot, upper); now remove
+                        // those keys from the source, still under the freeze.
+                        // Tombstoned keys were never copied, so their single
+                        // copies die here and their tombstones become inert.
+                        tree.retain(&pivot_key);
                         {
                             let mut dist_prop = dist_tree.prop.write();
                             dist_prop.boundary.upper = pivot_key.clone();
                             dist_prop.epoch += 1;
                             dist_prop.migration = None;
                         }
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                        if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!(
                                 "Failed to publish split source tree {:?}: {:?}",
                                 dist_tree.id, e
                             );
                         }
-                        pending_migrations.remove(&migration_target_id);
+                        // Retire the pending entry ONLY once the target is
+                        // known promoted into the active map. When the load
+                        // RPC failed (a store-full storm makes that routine),
+                        // this remove used to run anyway -- dropping the ONLY
+                        // in-memory copy of a committed split's target. The
+                        // next operation on its range then hydrated the tree
+                        // FROM DISK with a fresh, empty deletion set: pages as
+                        // of the seam barrier, tombstones (which are never
+                        // persisted) gone -- every deleted-but-uncompacted key
+                        // in the moved range came back to life. The 3h soak
+                        // caught it as a PERSISTENT resurrection with
+                        // contains=true and no delete miss, ~90 seconds into
+                        // the allocation-failure storm, three runs in a row.
+                        // The pending entry costs nothing to keep: promotion
+                        // through load_tree or hydrate_missing_tree removes it
+                        // and shares the live deletion set, which is the
+                        // whole point of the pending map.
+                        if target_loaded {
+                            pending_migrations.remove(&migration_target_id);
+                        }
+                        split_retry_streak.remove(&dist_tree.id);
                         debug!(
                             "LSM tree migration from {:?} to {:?} succeed in {:?}",
                             dist_tree.id,

@@ -28,6 +28,33 @@ where
         // the node version changes under a concurrent writer.
         let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
             let node = &**node_handler;
+            // None first: the off-page continuation below hands the loop a
+            // default follow ref at the end of a chain, and read_node then
+            // presents the shared all-None node -- which key_at_right_node's
+            // is_empty() answers with unreachable!(). The seek is simply
+            // over.
+            if node.is_none() {
+                return Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted));
+            }
+            // A Backward descent passes through empty pages LEFTWARD. Left
+            // alone, key_at_right_node bounces an empty page right
+            // unconditionally, and a Backward off-page continuation then
+            // ping-pongs empty -> right, non-empty -> prev forever (named by
+            // the retry counter within seconds: tombstone compaction leaves
+            // len==0 pages all over a deleted window). The cursor's page walk
+            // was always direction-aware here -- read_page follows prev for
+            // Backward -- and the descent continuation must be too. An empty
+            // node WITHOUT a left link falls through: that is the bypass
+            // shape (left None, right = the node it stands for), where
+            // following right is correct for both directions.
+            if ordering == Ordering::Backward && node.is_empty() {
+                if let Some(left) = node.left_ref() {
+                    let Some(follow) = left.try_clone_speculative() else {
+                        return Err(node_ref.clone());
+                    };
+                    return Err(follow);
+                }
+            }
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
                 // Pointer read from unlatched data: clone speculatively and
@@ -74,20 +101,35 @@ where
                             }
                         }
                     };
-                    Ok(match found {
-                        Some(idx) => RTCursor::from_lazy(
+                    match found {
+                        Some(idx) => Ok(RTCursor::from_lazy(
                             n.keys.key_at(idx),
                             filter_deleted
-                                && deletion.len() > 0
+                                && !deletion.is_empty()
                                 && deletion.contains(&n.keys.key_at(idx)),
                             node_ref.clone(),
                             ordering,
                             deletion.clone(),
                             filter_deleted,
-                        ),
+                        )),
                         None => {
-                            // Off-page position: hand the follow ref to the
-                            // cursor and let initialize() move on.
+                            // Off-page position: CONTINUE THE DESCENT at the
+                            // sibling instead of materializing a cursor that
+                            // would yield the sibling's raw first key at a
+                            // later read. Only a validated search on the node
+                            // that answers can guarantee the result is not
+                            // ordered before the seek key: the old
+                            // empty-snapshot cursor read the sibling AFTER
+                            // this closure, so a front-insert landing there
+                            // in between handed back a key BELOW the seek key
+                            // -- the "fresh root descent regressed" give-up
+                            // storms (2026-08-31). The same window also let
+                            // key_at_right_node's unvalidated sibling peek
+                            // (torn mid-memmove first key) strand a descent
+                            // one page short; descending through the sibling
+                            // makes both harmless. Modeled in
+                            // docs/tla/BLinkSeek.tla: SeekGE is violated by
+                            // the old semantics and exhaustive under these.
                             let follow_src = match ordering {
                                 Ordering::Forward => &n.next,
                                 Ordering::Backward => &n.prev,
@@ -95,17 +137,9 @@ where
                             let Some(follow) = follow_src.try_clone_speculative() else {
                                 return Err(node_ref.clone());
                             };
-                            RTCursor::from_snapshot(
-                                Vec::new(),
-                                usize::MAX,
-                                node_ref.clone(),
-                                follow,
-                                ordering,
-                                deletion.clone(),
-                                filter_deleted,
-                            )
+                            Err(follow)
                         }
-                    })
+                    }
                 }
                 &NodeData::Internal(ref n) => {
                     trace!(

@@ -477,6 +477,11 @@ fn parent_main(args: &[String]) -> ExitCode {
                         }
                     } else if let Some(rest) = line.strip_prefix("SCRUB_ERROR ") {
                         println!("    scrub FAILED: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("TOMBSTONES ") {
+                        // Stale entries are a scrub matter; the failure arm
+                        // below fires only when a delete was undone at BOTH
+                        // layers.
+                        println!("    tombstones: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
                         // Printed for every cycle, so a regression can be
                         // read as "index lost entries" or "store lost cells"
@@ -1169,6 +1174,89 @@ async fn child_async(
             seq += stride;
         }
         println!("CELLS_PRESENT {}/{} below {}", present, probed, probe_high);
+        flush_stdout();
+    }
+
+    // Tombstone durability: the OTHER side of the one-sided bar.
+    //
+    // The scanned-count invariant is deliberately one-sided -- holding MORE
+    // than expected is tolerated, because an over-reported delete must not
+    // read as a durability regression. That tolerance is exactly what makes
+    // it blind to a delete coming BACK after a restart, and the 2026-08-31
+    // soak campaign spent five runs on resurrections no scanned count could
+    // have caught.
+    //
+    // Two very different things can put a deleted key's entry back, so the
+    // probe asks about BOTH layers:
+    //
+    //   index entry present, cell ABSENT  -> a stale index entry. The cell
+    //     delete was durable; the index's own tombstone was not (it lives in
+    //     memory until a page compacts or the checkpoint journals it, so a
+    //     kill inside that window loses it). Reported, not failed: this is
+    //     what the scrub exists to repair, and the query layer already
+    //     tolerates ids whose cells are gone.
+    //   index entry present, cell PRESENT -> the delete was UNDONE at both
+    //     layers. Nothing legitimate resurrects a cell. Hard failure.
+    //
+    // `delete_from` is the prefix a PREVIOUS incarnation reported deleted,
+    // so those removes were acked before this process existed.
+    if delete_from > 1 {
+        use neb::index::EntryKey;
+        const SAMPLES: u64 = 400;
+        let stride = (delete_from / SAMPLES).max(1);
+        let ranged = server
+            .database_runtime
+            .indexer()
+            .map(|ix| ix.clients.ranged_client.clone());
+        let mut stale = 0u64;
+        let mut undone = Vec::new();
+        let mut probed = 0u64;
+        let mut seq = 0u64;
+        while seq < delete_from.saturating_sub(1) && probed < SAMPLES {
+            let id = Id::from_parts(9 + (seq % 64), seq);
+            let key = EntryKey::for_scannable(&id, neb::ram::schema::SchemaUid(CHURN_SCHEMA_ID));
+            let indexed = match &ranged {
+                Some(rc) => rc.contains(&key).await.unwrap_or(false),
+                None => false,
+            };
+            if indexed {
+                if matches!(client.read_cell(id).await, Ok(Ok(_))) {
+                    undone.push(seq);
+                } else {
+                    stale += 1;
+                }
+            }
+            probed += 1;
+            seq += stride;
+        }
+        // Reported, never failed on. The deleted prefix is an UPPER bound
+        // by construction: the deleter publishes its intent BEFORE the
+        // remove (so an interrupted delete cannot read as a durability
+        // regression), and a key skipped by a kill is never retried -- "gone
+        // is gone" advances the cursor past it forever. So the prefix
+        // permanently contains keys that were never actually deleted, in a
+        // band whose width is the kill's in-flight window, and a probe
+        // finding them is measuring the harness, not the store.
+        //
+        // What the two numbers ARE good for: their SHAPE over a long run.
+        // Stale index entries should track the scrub's repair count; "fully
+        // undone" should stay in the band and never grow with the prefix. A
+        // sound hard check needs an acked-delete watermark the deleter does
+        // not keep today (and a decision about whether a cell-removal ack
+        // implies durability under SIGKILL) -- noted in
+        // docs/ranged-index-robustness-plan.md.
+        println!(
+            "TOMBSTONES {} probed below {}: {} stale index entries, {} both-layers present{}",
+            probed,
+            delete_from,
+            stale,
+            undone.len(),
+            if undone.is_empty() {
+                String::new()
+            } else {
+                format!(" (seqs {:?})", &undone[..undone.len().min(12)])
+            }
+        );
         flush_stdout();
     }
 

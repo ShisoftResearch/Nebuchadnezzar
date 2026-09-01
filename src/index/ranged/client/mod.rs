@@ -107,6 +107,12 @@ impl RangedIndexerClient {
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         let trace_seek = log::log_enabled!(log::Level::Debug);
         let mut range = range;
+        // The follow-empty walk below has no bound and no sleep: a server
+        // that keeps answering "empty block, resume at <next>" keeps this
+        // loop issuing one full RPC per round, forever, without ever
+        // touching a timer -- an unyielding client-side spin. Count it and
+        // name it past a threshold, like every other spin on this path.
+        let mut follow_rounds = 0u64;
         loop {
             let key = range.key().clone();
             let block = self_ref
@@ -148,6 +154,16 @@ impl RangedIndexerClient {
                         Ordering::Backward => next_key < *range.key(),
                     };
                     if should_follow {
+                        follow_rounds += 1;
+                        if follow_rounds.is_power_of_two() && follow_rounds >= 1024 {
+                            warn!(
+                                "client seek has followed {} empty blocks (key {:?} -> next {:?}, ordering {:?}); the server keeps deferring this scan",
+                                follow_rounds,
+                                range.key().id(),
+                                next_key.id(),
+                                range.ordering
+                            );
+                        }
                         if trace_seek {
                             debug!(
                                 "MIGRATION_SEEK_FOLLOW_EMPTY request_key={:?} next_key={:?} ordering={:?}",
@@ -157,6 +173,14 @@ impl RangedIndexerClient {
                             );
                         }
                         range = range.move_to(next_key);
+                        // With the in-process RPC shortcut every await above
+                        // can be ready, so this loop never suspends on its
+                        // own. An unyielding task does worse than hog a
+                        // worker: with the runtime's driver seat empty, no
+                        // timer or I/O event fires process-wide (2026-08-31:
+                        // one such loop froze an 8-worker runtime; sleeps
+                        // parked forever, timeouts never fired).
+                        tokio::task::yield_now().await;
                         continue;
                     }
                 }
@@ -211,6 +235,47 @@ impl RangedIndexerClient {
         .await
     }
 
+    /// Raw per-tree audit of every tree in the index: physical key copies,
+    /// duplicates, and tombstoned-but-present keys. The duplicates count is
+    /// the observable form of the single-copy-per-key invariant, which no
+    /// scan can see (client cursors dedup ids by design).
+    pub async fn audit_trees(&self) -> Result<Vec<TreeAudit>, RPCError> {
+        let exec_err = |e: ExecError| {
+            RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Cannot walk tree placements: {:?}", e),
+            ))
+        };
+        let mut res = vec![];
+        let Some((mut lower, mut placement, _)) = self
+            .refresh_key_mapping(&min_entry_key())
+            .await
+            .map_err(exec_err)?
+        else {
+            return Ok(res);
+        };
+        loop {
+            let tree_client = locate_tree_server_from_conshash(
+                &placement.id,
+                &self.conshash,
+                &self.group_name,
+                &self.database_name,
+            )
+            .await?;
+            if let OpResult::Successful(audit) = tree_client.audit(placement.id).await? {
+                res.push(audit);
+            }
+            match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
+                NextTree::Found(next_lower, next_placement) => {
+                    lower = next_lower;
+                    placement = next_placement;
+                }
+                NextTree::End | NextTree::Unresolved(_) => break,
+            }
+        }
+        Ok(res)
+    }
+
     /// Statistics for every tree in the index, walked from the state machine's
     /// placements. The client's own placement cache only knows the trees it
     /// has touched, so a cache walk reported one tree for an index that had
@@ -242,7 +307,23 @@ impl RangedIndexerClient {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
                 }
-                _ => unreachable!(),
+                // NOT unreachable: a placement can name a tree this server
+                // has not loaded (or has just unloaded), and panicking the
+                // caller for asking about it turns a routine race into a
+                // dead task. Skip it -- stats are a report, not a contract.
+                other => {
+                    debug!(
+                        "Skipping stat for tree {:?}: {}",
+                        placement.id,
+                        match other {
+                            OpResult::NotFound => "not loaded here",
+                            OpResult::OutOfBound => "out of bound",
+                            OpResult::Migrating => "migrating",
+                            OpResult::EpochMissMatch(..) => "epoch mismatch",
+                            OpResult::Successful(_) => unreachable!(),
+                        }
+                    );
+                }
             }
             match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
                 NextTree::Found(next_lower, next_placement) => {
@@ -339,6 +420,11 @@ impl RangedIndexerClient {
                         key,
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
+                    // No sleep on this branch, and the in-process shortcut
+                    // makes every await ready: yield so a hot retry cycle
+                    // cannot become an unyielding poll that starves the
+                    // runtime's driver seat (timers die process-wide).
+                    tokio::task::yield_now().await;
                 }
                 OpResult::Migrating => {
                     if trace_seek {
@@ -383,6 +469,8 @@ impl RangedIndexerClient {
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
                     ensure_updated = true;
+                    // Sleepless retry branch: see the Successful arm.
+                    tokio::task::yield_now().await;
                 }
                 OpResult::NotFound => {
                     if trace_seek {
@@ -442,6 +530,8 @@ impl RangedIndexerClient {
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
                     ensure_updated = true;
+                    // Sleepless retry branch: see the Successful arm.
+                    tokio::task::yield_now().await;
                 }
             }
             retried += 1;
@@ -544,24 +634,21 @@ impl RangedIndexerClient {
     ) -> Result<NextTree, ExecError> {
         // Next tree for cursor
         // This function must be able to detect tree changes and ensure consistency
-        let (origin_lower, origin_upper) = {
+        // Clone the cached hit OUT of the guarded scope before any await: an
+        // `if let` scrutinee temporary keeps the read guard inside the
+        // future's layout across the refresh await, which made this future
+        // !Send and un-spawnable (the guard was dynamically dead -- the
+        // explicit drop -- but the generator still carried its slot).
+        let cached_origin = {
             let placement = self.placement.read();
-            if let Some((lower, (_placement, upper))) =
-                placement.range(..=origin_key.clone()).last()
-            {
-                if origin_key >= lower && origin_key < upper {
-                    (lower.clone(), upper.clone())
-                } else {
-                    drop(placement);
-                    let Some((lower, _placement, upper)) =
-                        self.refresh_key_mapping(origin_key).await?
-                    else {
-                        return Ok(NextTree::Unresolved("no tree covers the current key"));
-                    };
-                    (lower, upper)
-                }
-            } else {
-                drop(placement);
+            placement
+                .range(..=origin_key.clone())
+                .last()
+                .map(|(lower, (_placement, upper))| (lower.clone(), upper.clone()))
+        };
+        let (origin_lower, _origin_upper) = match cached_origin {
+            Some((lower, upper)) if origin_key >= &lower && origin_key < &upper => (lower, upper),
+            _ => {
                 let Some((lower, _placement, upper)) = self.refresh_key_mapping(origin_key).await?
                 else {
                     return Ok(NextTree::Unresolved("no tree covers the current key"));

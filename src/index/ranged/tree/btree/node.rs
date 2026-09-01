@@ -381,6 +381,16 @@ where
     // precede their referrer, and those chains are bounded by recent splits
     // rather than by the whole dirty working set.
     pub(super) persisted: std::sync::atomic::AtomicBool,
+    // Set when the page stops belonging to any live tree (a split's drained
+    // copy, a dropped tree's structure). Background work that holds an
+    // owned ref from before the detachment -- the write-back queue above
+    // all -- MUST refuse a detached page: build_cell's remove_contains on
+    // an orphan pairs stale key copies against the LIVE shared deletion
+    // set and consumes tombstones that belong to the surviving copies (the
+    // 3h soak's resurrection forge). This is the minimal form of the
+    // owner-generation scheme in docs/ranged-index-robustness-plan.md
+    // proposal 2: detachment is one-way, so a plain bool carries it.
+    pub(super) detached: std::sync::atomic::AtomicBool,
     data: UnsafeCell<NodeData<KS, PS>>,
 }
 
@@ -395,7 +405,14 @@ where
             cc: AtomicUsize::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             persisted: std::sync::atomic::AtomicBool::new(false),
+            detached: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// One-way: the page no longer belongs to any live tree; background
+    /// holders of owned refs must treat it as gone.
+    pub fn detach(&self) {
+        self.detached.store(true, Release);
     }
 
     pub fn with_internal(innode: Box<InNode<KS, PS>>) -> Self {
@@ -744,6 +761,12 @@ where
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
     ) -> Option<crate::ram::cell::OwnedCell> {
+        // A detached page belongs to no tree: compacting it would consume
+        // live tombstones against stale copies, and persisting it would
+        // write a cell nothing references. Refuse before taking the latch.
+        if self.detached.load(Acquire) {
+            return None;
+        }
         let mut guard = write_node::<KS, PS>(node_ref);
         // Clear the coalescing flag before reading the data: any touch after
         // this point re-queues the node, so the snapshot below plus the next

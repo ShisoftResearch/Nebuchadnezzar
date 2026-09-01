@@ -109,34 +109,6 @@ where
         }
     }
 
-    // Build a cursor from a page snapshot taken by the caller inside a
-    // validated read. `index == usize::MAX` means there is no valid position
-    // in this snapshot and the cursor must move to the following page first;
-    // `initialize` settles that.
-    pub(super) fn from_snapshot(
-        keys: Vec<EntryKey>,
-        index: usize,
-        page: NodeCellRef,
-        follow: NodeCellRef,
-        ordering: Ordering,
-        deletion: Arc<DeletionSet>,
-        filter_deleted: bool,
-    ) -> Self {
-        RTCursor {
-            index,
-            ordering,
-            page: Some(page),
-            marker: PhantomData,
-            current: UnsafeCell::new(None),
-            deletion,
-            filter_deleted,
-            keys: SnapKeys::Full(keys),
-            follow,
-            lazy: false,
-            current_deleted: false,
-        }
-    }
-
     // Build a cursor that has captured only the key at the seek position;
     // the rest of the page is read on first advance.
     pub(super) fn from_lazy(
@@ -217,7 +189,7 @@ where
                 };
                 // One emptiness check per page instead of one hash lookup
                 // per key when nothing is tombstoned (the common case).
-                let filtering = filter_deleted && deletion.len() > 0;
+                let filtering = filter_deleted && !deletion.is_empty();
                 let keys = if filtering {
                     SnapKeys::Full(
                         n.keys
@@ -300,7 +272,7 @@ where
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
                 &NodeData::External(ref n) => {
-                    let filtering = self.filter_deleted && self.deletion.len() > 0;
+                    let filtering = self.filter_deleted && !self.deletion.is_empty();
                     let snap = |range: std::ops::Range<usize>| -> SnapKeys {
                         if filtering {
                             SnapKeys::Full(

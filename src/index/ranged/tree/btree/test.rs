@@ -60,7 +60,7 @@ fn node_size() {
 }
 
 fn deletion_set() -> Arc<DeletionSet> {
-    Arc::new(HashSet::with_capacity(16))
+    Arc::new(DeletionSet::with_capacity(16))
 }
 
 #[test]
@@ -745,8 +745,8 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
 
 /// A structural split must leave the SOURCE tree writable.
 ///
-/// `split_off` / `split_off_spine` -- the production tree-split path, reached
-/// from `RangedTree::split_off` when a tree goes oversized -- collapse a root
+/// The copy split's commit -- `copy_off` then `retain`, reached from
+/// `RangedTree::copy_off` when a tree goes oversized -- can collapse a root
 /// left with a single child into a bypass `Empty`. Traversal forwards through
 /// one happily; `is_ext()` cannot, because it is a question only External and
 /// Internal can answer. `apply_top_level_split` asks the root exactly that on
@@ -762,7 +762,7 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
 /// which the verifier requires to be Nil for a level's first node. The
 /// bypass is not wrong, so the fix should not move it.
 #[test]
-fn splitting_off_at_any_pivot_leaves_the_source_writable() {
+fn copy_split_at_any_pivot_leaves_the_source_writable() {
     let _ = env_logger::try_init();
     let total = PAGE_SIZE as u64 * 4;
     for pivot_at in 2..=total {
@@ -771,7 +771,8 @@ fn splitting_off_at_any_pivot_leaves_the_source_writable() {
             tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
         }
         let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
-        let moved = super::split_off::split_off_spine(&tree, &pivot);
+        let moved = super::split_off::copy_off(&tree, &pivot);
+        super::split::retain(&tree, &pivot);
 
         // Whatever moved, the source keeps only keys below the pivot...
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);

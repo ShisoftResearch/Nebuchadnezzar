@@ -671,12 +671,32 @@ impl IndexBuilder {
         cell_id: Id,
         schema_id: SchemaUid,
     ) -> Result<(), IndexError> {
+        // Bound how many scannable write+verify sequences run at once. The
+        // builder spawns one task per written cell with nothing waiting on
+        // them at creation, so a bulk import queued 562K of these and their
+        // concurrent RPC loops starved the shared runtime (2026-08-31:
+        // 950%-2700% CPU, HTTP polls timing out). Tasks past the bound park
+        // on the semaphore, which costs nothing to the scheduler; permits
+        // turn over in well under a second in the healthy case.
+        static SCANNABLE_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
+            std::sync::OnceLock::new();
+        let permits = SCANNABLE_PERMITS.get_or_init(|| {
+            let n = std::env::var("NEB_SCANNABLE_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(64);
+            tokio::sync::Semaphore::new(n)
+        });
+        let _permit = permits
+            .acquire()
+            .await
+            .expect("scannable permit semaphore is never closed");
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
             cell_id,
             schema_id
         );
-        let pattern = Some(key.as_slice()[..16].to_vec());
         let inserted = match indexers.ranged_client.insert(&key).await {
             Ok(inserted) => inserted,
             Err(e) => {
@@ -685,35 +705,23 @@ impl IndexBuilder {
             }
         };
 
+        // Verify with an exact, read-only point probe -- NOT a range seek.
+        // The seek-based check compared the first element of a scan window
+        // against the expected id, so it inherited every scan-window
+        // degradation under concurrent load: bounded partial blocks from the
+        // seek guards, and the pre-`BLinkSeek` positioning race. Under the
+        // 2026-08-31 merge storms ~131 of ~20K sidecar-rebuild verifications
+        // timed out that way against a live store holding every key, and the
+        // rebuild aborted with IndexIncomplete. `contains` asks the exact
+        // question this verification means -- is THIS key present -- with a
+        // single-tree point lookup; the index scrub already trusts it for
+        // exactly this.
         for attempt in 0..32 {
-            let range = crate::index::ranged::tree::service::Range::new_inclusive_opened(
-                key.clone(),
-                crate::index::ranged::tree::btree::Ordering::Forward,
-            );
-            match crate::index::ranged::client::RangedIndexerClient::seek(
-                &indexers.ranged_client,
-                range,
-                1,
-                pattern.clone(),
-            )
-            .await
-            {
-                Ok(Some(cursor)) if cursor.current_block().first() == Some(&cell_id) => {
-                    return Ok(());
-                }
-                Ok(Some(cursor)) => {
+            match indexers.ranged_client.contains(&key).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
                     log::warn!(
-                        "ensure_scannable: inserted key not yet visible for cell_id={:?}, schema_id={}, attempt={}, inserted={}, first_seen={:?}",
-                        cell_id,
-                        schema_id,
-                        attempt + 1,
-                        inserted,
-                        cursor.current_block().first()
-                    );
-                }
-                Ok(None) => {
-                    log::warn!(
-                        "ensure_scannable: inserted key not yet queryable for cell_id={:?}, schema_id={}, attempt={}, inserted={}",
+                        "ensure_scannable: inserted key not yet visible for cell_id={:?}, schema_id={}, attempt={}, inserted={}",
                         cell_id,
                         schema_id,
                         attempt + 1,
