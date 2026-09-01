@@ -245,12 +245,14 @@ fn merge_compaction_drops_tombstones() {
     assert!(verification::is_tree_in_order(&tree, 0));
 }
 
-// Structural split: split_off must partition the tree exactly — source keeps
-// keys < pivot, the returned tree gets keys >= pivot, both valid and in order,
-// union == original, disjoint. Modeled in docs/tla/StructuralSplit.tla.
+// The copy split must partition the tree exactly — after copy + retain the
+// source keeps keys < pivot, the copy holds keys >= pivot, both valid and in
+// order, union == original, disjoint. The copy leaves the source untouched
+// until retain, which is why both calls appear here.
+// Modeled in docs/tla/CopySplit.tla.
 #[test]
-fn structural_split_off_partitions_exactly() {
-    use super::split_off::split_off;
+fn copy_split_partitions_exactly() {
+    use super::split_off::copy_off;
     let _ = env_logger::try_init();
     // Cover clean-cut pivots (page boundaries) and mid-leaf pivots across a
     // multi-level tree.
@@ -263,7 +265,8 @@ fn structural_split_off_partitions_exactly() {
             }
             let pivot = key_of(pivot_n * 2); // may be a real key or a gap
             let orig_len = tree.len();
-            let res = split_off(&tree, &pivot);
+            let res = copy_off(&tree, &pivot);
+            super::split::retain(&tree, &pivot);
 
             // Collect the source's remaining keys.
             let mut src_keys = vec![];
@@ -344,8 +347,8 @@ fn structural_split_off_partitions_exactly() {
 // Randomized structural split: random key sets and random pivots (including
 // values not present as keys), many rounds, against a Vec model.
 #[test]
-fn structural_split_off_randomized() {
-    use super::split_off::split_off;
+fn copy_split_randomized() {
+    use super::split_off::copy_off;
     use rand::prelude::*;
     let _ = env_logger::try_init();
     let mut rng = rand::rng();
@@ -365,7 +368,8 @@ fn structural_split_off_randomized() {
         // Pivot: a value in [0, 2001), often between keys.
         let pivot_v = rng.random_range(0..2001u64);
         let pivot = key_of(pivot_v);
-        let res = split_off(&tree, &pivot);
+        let res = copy_off(&tree, &pivot);
+        super::split::retain(&tree, &pivot);
 
         let mut src: Vec<u64> = vec![];
         let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
@@ -412,92 +416,6 @@ fn structural_split_off_randomized() {
     }
 }
 
-// Spine-structural split must produce the exact same partition as the proven
-// leaf-rebuild split_off, and both trees must verify in order.
-#[test]
-fn spine_split_matches_split_off() {
-    use super::split_off::split_off_spine;
-    use rand::prelude::*;
-    let _ = env_logger::try_init();
-    let mut rng = rand::rng();
-    for _round in 0..300 {
-        let n = rng.random_range(0..400u64);
-        let deletion = deletion_set();
-        let tree = TinyTree::new(&deletion);
-        let mut model: Vec<u64> = Vec::new();
-        for _ in 0..n {
-            let k = rng.random_range(0..2000u64);
-            if !model.contains(&k) {
-                model.push(k);
-                assert!(tree.insert(&key_of(k)));
-            }
-        }
-        model.sort();
-        let pivot_v = rng.random_range(0..2001u64);
-        let pivot = key_of(pivot_v);
-        let res = split_off_spine(&tree, &pivot);
-
-        let mut src: Vec<u64> = vec![];
-        let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
-        while let Some(k) = c.next() {
-            src.push(k.id().bits() & ((1u64 << 48) - 1));
-        }
-        assert!(
-            verification::is_tree_in_order(&tree, 0),
-            "spine src not in order (n={}, pivot={})",
-            n,
-            pivot_v
-        );
-        let mut moved: Vec<u64> = vec![];
-        if let Some(so) = res {
-            let nt = TinyTree::from_root(
-                so.new_root,
-                so.new_head_id,
-                so.moved_len,
-                so.new_height,
-                &deletion,
-            );
-            assert!(
-                verification::is_tree_in_order(&nt, 0),
-                "spine moved not in order (n={}, pivot={})",
-                n,
-                pivot_v
-            );
-            let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
-            while let Some(k) = c.next() {
-                moved.push(k.id().bits() & ((1u64 << 48) - 1));
-            }
-            assert_eq!(
-                moved.len(),
-                so.moved_len,
-                "spine moved_len (n={}, pivot={})",
-                n,
-                pivot_v
-            );
-        }
-        let exp_src: Vec<u64> = model
-            .iter()
-            .cloned()
-            .filter(|&k| key_of(k) < pivot)
-            .collect();
-        let exp_moved: Vec<u64> = model
-            .iter()
-            .cloned()
-            .filter(|&k| key_of(k) >= pivot)
-            .collect();
-        assert_eq!(
-            src, exp_src,
-            "spine source partition (n={}, pivot={})",
-            n, pivot_v
-        );
-        assert_eq!(
-            moved, exp_moved,
-            "spine moved partition (n={}, pivot={})",
-            n, pivot_v
-        );
-    }
-}
-
 // Every leaf must be at the same depth (B+ tree balance invariant).
 fn all_leaves_same_depth(root: &NodeCellRef) -> bool {
     fn depths(node: &NodeCellRef, d: usize, out: &mut Vec<usize>) {
@@ -517,20 +435,19 @@ fn all_leaves_same_depth(root: &NodeCellRef) -> bool {
     out.iter().all(|&x| x == out[0])
 }
 
-// For ARBITRARY pivots (including mid-leaf), the spine split must (a) always
-// produce a balanced moved tree — its O(height) balance guard falls back to the
-// leaf-rebuild split when a spine cut would unbalance the moved side — and
-// (b) never leave the source *more* unbalanced than the proven leaf-rebuild
-// split does at the same pivot. The source spine is truncated in place by both
-// methods, so a mid-subtree pivot can leave it a level short; that is a
-// pre-existing property (self-healing on the next reconstruct) and the balancer
-// never triggers it — see split_at_mid_key_is_balanced_both_methods.
+// The copy split builds its target with TreeConstructor over sorted leaves,
+// so the MOVED side is fully balanced (all leaves at one depth) at ANY pivot
+// -- unlike the spine cut it replaced, which could collapse a level short at
+// mid-subtree pivots and needed a simulation pass to detect it. The source's
+// post-retain shape is the retain path's own property, unchanged by the
+// split rework and self-healing on the next reconstruct.
 #[test]
-fn spine_split_no_balance_regression() {
-    use super::split_off::{split_off, split_off_spine};
+fn copy_split_is_balanced_at_any_pivot() {
+    use super::split_off::copy_off;
     use rand::prelude::*;
     let _ = env_logger::try_init();
     let mut rng = rand::rng();
+    let mut checked = 0;
     for _round in 0..400 {
         let n = rng.random_range(1..400u64);
         let mut keys = std::collections::BTreeSet::new();
@@ -538,137 +455,40 @@ fn spine_split_no_balance_regression() {
             keys.insert(rng.random_range(0..2000u64));
         }
         let pivot_v = rng.random_range(0..2001u64);
-
-        let d1 = deletion_set();
-        let spine_tree = TinyTree::new(&d1);
+        let deletion = deletion_set();
+        let tree = TinyTree::new(&deletion);
         for k in &keys {
-            spine_tree.insert(&key_of(*k));
+            tree.insert(&key_of(*k));
         }
-        let spine_moved = split_off_spine(&spine_tree, &key_of(pivot_v));
-
-        let d2 = deletion_set();
-        let leaf_tree = TinyTree::new(&d2);
-        for k in &keys {
-            leaf_tree.insert(&key_of(*k));
-        }
-        let _leaf_moved = split_off(&leaf_tree, &key_of(pivot_v));
-
-        // (a) spine's moved tree is always balanced.
-        if let Some(so) = &spine_moved {
-            assert!(
-                all_leaves_same_depth(&so.new_root),
-                "spine moved unbalanced (n={}, pivot={})",
-                n,
-                pivot_v
-            );
-        }
-        // (b) source balance is no worse than the leaf-rebuild baseline.
-        let spine_src_bal = all_leaves_same_depth(&spine_tree.get_root());
-        let leaf_src_bal = all_leaves_same_depth(&leaf_tree.get_root());
+        let Some(so) = copy_off(&tree, &key_of(pivot_v)) else {
+            continue;
+        };
+        checked += 1;
+        let moved = TinyTree::from_root(
+            so.new_root,
+            so.new_head_id,
+            so.moved_len,
+            so.new_height,
+            &deletion,
+        );
         assert!(
-            spine_src_bal || !leaf_src_bal,
-            "spine source unbalanced where leaf-rebuild stayed balanced (n={}, pivot={})",
+            all_leaves_same_depth(&moved.get_root()),
+            "copy is unbalanced (n={}, pivot={})",
             n,
             pivot_v
         );
-    }
-}
-
-#[test]
-fn leaf_rebuild_split_off_balance_baseline() {
-    use super::split_off::split_off;
-    use rand::prelude::*;
-    let _ = env_logger::try_init();
-    let mut rng = rand::rng();
-    let mut src_unbal = 0;
-    let mut moved_unbal = 0;
-    for _ in 0..400 {
-        let n = rng.random_range(1..400u64);
-        let deletion = deletion_set();
-        let tree = TinyTree::new(&deletion);
-        let mut keys = std::collections::BTreeSet::new();
-        while (keys.len() as u64) < n {
-            keys.insert(rng.random_range(0..2000u64));
-        }
-        for k in &keys {
-            tree.insert(&key_of(*k));
-        }
-        let pivot_v = rng.random_range(0..2001u64);
-        if let Some(so) = split_off(&tree, &key_of(pivot_v)) {
-            if !all_leaves_same_depth(&so.new_root) {
-                moved_unbal += 1;
-            }
-        }
-        if !all_leaves_same_depth(&tree.get_root()) {
-            src_unbal += 1;
-        }
-    }
-    println!(
-        "LEAF_REBUILD baseline: src_unbal={} moved_unbal={}",
-        src_unbal, moved_unbal
-    );
-}
-
-// The balancer never splits at an arbitrary key — it uses tree.mid_key(), a
-// subtree-boundary separator. At such pivots BOTH the spine split and the
-// leaf-rebuild split must produce fully balanced trees (all leaves at one
-// depth) on both sides. This is the property the migration actually relies on.
-#[test]
-fn split_at_mid_key_is_balanced_both_methods() {
-    use super::split_off::{split_off, split_off_spine};
-    use rand::prelude::*;
-    let _ = env_logger::try_init();
-    let mut rng = rand::rng();
-    let mut checked = 0;
-    for _ in 0..500 {
-        let n = rng.random_range(2..600u64);
-        // spine
-        let deletion = deletion_set();
-        let tree = TinyTree::new(&deletion);
-        let mut keys = std::collections::BTreeSet::new();
-        while (keys.len() as u64) < n {
-            keys.insert(rng.random_range(0..4000u64));
-        }
-        for k in &keys {
-            tree.insert(&key_of(*k));
-        }
-        let Some(pivot) = tree.mid_key() else {
-            continue;
-        };
-        // clone the same key set into a second tree for the leaf-rebuild method
-        let deletion2 = deletion_set();
-        let tree2 = TinyTree::new(&deletion2);
-        for k in &keys {
-            tree2.insert(&key_of(*k));
-        }
-        let pivot2 = tree2.mid_key().unwrap();
-
-        if let Some(so) = split_off_spine(&tree, &pivot) {
-            assert!(
-                all_leaves_same_depth(&so.new_root),
-                "spine mid_key moved unbalanced (n={})",
-                n
-            );
-        }
         assert!(
-            all_leaves_same_depth(&tree.get_root()),
-            "spine mid_key source unbalanced (n={})",
-            n
+            verification::is_tree_in_order(&moved, 0),
+            "copy not in order (n={}, pivot={})",
+            n,
+            pivot_v
         );
-        if let Some(so) = split_off(&tree2, &pivot2) {
-            assert!(
-                all_leaves_same_depth(&so.new_root),
-                "leaf-rebuild mid_key moved unbalanced (n={})",
-                n
-            );
-        }
-        assert!(
-            all_leaves_same_depth(&tree2.get_root()),
-            "leaf-rebuild mid_key source unbalanced (n={})",
-            n
+        let expected = keys.iter().filter(|k| **k >= pivot_v).count();
+        assert_eq!(
+            so.moved_len, expected,
+            "copy moved {} keys, expected {} (n={}, pivot={})",
+            so.moved_len, expected, n, pivot_v
         );
-        checked += 1;
     }
-    println!("MID_KEY balance: checked {} splits, all balanced", checked);
-    assert!(checked > 50);
+    assert!(checked > 50, "only {} pivots moved anything", checked);
 }

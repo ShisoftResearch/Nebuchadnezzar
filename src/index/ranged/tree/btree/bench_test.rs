@@ -203,53 +203,28 @@ fn bench_scan_ids() {
 #[test]
 #[ignore]
 fn bench_split_methods() {
-    use super::split_off::{copy_off, split_off, split_off_spine};
+    use super::split_off::copy_off;
     let n = bench_n();
     let mid = key_of(n / 2);
 
-    // copy-based split (the production default): source untouched.
-    let tree0 = BenchTree::new(&deletion_set());
-    for i in 0..n {
-        tree0.insert(&key_of(i));
-    }
-    let start = Instant::now();
-    let r0 = copy_off(&tree0, &mid);
-    let e0 = start.elapsed();
-    let moved0 = r0.map(|s| s.moved_len).unwrap_or(0);
-    let start = Instant::now();
-    super::split::retain(&tree0, &mid);
-    let e0r = start.elapsed();
-
-    // leaf-rebuild split
     let tree = BenchTree::new(&deletion_set());
     for i in 0..n {
         tree.insert(&key_of(i));
     }
     let start = Instant::now();
-    let r = split_off(&tree, &mid);
-    let e1 = start.elapsed();
-    let moved1 = r.map(|s| s.moved_len).unwrap_or(0);
-
-    // spine split
-    let tree2 = BenchTree::new(&deletion_set());
-    for i in 0..n {
-        tree2.insert(&key_of(i));
-    }
+    let r = copy_off(&tree, &mid);
+    let e_copy = start.elapsed();
+    let moved = r.map(|s| s.moved_len).unwrap_or(0);
     let start = Instant::now();
-    let r2 = split_off_spine(&tree2, &mid);
-    let e2 = start.elapsed();
-    let moved2 = r2.map(|s| s.moved_len).unwrap_or(0);
+    super::split::retain(&tree, &mid);
+    let e_retain = start.elapsed();
 
     println!(
-        "BENCH split: n={} copy={:.3}ms+retain={:.3}ms (moved {}) leaf_rebuild={:.3}ms (moved {}) spine={:.3}ms (moved {})",
+        "BENCH split: n={} copy={:.3}ms retain={:.3}ms (moved {})",
         n,
-        e0.as_secs_f64() * 1000.0,
-        e0r.as_secs_f64() * 1000.0,
-        moved0,
-        e1.as_secs_f64() * 1000.0,
-        moved1,
-        e2.as_secs_f64() * 1000.0,
-        moved2
+        e_copy.as_secs_f64() * 1000.0,
+        e_retain.as_secs_f64() * 1000.0,
+        moved
     );
-    assert_eq!(moved1, moved2);
+    assert_eq!(moved as u64, n / 2);
 }

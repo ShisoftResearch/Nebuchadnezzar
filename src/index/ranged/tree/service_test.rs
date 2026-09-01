@@ -2896,7 +2896,11 @@ mod test {
                     };
                     // The single-copy invariant, checked from the index side:
                     // no scan can see a duplicate (cursors dedup ids), so this
-                    // raw audit is the only observation of it.
+                    // raw audit is the only observation of it. Every 10
+                    // minutes: a raw walk of every tree is ~20M key
+                    // materializations at soak scale, which would otherwise
+                    // tax the very timings the soak is measuring.
+                    if minutes % 10 == 0 {
                     let (audit_keys, audit_dups, audit_tombs) =
                         match tokio::time::timeout(Duration::from_secs(60), rc.audit_trees()).await
                         {
@@ -2922,6 +2926,7 @@ mod test {
                         audit_dups,
                         audit_tombs
                     );
+                    }
                     let line = format!(
                         "t={}s inserts={} deletes={} scans={} audits={} trees={} rss_mb={} threads={}",
                         start.elapsed().as_secs(),

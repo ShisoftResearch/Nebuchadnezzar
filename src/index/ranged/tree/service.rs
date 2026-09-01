@@ -368,16 +368,6 @@ fn seek_regression_mode() -> SeekRegressionMode {
     })
 }
 
-/// Copy-based splits are the default (docs/ranged-index-robustness-plan.md
-/// proposal 1): the source is untouched until commit, so aborting is
-/// "drain and drop the copy" and no page ever belongs to two trees.
-/// NEB_SPLIT_SHARED=1 selects the legacy shared-leaf spine split for A/B;
-/// it is scheduled for removal.
-fn shared_leaf_splits() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("NEB_SPLIT_SHARED").is_ok())
-}
-
 /// Exponential per-tree backoff for repeatedly failing splits, capped.
 fn split_backoff_ms(streak: &mut StdHashMap<Id, u32>, tree: Id) -> u64 {
     const BASE_MS: u64 = 2_000;
@@ -1387,111 +1377,6 @@ impl TreeService {
         }
     }
 
-    /// Dispatch: copy-based splits abort, shared-leaf splits roll back.
-    async fn undo_split(
-        dist_tree: &Arc<DistTree>,
-        moved: &Arc<DistTree>,
-        target_id: Id,
-        pending_migrations: &Arc<HashMap<Id, Arc<DistTree>>>,
-        client: &Arc<AsyncClient>,
-    ) {
-        if shared_leaf_splits() {
-            Self::rollback_pending_split(dist_tree, moved, target_id, pending_migrations, client)
-                .await;
-        } else {
-            Self::abort_copy_split(dist_tree, moved, target_id, pending_migrations, client).await;
-        }
-    }
-
-    async fn rollback_pending_split(
-        dist_tree: &Arc<DistTree>,
-        moved: &Arc<DistTree>,
-        target_id: Id,
-        pending_migrations: &Arc<HashMap<Id, Arc<DistTree>>>,
-        client: &Arc<AsyncClient>,
-    ) {
-        // split_off already truncated the LIVE source tree, so clearing the
-        // markers alone orphans every moved key -- routing still sends their
-        // range to the source, which no longer holds them (2026-08-30: a
-        // full store failed the seam barrier and this "rollback" quietly
-        // dropped 5.7M of 8.4M keys in the stress test, and a handful of
-        // scannable keys per BANC bulk import). Reabsorb the moved half
-        // before dropping the target; a failed split must degrade into
-        // "split deferred", never into loss.
-        //
-        // Reopen the source's right edge FIRST: the kept spine's
-        // right_bounds were truncated to the pivot, and reinserting keys at
-        // or past the pivot into that shape lands them beyond the rightmost
-        // leaf's bound (silent disorder in release, a pivot assert in
-        // debug).
-        let restored_upper = { moved.prop.read().boundary.upper.clone() };
-        super::btree::split_off::reopen_right_edge(&dist_tree.tree.tree, &restored_upper);
-        // A RAW, unfiltered walk and RAW inserts, both deliberately:
-        //
-        // - The filtered walk silently dropped every tombstoned moved key's
-        //   physical copy (skipped by the snapshot filter, discarded with
-        //   the target), leaving lingering tombstones -- survivable, but it
-        //   made rollback correctness depend on the filter being right.
-        // - RangedTree::insert would be worse: its un-delete path CONSUMES a
-        //   tombstone and revives the key -- one filter miss during the walk
-        //   and a deleted key comes back to life (the soak's resurrection
-        //   shape, four runs).
-        //
-        // Raw inserts make the end state independent of any set answer: a
-        // tombstoned key goes back in WITH its tombstone intact, stays
-        // logically deleted, and compacts away at the next flush -- exactly
-        // as if the split had never happened. The tombstoned count is logged
-        // so a storm's rollbacks leave an audit trail.
-        // DRAIN the moved pages -- each leaf emptied under its own latch as
-        // its keys are collected -- then reinsert raw. The moved pages sit
-        // dirty-QUEUED on the write-back hub (usually the very backlog that
-        // failed the seam barrier), and the queue's owned refs outlive the
-        // dropped target: the flusher later compacts those orphaned pages
-        // against the LIVE shared deletion set, pairing a stale copy with a
-        // fresh tombstone and resurrecting the reabsorbed key (the soak's
-        // persistent resurrections, five runs in a row). Draining preserves
-        // a single copy of every key at every instant, so the orphan flush
-        // finds an empty page and consumes nothing.
-        let drained = super::btree::split_off::drain_all_keys(&moved.tree.tree);
-        let mut restored = 0usize;
-        let mut tombstoned = 0usize;
-        for key in &drained {
-            if dist_tree.tree.tree.deletion.contains(key) {
-                tombstoned += 1;
-            }
-            if dist_tree.tree.tree.insert(key) {
-                restored += 1;
-            }
-        }
-        info!(
-            "Rolled back split of {:?}: drained {} moved key(s), reabsorbed {} ({} tombstoned) from target {:?}",
-            dist_tree.id,
-            drained.len(),
-            restored,
-            tombstoned,
-            target_id
-        );
-        pending_migrations.remove(&target_id);
-        // The target's metadata cell (if its publish got that far) must not
-        // survive to be recovered as a tree; its leaves now belong to the
-        // source again.
-        let _ = client.remove_cell(target_id).await;
-        {
-            let mut dist_prop = dist_tree.prop.write();
-            dist_prop.migration = None;
-        }
-        if let Err(unmark_err) = dist_tree
-            .tree
-            .mark_migration(&dist_tree.id, None, client)
-            .await
-        {
-            warn!(
-                "Failed to clear migration marker for tree {:?} after split rollback: {:?}",
-                dist_tree.id, unmark_err
-            );
-        }
-    }
-
     async fn ensure_split_target_loaded(
         client: &Arc<AsyncClient>,
         target_id: Id,
@@ -1736,24 +1621,13 @@ impl TreeService {
                                 tokio::task::yield_now().await;
                             }
                         }
-                        debug!("Marking migration for tree {:?}", dist_tree.id);
-                        // Copy-based splits write NO durable marker: the
-                        // source chain is never cut, so a crash needs no
-                        // reconciliation surgery -- pre-flip it leaves an
-                        // unreferenced target cell (scrub fodder), post-flip
-                        // the boundary clamps the untrimmed tail. The marker
-                        // machinery stays for legacy shared-leaf stores.
-                        if shared_leaf_splits() {
-                            if let Err(e) = tree
-                                .mark_migration(&dist_tree.id, Some(migration_target_id), &client)
-                                .await
-                            {
-                                warn!(
-                                    "Failed to mark LSM tree migration for oversized tree {:?}: {:?}",
-                                    dist_tree.id, e
-                                );
-                            }
-                        }
+                        // No durable migration marker: a copy split never
+                        // cuts the source chain, so a crash needs no
+                        // reconciliation surgery. Pre-flip it leaves an
+                        // unreferenced target cell (scrub fodder); post-flip
+                        // the source's boundary clamps its untrimmed tail
+                        // until the next retain. The marker READER stays for
+                        // stores written by the old shared-leaf splitter.
                         // Structural split: re-parent the leaves >= pivot into a
                         // new tree sharing the source's leaf nodes — O(leaves)
                         // instead of copying every key. This also truncates the
@@ -1762,12 +1636,7 @@ impl TreeService {
                             "Structurally splitting {:?} at {:?} into {:?}",
                             dist_tree.id, pivot_key, migration_target_id
                         );
-                        let split_result = if shared_leaf_splits() {
-                            tree.split_off(&pivot_key, &client)
-                        } else {
-                            tree.copy_off(&pivot_key, &client)
-                        };
-                        let Some((moved_tree, moved_len)) = split_result
+                        let Some((moved_tree, moved_len)) = tree.copy_off(&pivot_key, &client)
                         else {
                             // Nothing moved (pivot past every key); undo the
                             // marker and try again later.
@@ -1813,7 +1682,7 @@ impl TreeService {
                                 "Failed to publish target tree {:?} before split from {:?}: {:?}",
                                 migration_target_id, dist_tree.id, e
                             );
-                            Self::undo_split(
+                            Self::abort_copy_split(
                                 &dist_tree,
                                 &migration_tree,
                                 migration_target_id,
@@ -1846,7 +1715,7 @@ impl TreeService {
                                 "Seam barrier for split of {:?} NOT established; rolling back",
                                 dist_tree.id
                             );
-                            Self::undo_split(
+                            Self::abort_copy_split(
                                 &dist_tree,
                                 &migration_tree,
                                 migration_target_id,
@@ -1920,7 +1789,7 @@ impl TreeService {
                                         pivot_key,
                                         split_started.elapsed()
                                     );
-                                    Self::undo_split(
+                                    Self::abort_copy_split(
                                         &dist_tree,
                                         &migration_tree,
                                         migration_target_id,
@@ -1969,15 +1838,12 @@ impl TreeService {
                         // below and the seam-pointer changes persist async, so
                         // the serial balancer is not stalled on the whole
                         // write-back backlog after every migration.
-                        if !shared_leaf_splits() {
-                            // COMMIT on the source: the placement flip made
-                            // the copy authoritative for [pivot, upper); now
-                            // remove those keys from the source, still under
-                            // the freeze. Tombstoned keys were never copied,
-                            // so their single copies die here and their
-                            // tombstones become inert.
-                            tree.retain(&pivot_key);
-                        }
+                        // COMMIT on the source: the placement flip made the
+                        // copy authoritative for [pivot, upper); now remove
+                        // those keys from the source, still under the freeze.
+                        // Tombstoned keys were never copied, so their single
+                        // copies die here and their tombstones become inert.
+                        tree.retain(&pivot_key);
                         {
                             let mut dist_prop = dist_tree.prop.write();
                             dist_prop.boundary.upper = pivot_key.clone();

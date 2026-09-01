@@ -76,29 +76,39 @@ where
             debug!("Retain key lock obtained for {:?}", node_ref);
             let n = node.extnode_mut(tree);
             let key_index = n.search(mid_key);
-            if key_index >= n.len {
-                // Pivot is beyond reach, nothing to do
-                return true;
-            }
-            let selected_key = &n.keys.key_at(key_index);
             let origin_node_len = n.len;
             let prev_node_ref = n.prev.clone();
             let node_id = n.id;
-            debug_assert!(
-                selected_key >= mid_key,
-                "Selected {:?}, mid {:?}",
-                selected_key,
-                mid_key
-            );
+            if key_index < origin_node_len {
+                debug_assert!(
+                    &n.keys.key_at(key_index) >= mid_key,
+                    "Selected {:?}, mid {:?}",
+                    n.keys.key_at(key_index),
+                    mid_key
+                );
+            }
+            // Sever the forward chain even when THIS leaf keeps every key.
+            // A pivot landing in the gap after the last key used to return
+            // "beyond reach, nothing to do" -- and left every following leaf
+            // in place, all of them holding keys past the pivot, because the
+            // descent picked this leaf precisely for covering the pivot with
+            // its right_bound. Latent while nothing in production called
+            // retain (the shared-leaf split truncated the source itself);
+            // load-bearing the moment the copy split made retain its commit,
+            // where it left the source shadowing the copy's whole range with
+            // a second physical copy of every key past the gap. Caught by
+            // copy_split_randomized at pivot 1799 between leaves ending 1791
+            // and starting 1802.
             let mut right_node_ref = mem::take(&mut n.next);
-            let mut num_removed_keys = origin_node_len - key_index;
+            let mut num_removed_keys = origin_node_len.saturating_sub(key_index);
             // Emptied rather than destroyed when this is the level head: an
             // external node with no keys is exactly what a fresh tree's root
             // is, so the tree stays readable and writable with nothing in it.
             if key_index == 0 && !is_level_head {
                 *node = NodeData::Empty(Box::new(Default::default()));
             } else {
-                n.len = key_index; // All others will be ignored
+                // min: a pivot past every key here keeps them all.
+                n.len = key_index.min(origin_node_len);
             }
             drop(node);
             if key_index == 0 && !is_level_head {
