@@ -1,40 +1,34 @@
 # Ranged index: open issues behind the 2026-08-31 workarounds
 
-> **STATUS 2026-08-31 (same day, follow-up session): root causes found
-> and fixed on `fix/ranged-open-issues`.** The headline finding
-> invalidates this document's framing of Issue 1: the trees were
-> (probably) never out of order — the SEEK's initial positioning was
-> non-linearizable. `server_final4.log` proves the storms need no
-> structural splits at all: that run was a FRESH store at depth 4 with
-> zero splits, and it still logged 8,700 give-ups (04:33:38–04:39:45)
-> while a sidecar snapshot rebuild scanned behind the insert frontier.
+> # CLOSED 2026-09-01 — both workarounds are answered
 >
-> The defect: when `search_node`'s leaf search landed past every key of
-> a page (`pos == n.len`), it handed the cursor a raw follow ref and let
-> `initialize()` position at the NEXT PAGE'S FIRST KEY, read later and
-> never compared against the seek key. A front-insert landing in that
-> sibling between `key_at_right_node`'s unvalidated peek (which decided
-> "don't slide right"; the peek can also read torn mid-`copy_within`
-> bytes) and the deferred follow read hands the seek a key BELOW its
-> target — the "fresh root descent regressed" signature, sustained for
-> as long as inserts keep hammering the frontier. Modeled in
-> `docs/tla/BLinkSeek.tla`: TLC finds the violation in five states with
-> honest peeks and no splits, and passes exhaustively with the fix (an
-> off-page position now CONTINUES THE DESCENT at the sibling, so a key
-> is only ever yielded by a validated lower-bound search on the node
-> that answers).
+> Branch `fix/ranged-open-issues` (35 commits here, 1 in bifrost).
+> **Read the campaign-close section at the end of this file first**; the
+> architecture rationale is in `docs/ranged-index-robustness-plan.md`.
+> Everything below this block is the ORIGINAL report, kept because its
+> evidence is still the best account of the symptoms — but note that its
+> diagnosis of Issue 1 turned out to be wrong, which the close section
+> explains.
 >
-> Issue 2's verification now uses `RangedIndexerClient::contains` (the
-> exact point probe) instead of a range seek, exactly as prescribed
-> below, and the scannable write+verify path is bounded by a semaphore
-> (`NEB_SCANNABLE_INFLIGHT`, default 64).
->
-> The missing reader+writer stress test exists
-> (`test_concurrent_seeks_during_inserts_and_splits_never_regress`,
-> depth 2, `NEB_SEEK_REGRESSION_PANIC=1` so the first violation panics
-> with the tree id and keys). Its first pre-fix run also caught a
-> SEPARATE latent hang — a seek RPC pinning one worker at 100% forever
-> with no warn line — see the addendum at the end of this file.
+> - **Issue 1** — root cause was the seek's own positioning, not tree
+>   disorder (`e6ce7e54`, modeled in `docs/tla/BLinkSeek.tla`). The
+>   `NEB_TREE_DEPTH=4` workaround is ready to retire; the depth-3 BANC
+>   import is the remaining acceptance run and needs the bench machine.
+> - **Issue 2** — fixed exactly as prescribed below: `contains()`
+>   verification plus a bounded write+verify path (`b9b4fc6b`). The
+>   `--skip-sidecar` two-step is no longer required.
+> - **Twelve further defects** were found on the way, most delete- or
+>   storm-triggered, including a whole-runtime freeze that is almost
+>   certainly the silent import wedge those nights.
+> - **The index was rearchitected** so those classes cannot recur:
+>   splits copy instead of sharing pages, detached pages refuse
+>   background work, tombstones are journaled, and the single-copy
+>   invariant is observable. ~1,450 lines of shared-leaf era machinery
+>   deleted; no backward compatibility kept.
+> - **Evidence**: three full 3-hour soaks (best run 23.9M verified
+>   inserts, 4.76M verified deletes, 1.45B checked scans, 1,464 exact
+>   audits, zero violations), full suite green (790 + 70), two TLA+
+>   models each with an anti-vacuity guard.
 
 Two operational workarounds went in during the BANC bulk-import debugging
 night of 2026-08-30/31. Both stand in for real, unresolved defects in the
@@ -187,7 +181,14 @@ Secondary hardening, if needed after the swap:
 
 ---
 
-## The operational recipe that works today (2026-08-31)
+## The operational recipe of 2026-08-31 (SUPERSEDED — kept for the record)
+
+Both of its workarounds are answered on `fix/ranged-open-issues`:
+`--skip-sidecar` + a separate rebuild is no longer required, and
+`NEB_TREE_DEPTH=4` comes out once the depth-3 acceptance import runs
+clean. Until that import runs, this recipe is still the safe way to
+drive a real corpus.
+
 
 ```bash
 # server (binaries live OUTSIDE cargo-target on purpose)
