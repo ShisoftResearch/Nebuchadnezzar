@@ -165,3 +165,17 @@ Proposal 1 should land first: it deletes more code than it adds, both
 of its primitives already exist and are tested, and it converts the
 index's most dangerous operation into "build a copy, flip a pointer,
 drop on failure".
+
+---
+
+## Finding #9 (soak attempt 12, recorded for follow-up)
+
+Under PERMANENT store overload -- the workload's target exceeding
+capacity for the final hour -- the write-back backlog grows without
+bound: abandoned batches re-queue, new dirty pages keep arriving, and
+RSS climbed 5GB -> 17GB over ~40 minutes while correctness held (912
+exact audits clean, zero violations). A real deployment needs
+back-pressure here: cap the retry lane and surface a hard "store full,
+shedding index persistence" state instead of converting overload into
+memory growth. Orthogonal to proposals 1-3; belongs with the
+crash-safety work.
