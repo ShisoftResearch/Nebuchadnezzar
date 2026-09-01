@@ -1406,6 +1406,9 @@ pub async fn schema_persistence_multiple_restarts() {
 #[tokio::test]
 pub async fn memory_status_test() {
     let _ = env_logger::try_init();
+    // A tier without backup_storage is refused at startup (it could never
+    // evict), so give this one a directory even though nothing spills here.
+    let backup_dir = tempfile::TempDir::new().unwrap();
 
     // Create server with tiered memory enabled
     let server = NebServer::new_from_opts(
@@ -1415,7 +1418,7 @@ pub async fn memory_status_test() {
             tiered_config: Some(crate::ram::tiered::TieredConfig::with_memory_limit(
                 64 * 1024 * 1024, // 64 MB physical limit
             )),
-            backup_storage: None,
+            backup_storage: Some(backup_dir.path().to_string_lossy().to_string()),
             wal_storage: None,
             raft_storage: None,
             services: vec![],
@@ -2593,4 +2596,23 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
          scan sees {high} of {CELLS_PER_SCHEMA}"
     );
     server.shutdown().await;
+}
+
+/// A tier with no backup_storage can never evict -- every eviction aborts at
+/// "archive returned false" -- so it is refused at startup instead of being
+/// discovered mid-import.
+#[test]
+fn tiered_eviction_without_backup_storage_is_refused() {
+    use super::{check_tiered_eviction_can_archive, ServerError};
+    assert!(matches!(
+        check_tiered_eviction_can_archive(true, None),
+        Err(ServerError::TieredEvictionWithoutBackupStorage)
+    ));
+    assert!(matches!(
+        check_tiered_eviction_can_archive(true, Some("   ")),
+        Err(ServerError::TieredEvictionWithoutBackupStorage)
+    ));
+    assert!(check_tiered_eviction_can_archive(true, Some("/tmp/backup")).is_ok());
+    // No tier, no requirement: an in-memory store needs nowhere to spill.
+    assert!(check_tiered_eviction_can_archive(false, None).is_ok());
 }

@@ -900,6 +900,11 @@ pub enum ServerError {
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
     StandaloneMustAlsoBeMetaServer,
+    /// `tiered_config` is set but `backup_storage` is not. Eviction frees
+    /// memory by archiving a segment to its backup file and dropping the
+    /// pages; with nowhere to archive to, every eviction aborts and the tier
+    /// can never reclaim anything.
+    TieredEvictionWithoutBackupStorage,
 }
 
 impl std::fmt::Display for ServerError {
@@ -940,8 +945,33 @@ impl std::fmt::Display for ServerError {
             ServerError::StandaloneMustAlsoBeMetaServer => {
                 write!(f, "standalone server must also be a meta server")
             }
+            ServerError::TieredEvictionWithoutBackupStorage => write!(
+                f,
+                "tiered_config is set but backup_storage is null: tiered eviction archives a \
+                 segment to backup_storage before dropping its pages, so without one it can \
+                 never free memory (every eviction aborts with \"archive returned false\"). \
+                 Set storage.backup_storage to a directory, or remove tiered_config."
+            ),
         }
     }
+}
+
+/// Refuse a tier that can never evict.
+///
+/// Eviction archives a segment to its backup file and then drops the pages;
+/// with no `backup_storage` there is nowhere to archive to, so every eviction
+/// aborts and the tier reclaims nothing. That is knowable here, at startup.
+/// The alternative was discovering it as 5,048 "archive returned false" lines
+/// in the middle of a 13.6M-edge import, under a million allocation failures
+/// that had nothing to do with it.
+pub fn check_tiered_eviction_can_archive(
+    tiered_enabled: bool,
+    backup_storage: Option<&str>,
+) -> Result<(), ServerError> {
+    if tiered_enabled && backup_storage.map_or(true, |path| path.trim().is_empty()) {
+        return Err(ServerError::TieredEvictionWithoutBackupStorage);
+    }
+    Ok(())
 }
 
 impl std::error::Error for ServerError {}
@@ -2419,15 +2449,17 @@ impl NebServer {
         // database's transaction manager (coordinator) and data manager
         // (participant) hosted on this server.
         let hlc = Arc::new(bifrost::hlc::HlcSource::new(rpc_server.server_id));
-        let shared_memory_pool = opts
+        let tiered_config = opts
             .tiered_config
+            .clone()
+            .or_else(crate::ram::tiered::TieredConfig::from_env);
+        check_tiered_eviction_can_archive(
+            tiered_config.is_some(),
+            opts.backup_storage.as_deref(),
+        )?;
+        let shared_memory_pool = tiered_config
             .as_ref()
-            .or_else(|| None) // placeholder so or_else chain compiles cleanly
-            .map(|c| crate::ram::tiered::SharedMemoryPool::new(c))
-            .or_else(|| {
-                crate::ram::tiered::TieredConfig::from_env()
-                    .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c))
-            });
+            .map(crate::ram::tiered::SharedMemoryPool::new);
         let shared_tiered_manager = shared_memory_pool.as_ref().map(|pool| {
             Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
                 pool.clone(),
