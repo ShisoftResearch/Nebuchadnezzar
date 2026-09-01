@@ -223,9 +223,12 @@ where
             None => break,
         }
     }
-    // Walk the chain, emptying each leaf as it is read.
+    // Walk the chain, emptying each leaf as it is read. Detach as well:
+    // emptying protects against tombstone mispairing, detaching also stops
+    // the flusher from persisting a cell nothing will ever reference.
     let mut keys = Vec::new();
     while !cur.is_default() {
+        cur.deref::<KS, PS>().detach();
         let next = {
             let mut guard = write_node::<KS, PS>(&cur);
             match &mut *guard {
