@@ -146,9 +146,8 @@ where
         neb: &AsyncClient,
         deletion: &Arc<DeletionSet>,
         level: usize,
-        upper_bound: Option<&EntryKey>,
     ) -> Result<Self, reconstruct::ReconstructError> {
-        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level, upper_bound).await
+        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
     }
 
     pub fn from_root(

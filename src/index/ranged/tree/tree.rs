@@ -87,7 +87,6 @@ impl DeletionSet {
 
 pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
 pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
-pub const RANGED_TREE_MIGRATION_NAME: &'static str = "migration";
 pub const RANGED_TREE_TOMBSTONES_NAME: &'static str = "tombstones";
 pub const INITIAL_TREE_EPOCH: u64 = 0;
 /// Journaled tombstones past which compaction is visibly losing to the
@@ -106,7 +105,6 @@ lazy_static! {
     pub static ref RANGED_TREE_SCHEMA_ID: SchemaVid =
         SchemaVid(key_hash(RANGED_TREE_SCHEMA_NAME) as u32);
     pub static ref RANGED_TREE_HEAD_HASH: u64 = key_hash(RANGED_TREE_HEAD_NAME);
-    pub static ref RANGED_TREE_MIGRATION_HASH: u64 = key_hash(RANGED_TREE_MIGRATION_NAME);
     pub static ref RANGED_TREE_TOMBSTONES_HASH: u64 = key_hash(RANGED_TREE_TOMBSTONES_NAME);
     pub static ref RANGED_TREE_SCHEMA: Schema = ranged_tree_schema();
 }
@@ -179,7 +177,7 @@ impl RangedTree {
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
 
-        let tree_cell = ranged_tree_cell(&tree.head_id(), id, None);
+        let tree_cell = ranged_tree_cell(&tree.head_id(), id);
         match neb_client.write_cell(tree_cell).await {
             Ok(Ok(_)) => {
                 info!("Created new ranged tree {:?}", id);
@@ -238,19 +236,6 @@ impl RangedTree {
         neb_client: &Arc<AsyncClient>,
         tree_id: &Id,
     ) -> Result<Self, TreeRecoverError> {
-        Self::recover_bounded(neb_client, tree_id, None).await
-    }
-
-    /// Like [`Self::recover`], but with the tree's placement upper bound.
-    /// A bounded tree may carry a stale chain link into pages a split-off
-    /// moved to a sibling; the bound lets reconstruction stop at the
-    /// boundary (or truncate a dangling link beyond it) instead of refusing
-    /// to load a tree whose own range is fully readable.
-    pub async fn recover_bounded(
-        neb_client: &Arc<AsyncClient>,
-        tree_id: &Id,
-        upper_bound: Option<&EntryKey>,
-    ) -> Result<Self, TreeRecoverError> {
         info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
         let deletion_set = Arc::new(DeletionSet::with_capacity(0));
@@ -296,9 +281,7 @@ impl RangedTree {
         };
         info!("[TREE LOAD] Loading B-tree from head {:?}", head_id);
 
-        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0, upper_bound)
-            .await
-        {
+        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await {
             Ok(mut tree) => {
                 tree.set_writeback_client(neb_client);
                 tree
@@ -445,13 +428,13 @@ impl RangedTree {
         info!("Retain completed");
     }
 
-    /// Mark tree as migrating
-    pub async fn mark_migration(
-        &self,
-        id: &Id,
-        migration: Option<Id>,
-        client: &Arc<AsyncClient>,
-    ) -> Result<(), String> {
+    /// Publish this tree's head pointer and tombstone journal -- the
+    /// checkpoint. Named for what it does: the durable migration marker it
+    /// used to carry is gone with the shared-leaf split, whose chain
+    /// surgery was the only thing that needed to know a split had been
+    /// interrupted. A copy split never cuts the source chain, so there is
+    /// nothing to reconcile at load.
+    pub async fn publish_head(&self, id: &Id, client: &Arc<AsyncClient>) -> Result<(), String> {
         use crate::ram::cell::WriteError;
 
         let tombstones: Vec<EntryKey> = self.tree.deletion.snapshot().into_iter().collect();
@@ -463,8 +446,7 @@ impl RangedTree {
                 tombstones.len()
             );
         }
-        let tree_cell =
-            ranged_tree_cell_with_tombstones(&self.tree.head_id(), id, migration, &tombstones);
+        let tree_cell = ranged_tree_cell_with_tombstones(&self.tree.head_id(), id, &tombstones);
         match client.update_cell(tree_cell.clone()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(WriteError::CellDoesNotExisted)) => {
@@ -615,78 +597,6 @@ impl RangedTree {
     }
 }
 
-/// Read a tree's metadata cell: (head id, migration marker). None when the
-/// cell is missing or unreadable.
-pub async fn read_tree_metadata(
-    client: &Arc<AsyncClient>,
-    tree_id: &Id,
-) -> Option<(Id, Option<Id>)> {
-    let cell = client.read_cell(*tree_id).await.ok()?.ok()?;
-    let head = *cell.data[*RANGED_TREE_HEAD_HASH].id()?;
-    let migration = cell.data[*RANGED_TREE_MIGRATION_HASH].id().copied();
-    Some((head, migration))
-}
-
-/// Clear a tree's durable migration marker without touching its head
-/// pointer. Used by split reconciliation at load time, before the tree
-/// itself is reconstructed.
-pub async fn clear_migration_marker(client: &Arc<AsyncClient>, tree_id: &Id) {
-    let Some((head, _)) = read_tree_metadata(client, tree_id).await else {
-        return;
-    };
-    let cell = ranged_tree_cell(&head, tree_id, None);
-    if let Err(e) = client.upsert_cell(cell).await {
-        warn!(
-            "Failed to clear migration marker on tree {:?}: {:?}",
-            tree_id, e
-        );
-    }
-}
-
-/// Walk a persisted page chain from `head`, returning the page ids in
-/// order. Stops at the first unreadable page (the ids read so far are
-/// returned) — reconciliation uses the shape of the walk, not its
-/// completeness.
-pub async fn walk_chain_page_ids(client: &Arc<AsyncClient>, head: Id) -> Vec<Id> {
-    use super::btree::NEXT_PAGE_KEY_HASH;
-    let mut ids = Vec::new();
-    let mut current = head;
-    let mut seen = std::collections::HashSet::new();
-    while !current.is_unit_id() && seen.insert(current) {
-        let Ok(Ok(cell)) = client.read_cell(current).await else {
-            break;
-        };
-        ids.push(current);
-        let Some(next) = cell.data[*NEXT_PAGE_KEY_HASH].id().copied() else {
-            break;
-        };
-        current = next;
-    }
-    ids
-}
-
-/// Point `page`'s persisted next pointer at `next`: the cell-level relink
-/// used when rolling back an uncommitted split (the severed chain is
-/// rejoined to the orphaned target's head).
-pub async fn relink_page_next(client: &Arc<AsyncClient>, page: Id, next: Id) -> Result<(), String> {
-    use super::btree::NEXT_PAGE_KEY_HASH;
-    let mut cell = client
-        .read_cell(page)
-        .await
-        .map_err(|e| format!("rpc reading page {:?}: {:?}", page, e))?
-        .map_err(|e| format!("reading page {:?}: {:?}", page, e))?;
-    if let OwnedValue::Map(ref mut map) = cell.data {
-        map.insert_key_id(*NEXT_PAGE_KEY_HASH, OwnedValue::Id(next));
-    } else {
-        return Err(format!("page {:?} does not hold a map body", page));
-    }
-    match client.upsert_cell(cell).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("relinking page {:?}: {:?}", page, e)),
-        Err(e) => Err(format!("rpc relinking page {:?}: {:?}", page, e)),
-    }
-}
-
 /// Schema for ranged tree persistence
 fn ranged_tree_schema() -> Schema {
     Schema::new_with_id(
@@ -695,7 +605,6 @@ fn ranged_tree_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
-            Field::new_unindexed_nullable(RANGED_TREE_MIGRATION_NAME, Type::Id),
             // NULLABLE: every ranged-tree cell written before this field
             // existed carries no value for it, and a non-nullable array
             // rejects exactly those cells -- caught by
@@ -709,8 +618,8 @@ fn ranged_tree_schema() -> Schema {
 }
 
 /// Create a cell for storing tree metadata
-fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
-    ranged_tree_cell_with_tombstones(head_id, id, migration, &[])
+fn ranged_tree_cell(head_id: &Id, id: &Id) -> OwnedCell {
+    ranged_tree_cell_with_tombstones(head_id, id, &[])
 }
 
 /// The metadata cell, with the tombstone journal.
@@ -727,17 +636,10 @@ fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
 fn ranged_tree_cell_with_tombstones(
     head_id: &Id,
     id: &Id,
-    migration: Option<Id>,
     tombstones: &[EntryKey],
 ) -> OwnedCell {
     let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(*head_id));
-    cell_map.insert_key_id(
-        *RANGED_TREE_MIGRATION_HASH,
-        migration
-            .map(|id| OwnedValue::Id(id))
-            .unwrap_or(OwnedValue::Null),
-    );
     cell_map.insert_key_id(
         *RANGED_TREE_TOMBSTONES_HASH,
         tombstones
@@ -1278,7 +1180,7 @@ mod tests {
             assert!(tree.delete(key), "delete should land for {:?}", key.id());
         }
         // The checkpoint the balancer runs every 60s: publish head + journal.
-        tree.mark_migration(&tree_id, None, &client)
+        tree.publish_head(&tree_id, &client)
             .await
             .expect("checkpoint should publish the tombstone journal");
         let live_before = tree.count();
@@ -1365,8 +1267,7 @@ mod tests {
             None,
             Field::new_schema(vec![
                 Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
-                Field::new_unindexed_nullable(RANGED_TREE_MIGRATION_NAME, Type::Id),
-            ]),
+                ]),
             false,
             false,
         );
@@ -1389,7 +1290,7 @@ mod tests {
 
         // THE point: the checkpoint must still succeed and still publish a
         // usable head pointer on the old schema.
-        tree.mark_migration(&tree_id, None, &client)
+        tree.publish_head(&tree_id, &client)
             .await
             .expect("checkpoint must survive a store whose schema predates the journal");
         let head_before = tree.head_id();
@@ -1540,7 +1441,7 @@ mod tests {
     /// are readable and provably foreign (their first key sits at or beyond
     /// the bound), so the walk excludes them instead of double-serving.
     #[tokio::test(flavor = "multi_thread")]
-    async fn bounded_tree_refuses_missing_page_but_stops_at_boundary() {
+    async fn a_tree_refuses_to_load_over_a_missing_page() {
         use crate::client;
         use crate::index::ranged::tree::btree::{page_schema, storage, NEXT_PAGE_KEY_HASH};
         use crate::server::{NebServer, ServerOptions, Service};
@@ -1548,7 +1449,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let server_addr = crate::utils::test_port::unique_localhost_addr();
-        let server_group = "ranged_tree_bounded_truncate";
+        let server_group = "ranged_tree_missing_page";
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -1637,26 +1538,6 @@ mod tests {
             page_ids.len()
         );
 
-        // Half 2 setup runs FIRST while every page is readable: a bounded
-        // load whose upper bound equals the last page's first key must stop
-        // before that page — it is provably foreign — and serve the rest.
-        let keys_before_last_page = 128 * (page_ids.len() as u64 - 1);
-        let upper = make_field_key(
-            SchemaUid(schema_id),
-            field,
-            keys_before_last_page,
-            Id::from_parts(7, keys_before_last_page),
-        );
-        let bounded = RangedTree::recover_bounded(&client, &tree_id, Some(&upper))
-            .await
-            .expect("a bounded tree must stop at a readable foreign page and load");
-        assert_eq!(
-            bounded.count() as u64,
-            keys_before_last_page,
-            "the bounded tree must serve exactly the keys below its boundary"
-        );
-        drop(bounded);
-
         // Half 1: delete the LAST page's cell. The chain now references an
         // unreadable page, and BOTH load modes must refuse — truncating here
         // would hide the hole.
@@ -1666,125 +1547,7 @@ mod tests {
         let outcome = RangedTree::recover(&client, &tree_id).await;
         assert!(
             outcome.is_err(),
-            "an unbounded tree with an unreadable page must refuse to load"
-        );
-        let outcome = RangedTree::recover_bounded(&client, &tree_id, Some(&upper)).await;
-        assert!(
-            outcome.is_err(),
-            "a bounded tree with an unreadable page inside its range must refuse to load"
-        );
-
-        server.shutdown().await;
-    }
-
-    /// The split-rollback mechanics: a chain severed by an uncommitted
-    /// split (durable seam cut, orphaned target head) loads short; after
-    /// `relink_page_next` rejoins the severed tail, a fresh load serves
-    /// every key again. This is what `reconcile_split_marker` performs when
-    /// the placement flip never happened.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn severed_chain_relinks_and_recovers_fully() {
-        use crate::client;
-        use crate::index::ranged::tree::btree::{page_schema, storage, NEXT_PAGE_KEY_HASH};
-        use crate::server::{NebServer, ServerOptions, Service};
-
-        let _ = env_logger::try_init();
-
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
-        let server_group = "ranged_tree_split_relink";
-        let server = NebServer::new_from_opts(
-            &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
-                db_size: 64 * 1024 * 1024,
-                tiered_config: None,
-                backup_storage: None,
-                wal_storage: None,
-                raft_storage: None,
-                index_enabled: false,
-                services: vec![Service::Cell],
-                disable_storage_locks: true,
-                enable_recovery: false,
-            },
-            &server_addr,
-            &server_group,
-            async |_| {},
-        )
-        .await
-        .unwrap();
-        let client = Arc::new(
-            client::AsyncClient::new(
-                &server.rpc,
-                &server.membership,
-                &vec![server_addr],
-                server_group,
-            )
-            .await
-            .unwrap(),
-        );
-        client
-            .new_schema_with_id(page_schema())
-            .await
-            .unwrap()
-            .unwrap();
-        client
-            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        storage::start_external_nodes_write_back(&client);
-
-        let tree_id = Id::from_parts(904, 904);
-        let schema_id = 1;
-        let field = 780;
-        let tree = RangedTree::create(&client, &tree_id).await;
-        let n = 300u64;
-        for value in 0..n {
-            assert!(tree.insert(&make_field_key(
-                SchemaUid(schema_id),
-                field,
-                value,
-                Id::from_parts(8, value)
-            )));
-        }
-        storage::wait_until_updated().await;
-        drop(tree);
-
-        let head_id = client.read_cell(tree_id).await.unwrap().unwrap().data
-            [*RANGED_TREE_HEAD_HASH]
-            .id()
-            .copied()
-            .unwrap();
-        let chain = walk_chain_page_ids(&client, head_id).await;
-        assert!(chain.len() >= 3);
-        let severed_at = chain[chain.len() - 2];
-        let orphan_head = *chain.last().unwrap();
-
-        // Durable seam cut with no committed placement: the tail dangles.
-        relink_page_next(&client, severed_at, Id::unit_id())
-            .await
-            .expect("severing must be expressible as a relink to unit");
-
-        let short = RangedTree::recover(&client, &tree_id)
-            .await
-            .expect("a cleanly severed chain still loads");
-        assert!(
-            (short.count() as u64) < n,
-            "the severed tree must load short, got {}",
-            short.count()
-        );
-        drop(short);
-
-        // Rollback: rejoin the severed tail, reload, and every key returns.
-        relink_page_next(&client, severed_at, orphan_head)
-            .await
-            .expect("the rollback relink must succeed");
-        let whole = RangedTree::recover(&client, &tree_id)
-            .await
-            .expect("the rejoined chain must load");
-        assert_eq!(
-            whole.count() as u64,
-            n,
-            "the rolled-back tree must serve every key"
+            "a tree with an unreadable page must refuse to load"
         );
 
         server.shutdown().await;
@@ -1849,7 +1612,7 @@ mod tests {
         let head_id = tree.head_id();
 
         client.remove_cell(tree_id).await.unwrap().unwrap();
-        tree.mark_migration(&tree_id, None, &client)
+        tree.publish_head(&tree_id, &client)
             .await
             .expect("mark_migration should recreate a missing tree metadata cell");
 

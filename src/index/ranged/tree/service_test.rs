@@ -689,7 +689,7 @@ mod test {
         // Update the LSM tree cell with the current head IDs (critical for recovery!)
         println!("=== Updating LSM tree cell with new head IDs ===");
         println!("Tree head ID: {:?}", tree.head_id());
-        tree.mark_migration(&lsm_tree_id, None, &client)
+        tree.publish_head(&lsm_tree_id, &client)
             .await
             .expect("Failed to mark migration in test");
         println!("LSM tree cell updated");
@@ -918,7 +918,7 @@ mod test {
         println!("Tree count after additional merges: {}", tree.count());
 
         // Update the LSM tree cell with the current head IDs (critical for recovery!)
-        tree.mark_migration(&lsm_tree_id, None, &client)
+        tree.publish_head(&lsm_tree_id, &client)
             .await
             .expect("Failed to mark migration in test");
 
@@ -1386,7 +1386,7 @@ mod test {
         target_tree.merge_keys(moved_keys.clone());
         storage::wait_until_updated().await;
         target_tree
-            .mark_migration(&target_tree_id, None, &client)
+            .publish_head(&target_tree_id, &client)
             .await
             .expect("target tree head should be published before routing");
 

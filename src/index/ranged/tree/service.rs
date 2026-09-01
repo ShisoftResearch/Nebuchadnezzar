@@ -437,9 +437,8 @@ impl Service for TreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
-            self.reconcile_split_marker(&id, &boundary).await;
             let tree =
-                match RangedTree::recover_bounded(&self.client, &id, Some(&boundary.upper)).await {
+                match RangedTree::recover(&self.client, &id).await {
                     Ok(tree) => tree,
                     Err(error) => {
                         // Leave it absent rather than installing an empty tree.
@@ -1038,80 +1037,6 @@ impl TreeService {
         }
     }
 
-    /// Reconcile a durable split marker before loading `id`. A crash after
-    /// the seam barrier but before the placement flip leaves the source's
-    /// chain cut with an orphaned target tree; a crash before the barrier
-    /// leaves the chain intact with a stale marker. Committed splits (the
-    /// placement map knows the target) just shed the marker. The decision
-    /// key: whoever owns the key at this tree's placement upper bound.
-    async fn reconcile_split_marker(&self, id: &Id, boundary: &Boundary) {
-        let Some((head, Some(target))) = super::tree::read_tree_metadata(&self.client, id).await
-        else {
-            return;
-        };
-        let committed = match self.sm_client.locate_key(&boundary.upper).await {
-            Ok(Some((_, placement, _))) => placement.id == target,
-            Ok(None) => {
-                warn!(
-                    "Cannot reconcile split marker on {:?} (target {:?}): no placement \
-                     covers the boundary yet; leaving the marker for the next load",
-                    id, target
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "Cannot reconcile split marker on {:?} (target {:?}): placement \
-                     lookup failed: {:?}; leaving the marker for the next load",
-                    id, target, e
-                );
-                return;
-            }
-        };
-        if committed {
-            info!(
-                "Tree {:?} carries a committed split marker for {:?}; clearing it",
-                id, target
-            );
-            super::tree::clear_migration_marker(&self.client, id).await;
-            return;
-        }
-        // Uncommitted: the placement never flipped, so this tree still owns
-        // the whole range and the split must be undone.
-        if let Some((target_head, _)) = super::tree::read_tree_metadata(&self.client, &target).await
-        {
-            let chain = super::tree::walk_chain_page_ids(&self.client, head).await;
-            if chain.contains(&target_head) {
-                debug!(
-                    "Uncommitted split of {:?}: chain still reaches the moved head; \
-                     no relink needed",
-                    id
-                );
-            } else if let Some(last) = chain.last() {
-                match super::tree::relink_page_next(&self.client, *last, target_head).await {
-                    Ok(()) => info!(
-                        "Uncommitted split of {:?}: rejoined severed chain at {:?} -> {:?}",
-                        id, last, target_head
-                    ),
-                    Err(e) => {
-                        error!(
-                            "Uncommitted split of {:?}: failed to rejoin chain: {}; \
-                             leaving marker so the next load retries",
-                            id, e
-                        );
-                        return;
-                    }
-                }
-            }
-            let _ = self.client.remove_cell(target).await;
-        }
-        super::tree::clear_migration_marker(&self.client, id).await;
-        info!(
-            "Rolled back uncommitted split of {:?} (orphaned target {:?})",
-            id, target
-        );
-    }
-
     async fn hydrate_missing_tree(&self, id: Id, entry: &EntryKey) -> bool {
         if self.trees.contains_key(&id) {
             return true;
@@ -1149,10 +1074,7 @@ impl TreeService {
                     upper,
                     placement.epoch
                 );
-                self.reconcile_split_marker(&id, &Boundary::new(lower.clone(), upper.clone()))
-                    .await;
-                let tree = match RangedTree::recover_bounded(&self.client, &id, Some(&upper)).await
-                {
+                let tree = match RangedTree::recover(&self.client, &id).await {
                     Ok(tree) => tree,
                     Err(error) => {
                         // Same reasoning as the load path: an unreadable tree
@@ -1264,7 +1186,7 @@ impl TreeService {
             // Now it's safe to update the LSM tree cells with the new head IDs
             for (tree_id, dist_tree) in self.trees.entries() {
                 let tree = &dist_tree.tree;
-                if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
+                if let Err(e) = tree.publish_head(&tree_id, &self.client).await {
                     warn!(
                         "Failed to mark LSM tree migration after flush for tree {:?}: {:?}",
                         tree_id, e
@@ -1517,7 +1439,7 @@ impl TreeService {
                         // Wait for all external B+tree nodes to be written to storage
                         if storage::wait_until_updated().await {
                             // Now update the cell with the new head IDs
-                            if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await
+                            if let Err(e) = tree.publish_head(&dist_tree.id, &client).await
                             {
                                 warn!("Failed to mark LSM tree migration after merge: {:?}", e);
                             }
@@ -1530,7 +1452,7 @@ impl TreeService {
                         }
                     } else if do_checkpoint && checkpoint_barrier {
                         // Periodic checkpoint: update tree root cell to reflect current state
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                        if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
                         }
                     }
@@ -1648,7 +1570,7 @@ impl TreeService {
                                 let mut dist_prop = dist_tree.prop.write();
                                 dist_prop.migration = None;
                             }
-                            let _ = tree.mark_migration(&dist_tree.id, None, &client).await;
+                            let _ = tree.publish_head(&dist_tree.id, &client).await;
                             continue;
                         };
                         debug!("Structural split moved {} keys", moved_len);
@@ -1675,7 +1597,7 @@ impl TreeService {
                         );
                         if let Err(e) = migration_tree
                             .tree
-                            .mark_migration(&migration_target_id, None, &client)
+                            .publish_head(&migration_target_id, &client)
                             .await
                         {
                             warn!(
@@ -1850,7 +1772,7 @@ impl TreeService {
                             dist_prop.epoch += 1;
                             dist_prop.migration = None;
                         }
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                        if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!(
                                 "Failed to publish split source tree {:?}: {:?}",
                                 dist_tree.id, e
