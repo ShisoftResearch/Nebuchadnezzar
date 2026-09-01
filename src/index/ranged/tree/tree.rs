@@ -461,23 +461,38 @@ impl RangedTree {
     /// past `pivot`, sharing no pages with this tree, which is not mutated
     /// at all. The caller commits by flipping placement and then calling
     /// [`Self::retain`], or aborts by draining and dropping the copy --
-    /// there is nothing to roll back. The deletion set stays shared
-    /// (disjoint ranges; a tombstone touches one tree's key), and the walk
-    /// is filtered so no tombstoned key ever exists in two trees. The
-    /// caller must hold this tree frozen for the whole copy-to-retain
-    /// window, exactly as for split_off.
+    /// there is nothing to roll back. The caller must hold this tree frozen
+    /// for the whole copy-to-retain window, exactly as for split_off.
+    ///
+    /// The copy gets its OWN deletion set. Sharing one was inherited from
+    /// the shared-leaf design, where shared PAGES made a shared set
+    /// mandatory; with disjoint pages it is not just unnecessary but wrong.
+    /// docs/tla/CopySplit.tla (`CopySplitShared.cfg`) finds the trace in
+    /// six states: after the placement flip the copy serves the moved range
+    /// and is NOT frozen, so a delete lands there and tombstones the SHARED
+    /// set -- and the source, which still physically holds that key until
+    /// retain, flushes a page, pairs the key against the shared tombstone
+    /// in `remove_contains`, and consumes it. The copy's key is visible
+    /// again. Disjoint sets make the pairing impossible: a tombstone can
+    /// only ever meet the pages of the tree that owns the key.
+    ///
+    /// Correct without seeding: the copy walk is FILTERED, so a key
+    /// tombstoned before the split is never copied -- its physical copy
+    /// dies with the source's retain and its tombstone stays behind,
+    /// inert, in the source's set.
     pub fn copy_off(
         &self,
         pivot: &EntryKey,
         client: &Arc<AsyncClient>,
     ) -> Option<(RangedTree, usize)> {
         let so = super::btree::split_off::copy_off(&self.tree, pivot)?;
+        let deletion = Arc::new(DeletionSet::with_capacity(0));
         let mut new_tree = DiskTree::from_root(
             so.new_root,
             so.new_head_id,
             so.moved_len,
             so.new_height,
-            &self.tree.deletion,
+            &deletion,
         );
         new_tree.set_writeback_client(client);
         Some((RangedTree { tree: new_tree }, so.moved_len))

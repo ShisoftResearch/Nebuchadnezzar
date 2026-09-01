@@ -104,3 +104,34 @@ lower-bound search on the node that answers.
 | `BLinkSeekBuggyTorn.cfg` | old, torn peeks | **`SeekGE` violated** (also without the racing insert). |
 | `BLinkSeekFixed.cfg` | new, torn peeks | **No error.** Exhaustive: 3,463 distinct states, depth 10, with torn peeks, concurrent inserts and splits all enabled. |
 | `BLinkSeekReach.cfg` | new | `OffPageUnreachable` violated **on purpose** — its counterexample walks the off-page path. If this one ever passes, the model has gone vacuous and the clean run above means nothing. |
+
+## `CopySplit.tla` — the copy-based split lifecycle, with the flusher
+
+Models the split of `docs/ranged-index-robustness-plan.md` proposal 1
+(implemented in `a16fd84d`): build a copy of the live keys at or past
+the pivot on fresh pages, publish, flip placement, then retain on the
+source; abort before the flip drains and drops the copy. The write-back
+flusher is a MODELED PROCESS, not an assumption, because every
+resurrection of the 2026-08-31 soak campaign was `remove_contains`
+pairing a page's key against a deletion set while that key existed in
+two places.
+
+Freeze fidelity is what makes it interesting: the source is frozen for
+the whole window, but the copy starts serving at the placement flip and
+is NOT frozen, so deletes of moved keys land during the commit->retain
+window while the source still physically holds those keys.
+
+| config | toggles | result |
+|---|---|---|
+| `CopySplitFixed.cfg` | disjoint sets, filtered copy, detach on abort | **No error.** Exhaustive: 630 distinct states. |
+| `CopySplitShared.cfg` | copy SHARES the source's deletion set | **`NoResurrection` violated in six states** — and it caught a live bug in the first implementation. Commit; a delete of a moved key routes to the (unfrozen) copy and tombstones the shared set; the source flushes a page it has not yet retained, pairs the key against that tombstone, consumes it, and the copy's key is visible again. Fixed by giving the copy its own set. |
+| `CopySplitUnfiltered.cfg` | copy walk does not skip tombstoned keys | **`NoResurrection` violated.** A key tombstoned before the split exists twice with one tombstone; whichever page flushes first frees the other copy. |
+| `CopySplitNoDetach.cfg` | aborted copy's pages still accept flushes | **`NoResurrection` violated** — the abandoned pages consume live tombstones (the campaign's `1d8440b8`/`94959498` shape). |
+| `CopySplitReach.cfg` | fixed | `LivenessSanity` violated **on purpose**: its counterexample is a delete landing on the copy inside the commit->retain window. If this passes, the model is vacuous. |
+
+The lesson generalizes past this split: **shared mutable state between
+two trees is only safe while their PAGES are shared.** The shared
+deletion set was correct for the shared-leaf design and became a defect
+the moment ownership was made disjoint — an invariant that changed
+meaning under a refactor, which is exactly the class of thing a model
+catches and a test suite does not.
