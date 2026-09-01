@@ -197,6 +197,31 @@ shedding index persistence" state instead of converting overload into
 memory growth. Orthogonal to proposals 1-3; belongs with the
 crash-safety work.
 
+## Correction to finding #9 (measured 2026-09-01)
+
+Finding #9 called the write-back backlog "unbounded under permanent
+overload" and treated the split retry cadence as cosmetic ("each attempt
+costs ~0.5ms"). That was CPU-per-attempt reasoning, and it was wrong
+about what an attempt costs: every retried split copies keys into FRESH
+pages, which the write-back hub must then persist -- in a store that is
+already refusing allocations. The retry storm was feeding the backlog it
+was waiting on.
+
+Two 3-hour soaks of the same workload, same machine, at hour 2 --
+before and after the exponential per-tree backoff (`7c4da835`):
+
+| | aborts | allocation failures | RSS |
+|---|---|---|---|
+| flat 2s retry | 23,604 | 62,435 | 10.0 GB |
+| exponential backoff | 421 | 24,716 | 2.6 GB |
+
+56x fewer split attempts, 2.5x fewer allocation failures, and 3.9x less
+memory, with identical insert/delete/audit counts. The backlog is still
+unbounded in principle -- a store that cannot persist will still
+accumulate -- but most of what looked like an unbounded leak was
+self-inflicted retry churn. Real back-pressure is still worth building;
+it is no longer urgent.
+
 ## Finding #10 (crash-churn, 2026-09-01)
 
 The fuzzer now probes both layers below the deleted prefix after every
