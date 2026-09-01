@@ -696,7 +696,12 @@ fn ranged_tree_schema() -> Schema {
         Field::new_schema(vec![
             Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
             Field::new_unindexed_nullable(RANGED_TREE_MIGRATION_NAME, Type::Id),
-            Field::new_unindexed_array(RANGED_TREE_TOMBSTONES_NAME, Type::SmallBytes),
+            // NULLABLE: every ranged-tree cell written before this field
+            // existed carries no value for it, and a non-nullable array
+            // rejects exactly those cells -- caught by
+            // ram::tests::chunk::ranged_tree_metadata_updates_do_not_refresh_chunk_statistics,
+            // which builds the metadata cell by hand the way older code did.
+            Field::new_unindexed_array_nullable(RANGED_TREE_TOMBSTONES_NAME, Type::SmallBytes),
         ]),
         false,
         false,
