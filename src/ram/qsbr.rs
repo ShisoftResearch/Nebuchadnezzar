@@ -97,6 +97,48 @@ impl SegmentQsbr {
     /// Must be called *after* the segment is removed from `Chunk::segs`, so
     /// that any thread whose entry epoch is at least this stamp provably could
     /// not have found it.
+    /// Run `f` with this thread's section suspended, then restore it.
+    ///
+    /// **A thread cannot reclaim past its own section.** `is_quiesced` asks
+    /// whether every thread has left the sections it was in when a segment
+    /// was retired; a thread that is *inside* one is, by that definition, a
+    /// reader the retirement must wait for -- including when the thing it
+    /// is doing inside the section is the collection itself. Measured on a
+    /// 13.6M-edge import: six writers, each holding a `CellGuard` (which
+    /// carries a section) while running the emergency collection from the
+    /// allocator, reported `blocking_threads=6 references=0` on 61 retired
+    /// segments, 171 full passes freed nothing, and the import fell from
+    /// 423k to 11k edges/s.
+    ///
+    /// Suspending is sound only when the caller holds no bare pointer into a
+    /// segment that the collection could free. The allocator's emergency
+    /// path meets that: it runs after the guard has pinned its own segment
+    /// by reference (`CellGuard::segment`), and a pinned segment is never
+    /// freed (`no_references` gates it). The section's job -- covering the
+    /// lookup-to-pin window -- is already done by then.
+    ///
+    /// Nesting is restored exactly, so a suspended outer section resumes as
+    /// the outer section.
+    pub fn suspended<R>(&self, f: impl FnOnce() -> R) -> R {
+        let state = self.state();
+        let depth = state.depth.get();
+        if depth == 0 {
+            return f();
+        }
+        state.entry_epoch.store(0, Ordering::Release);
+        state.depth.set(0);
+        let out = f();
+        // Re-enter at the CURRENT epoch, not the one we left at: anything
+        // retired while we were out was retired against a quiescent thread
+        // and owes us nothing, and claiming the older epoch would make us
+        // block it for no reason.
+        state
+            .entry_epoch
+            .store(self.epoch.load(Ordering::Acquire), Ordering::Release);
+        state.depth.set(depth);
+        out
+    }
+
     pub fn retire_stamp(&self) -> usize {
         self.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -182,6 +224,25 @@ mod tests {
             "a section entered after the unpublish cannot have found the segment"
         );
         qsbr.exit();
+    }
+
+    #[test]
+    fn a_suspended_section_is_quiescent_and_comes_back_at_its_depth() {
+        let qsbr = SegmentQsbr::new();
+        qsbr.enter();
+        qsbr.enter(); // depth 2
+        let stamp = qsbr.retire_stamp();
+        assert!(!qsbr.is_quiesced(stamp), "inside a section we block a retirement");
+        assert_eq!(qsbr.blocking_threads(stamp), 1);
+        let seen = qsbr.suspended(|| qsbr.is_quiesced(stamp));
+        assert!(seen, "while suspended the thread must not block its own collection");
+        // back at depth 2: two exits are needed before we are quiescent
+        let later = qsbr.retire_stamp();
+        assert!(!qsbr.is_quiesced(later));
+        qsbr.exit();
+        assert!(!qsbr.is_quiesced(later), "one exit from depth 2 is not the outermost");
+        qsbr.exit();
+        assert!(qsbr.is_quiesced(later));
     }
 
     #[test]

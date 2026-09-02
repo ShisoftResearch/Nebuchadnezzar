@@ -2027,7 +2027,12 @@ impl Chunk {
                     headroom,
                     if full_gc { "full" } else { "best effort" }
                 );
-                let _ = Cleaner::clean(self, true, full_gc);
+                // The writer that got here holds a `CellGuard`, and with it a
+                // QSBR section; run the collection outside that section or it
+                // counts this very thread as the reader it is waiting for and
+                // frees nothing. See `SegmentQsbr::suspended`.
+                let _ = crate::ram::qsbr::segment_qsbr()
+                    .suspended(|| Cleaner::clean(self, true, full_gc));
                 tried_gc = true;
                 continue;
             }
@@ -2052,7 +2057,12 @@ impl Chunk {
                     self.id,
                     if full_gc { "full" } else { "best effort" }
                 );
-                let _ = Cleaner::clean(self, true, full_gc);
+                // The writer that got here holds a `CellGuard`, and with it a
+                // QSBR section; run the collection outside that section or it
+                // counts this very thread as the reader it is waiting for and
+                // frees nothing. See `SegmentQsbr::suspended`.
+                let _ = crate::ram::qsbr::segment_qsbr()
+                    .suspended(|| Cleaner::clean(self, true, full_gc));
                 tried_gc = true;
                 continue;
             }
@@ -5901,6 +5911,29 @@ mod tests {
     /// A *reference* held in database A must not block database B: references
     /// are per-segment, and B's segment has none. Only an in-flight read
     /// section is global, and only for as long as the read runs.
+    #[test]
+    fn a_writer_inside_its_own_qsbr_section_still_reclaims_during_emergency() {
+        // The shape of the 13.6M-edge stall: the thread asking for the
+        // collection is itself inside a section, so the collection sees a
+        // reader that never leaves. Suspending the section for the duration
+        // of the collection is what lets it reclaim.
+        let _ = env_logger::try_init();
+        let (chunks, _schema) = setup_test_chunks();
+        let chunk = &chunks.list[0];
+        let seg_id = chunk.get_head_seg_id();
+        let _section = crate::ram::qsbr::QsbrSection::new();
+        chunk.remove_segment(seg_id);
+        assert_eq!(chunk.retired_segment_count(), 1);
+        assert_eq!(
+            chunk.drain_retired_segments(),
+            0,
+            "inside our own section the retirement must still be blocked -- by us"
+        );
+        let freed = crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        assert_eq!(freed, 1, "suspended, the same thread's collection reclaims");
+        assert_eq!(chunk.retired_segment_count(), 0);
+    }
+
     #[test]
     fn a_reference_in_one_database_does_not_block_another_from_reclaiming() {
         let _ = env_logger::try_init();
