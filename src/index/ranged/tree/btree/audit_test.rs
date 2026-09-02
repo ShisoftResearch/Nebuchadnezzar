@@ -265,7 +265,7 @@ fn copy_split_partitions_exactly() {
             }
             let pivot = key_of(pivot_n * 2); // may be a real key or a gap
             let orig_len = tree.len();
-            let res = copy_off(&tree, &pivot);
+            let res = copy_off(&tree, &pivot, &Id::rand());
             super::split::retain(&tree, &pivot);
 
             // Collect the source's remaining keys.
@@ -368,7 +368,7 @@ fn copy_split_randomized() {
         // Pivot: a value in [0, 2001), often between keys.
         let pivot_v = rng.random_range(0..2001u64);
         let pivot = key_of(pivot_v);
-        let res = copy_off(&tree, &pivot);
+        let res = copy_off(&tree, &pivot, &Id::rand());
         super::split::retain(&tree, &pivot);
 
         let mut src: Vec<u64> = vec![];
@@ -460,7 +460,7 @@ fn copy_split_is_balanced_at_any_pivot() {
         for k in &keys {
             tree.insert(&key_of(*k));
         }
-        let Some(so) = copy_off(&tree, &key_of(pivot_v)) else {
+        let Some(so) = copy_off(&tree, &key_of(pivot_v), &Id::rand()) else {
             continue;
         };
         checked += 1;

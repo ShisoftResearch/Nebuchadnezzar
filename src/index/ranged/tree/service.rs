@@ -1545,7 +1545,7 @@ impl TreeService {
                             "Structurally splitting {:?} at {:?} into {:?}",
                             dist_tree.id, pivot_key, migration_target_id
                         );
-                        let Some((moved_tree, moved_len)) = tree.copy_off(&pivot_key, &client)
+                        let Some((moved_tree, moved_len)) = tree.copy_off(&pivot_key, &client, &migration_target_id)
                         else {
                             // Nothing moved (pivot past every key); undo the
                             // marker and try again later.

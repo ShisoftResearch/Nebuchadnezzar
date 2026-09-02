@@ -212,7 +212,7 @@ fn bench_split_methods() {
         tree.insert(&key_of(i));
     }
     let start = Instant::now();
-    let r = copy_off(&tree, &mid);
+    let r = copy_off(&tree, &mid, &Id::rand());
     let e_copy = start.elapsed();
     let moved = r.map(|s| s.moved_len).unwrap_or(0);
     let start = Instant::now();

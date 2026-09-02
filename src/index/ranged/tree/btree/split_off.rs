@@ -40,13 +40,27 @@ pub struct SplitOff {
 ///
 /// Costs ~4ms per 500K keys moved (measured, release) against 0.35ms for
 /// the spine cut -- both under a tree that is frozen anyway.
-pub fn copy_off<KS, PS>(tree: &BPlusTree<KS, PS>, pivot: &EntryKey) -> Option<SplitOff>
+/// `home` is the id of the tree the copy will BECOME -- the caller's
+/// migration target id -- and every page of the copy is minted in its slot.
+///
+/// **Anchoring on the source's head was the index-tree chunk cap.** A tree
+/// is a closure within one slot (placement moves a slot at a time), and a
+/// slot is one chunk, so one tree cannot exceed 512 MB. Splitting is what
+/// should spread a large index over chunks -- but a copy minted near the
+/// SOURCE's head is born in the source's slot, so the split divides the tree
+/// and not the chunk, and adds the copy's garbage to that same chunk on the
+/// way. Measured on BANC (13.6M-edge index): five splits, still exactly one
+/// hot chunk, and a worse import than with no splits at all. It was also a
+/// routing inconsistency waiting for a cluster: `locate_tree_server` keys on
+/// the TREE id's slot, which the caller draws fresh, while the pages sat in
+/// the source's.
+pub fn copy_off<KS, PS>(tree: &BPlusTree<KS, PS>, pivot: &EntryKey, home: &Id) -> Option<SplitOff>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let cap = KS::slice_len();
-    let anchor = tree.head_id();
+    let anchor = *home;
     let mut all: Vec<EntryKey> = Vec::new();
     {
         let mut cursor = tree.seek(pivot, Ordering::Forward);

@@ -762,6 +762,26 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
 /// which the verifier requires to be Nil for a level's first node. The
 /// bypass is not wrong, so the fix should not move it.
 #[test]
+fn a_split_off_copy_is_born_in_its_own_slot_not_the_sources() {
+    // The index-tree chunk cap: a copy minted near the SOURCE head lives in
+    // the source's slot, so a split divides the tree and not the chunk.
+    let _ = env_logger::try_init();
+    let total = PAGE_SIZE as u64 * 4;
+    let tree = LevelBPlusTree::new(&deletion_set());
+    for i in (1..=total).map(|i| i * 2) {
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+    }
+    let source_slot = tree.head_id().locality();
+    // a home whose slot differs from the source's, so the assertion can fail
+    let home = Id::from_parts(u64::from(source_slot) + 1, 7);
+    assert_ne!(home.locality(), source_slot);
+    let pivot = EntryKey::from_id(&Id::from_parts(1, total));
+    let so = super::split_off::copy_off(&tree, &pivot, &home).expect("keys past the pivot");
+    assert_eq!(so.new_head_id.locality(), home.locality(), "first page in the home slot");
+    assert_ne!(so.new_head_id.locality(), source_slot, "and not in the source's");
+}
+
+#[test]
 fn copy_split_at_any_pivot_leaves_the_source_writable() {
     let _ = env_logger::try_init();
     let total = PAGE_SIZE as u64 * 4;
@@ -771,7 +791,7 @@ fn copy_split_at_any_pivot_leaves_the_source_writable() {
             tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
         }
         let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
-        let moved = super::split_off::copy_off(&tree, &pivot);
+        let moved = super::split_off::copy_off(&tree, &pivot, &Id::rand());
         super::split::retain(&tree, &pivot);
 
         // Whatever moved, the source keeps only keys below the pivot...

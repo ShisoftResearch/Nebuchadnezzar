@@ -517,8 +517,9 @@ impl RangedTree {
         &self,
         pivot: &EntryKey,
         client: &Arc<AsyncClient>,
+        home: &Id,
     ) -> Option<(RangedTree, usize)> {
-        let so = super::btree::split_off::copy_off(&self.tree, pivot)?;
+        let so = super::btree::split_off::copy_off(&self.tree, pivot, home)?;
         let deletion = Arc::new(DeletionSet::with_capacity(0));
         let mut new_tree = DiskTree::from_root(
             so.new_root,
