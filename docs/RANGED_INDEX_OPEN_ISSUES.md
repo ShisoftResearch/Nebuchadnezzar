@@ -455,3 +455,14 @@ unloaded or migrated away -- now retries the way `Migrating` does.
 **Still open.** Finding #10's hard tombstone check in the crash fuzzer
 (`server/transactions/corruption_tests.rs` has no tombstone check to
 extend; it is a new assertion, not a repair). The cargo-target wipe.
+
+**The 30-minute soak is a bench-box test, not a workstation one.** Its server
+is sized `chunk_size = db_size = 256 GB` ("sized for large machines"), and on
+a 121 GB workstation it grows at ~90 MB/s with no cap of its own: at 337 s it
+held 29 GB and would have exhausted RAM at ~18 min, thrashing the machine
+the way the Morpheus `run_capped.sh` note records. It was stopped at 337 s
+with 61 of 64 workers running and memory climbing -- working, not stuck. The
+placement guard now sits in that driver; the first full run of it belongs
+on the bench box. What was soaked here: the 6-second pressure driver (same
+guard), the two real-split tests under concurrent writes and seeks, and the
+full BANC import at default depth.
