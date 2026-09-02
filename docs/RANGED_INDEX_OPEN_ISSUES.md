@@ -413,3 +413,45 @@ recovery, marker reconciliation, the durable marker -- is deleted:
   apparent leak was retry churn, fixed).
 - A sound hard tombstone check in the crash fuzzer (finding #10).
 - The cargo-target wipe is still unexplained.
+
+---
+
+## 2026-09-02 — the acceptance run this ledger was waiting for, and what it found
+
+The "Still open" list above kept one item that the CLOSED banner did not
+wait for: **the depth-3 full BANC import acceptance run.** It has now been
+done, and it found a defect the three 3-hour soaks could not see.
+
+**Run.** Default depth (no `NEB_TREE_DEPTH`), 72 GB, 13,620,865 edges,
+index ON. Before the fix below: 43,191 edges lost, 2,394 refusals, five
+splits, **one** hot chunk. After: 13,620,865/0, zero refusals, zero
+emergency collections, four splits, **zero** hot chunks, `chain restarts` 0,
+`gave up` 0; then a second edge table (562,378 gap junctions, 0 errors) and
+`rebuild-sidecar` succeed on the same store. `NEB_TREE_DEPTH=4` is retired
+from the recipe.
+
+**The defect (Nebuchadnezzar `753b0e59`).** `split_off::copy_off` minted
+every page of a split-off copy `new_page_id_near(&tree.head_id())` -- the
+SOURCE's head -- so the copy was born in the source's slot. A tree is a
+closure within one slot and a slot is one chunk, so a split divided the tree
+and not the chunk, and the copy's garbage joined it. That is a one-chunk
+ceiling of 512 MB on any single index whatever `db_size` says, and a latent
+cluster inconsistency (`locate_tree_server` routes by the target id's slot,
+drawn fresh by the caller). `copy_off` now takes the tree the copy will
+become and mints it there.
+
+**Why the soaks missed it, and the fix to the soaks.** Every soak asserts
+what a scan returns; none asserted where the trees are. A copy in the wrong
+slot is functionally perfect. `assert_trees_spread_across_slots` now runs at
+the end of both soak drivers (`run_insert_pressure_test`, which every
+6-second run uses, and `run_timed_insert_soak_test`): with more than one
+tree, their heads must not all share a slot. Under the old code this fails
+at the first split.
+
+**Also closed.** The cursor refill's `OutOfBound | NotFound => unreachable!()`
+(`client/cursor.rs`) -- reachable when a placement names a tree just
+unloaded or migrated away -- now retries the way `Migrating` does.
+
+**Still open.** Finding #10's hard tombstone check in the crash fuzzer
+(`server/transactions/corruption_tests.rs` has no tombstone check to
+extend; it is a new assertion, not a repair). The cargo-target wipe.

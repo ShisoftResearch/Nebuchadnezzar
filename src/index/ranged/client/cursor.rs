@@ -493,7 +493,32 @@ impl ClientCursor {
                         ))
                         .await;
                     }
-                    OpResult::OutOfBound | OpResult::NotFound => unreachable!(),
+                    // NOT unreachable. A placement can name a tree this server has
+                    // just unloaded or migrated away, and the refill then comes back
+                    // NotFound (or OutOfBound once the boundary moved). The ledger
+                    // flagged this panic as a race waiting to happen; treat it the
+                    // way a migration is treated -- drop the cached placement, wait,
+                    // refresh, retry -- and let the bound on retries decide.
+                    OpResult::OutOfBound | OpResult::NotFound => {
+                        last_retry_reason = Some(
+                            "tree not found or out of bound during cursor refill (unloaded or migrated)"
+                                .to_string(),
+                        );
+                        self.query_client.placement.write().remove(&tree_key);
+                        if (retried + 1) % MIGRATION_REFRESH_INTERVAL == 0 {
+                            let _ = self.query_client.refresh_key_mapping(current_key).await;
+                        }
+                        debug!(
+                            "Ranged cursor retry {} for key {:?}: {}",
+                            retried + 1,
+                            current_key,
+                            last_retry_reason.as_deref().unwrap_or("unknown")
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            migration_retry_delay_ms(retried, current_key),
+                        ))
+                        .await;
+                    }
                     OpResult::EpochMissMatch(expect, actual) => {
                         last_retry_reason = Some(format!(
                             "tree epoch mismatch during cursor refill (expected {expect}, actual {actual})"

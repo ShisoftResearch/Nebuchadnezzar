@@ -142,6 +142,37 @@ mod tests {
             rt_cursor.next().await.unwrap().is_none(),
             "Expected scan to finish exactly at end of list"
         );
+        // placement, not just contents: see assert_trees_spread_across_slots
+        assert_trees_spread_across_slots(&index_client.tree_stats().await.unwrap());
+    }
+
+    /// The check three 3-hour soaks lacked, and the bug that got through them.
+    ///
+    /// Every soak here asserts what a scan returns. None asserted WHERE the
+    /// trees ended up -- and a split-off copy minted in its source's slot is
+    /// functionally perfect and physically concentrated: the tree divides,
+    /// the chunk does not. On a single server with a roomy `db_size` that is
+    /// invisible to correctness checks, and on BANC it capped every index at
+    /// one 512 MB chunk. So: once there is more than one tree, their heads
+    /// must not all share a slot. Target ids are drawn at random, so with the
+    /// fix this holds with probability ~1; without it, every split-off tree
+    /// inherits the source's slot and this fails at the first split.
+    fn assert_trees_spread_across_slots(stats: &[crate::index::ranged::tree::service::TreeStat]) {
+        let heads: Vec<u16> = stats
+            .iter()
+            .flat_map(|t| t.trees.iter().map(|b| b.head.locality()))
+            .collect();
+        if heads.len() < 2 {
+            return;
+        }
+        let distinct: std::collections::HashSet<u16> = heads.iter().copied().collect();
+        assert!(
+            distinct.len() >= 2,
+            "{} trees after the soak and every head in slot {}: split-off trees are being \
+             born in their source's slot, which is the one-chunk index cap",
+            heads.len(),
+            heads[0]
+        );
     }
 
     async fn run_timed_insert_soak_test(
@@ -275,10 +306,9 @@ mod tests {
             );
         }
 
-        assert!(
-            !index_client.tree_stats().await.unwrap().is_empty(),
-            "expected ranged tree stats after soak test"
-        );
+        let stats = index_client.tree_stats().await.unwrap();
+        assert!(!stats.is_empty(), "expected ranged tree stats after soak test");
+        assert_trees_spread_across_slots(&stats);
     }
 
     #[tokio::test(flavor = "multi_thread")]
