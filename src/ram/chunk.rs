@@ -1757,6 +1757,18 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
+        // **A writer must not wait inside its own QSBR section.** The caller
+        // holds a `CellGuard`, and with it a section, for the whole write;
+        // this function is where a write waits -- for a head to come free,
+        // for a GC pass to finish, and for the emergency collection it runs
+        // itself -- and a thread inside a section is, to `is_quiesced`, a
+        // reader every retirement must wait for. Twelve writers waiting here
+        // were `blocking_threads=12` on segments nobody referenced, and the
+        // collections they were waiting on freed nothing. Sound to suspend:
+        // the guard has already pinned its own segment by reference, and a
+        // pinned segment is never freed; the section's lookup-to-pin job is
+        // done before allocation starts.
+        let _outside_section = crate::ram::qsbr::segment_qsbr().suspend();
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
         }
@@ -2027,12 +2039,7 @@ impl Chunk {
                     headroom,
                     if full_gc { "full" } else { "best effort" }
                 );
-                // The writer that got here holds a `CellGuard`, and with it a
-                // QSBR section; run the collection outside that section or it
-                // counts this very thread as the reader it is waiting for and
-                // frees nothing. See `SegmentQsbr::suspended`.
-                let _ = crate::ram::qsbr::segment_qsbr()
-                    .suspended(|| Cleaner::clean(self, true, full_gc));
+                let _ = Cleaner::clean(self, true, full_gc);
                 tried_gc = true;
                 continue;
             }
@@ -2057,12 +2064,7 @@ impl Chunk {
                     self.id,
                     if full_gc { "full" } else { "best effort" }
                 );
-                // The writer that got here holds a `CellGuard`, and with it a
-                // QSBR section; run the collection outside that section or it
-                // counts this very thread as the reader it is waiting for and
-                // frees nothing. See `SegmentQsbr::suspended`.
-                let _ = crate::ram::qsbr::segment_qsbr()
-                    .suspended(|| Cleaner::clean(self, true, full_gc));
+                let _ = Cleaner::clean(self, true, full_gc);
                 tried_gc = true;
                 continue;
             }

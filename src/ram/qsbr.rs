@@ -120,23 +120,24 @@ impl SegmentQsbr {
     /// Nesting is restored exactly, so a suspended outer section resumes as
     /// the outer section.
     pub fn suspended<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _out = self.suspend();
+        f()
+    }
+
+    /// Suspend this thread's section until the returned guard drops.
+    ///
+    /// The guard form exists for a function like the writer's allocation
+    /// loop, which waits in several places (a head-queue spin, the GC lock,
+    /// the collection itself) and returns from the middle of them; one guard
+    /// at entry covers every wait, where a closure would have to wrap each.
+    pub fn suspend(&self) -> SuspendedSection<'_> {
         let state = self.state();
         let depth = state.depth.get();
-        if depth == 0 {
-            return f();
+        if depth != 0 {
+            state.entry_epoch.store(0, Ordering::Release);
+            state.depth.set(0);
         }
-        state.entry_epoch.store(0, Ordering::Release);
-        state.depth.set(0);
-        let out = f();
-        // Re-enter at the CURRENT epoch, not the one we left at: anything
-        // retired while we were out was retired against a quiescent thread
-        // and owes us nothing, and claiming the older epoch would make us
-        // block it for no reason.
-        state
-            .entry_epoch
-            .store(self.epoch.load(Ordering::Acquire), Ordering::Release);
-        state.depth.set(depth);
-        out
+        SuspendedSection { qsbr: self, depth }
     }
 
     pub fn retire_stamp(&self) -> usize {
@@ -179,6 +180,29 @@ impl QsbrSection {
     pub fn new() -> Self {
         segment_qsbr().enter();
         Self
+    }
+}
+
+/// A suspended section; dropping it resumes the section at its depth.
+pub struct SuspendedSection<'a> {
+    qsbr: &'a SegmentQsbr,
+    depth: usize,
+}
+
+impl Drop for SuspendedSection<'_> {
+    fn drop(&mut self) {
+        if self.depth == 0 {
+            return;
+        }
+        let state = self.qsbr.state();
+        // Re-enter at the CURRENT epoch, not the one we left at: anything
+        // retired while we were out was retired against a quiescent thread
+        // and owes us nothing, and claiming the older epoch would make us
+        // block it for no reason.
+        state
+            .entry_epoch
+            .store(self.qsbr.epoch.load(Ordering::Acquire), Ordering::Release);
+        state.depth.set(self.depth);
     }
 }
 
@@ -241,6 +265,25 @@ mod tests {
         assert!(!qsbr.is_quiesced(later));
         qsbr.exit();
         assert!(!qsbr.is_quiesced(later), "one exit from depth 2 is not the outermost");
+        qsbr.exit();
+        assert!(qsbr.is_quiesced(later));
+    }
+
+    #[test]
+    fn a_suspend_guard_resumes_on_every_exit_path() {
+        let qsbr = SegmentQsbr::new();
+        qsbr.enter();
+        let stamp = qsbr.retire_stamp();
+        let early = || -> bool {
+            let _g = qsbr.suspend();
+            if qsbr.is_quiesced(stamp) {
+                return true; // early return: the guard must still resume us
+            }
+            false
+        };
+        assert!(early());
+        let later = qsbr.retire_stamp();
+        assert!(!qsbr.is_quiesced(later), "resumed at depth 1 after the early return");
         qsbr.exit();
         assert!(qsbr.is_quiesced(later));
     }
