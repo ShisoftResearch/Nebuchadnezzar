@@ -25,6 +25,17 @@ pub struct DataCursor {
     pub(super) pos: usize,
 }
 
+/// One page of a resumable schema scan; see
+/// `IndexedDataClient::query_ids_resumable`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Matching ids in ascending id order.
+    pub ids: Vec<Id>,
+    /// Pass as `start_after` to continue; `None` when the scan reached the
+    /// end of the schema.
+    pub next_cursor: Option<Id>,
+}
+
 pub struct IdCursor {
     pub(super) buffer: Vec<Id>,
     pub(super) pos: usize,

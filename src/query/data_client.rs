@@ -32,7 +32,7 @@ use aggregate::{
     collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
     AggregateGroupState,
 };
-pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor};
+pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor, ScanPage};
 use ids::sort_ids_by_query_order;
 pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
 
@@ -464,6 +464,36 @@ impl IndexedDataClient {
             schema, selection, ordering, None, None, None, None, hit_table,
         )
         .await
+    }
+
+    /// A resumable page of the ids matching `selection`, in ascending id
+    /// order, resuming strictly after `start_after`.
+    ///
+    /// Only a plain filtered schema scan can resume at a position: that is a
+    /// non-empty `selection` the ranged indexes cannot serve, whose scan order
+    /// is the id order. Any other query (an index-served predicate, whose
+    /// order is the index's) returns `Ok(None)` and must be paged with
+    /// `limit`/`offset` instead. See `stream_schema_scan_page` for the cursor
+    /// semantics. `limit` must be non-zero for the page to make progress.
+    pub async fn query_ids_resumable(
+        &self,
+        schema: SchemaUid,
+        selection: Expr,
+        limit: usize,
+        start_after: Option<Id>,
+    ) -> Result<Option<ScanPage>, RPCError> {
+        if selection.is_empty() {
+            return Ok(None);
+        }
+        let plan = self
+            .indexed_predicate_plan(schema, &selection, None, Some(limit))
+            .await;
+        if plan.is_some() {
+            return Ok(None);
+        }
+        self.stream_schema_scan_page(schema, &selection, limit, start_after)
+            .await
+            .map(Some)
     }
 
     pub async fn query_ids_with_options<'a>(

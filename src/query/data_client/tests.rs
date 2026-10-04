@@ -6132,3 +6132,215 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
         num
     );
 }
+
+mod resumable_scan {
+    use super::*;
+    use crate::query::data_client::ScanPage;
+
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+
+    fn every_third() -> Expr {
+        parse_to_serde_expr(&format!("(= {} 0u32)", DATA_2)).unwrap()[0].clone()
+    }
+
+    async fn fixture(
+        schema_id: u32,
+        rows: u64,
+    ) -> (Arc<NebServer>, Arc<crate::client::AsyncClient>) {
+        let _ = env_logger::try_init();
+        let server = create_test_server(schema_id as u16).await;
+        let server_addr = server.rpc.address.clone();
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema = Schema::new_with_id(
+            schema_id,
+            &format!("resumable_scan_{schema_id}"),
+            None,
+            fields,
+            false,
+            true,
+        );
+        let client = Arc::new(server.data_client(&vec![server_addr]).await.unwrap());
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+        let mut writes = futures::stream::FuturesUnordered::new();
+        for i in 0..rows {
+            let client = client.clone();
+            writes.push(async move {
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value[DATA_1] = OwnedValue::U64(i);
+                value[DATA_2] = OwnedValue::U32((i % 3) as u32);
+                let cell = OwnedCell::new_with_id(
+                    SchemaVid(schema_id),
+                    &Id::from_parts(1, i),
+                    value,
+                );
+                client.write_cell(cell).await.unwrap().unwrap();
+            });
+            if writes.len() >= 256 {
+                futures::StreamExt::next(&mut writes).await;
+            }
+        }
+        while futures::StreamExt::next(&mut writes).await.is_some() {}
+        await_ranged_indices_ready().await;
+        (server, client)
+    }
+
+    async fn page(
+        server: &NebServer,
+        schema_id: u32,
+        limit: usize,
+        after: Option<Id>,
+    ) -> ScanPage {
+        server
+            .indexed_data_client()
+            .query_ids_resumable(SchemaUid(schema_id), every_third(), limit, after)
+            .await
+            .unwrap()
+            .expect("an unindexed selection is resumable")
+    }
+
+    /// Walks the scan to its end in pages of `limit`, returning every page.
+    async fn pages(server: &NebServer, schema_id: u32, limit: usize) -> Vec<ScanPage> {
+        let mut out = vec![];
+        let mut after = None;
+        loop {
+            let p = page(server, schema_id, limit, after).await;
+            let next = p.next_cursor;
+            out.push(p);
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => return out,
+            }
+            assert!(out.len() < 1_000_000, "the cursor does not advance");
+        }
+    }
+
+    fn matching(rows: u64) -> Vec<Id> {
+        (0..rows)
+            .filter(|i| i % 3 == 0)
+            .map(|i| Id::from_parts(1, i))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pages_tile_the_scan_without_gaps_or_duplicates() {
+        let rows = 300;
+        let (server, _client) = fixture(7101, rows).await;
+        let want = matching(rows);
+        assert_eq!(want.len(), 100);
+        for limit in [1usize, 7, 33, 99, 100, 101, 1000] {
+            let pages = pages(&server, 7101, limit).await;
+            let got: Vec<Id> = pages.iter().flat_map(|p| p.ids.clone()).collect();
+            assert_eq!(got, want, "pages of {limit} must tile the scan in id order");
+            assert!(
+                pages.iter().all(|p| p.ids.len() <= limit),
+                "no page may exceed its limit ({limit})"
+            );
+            assert_eq!(pages.last().unwrap().next_cursor, None);
+            // Every page but the last stopped at its limit.
+            for p in &pages[..pages.len() - 1] {
+                assert_eq!(p.ids.len(), limit);
+                assert_eq!(p.next_cursor, p.ids.last().copied());
+            }
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_positions_at_the_edges() {
+        let rows = 300;
+        let (server, client) = fixture(7102, rows).await;
+        let want = matching(rows);
+
+        // Strictly after: a cursor on a matching cell excludes it.
+        let from_first = page(&server, 7102, 1000, Some(want[0])).await;
+        assert_eq!(from_first.ids, want[1..]);
+
+        // Empty remainder: cursor on the last match.
+        let last_match = *want.last().unwrap();
+        let tail = page(&server, 7102, 10, Some(last_match)).await;
+        assert!(tail.ids.is_empty());
+        assert_eq!(tail.next_cursor, None);
+
+        // Cursor on the last cell of the schema (which does not match).
+        let last_cell = Id::from_parts(1, rows - 1);
+        let tail = page(&server, 7102, 10, Some(last_cell)).await;
+        assert!(tail.ids.is_empty());
+        assert_eq!(tail.next_cursor, None);
+
+        // A cursor past every cell, and one before every cell.
+        let past = page(&server, 7102, 10, Some(Id::from_parts(1, 1 << 30))).await;
+        assert!(past.ids.is_empty() && past.next_cursor.is_none());
+        let before = page(&server, 7102, 1000, Some(Id::from_parts(0, 0))).await;
+        assert_eq!(before.ids, want);
+
+        // Cursor for a cell that was deleted: the scan resumes at the next
+        // surviving id, neither skipping nor repeating anything.
+        let deleted = want[10];
+        client.remove_cell(deleted).await.unwrap().unwrap();
+        await_ranged_indices_ready().await;
+        let after_deleted = page(&server, 7102, 1000, Some(deleted)).await;
+        assert_eq!(after_deleted.ids, want[11..]);
+        // A cursor between two live cells that never existed behaves alike.
+        let gap = Id::from_parts(1, 31);
+        let after_gap = page(&server, 7102, 1000, Some(gap)).await;
+        assert_eq!(after_gap.ids, want[11..]);
+
+        // A zero limit consumes nothing and keeps the position.
+        let none = page(&server, 7102, 0, Some(want[3])).await;
+        assert!(none.ids.is_empty());
+        assert_eq!(none.next_cursor, Some(want[3]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_plain_filtered_scan_is_resumable() {
+        let (server, _client) = fixture(7103, 20).await;
+        let indexed = parse_to_serde_expr(&format!("(= {} 4u64)", DATA_1)).unwrap()[0].clone();
+        let client = server.indexed_data_client();
+        assert!(client
+            .query_ids_resumable(SchemaUid(7103), indexed, 10, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(client
+            .query_ids_resumable(SchemaUid(7103), Expr::nothing(), 10, None)
+            .await
+            .unwrap()
+            .is_none());
+        server.shutdown().await;
+    }
+
+    /// Pages that end inside a tree and pages that straddle a tree boundary
+    /// both resume exactly. Depth 2 caps a tree at ~16K keys, so 40K cells
+    /// span at least three trees once the index has migrated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pages_resume_across_ranged_index_partitions() {
+        crate::index::ranged::tree::btree::set_tree_depth(2);
+        let rows = 40_000;
+        let (server, _client) = fixture(7104, rows).await;
+        let ranged = server.indexed_data_client().index_clients.ranged_client.clone();
+        let deadline = Instant::now() + std::time::Duration::from_secs(180);
+        let trees = loop {
+            let trees = ranged.tree_stats().await.unwrap().len();
+            if trees > 1 || Instant::now() > deadline {
+                break trees;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        };
+        await_ranged_indices_ready().await;
+        assert!(trees > 1, "the fixture must span several trees, saw {trees}");
+
+        let want = matching(rows);
+        for limit in [97usize, 4096, 5000, 20_000] {
+            let pages = pages(&server, 7104, limit).await;
+            let got: Vec<Id> = pages.iter().flat_map(|p| p.ids.clone()).collect();
+            assert_eq!(got.len(), want.len(), "pages of {limit} across {trees} trees");
+            assert_eq!(got, want, "pages of {limit} across {trees} trees");
+        }
+        server.shutdown().await;
+    }
+}

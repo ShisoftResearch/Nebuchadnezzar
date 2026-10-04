@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
+use super::{DataCursor, IndexedDataClient, QueryOrdering, ScanPage, SCAN_BUFFER_SIZE};
 use crate::ram::schema::SchemaUid;
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
@@ -113,10 +113,48 @@ impl IndexedDataClient {
         selection: &Expr,
         limit: usize,
     ) -> Result<Vec<Id>, RPCError> {
+        Ok(self
+            .stream_schema_scan_page(schema, selection, limit, None)
+            .await?
+            .ids)
+    }
+
+    /// One resumable page of the filtered schema scan.
+    ///
+    /// The scan walks the schema's index entries in ascending key order. A
+    /// schema's entries share their leading bytes and differ only in the
+    /// trailing id, so that is ascending id order, across every ranged-index
+    /// tree (partition) the schema spans: the client cursor chains the trees
+    /// in key order.
+    ///
+    /// `start_after` is a position, not a row count: the scan resumes at the
+    /// first entry whose id is STRICTLY greater than it. The cursor id need
+    /// not exist -- a cell deleted since the previous page leaves the
+    /// position intact and the scan continues at the next surviving id, so
+    /// resuming never skips or repeats a live cell on the account of one
+    /// that is gone. Cells inserted behind the position after it was taken
+    /// are not seen; cells inserted ahead of it are.
+    ///
+    /// The returned `next_cursor` is the id of the last match when the page
+    /// stopped because `limit` was reached (more may follow), and `None` when
+    /// the scan ran to the end of the schema.
+    pub(super) async fn stream_schema_scan_page(
+        &self,
+        schema: SchemaUid,
+        selection: &Expr,
+        limit: usize,
+        start_after: Option<Id>,
+    ) -> Result<ScanPage, RPCError> {
         if limit == 0 {
-            return Ok(vec![]);
+            return Ok(ScanPage {
+                ids: vec![],
+                next_cursor: start_after,
+            });
         }
-        let key = EntryKey::for_schema(schema);
+        let key = match start_after {
+            Some(after) => EntryKey::for_scannable(&after, schema),
+            None => EntryKey::for_schema(schema),
+        };
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(
@@ -126,16 +164,24 @@ impl IndexedDataClient {
             )
             .await?
         else {
-            return Ok(vec![]);
+            return Ok(ScanPage::default());
         };
         let batch = usize::from(SCAN_BUFFER_SIZE.max(1));
-        let mut selected: Vec<Id> = Vec::with_capacity(limit);
+        let mut selected: Vec<Id> = Vec::with_capacity(limit.min(batch * 16));
         let mut pending: Vec<Id> = Vec::with_capacity(batch);
+        // The seek is inclusive, so the entry AT the cursor is the first one
+        // returned when it still exists; it is the one to drop.
+        let mut skip_cursor = start_after;
         loop {
             pending.clear();
             while pending.len() < batch {
                 match index_cursor.next().await? {
-                    Some(id) => pending.push(id),
+                    Some(id) => {
+                        if skip_cursor.take() == Some(id) {
+                            continue;
+                        }
+                        pending.push(id);
+                    }
                     None => break,
                 }
             }
@@ -149,12 +195,19 @@ impl IndexedDataClient {
                 if cell_matches_selection(&cell, selection) {
                     selected.push(cell.id());
                     if selected.len() >= limit {
-                        return Ok(selected);
+                        let next_cursor = selected.last().copied();
+                        return Ok(ScanPage {
+                            ids: selected,
+                            next_cursor,
+                        });
                     }
                 }
             }
         }
-        Ok(selected)
+        Ok(ScanPage {
+            ids: selected,
+            next_cursor: None,
+        })
     }
 
     pub(super) async fn filter_ids_by_selection_limit(
