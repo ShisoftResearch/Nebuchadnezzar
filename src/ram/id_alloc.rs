@@ -61,6 +61,13 @@ pub trait LeaseStore: Send + Sync {
     /// Highest durably-leased end for the origin, if any. Used by
     /// recovery to establish the resume floor.
     fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>>;
+
+    /// Durably raise `origin`'s lease end to at least `floor` (monotone,
+    /// idempotent), so no later lease for the origin starts at or below it.
+    /// Returns the lease end after the call. Needs no epoch: it is used to
+    /// account for ids imported from elsewhere, including for origins whose
+    /// holder has not claimed the slot yet.
+    fn reserve_floor(&self, origin: u16, floor: u64) -> BoxFuture<'_, io::Result<u64>>;
 }
 
 /// In-memory lease store for tests and volatile deployments. Volatile
@@ -126,6 +133,21 @@ impl LeaseStore for VolatileLeaseStore {
     fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>> {
         future::ready(Ok(self.state.lock().get(&origin).map(|(_, end)| *end))).boxed()
     }
+
+    fn reserve_floor(&self, origin: u16, floor: u64) -> BoxFuture<'_, io::Result<u64>> {
+        let result = if floor > ID_SEQUENCE_MASK {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("floor {} exceeds the sequence space of origin {}", floor, origin),
+            ))
+        } else {
+            let mut state = self.state.lock();
+            let entry = state.entry(origin).or_insert((0, 0));
+            entry.1 = entry.1.max(floor);
+            Ok(entry.1)
+        };
+        future::ready(result).boxed()
+    }
 }
 
 /// Per-database allocator for one origin slot.
@@ -170,6 +192,20 @@ impl IdAllocator {
 
     pub fn origin(&self) -> u16 {
         self.origin
+    }
+
+    /// Guarantee that no sequence at or below `floor` is issued from here on.
+    ///
+    /// Persists the floor through the lease store first (so a restart cannot
+    /// resume below it), then moves the in-memory cursor. `next` only moves
+    /// forward (`fetch_max`, the same rule `refill` follows): a taker that
+    /// already holds a candidate above `floor` keeps it, one below it is
+    /// pushed past it on its next take, because a candidate beyond the warm
+    /// block's end forces a refill that leases at `max(lease end, next)`.
+    pub async fn raise_floor(&self, floor: u64) -> io::Result<()> {
+        self.store.reserve_floor(self.origin, floor).await?;
+        self.next.fetch_max(floor, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Fences this allocator: a bumped epoch elsewhere makes every
@@ -311,6 +347,17 @@ impl LeaseStore for RaftLeaseStore {
         }
         .boxed()
     }
+
+    fn reserve_floor(&self, origin: u16, floor: u64) -> BoxFuture<'_, io::Result<u64>> {
+        async move {
+            self.sm
+                .reserve_floor(&origin, &floor)
+                .await
+                .map_err(|e| sm_err("reserve_floor consensus round failed", e))?
+                .map_err(|e| sm_err("reserve_floor refused", e))
+        }
+        .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +461,43 @@ mod tests {
         // clumping (chi-squared level checks live in the design's test
         // plan; this is the smoke bound).
         assert!(buckets.len() > 3000, "uniform locality clumped: {}", buckets.len());
+    }
+
+    #[tokio::test]
+    async fn raise_floor_pushes_issuance_past_the_floor() {
+        let alloc = allocator(7).await;
+        let before = alloc.take_sequence().await.unwrap();
+        let floor = before + 3 * ID_BLOCK_SPAN + 17;
+        alloc.raise_floor(floor).await.unwrap();
+        let after = alloc.take_sequence().await.unwrap();
+        assert!(after > floor, "{after} must exceed the raised floor {floor}");
+    }
+
+    #[tokio::test]
+    async fn raise_floor_is_durable_across_a_restart() {
+        let store = Arc::new(VolatileLeaseStore::default());
+        let first = IdAllocator::recover(store.clone(), 8, 1, 0).await.unwrap();
+        first.raise_floor(9_000_000).await.unwrap();
+        drop(first);
+        let second = IdAllocator::recover(store, 8, 2, 0).await.unwrap();
+        assert!(second.take_sequence().await.unwrap() > 9_000_000);
+    }
+
+    #[tokio::test]
+    async fn raise_floor_never_lowers_the_cursor() {
+        let alloc = allocator(9).await;
+        for _ in 0..100 {
+            alloc.take_sequence().await.unwrap();
+        }
+        alloc.raise_floor(5).await.unwrap();
+        assert!(alloc.take_sequence().await.unwrap() > 100);
+    }
+
+    #[tokio::test]
+    async fn reserve_floor_on_a_foreign_origin_binds_a_later_holder() {
+        let store = Arc::new(VolatileLeaseStore::default());
+        store.reserve_floor(11, 4_000_000).await.unwrap();
+        let later = IdAllocator::recover(store, 11, 1, 0).await.unwrap();
+        assert!(later.take_sequence().await.unwrap() > 4_000_000);
     }
 }
