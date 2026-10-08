@@ -105,6 +105,39 @@ service! {
     rpc post_schema_evolve(previous_id: u32, evolved_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
     rpc scrub_ranged_index(repair: bool) -> Result<ScrubReport, String>;
+    rpc cell_scan_open() -> u64;
+    rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
+    rpc cell_scan_close(cursor: u64) -> ();
+}
+
+/// One page of a cell scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellScanPage {
+    /// Live cell ids of this server, ascending within the page. A page never
+    /// spans two chunks, so it can be shorter than the page size without the
+    /// scan being over.
+    pub ids: Vec<Id>,
+    /// The scan has visited every chunk. The cursor is closed by the server.
+    pub done: bool,
+}
+
+/// Server-side state of one open cell scan: where it is in the chunk list and
+/// the current chunk's ids. Holds one chunk's ids at most.
+struct CellScan {
+    next_chunk: usize,
+    ids: Vec<u64>,
+    position: usize,
+    last_used: std::time::Instant,
+}
+
+/// A scan abandoned by a vanished client is dropped after this long without a
+/// call, so a crashed dump cannot pin a chunk's worth of ids forever.
+const CELL_SCAN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[derive(Default)]
+pub struct CellScans {
+    next_id: std::sync::atomic::AtomicU64,
+    open: parking_lot::Mutex<std::collections::HashMap<u64, CellScan>>,
 }
 
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
@@ -131,6 +164,7 @@ fn available_bytes_for(path: &str) -> Option<u64> {
 pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
+    cell_scans: CellScans,
 }
 
 #[cfg(test)]
@@ -893,6 +927,79 @@ impl Service for NebRPCService {
         .boxed()
     }
 
+    fn cell_scan_open(&self) -> BoxFuture<'_, u64> {
+        let scans = &self.cell_scans;
+        let mut open = scans.open.lock();
+        open.retain(|_, scan| scan.last_used.elapsed() < CELL_SCAN_IDLE);
+        let id = scans
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        open.insert(
+            id,
+            CellScan {
+                next_chunk: 0,
+                ids: Vec::new(),
+                position: 0,
+                last_used: std::time::Instant::now(),
+            },
+        );
+        future::ready(id).boxed()
+    }
+
+    fn cell_scan_next(
+        &self,
+        cursor: u64,
+        max: u32,
+    ) -> BoxFuture<'_, Result<CellScanPage, String>> {
+        let max = (max as usize).max(1);
+        let result = (|| {
+            let chunks = self.database_runtime.chunks();
+            let mut open = self.cell_scans.open.lock();
+            let scan = open
+                .get_mut(&cursor)
+                .ok_or_else(|| format!("cell scan {cursor} is not open (expired or closed)"))?;
+            scan.last_used = std::time::Instant::now();
+            // Skip exhausted chunks until one has ids. The previous chunk's ids
+            // are dropped before the next chunk's are built, so at most one
+            // chunk is ever resident.
+            while scan.position >= scan.ids.len() {
+                if scan.next_chunk >= chunks.chunk_count() {
+                    open.remove(&cursor);
+                    return Ok(CellScanPage {
+                        ids: Vec::new(),
+                        done: true,
+                    });
+                }
+                scan.ids = Vec::new();
+                scan.ids = chunks.live_cell_ids_of_chunk(scan.next_chunk);
+                scan.next_chunk += 1;
+                scan.position = 0;
+            }
+            let end = (scan.position + max).min(scan.ids.len());
+            let ids = scan.ids[scan.position..end]
+                .iter()
+                .map(|bits| Id::from_bits(*bits))
+                .collect();
+            scan.position = end;
+            let exhausted =
+                scan.position >= scan.ids.len() && scan.next_chunk >= chunks.chunk_count();
+            if exhausted {
+                open.remove(&cursor);
+            }
+            Ok(CellScanPage {
+                ids,
+                done: exhausted,
+            })
+        })();
+        future::ready(result).boxed()
+    }
+
+    fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
+        self.cell_scans.open.lock().remove(&cursor);
+        future::ready(()).boxed()
+    }
+
     fn post_schema_add<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
             let schema = self
@@ -973,6 +1080,7 @@ impl NebRPCService {
         Arc::new(NebRPCService {
             database_runtime,
             neb_client,
+            cell_scans: CellScans::default(),
         })
     }
     async fn refresh_local_schema_cache_for_write(&self, schema_id: u32) -> Result<(), WriteError> {

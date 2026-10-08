@@ -2800,4 +2800,141 @@ mod write_fence_server_tests {
         assert!(refused.load(Ordering::Relaxed) > 0, "the fence refused writers");
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cell_walk_visits_exactly_the_live_cells_with_bounded_pages() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("cell_walk").await;
+        // Neither fixture schema is scannable and the index service is off: the
+        // walk must not depend on the ranged index at all.
+        let mut expected = std::collections::BTreeSet::new();
+        for n in 0..2_000u64 {
+            let schema = if n % 2 == 0 { PROTECTED_SCHEMA } else { OTHER_SCHEMA };
+            // Spread over many localities so several chunks are populated.
+            let id = Id::from_parts(n % 97, n + 1);
+            client.write_cell(cell(schema, &id, n)).await.unwrap().unwrap();
+            expected.insert(id.bits());
+        }
+        // Delete some: they must not be visited.
+        for n in (0..2_000u64).step_by(7) {
+            let id = Id::from_parts(n % 97, n + 1);
+            client.remove_cell(id).await.unwrap().unwrap();
+            expected.remove(&id.bits());
+        }
+
+        let mut scan = client.cell_id_scan().await.unwrap();
+        let mut seen = Vec::new();
+        let mut pages = 0usize;
+        while let Some(page) = scan.next_page(50).await.unwrap() {
+            assert!(page.len() <= 50, "a page never exceeds the requested size");
+            seen.extend(page.into_iter().map(|id| id.bits()));
+            pages += 1;
+        }
+        assert!(pages > 1, "paging actually paged");
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "no cell is visited twice");
+        assert_eq!(sorted.into_iter().collect::<std::collections::BTreeSet<_>>(), expected);
+
+        // The visited count is the number of live entries in the cell index.
+        let live: usize = (0..runtime.chunks().chunk_count())
+            .map(|chunk| runtime.chunks().live_cell_ids_of_chunk(chunk).len())
+            .sum();
+        assert_eq!(seen.len(), live);
+        assert_eq!(scan.not_owned_skipped(), 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_or_unknown_scan_cursor_is_an_error_not_an_empty_page() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("cell_walk_cursor").await;
+        let servers = {
+            let (members, _) = client.conshash.membership().all_members(true).await.unwrap();
+            members
+        };
+        let rpc = client.client_by_server_id(servers[0].id).await.unwrap();
+        let cursor = rpc.cell_scan_open().await.unwrap();
+        rpc.cell_scan_close(cursor).await.unwrap();
+        assert!(rpc.cell_scan_next(cursor, 10).await.unwrap().is_err());
+        assert!(rpc.cell_scan_next(u64::MAX, 10).await.unwrap().is_err());
+        server.shutdown().await;
+    }
+
+    fn proc_status_kb(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with(field))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap()
+    }
+
+    /// Measures the transient memory of paging one chunk's ids. Ignored by
+    /// default (it writes millions of cells); run with
+    /// `NEB_WALK_CELLS=5000000 cargo test ... -- --ignored measure_cell_walk_memory`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn measure_cell_walk_memory() {
+        let cells: u64 = env::var("NEB_WALK_CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &"walk_memory".to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let runtime = server.current_database();
+        runtime.meta().schemas.debug_only_new_schema(Schema::new_with_id(
+            PROTECTED_SCHEMA,
+            "m",
+            None,
+            Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
+            false,
+            false,
+        ));
+        for n in 0..cells {
+            let mut c = cell(PROTECTED_SCHEMA, &Id::from_parts(5, n + 1), n);
+            runtime.chunks().write_cell(&mut c).unwrap();
+        }
+        let populated = (0..runtime.chunks().chunk_count())
+            .map(|i| (i, runtime.chunks().list[i].count()))
+            .filter(|(_, n)| *n > 0)
+            .collect::<Vec<_>>();
+        let (chunk, in_chunk) = populated[0];
+        // Reset the high-water mark, then page the chunk.
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let rss_before = proc_status_kb("VmRSS:");
+        let started = std::time::Instant::now();
+        let ids = runtime.chunks().live_cell_ids_of_chunk(chunk);
+        let elapsed = started.elapsed();
+        let hwm = proc_status_kb("VmHWM:");
+        let retained = proc_status_kb("VmRSS:") - rss_before;
+        println!(
+            "WALK_MEMORY cells_in_chunk={} ids={} elapsed_ms={} transient_peak_kb={} retained_kb={} peak_bytes_per_cell={:.1} retained_bytes_per_cell={:.1}",
+            in_chunk,
+            ids.len(),
+            elapsed.as_millis(),
+            hwm.saturating_sub(rss_before),
+            retained,
+            (hwm.saturating_sub(rss_before) * 1024) as f64 / in_chunk as f64,
+            (retained * 1024) as f64 / in_chunk as f64,
+        );
+        server.shutdown().await;
+    }
 }

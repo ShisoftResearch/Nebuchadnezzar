@@ -618,6 +618,59 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
+    /// Headers (no bodies) for many cells, in the order of `ids`, each from the
+    /// server that owns it.
+    pub async fn head_all_cells(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Result<CellHeader, ReadError>>, RPCError> {
+        let mut by_server: HashMap<u64, Vec<(usize, Id)>> = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let server_id = self.locate_server_id(id)?;
+            by_server.entry(server_id).or_default().push((index, *id));
+        }
+        let mut out: Vec<Option<Result<CellHeader, ReadError>>> =
+            (0..ids.len()).map(|_| None).collect();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<Id>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let heads = client.head_all_cells(&batch).await?;
+                Ok::<_, RPCError>((indices, heads))
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(batch) = batches.next().await {
+            let (indices, heads) = batch?;
+            for (index, head) in indices.into_iter().zip(heads) {
+                out[index] = Some(head);
+            }
+        }
+        Ok(out.into_iter().map(|head| head.expect("every id was routed")).collect())
+    }
+
+    /// Begin a bounded-memory walk over every live cell id in the database,
+    /// server by server and chunk by chunk, straight off each chunk's primary
+    /// `cell_index`.
+    ///
+    /// The walk only yields ids the visited server OWNS. After a migration the
+    /// donor keeps a deferred copy of a cell until it is reclaimed, and
+    /// reporting both copies would visit one cell twice. Concurrent writes are
+    /// not frozen by this call: a caller that needs a stable set holds the
+    /// database's write fence for the walk.
+    pub async fn cell_id_scan(&self) -> Result<CellIdScan<'_>, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut servers: Vec<u64> = members.into_iter().map(|m| m.id).collect();
+        servers.sort_unstable();
+        Ok(CellIdScan {
+            client: self,
+            servers,
+            next_server: 0,
+            current: None,
+            not_owned: 0,
+        })
+    }
+
     pub async fn count(&self) -> Result<u64, RPCError> {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut member_futs: FuturesUnordered<_> = members
@@ -1216,4 +1269,65 @@ pub async fn client_by_server_name_for_database(
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
+}
+
+/// A walk over the live cell ids of a database. See [`AsyncClient::cell_id_scan`].
+pub struct CellIdScan<'a> {
+    client: &'a AsyncClient,
+    servers: Vec<u64>,
+    next_server: usize,
+    /// The server being walked and its open cursor.
+    current: Option<(u64, Arc<plain_server::AsyncServiceClient>, u64)>,
+    not_owned: u64,
+}
+
+impl CellIdScan<'_> {
+    /// Deferred donor copies skipped so far (ids a server holds but does not own).
+    pub fn not_owned_skipped(&self) -> u64 {
+        self.not_owned
+    }
+
+    /// The next page of at most `max` ids, or `None` when every server has been
+    /// walked. A page can be empty or short without the walk being over.
+    pub async fn next_page(&mut self, max: u32) -> Result<Option<Vec<Id>>, RPCError> {
+        loop {
+            if self.current.is_none() {
+                let Some(&server_id) = self.servers.get(self.next_server) else {
+                    return Ok(None);
+                };
+                self.next_server += 1;
+                let rpc = self.client.client_by_server_id(server_id).await?;
+                let cursor = rpc.cell_scan_open().await?;
+                self.current = Some((server_id, rpc, cursor));
+            }
+            let (server_id, rpc, cursor) = self.current.clone().expect("just set");
+            let page = rpc.cell_scan_next(cursor, max).await?.map_err(|reason| {
+                RPCError::IOError(io::Error::new(io::ErrorKind::Other, reason))
+            })?;
+            if page.done {
+                self.current = None;
+            }
+            let mut ids = Vec::with_capacity(page.ids.len());
+            for id in page.ids {
+                if self.client.locate_server_id(&id)? == server_id {
+                    ids.push(id);
+                } else {
+                    self.not_owned += 1;
+                }
+            }
+            if !ids.is_empty() || !page.done {
+                if ids.is_empty() {
+                    continue;
+                }
+                return Ok(Some(ids));
+            }
+        }
+    }
+}
+
+impl Drop for CellIdScan<'_> {
+    fn drop(&mut self) {
+        // A walk dropped part-way leaves its cursor to the server's idle expiry.
+        self.current = None;
+    }
 }

@@ -3804,6 +3804,34 @@ impl Chunk {
             .collect()
     }
 
+    /// The ids of every live cell this chunk holds, ascending.
+    ///
+    /// `cell_index` is the authoritative id -> address map: a cell exists if
+    /// and only if it is in here with a non-zero address (a zero address is a
+    /// slot reserved by a writer that has not published its cell yet, exactly
+    /// the entries `cell_ids_in_slots` skips). Unlike a ranged-index scan this
+    /// does not depend on any secondary structure being complete.
+    ///
+    /// Memory: `WordMap::entries()` materialises the chunk's `(key, address)`
+    /// pairs, 16 bytes per cell, before they are reduced to 8-byte ids. A
+    /// caller pages ONE chunk at a time (`Chunks::live_cell_ids_of_chunk`), so
+    /// the transient peak is `16 * cells_in_the_largest_chunk`, plus
+    /// `8 * cells_in_that_chunk` retained while it is paged out -- never a
+    /// function of the whole store.
+    pub fn live_cell_ids(&self) -> Vec<u64> {
+        let entries = self.cell_index.entries();
+        let mut ids: Vec<u64> = Vec::with_capacity(entries.len());
+        ids.extend(
+            entries
+                .iter()
+                .filter(|(_, address)| *address != 0)
+                .map(|(key, _)| *key as u64),
+        );
+        drop(entries);
+        ids.sort_unstable();
+        ids
+    }
+
     #[inline]
     fn refresh_statistics(&self) {
         self.statistics.refresh_from_chunk(self)
@@ -4902,6 +4930,20 @@ impl Chunks {
 
     pub fn count(&self) -> usize {
         self.list.iter().map(|c| c.count()).sum()
+    }
+
+    /// How many chunks this store has. A cell scan visits them one at a time.
+    pub fn chunk_count(&self) -> usize {
+        self.list.len()
+    }
+
+    /// Live cell ids of one chunk, ascending. See [`Chunk::live_cell_ids`] for
+    /// what this costs; an out-of-range index is an empty chunk.
+    pub fn live_cell_ids_of_chunk(&self, chunk: usize) -> Vec<u64> {
+        self.list
+            .get(chunk)
+            .map(Chunk::live_cell_ids)
+            .unwrap_or_default()
     }
 
     pub fn clear_cell_index(&self) -> usize {
