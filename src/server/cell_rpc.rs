@@ -242,6 +242,7 @@ impl Service for NebRPCService {
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;
@@ -263,6 +264,7 @@ impl Service for NebRPCService {
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
                 .await;
@@ -283,6 +285,7 @@ impl Service for NebRPCService {
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
             self.remove_cell_unchecked(key).await
         }
         .boxed()
@@ -290,6 +293,7 @@ impl Service for NebRPCService {
     fn upsert_cell(&self, cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             self.upsert_cell_unchecked(cell).await
         }
         .boxed()
@@ -706,6 +710,7 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| {
                     self.database_runtime
@@ -738,6 +743,7 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
             let first_value = value.clone();
             let result = self
                 .with_indices_ensured(|| {
@@ -1025,6 +1031,34 @@ impl NebRPCService {
             }
         }
         .boxed()
+    }
+
+    /// Admit a write of `cell` through the database's write fence.
+    ///
+    /// The cell names its own generation, which resolves to the family the
+    /// fence protects.
+    fn fence_for_cell_body(
+        &self,
+        cell: &OwnedCell,
+    ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
+        self.database_runtime.write_fence().enter(|| {
+            self.database_runtime
+                .schemas()
+                .uid_of_vid(&cell.header.schema)
+        })
+    }
+
+    /// Admit a write that names only a cell id (a remove, a field set). The
+    /// family is read off the stored cell's header, and only when a fence is
+    /// engaged: the normal path never pays for the lookup.
+    fn fence_for_cell_id(
+        &self,
+        id: &Id,
+    ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
+        self.database_runtime.write_fence().enter(|| {
+            let header = self.database_runtime.chunks().head_cell(id).ok()?;
+            self.database_runtime.schemas().uid_of_vid(&header.schema)
+        })
     }
 
     /// Refuse a write for a slot this member does not own.

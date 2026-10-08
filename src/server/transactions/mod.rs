@@ -147,6 +147,10 @@ pub enum DMPrepareResult {
     NotRealizable,
     StateError(TxnState),
     NetworkError,
+    /// The database is fenced for a logical dump and this transaction would
+    /// write a cell the dump is copying (or one whose family cannot be told).
+    /// Nothing was prepared; retryable once the fence is released.
+    DatabaseFenced,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]

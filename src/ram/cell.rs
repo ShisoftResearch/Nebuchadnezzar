@@ -109,6 +109,13 @@ pub enum WriteError {
     /// error instead would lie the other way, telling a caller nothing was
     /// stored when the cell is right there.
     IndexIncomplete(String),
+    /// The database is fenced for a logical dump and this cell's schema is
+    /// among the ones being copied. Nothing was written; the write is
+    /// retryable once the fence is released.
+    ///
+    /// Refused rather than queued on purpose: a dump can run for hours, and a
+    /// writer parked behind it would pin a request slot for the whole time.
+    DatabaseFenced,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]

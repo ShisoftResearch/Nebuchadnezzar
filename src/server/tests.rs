@@ -2616,3 +2616,188 @@ fn tiered_eviction_without_backup_storage_is_refused() {
     // No tier, no requirement: an in-memory store needs nowhere to spill.
     assert!(check_tiered_eviction_can_archive(false, None).is_ok());
 }
+
+mod write_fence_server_tests {
+    use super::*;
+    use crate::ram::cell::WriteError;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const DATA: &str = "DATA";
+    const PROTECTED_SCHEMA: u32 = 4401;
+    const OTHER_SCHEMA: u32 = 4402;
+
+    async fn fenced_fixture(
+        group: &str,
+    ) -> (Arc<NebServer>, Arc<client::AsyncClient>, Arc<DatabaseRuntime>) {
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = group.to_string();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                &server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        for (id, name) in [(PROTECTED_SCHEMA, "protected"), (OTHER_SCHEMA, "other")] {
+            client
+                .new_schema_with_id(Schema::new_with_id(
+                    id,
+                    name,
+                    None,
+                    Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
+                    false,
+                    false,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let runtime = server.current_database();
+        (server, client, runtime)
+    }
+
+    fn cell(schema: u32, id: &Id, value: u64) -> OwnedCell {
+        let mut map = OwnedValue::Map(OwnedMap::new());
+        map[DATA] = OwnedValue::U64(value);
+        OwnedCell::new_with_id(SchemaVid(schema), id, map)
+    }
+
+    fn protected() -> HashSet<SchemaUid> {
+        [SchemaUid(PROTECTED_SCHEMA)].into_iter().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mutating_rpc_is_refused_for_a_protected_schema_and_reads_still_work() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_rpc_surface").await;
+        let kept = Id::from_parts(1, 1);
+        let victim = Id::from_parts(1, 2);
+        client.write_cell(cell(PROTECTED_SCHEMA, &kept, 1)).await.unwrap().unwrap();
+        client.write_cell(cell(PROTECTED_SCHEMA, &victim, 1)).await.unwrap().unwrap();
+
+        let hold = runtime
+            .engage_write_fence(protected(), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let fenced: Result<(), WriteError> = Err(WriteError::DatabaseFenced);
+        let fresh = Id::from_parts(1, 3);
+        assert_eq!(client.write_cell(cell(PROTECTED_SCHEMA, &fresh, 9)).await.unwrap().map(|_| ()), fenced.clone());
+        assert_eq!(client.update_cell(cell(PROTECTED_SCHEMA, &kept, 9)).await.unwrap().map(|_| ()), fenced.clone());
+        assert_eq!(client.upsert_cell(cell(PROTECTED_SCHEMA, &kept, 9)).await.unwrap().map(|_| ()), fenced.clone());
+        assert_eq!(client.remove_cell(victim).await.unwrap(), fenced.clone());
+        let batch = client
+            .upsert_all_cells(vec![cell(PROTECTED_SCHEMA, &kept, 9)])
+            .await
+            .unwrap();
+        assert_eq!(batch[0].clone().map(|_| ()), fenced.clone());
+
+        // Nothing changed, and reads are untouched.
+        assert_eq!(*client.read_cell(kept).await.unwrap().unwrap().data[DATA].u64().unwrap(), 1);
+        assert!(client.read_cell(victim).await.unwrap().is_ok());
+        assert!(client.read_cell(fresh).await.unwrap().is_err());
+
+        // A schema outside the protected set is unaffected.
+        let other = Id::from_parts(2, 1);
+        client.write_cell(cell(OTHER_SCHEMA, &other, 5)).await.unwrap().unwrap();
+        client.update_cell(cell(OTHER_SCHEMA, &other, 6)).await.unwrap().unwrap();
+        client.remove_cell(other).await.unwrap().unwrap();
+
+        assert!(runtime.write_fence().refused_writes() >= 5);
+        drop(hold);
+        client.update_cell(cell(PROTECTED_SCHEMA, &kept, 2)).await.unwrap().unwrap();
+        client.remove_cell(victim).await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_writer_racing_the_fence_is_refused_and_never_slips_through() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_race").await;
+        let held = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let admitted_while_held = Arc::new(AtomicU64::new(0));
+        let refused = Arc::new(AtomicU64::new(0));
+        let admitted = Arc::new(AtomicU64::new(0));
+
+        let mut writers = Vec::new();
+        for w in 0..6u64 {
+            let client = client.clone();
+            let held = held.clone();
+            let stop = stop.clone();
+            let admitted_while_held = admitted_while_held.clone();
+            let refused = refused.clone();
+            let admitted = admitted.clone();
+            writers.push(tokio::spawn(async move {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let id = Id::from_parts(3, w * 1_000_000 + n);
+                    // `held` is read AFTER the write returns Ok: a write that
+                    // started before the hold may legitimately finish just
+                    // after `engage` reports... no -- engage waits for it. So an
+                    // Ok observed while the hold is flagged is a slip-through.
+                    match client.write_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap() {
+                        Ok(_) => {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                            if held.load(Ordering::SeqCst) {
+                                admitted_while_held.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(WriteError::DatabaseFenced) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            tokio::task::yield_now().await;
+                        }
+                        Err(other) => panic!("unexpected write error {other:?}"),
+                    }
+                }
+            }));
+        }
+
+        for round in 0..30 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let hold = runtime
+                .engage_write_fence(protected(), Duration::from_secs(10))
+                .await
+                .unwrap();
+            let before = runtime.chunks().count();
+            held.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let after = runtime.chunks().count();
+            held.store(false, Ordering::SeqCst);
+            assert_eq!(before, after, "round {round}: the store changed under an engaged fence");
+            drop(hold);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.await.unwrap();
+        }
+        assert_eq!(admitted_while_held.load(Ordering::Relaxed), 0);
+        assert!(admitted.load(Ordering::Relaxed) > 0, "writers made progress between fences");
+        assert!(refused.load(Ordering::Relaxed) > 0, "the fence refused writers");
+        server.shutdown().await;
+    }
+}
