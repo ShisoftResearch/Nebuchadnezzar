@@ -1,10 +1,12 @@
 //! A per-database write fence.
 //!
 //! A logical dump has to read a database that is not changing underneath it.
-//! The store has no snapshot scan (point-cell MVCC covers single-cell reads for
-//! a short window, and says in its own design that ranges and predicates are
-//! outside it), so the consistent copy is taken the other way: the writers are
-//! held off for as long as the copy takes.
+//! The store has no snapshot scan and no multi-version storage to build one on
+//! (point-cell MVCC was abandoned, see
+//! `docs/superpowers/specs/2026-08-02-point-cell-mvcc-retrospective.md`; the
+//! engine is repeatable-read OCC with per-transaction snapshots and no history),
+//! so the consistent copy is taken the other way: the writers are held off for as
+//! long as the copy takes.
 //!
 //! # What is fenced
 //!
