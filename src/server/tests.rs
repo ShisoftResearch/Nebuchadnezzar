@@ -2937,4 +2937,58 @@ mod write_fence_server_tests {
         );
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cluster_fence_is_renewed_released_and_lapses_when_abandoned() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("fence_cluster").await;
+        let id = Id::from_parts(1, 1);
+        client.write_cell(cell(PROTECTED_SCHEMA, &id, 1)).await.unwrap().unwrap();
+        let families = [PROTECTED_SCHEMA];
+
+        // Held and renewed well past one lease length: still fenced.
+        let fence = client
+            .engage_write_fence(&families, Duration::from_secs(5), Duration::from_millis(300))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(
+            client.update_cell(cell(PROTECTED_SCHEMA, &id, 2)).await.unwrap().map(|_| ()),
+            Err(WriteError::DatabaseFenced)
+        );
+        assert!(!fence.is_lost());
+        // A second fence on the same database is refused, not stacked.
+        assert!(client
+            .engage_write_fence(&families, Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .is_err());
+        fence.release().await;
+        client.update_cell(cell(PROTECTED_SCHEMA, &id, 3)).await.unwrap().unwrap();
+
+        // Abandoned (dropped without release): the lease lapses by itself.
+        let fence = client
+            .engage_write_fence(&families, Duration::from_secs(5), Duration::from_millis(300))
+            .await
+            .unwrap();
+        drop(fence);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        client.update_cell(cell(PROTECTED_SCHEMA, &id, 4)).await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_cell_count_matches_the_walk() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("live_count").await;
+        for n in 1..=300u64 {
+            client.write_cell(cell(OTHER_SCHEMA, &Id::from_parts(n % 11, n), n)).await.unwrap().unwrap();
+        }
+        let mut scan = client.cell_id_scan().await.unwrap();
+        let mut seen = 0u64;
+        while let Some(page) = scan.next_page(64).await.unwrap() {
+            seen += page.len() as u64;
+        }
+        assert_eq!(seen, client.live_cell_count().await.unwrap());
+        server.shutdown().await;
+    }
 }

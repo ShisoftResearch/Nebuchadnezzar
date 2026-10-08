@@ -108,6 +108,10 @@ service! {
     rpc cell_scan_open() -> u64;
     rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
     rpc cell_scan_close(cursor: u64) -> ();
+    rpc live_cell_count() -> u64;
+    rpc fence_engage(families: &Vec<u32>, drain_ms: u64, lease_ms: u64) -> Result<u64, String>;
+    rpc fence_renew(token: u64, lease_ms: u64) -> bool;
+    rpc fence_release(token: u64) -> ();
 }
 
 /// One page of a cell scan.
@@ -133,6 +137,24 @@ struct CellScan {
 /// A scan abandoned by a vanished client is dropped after this long without a
 /// call, so a crashed dump cannot pin a chunk's worth of ids forever.
 const CELL_SCAN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A write fence held on behalf of a remote caller, kept alive by renewals.
+///
+/// The caller is another process, so the hold cannot be tied to a guard in its
+/// stack: a dump that dies would leave the database read-only forever. The
+/// lease makes the fence self-releasing -- it lapses unless the holder keeps
+/// renewing it.
+struct LeasedFence {
+    // Held for its Drop, which lifts the fence.
+    _hold: crate::server::write_fence::FenceHold,
+    expires: std::time::Instant,
+}
+
+#[derive(Default)]
+pub struct FenceLeases {
+    next_token: std::sync::atomic::AtomicU64,
+    holds: parking_lot::Mutex<std::collections::HashMap<u64, LeasedFence>>,
+}
 
 #[derive(Default)]
 pub struct CellScans {
@@ -165,6 +187,7 @@ pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
     cell_scans: CellScans,
+    fence_leases: Arc<FenceLeases>,
 }
 
 #[cfg(test)]
@@ -995,6 +1018,86 @@ impl Service for NebRPCService {
         future::ready(result).boxed()
     }
 
+    fn live_cell_count(&self) -> BoxFuture<'_, u64> {
+        let chunks = self.database_runtime.chunks();
+        let count: usize = (0..chunks.chunk_count())
+            .map(|chunk| chunks.live_cell_ids_of_chunk(chunk).len())
+            .sum();
+        future::ready(count as u64).boxed()
+    }
+
+    fn fence_engage(
+        &self,
+        families: &Vec<u32>,
+        drain_ms: u64,
+        lease_ms: u64,
+    ) -> BoxFuture<'_, Result<u64, String>> {
+        let families: std::collections::HashSet<crate::ram::schema::SchemaUid> = families
+            .iter()
+            .map(|uid| crate::ram::schema::SchemaUid(*uid))
+            .collect();
+        async move {
+            let hold = self
+                .database_runtime
+                .engage_write_fence(families, std::time::Duration::from_millis(drain_ms))
+                .await
+                .map_err(|e| e.to_string())?;
+            let leases = &self.fence_leases;
+            let token = leases
+                .next_token
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let lease = std::time::Duration::from_millis(lease_ms.max(1));
+            leases.holds.lock().insert(
+                token,
+                LeasedFence {
+                    _hold: hold,
+                    expires: std::time::Instant::now() + lease,
+                },
+            );
+            // The reaper: lifts the fence if the holder stops renewing.
+            let leases = Arc::clone(&self.fence_leases);
+            tokio::spawn(async move {
+                loop {
+                    let wait = {
+                        let holds = leases.holds.lock();
+                        match holds.get(&token) {
+                            None => return,
+                            Some(held) => held.expires.saturating_duration_since(std::time::Instant::now()),
+                        }
+                    };
+                    if wait.is_zero() {
+                        if leases.holds.lock().remove(&token).is_some() {
+                            warn!("write fence lease {token} lapsed without a renewal; fence lifted");
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+            });
+            Ok(token)
+        }
+        .boxed()
+    }
+
+    fn fence_renew(&self, token: u64, lease_ms: u64) -> BoxFuture<'_, bool> {
+        let mut holds = self.fence_leases.holds.lock();
+        let renewed = match holds.get_mut(&token) {
+            Some(held) => {
+                held.expires = std::time::Instant::now()
+                    + std::time::Duration::from_millis(lease_ms.max(1));
+                true
+            }
+            None => false,
+        };
+        future::ready(renewed).boxed()
+    }
+
+    fn fence_release(&self, token: u64) -> BoxFuture<'_, ()> {
+        self.fence_leases.holds.lock().remove(&token);
+        future::ready(()).boxed()
+    }
+
     fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
         self.cell_scans.open.lock().remove(&cursor);
         future::ready(()).boxed()
@@ -1081,6 +1184,7 @@ impl NebRPCService {
             database_runtime,
             neb_client,
             cell_scans: CellScans::default(),
+            fence_leases: Arc::new(FenceLeases::default()),
         })
     }
     async fn refresh_local_schema_cache_for_write(&self, schema_id: u32) -> Result<(), WriteError> {
