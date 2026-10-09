@@ -1129,6 +1129,7 @@ impl Segment {
                 >= ENTRY_HEAD_SIZE
     }
 
+    #[inline]
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
         self.try_acquire_reserving(size, 0)
     }
@@ -2595,8 +2596,14 @@ image, not an empty segment; archiving it would persist the damage.",
     #[inline]
     pub fn release_own(&self) {
         if let Err(refused) = self.try_release_own() {
-            error!("{refused}");
+            Self::report_refused_release(refused);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn report_refused_release(refused: OpenBracketRefused) {
+        error!("{refused}");
     }
 
     /// THE release point: every head goes back to the pool through here.
@@ -2620,19 +2627,33 @@ image, not an empty segment; archiving it would persist the damage.",
     /// the owner's bracket, and the owner is leaving.
     #[inline]
     pub fn try_release_own(&self) -> Result<(), OpenBracketRefused> {
-        if self.pending_journals.load(Ordering::Acquire) & BRACKET_OPEN != 0
-            && self.can_still_append()
-        {
-            OPEN_BRACKET_RELEASES_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return Err(OpenBracketRefused {
-                chunk_id: self.chunk_id,
-                segment_id: self.id,
-                seq_id: self.seq_id,
-            });
+        // One relaxed load and one branch on the word this release is about
+        // to write: only the owner -- the caller -- ever sets the bracket
+        // bits, so its own earlier store is visible to it without ordering.
+        if self.pending_journals.load(Ordering::Relaxed) & BRACKET_OPEN != 0 {
+            if let Some(refused) = self.refuse_open_bracket_release() {
+                return Err(refused);
+            }
         }
         self.pending_journals
             .fetch_and(!(HEAD_OWNED | BRACKET_STATE_MASK), Ordering::Release);
         Ok(())
+    }
+
+    /// The off-path half of `try_release_own`: a bracket is open, so decide
+    /// whether the head can still take an append, and build the refusal.
+    #[cold]
+    #[inline(never)]
+    fn refuse_open_bracket_release(&self) -> Option<OpenBracketRefused> {
+        if !self.can_still_append() {
+            return None;
+        }
+        OPEN_BRACKET_RELEASES_REFUSED.fetch_add(1, Ordering::Relaxed);
+        Some(OpenBracketRefused {
+            chunk_id: self.chunk_id,
+            segment_id: self.id,
+            seq_id: self.seq_id,
+        })
     }
 
     /// The owner wrote a BEGIN here: from now until COMMIT, disown or
