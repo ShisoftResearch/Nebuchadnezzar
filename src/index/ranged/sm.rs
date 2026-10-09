@@ -705,6 +705,25 @@ mod tests {
         let legacy = utils::serde::serialize(&tree);
         let restored = decode_tree_snapshot(&legacy).expect("legacy snapshot decodes");
         assert_eq!(restored.len(), tree.len());
+        for (key, placement) in &tree {
+            let got = restored.get(key).expect("key survives");
+            assert_eq!((got.id, got.epoch), (placement.id, placement.epoch));
+        }
+    }
+
+    /// Downgrade contract: a binary that knows only the map form must REFUSE
+    /// the pair list (its `recover` unwraps the failed decode and stops),
+    /// never read it as some other map. Empty and non-empty, in both codecs.
+    #[test]
+    fn pair_list_snapshot_is_refused_by_the_map_only_decoder() {
+        for tree in [BTreeMap::new(), sample_tree()] {
+            let bytes = utils::serde::serialize(&tree_snapshot_entries(&tree));
+            assert!(
+                utils::serde::deserialize::<BTreeMap<EntryKey, TreePlacement>>(&bytes).is_none(),
+                "a map-only decoder accepted the pair list ({} entries)",
+                tree.len()
+            );
+        }
     }
 
     #[test]
