@@ -19,7 +19,7 @@ use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
-    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema, SetAppMetaError,
     SchemaEdit, SchemaVid,
 };
 use crate::ram::types::Id;
@@ -856,6 +856,8 @@ impl AsyncClient {
         let schema_id = schema.vid;
         match res {
             Ok(Ok(_)) => {
+                // The record is committed here; only derived state remains.
+                crate::ram::schema::schema_create_point("neb_after_raft_commit", &schema.name);
                 if schema.index_fields.is_empty() && schema.compound_index_fields.is_empty() {
                     // Nothing to process
                     return res;
@@ -1028,6 +1030,18 @@ impl AsyncClient {
         new_name: String,
     ) -> Result<Result<(), RenameSchemaError>, ExecError> {
         self.schema_client.rename_schema(&old_name, &new_name).await
+    }
+
+    /// Replace the owner metadata stored in the family's schema record. One
+    /// raft command: it is applied in full or not at all.
+    pub async fn set_schema_app_meta(
+        &self,
+        name: &str,
+        app_meta: Vec<u8>,
+    ) -> Result<Result<(), SetAppMetaError>, ExecError> {
+        self.schema_client
+            .set_app_meta(&name.to_string(), &app_meta)
+            .await
     }
 
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
