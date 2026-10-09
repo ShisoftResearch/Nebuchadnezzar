@@ -36,9 +36,9 @@ fn chunk_mb() -> usize {
         .unwrap_or(16)
 }
 
-fn options(dir: &std::path::Path) -> ServerOptions {
+fn options(dir: &std::path::Path, chunk_mb: usize) -> ServerOptions {
     ServerOptions {
-        chunk_size: chunk_mb() * 1024 * 1024,
+        chunk_size: chunk_mb * 1024 * 1024,
         db_size: 128 * 1024 * 1024,
         tiered_config: None,
         backup_storage: Some(dir.join("backup").to_string_lossy().to_string()),
@@ -112,25 +112,31 @@ struct Store {
     server: Arc<NebServer>,
     client: Arc<client::AsyncClient>,
     mode: Mode,
+    chunk_mb: usize,
 }
 
 impl Store {
     async fn start(dir: &std::path::Path, group: &str, mode: Mode) -> Store {
+        Store::start_in(dir, group, mode, chunk_mb()).await
+    }
+
+    /// Use one chunk when the chunk size equals the database size (128 MiB).
+    async fn start_in(dir: &std::path::Path, group: &str, mode: Mode, chunk_mb: usize) -> Store {
         let addr = crate::utils::test_port::unique_localhost_addr();
-        let server = NebServer::new_from_opts(&options(dir), &addr, group, async |_| {})
+        let server = NebServer::new_from_opts(&options(dir, chunk_mb), &addr, group, async |_| {})
             .await
             .expect("server start");
         server.meta().schemas.register_internal_schema(schema());
         let client = Arc::new(server.data_client(&vec![addr]).await.expect("data client"));
-        Store { server, client, mode }
+        Store { server, client, mode, chunk_mb }
     }
 
     async fn restart(self, dir: &std::path::Path, group: &str) -> Store {
-        let mode = self.mode;
+        let (mode, chunk_mb) = (self.mode, self.chunk_mb);
         self.server.shutdown().await;
         drop(self.client);
         drop(self.server);
-        Store::start(dir, group, mode).await
+        Store::start_in(dir, group, mode, chunk_mb).await
     }
 
     async fn write(&self, c: OwnedCell) {
@@ -351,4 +357,242 @@ scenarios! {
     after_updates_hashed_plain_then_txn_deletes: recreated_after_updates(IdClass::Hashed, Mode::DirectWritesTxnDeletes, "rd_d_hpt");
     mixed_updated_deleted_txn_then_plain: updated_then_deleted(IdClass::Hashed, Mode::TxnWritesDirectDeletes, "rd_a_htp");
     mixed_updated_deleted_plain_then_txn: updated_then_deleted(IdClass::Allocated, Mode::DirectWritesTxnDeletes, "rd_a_apt");
+}
+
+/// Writes 256 KiB cells with fresh keyed ids until the (only) chunk opens a
+/// new segment. Returns the ids; the last one lives in the new segment.
+fn fill_until_new_segment(store: &Store, tag: &str, counter: &mut u64) -> Vec<Id> {
+    let chunk = &store.server.chunks().list[0];
+    let before = chunk.seg_count();
+    let mut ids = Vec::new();
+    while chunk.seg_count() == before {
+        *counter += 1;
+        let id = Id::from_obj(&format!("filler-{tag}-{counter}"));
+        store
+            .server
+            .chunks()
+            .write_cell(&mut cell(&id, *counter, 256 * 1024))
+            .expect("filler write");
+        ids.push(id);
+    }
+    ids
+}
+
+fn tombstones_for(store: &Store, id: Id) -> Vec<(u64, u64, u64)> {
+    use crate::ram::entry::EntryType;
+    use crate::ram::tombstone::Tombstone;
+    store.server.chunks().list[0]
+        .segments()
+        .iter()
+        .flat_map(|segment| {
+            segment.entry_iter().filter_map(move |entry| {
+                if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                    return None;
+                }
+                let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                (tombstone.id == id).then_some((
+                    segment.seq_id,
+                    tombstone.segment_seq_id,
+                    tombstone.version,
+                ))
+            })
+        })
+        .collect()
+}
+
+/// A keyed id is deleted after updates (tombstone at version 4), then
+/// re-created (version 2) in a LATER segment than the tombstone.
+async fn recreated_in_another_segment_below_the_tombstone_version(mode: Mode, group: &str) {
+    let _ = env_logger::try_init();
+    let dir = scratch_dir();
+    let mut store = Store::start_in(dir.path(), group, mode, 128).await;
+    store.server.cleaner().pause();
+    let mut model = HashMap::new();
+    let mut counter = 0u64;
+    for index in 0..20u64 {
+        let id = Id::from_obj(&format!("recreate-key-{index}"));
+        store.write(cell(&id, 1, 8)).await;
+        store.update(cell(&id, 2, 8)).await;
+        store.update(cell(&id, 3, 8)).await;
+        store.remove(id).await;
+        model.insert(index, (id, None));
+    }
+    let tombstone_segments = store.server.chunks().list[0].seg_count();
+    fill_until_new_segment(&store, "r", &mut counter);
+    assert!(store.server.chunks().list[0].seg_count() > tombstone_segments);
+    for index in 0..20u64 {
+        let id = model[&index].0;
+        let tombstones = tombstones_for(&store, id);
+        assert_eq!(tombstones.len(), 1, "one tombstone per deleted key");
+        assert_eq!(tombstones[0].2, 4, "the deleted version must be 4");
+        store.write(cell(&id, 100 + index, 8)).await;
+        let chunk = &store.server.chunks().list[0];
+        let (location, version) = chunk.cell_location_and_version(id.bits()).unwrap();
+        let segment = chunk
+            .segments()
+            .into_iter()
+            .find(|s| s.contains_address(location))
+            .unwrap();
+        assert_eq!(version, 2, "a re-create must restart at version 2");
+        assert!(
+            segment.seq_id > tombstones[0].0,
+            "the re-create must follow the tombstone segment"
+        );
+        model.get_mut(&index).unwrap().1 = Some(100 + index);
+    }
+    check(&store.server, &model, "before the restart");
+    store = store.restart(dir.path(), group).await;
+    check(
+        &store.server,
+        &model,
+        &format!("after a graceful restart ({mode:?})"),
+    );
+    store.server.shutdown().await;
+}
+
+macro_rules! other_segment_scenarios {
+    ($($name:ident: $mode:expr, $group:expr;)*) => {
+        $(
+            // Recovery loses a lower-version re-create in a later segment.
+            #[ignore = "recovery loses a lower-version re-create in another segment"]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn $name() {
+                recreated_in_another_segment_below_the_tombstone_version($mode, $group).await;
+            }
+        )*
+    };
+}
+
+other_segment_scenarios! {
+    recreate_in_other_segment_direct: Mode::Direct, "rd_e_d";
+    recreate_in_other_segment_txn: Mode::Txn, "rd_e_t";
+}
+
+/// The cleaner removes the segment a tombstone names, then drops the
+/// tombstone, while an older version of the same cell still sits in another
+/// segment.
+// Recovery resurrects an older cell after the cleaner removes its tombstone.
+#[ignore = "recovery resurrects an older cell after tombstone removal"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleaned_tombstone_does_not_bring_back_an_older_version() {
+    use crate::ram::cleaner::combine::CombinedCleaner;
+    let _ = env_logger::try_init();
+    let dir = scratch_dir();
+    let group = "rd_f_clean";
+    let mut store = Store::start_in(dir.path(), group, Mode::Direct, 128).await;
+    store.server.cleaner().pause();
+    let chunk = &store.server.chunks().list[0];
+    let mut counter = 0u64;
+    let mut model: HashMap<u64, (Id, Option<u64>)> = HashMap::new();
+    let mut next = 0u64;
+    let mut track = |model: &mut HashMap<u64, (Id, Option<u64>)>, id: Id, value: Option<u64>| {
+        next += 1;
+        model.insert(next, (id, value));
+    };
+
+    // Segment A: the key at version 2, and live fillers that keep A out of
+    // the cleaner's reach.
+    let key = Id::from_obj(&"cleaned-key");
+    store.write(cell(&key, 1, 8)).await;
+    let a_fillers = fill_until_new_segment(&store, "a", &mut counter);
+    for (i, id) in a_fillers.iter().enumerate() {
+        track(
+            &mut model,
+            *id,
+            Some(counter - a_fillers.len() as u64 + 1 + i as u64),
+        );
+    }
+    // Segment B: the key at version 3.
+    store.update(cell(&key, 2, 8)).await;
+    let b_fillers = fill_until_new_segment(&store, "b", &mut counter);
+    // Segment C: the tombstones. Everything in B dies.
+    store.remove(key).await;
+    track(&mut model, key, None);
+    for id in b_fillers {
+        store.remove(id).await;
+        track(&mut model, id, None);
+    }
+    let c_fillers = fill_until_new_segment(&store, "c", &mut counter);
+    for id in &c_fillers {
+        store.remove(*id).await;
+        track(&mut model, *id, None);
+    }
+    let _d_fillers = fill_until_new_segment(&store, "d", &mut counter);
+
+    // Combine B with C. The cleaner removes B and its tombstones.
+    let mut by_seq = chunk.segments();
+    by_seq.sort_by_key(|segment| segment.seq_id);
+    println!(
+        "segments before the cleaner: {:?}",
+        by_seq.iter().map(|s| s.seq_id).collect::<Vec<_>>()
+    );
+    let pick = |seqs: &[usize],
+                by_seq: &Vec<lightning::aarc::Arc<crate::ram::segs::Segment>>|
+     -> Vec<_> { seqs.iter().map(|i| by_seq[*i].clone()).collect() };
+    let first = CombinedCleaner::combine_segments(chunk, &pick(&[1, 2], &by_seq));
+    println!("first combine: {first:?}");
+    // Combine again: the tombstones now name a segment that is gone.
+    for _ in 0..3 {
+        let mut now = chunk.segments();
+        now.sort_by_key(|segment| segment.seq_id);
+        let candidates: Vec<_> = now
+            .iter()
+            .filter(|s| !chunk.is_active_head(s.id))
+            .cloned()
+            .collect();
+        // Never A: it holds the older version of the key.
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|s| s.seq_id != by_seq[0].seq_id)
+            .collect();
+        println!(
+            "round candidates: {:?}",
+            candidates.iter().map(|s| s.seq_id).collect::<Vec<_>>()
+        );
+        if candidates.len() >= 2 {
+            let r = CombinedCleaner::combine_segments(chunk, &candidates);
+            println!("combine: {r:?}");
+        }
+    }
+    let after: Vec<u64> = {
+        let mut v: Vec<u64> = chunk.segments().iter().map(|s| s.seq_id).collect();
+        v.sort();
+        v
+    };
+    println!("segments after the cleaner: {after:?}");
+    assert!(
+        after.contains(&by_seq[0].seq_id),
+        "segment A must still exist"
+    );
+    assert!(
+        !after.contains(&by_seq[1].seq_id),
+        "segment B must be gone, or the test proves nothing"
+    );
+    assert!(
+        tombstones_for(&store, key).is_empty(),
+        "the cleaner must remove the key's tombstone"
+    );
+    let old_versions: Vec<_> = by_seq[0]
+        .entry_iter()
+        .filter_map(|entry| {
+            if entry.entry_header.entry_type != crate::ram::entry::EntryType::CELL {
+                return None;
+            }
+            let header = crate::ram::cell::cell_header_from_entry_content_addr(entry.body_pos);
+            (header.id == key).then_some(header.version)
+        })
+        .collect();
+    assert_eq!(
+        old_versions,
+        vec![2],
+        "segment A must retain the old physical entry"
+    );
+    check(
+        &store.server,
+        &model,
+        "after the cleaner, before the restart",
+    );
+    store = store.restart(dir.path(), group).await;
+    check(&store.server, &model, "after a graceful restart");
+    store.server.shutdown().await;
 }
