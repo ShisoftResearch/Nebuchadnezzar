@@ -27,6 +27,23 @@ use std::ops::Deref;
 
 pub mod sm;
 
+/// Crash-injection seam for tests of schema creation. Inert unless a test
+/// installs a hook; on the creation path it costs one atomic load.
+static SCHEMA_CREATE_HOOK: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+
+/// Install the hook called at named points of schema creation with the point
+/// and the schema's name (a server creates system schemas too, so a test has
+/// to be able to pick its own). First call wins.
+pub fn set_schema_create_hook(hook: fn(&str, &str)) {
+    let _ = SCHEMA_CREATE_HOOK.set(hook);
+}
+
+pub(crate) fn schema_create_point(point: &str, schema_name: &str) {
+    if let Some(hook) = SCHEMA_CREATE_HOOK.get() {
+        hook(point, schema_name);
+    }
+}
+
 pub type FieldPtr = u32;
 
 pub const PTR_ALIGN: usize = mem::align_of::<u32>();
@@ -173,6 +190,17 @@ pub struct Schema {
     pub is_scannable: bool,
     #[serde(default)]
     pub blobs: bool,
+    /// Opaque bytes the layer above Neb stores WITH the schema, in the same
+    /// record.
+    ///
+    /// A schema is one durable record: the raft command that creates it
+    /// carries these bytes too, so an owner's per-schema metadata (Morpheus's
+    /// graph kind and flags) is never in a different store from the schema it
+    /// describes and cannot disagree with it after a crash. Neb never
+    /// interprets them. They belong to the family: an evolution inherits them,
+    /// and only `set_app_meta` changes them.
+    #[serde(default)]
+    pub app_meta: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -272,6 +300,7 @@ impl Schema {
             is_dynamic,
             is_scannable,
             blobs: false,
+            app_meta: Vec::new(),
             field_index,
             id_index,
             index_fields,
@@ -332,6 +361,12 @@ impl Schema {
         if !self.transform.renames.contains(&pair) {
             self.transform.renames.push(pair);
         }
+        self
+    }
+
+    /// Attach the owner's metadata to the record. See [`Schema::app_meta`].
+    pub fn with_app_meta(mut self, app_meta: Vec<u8>) -> Schema {
+        self.app_meta = app_meta;
         self
     }
 
@@ -1811,6 +1846,12 @@ pub enum EvolveSchemaError {
     Illegal(String),
     NotifyError(NotifyError),
     PostProcessError(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SetAppMetaError {
+    SchemaDoesNotExist,
+    NotifyError(NotifyError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

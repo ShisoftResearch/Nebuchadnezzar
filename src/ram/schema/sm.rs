@@ -65,6 +65,7 @@ raft_state_machine! {
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
     def cmd evolve_schema(name: String, schema: Schema, expected_base: Option<SchemaVid>) -> Result<EvolutionOutcome, EvolveSchemaError>;
+    def cmd set_app_meta(name: String, app_meta: Vec<u8>) -> Result<(), SetAppMetaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
@@ -155,6 +156,27 @@ impl StateMachineCmds for SchemasSM {
                     old_name,
                     new_name
                 );
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn set_app_meta(
+        &mut self,
+        name: String,
+        app_meta: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), SetAppMetaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
+        async move {
+            let updated = self.map.set_app_meta(&name, app_meta)?;
+            // Re-announced as an addition on purpose: `new_schema` on a node's
+            // cache is an idempotent upsert of the record, which is exactly
+            // "this record changed in place".
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_added::new(), updated)
+                    .await
+                    .map_err(|e| SetAppMetaError::NotifyError(e))?;
             }
             Ok(())
         }
@@ -439,6 +461,20 @@ impl SchemasMap {
         );
         Ok(())
     }
+    /// Replace the owner metadata of the family's CURRENT generation.
+    fn set_app_meta(&mut self, name: &str, app_meta: Vec<u8>) -> Result<Schema, SetAppMetaError> {
+        let vid = self
+            .uid_of_name(name)
+            .and_then(|uid| self.handles.get(&uid))
+            .map(|handle| handle.current_vid)
+            .ok_or(SetAppMetaError::SchemaDoesNotExist)?;
+        let record = self
+            .schema_map
+            .get_mut(&vid)
+            .ok_or(SetAppMetaError::SchemaDoesNotExist)?;
+        record.app_meta = app_meta;
+        Ok(record.clone())
+    }
     fn load_from_list(&mut self, data: Vec<Schema>) {
         info!("load_from_list: Loading {} schemas", data.len());
         for schema in data {
@@ -576,6 +612,13 @@ impl SchemasMap {
         proposed.generation = handle.generation + 1;
         proposed.status = SchemaVersionStatus::Current;
         proposed.name = handle.current_name.clone();
+        // The owner's metadata belongs to the family, not to a layout: an
+        // evolution proposes field content only and must not reset it.
+        proposed.app_meta = self
+            .schema_map
+            .get(&previous_vid)
+            .map(|previous| previous.app_meta.clone())
+            .unwrap_or_default();
 
         // Drops accumulate across the family. Migration takes ONE hop --
         // generation 0 straight to generation 3 -- so a generation that only
@@ -723,6 +766,38 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[test]
+    fn app_meta_is_created_with_the_record_and_survives_a_snapshot() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "typed").with_app_meta(vec![7, 8, 9]))
+            .unwrap();
+        let mut restored = SchemasMap::new();
+        restored.load_from_list(decode_snapshot(&utils::serde::serialize(&map.get_all())));
+        let uid = restored.uid_of_name("typed").unwrap();
+        let vid = restored.handles.get(&uid).unwrap().current_vid;
+        assert_eq!(restored.schema_map.get(&vid).unwrap().app_meta, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn set_app_meta_replaces_the_current_generation_and_evolution_inherits_it() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "typed").with_app_meta(vec![1]))
+            .unwrap();
+        let updated = map.set_app_meta("typed", vec![2, 2]).unwrap();
+        assert_eq!(updated.app_meta, vec![2, 2]);
+        assert!(map.set_app_meta("missing", vec![]).is_err());
+
+        // A proposal carries field content only; it must not reset the meta.
+        let proposed = schema_named(0, "typed");
+        assert!(proposed.app_meta.is_empty());
+        let (evolved, previous) = map
+            .install_evolution("typed", proposed, SchemaVid(50))
+            .unwrap();
+        assert_eq!(previous, SchemaVid(1));
+        assert_eq!(evolved.app_meta, vec![2, 2]);
+        assert_eq!(map.schema_map.get(&SchemaVid(50)).unwrap().app_meta, vec![2, 2]);
     }
 
     #[test]
