@@ -161,10 +161,6 @@ static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
-/// How many in-progress GC passes an allocation at the wall will wait out
-/// before running its own emergency pass. Each wait is bounded by one pass.
-const MAX_EMERGENCY_GC_WAITS: usize = 4;
-
 /// Ceiling on one chunk's cell index, in slots. Only guards against a nonsense
 /// estimate; a legitimate 16 GB chunk of 8 MiB segments wants ~17 M.
 const MAX_CELL_INDEX_CAPACITY: usize = 1 << 26;
@@ -2274,7 +2270,6 @@ impl Chunk {
             return Err(WriteError::ServerShuttingDown);
         }
         let mut tried_gc = false;
-        let mut gc_waits = 0usize;
         let mut queueing_since: Option<std::time::Instant> = None;
         let backoff = Backoff::new();
         let slots = self.head_slots(segment_class);
@@ -2519,21 +2514,9 @@ impl Chunk {
                 continue;
             }
             if near_wall && !tried_gc {
-                // A pass already holding this chunk's GC lock IS the reclaim
-                // this write is waiting for. Without `full_gc` the emergency
-                // pass steps aside from it (try_lock) and would count that
-                // no-op as the one attempt; wait for the running pass to
-                // finish instead and re-judge the headroom. Bounded, in case
-                // passes come back to back under pressure.
-                if !full_gc && self.gc_lock.is_locked() && gc_waits < MAX_EMERGENCY_GC_WAITS {
-                    gc_waits += 1;
-                    debug!(
-                        "Chunk {} near capacity with a GC pass in progress; waiting for it ({}/{})",
-                        self.id, gc_waits, MAX_EMERGENCY_GC_WAITS
-                    );
-                    drop(self.gc_lock.lock());
-                    continue;
-                }
+                // The caller can hold a cell-index lock that a running
+                // cleaner needs. Waiting for its GC lock creates a lock cycle.
+                // Best-effort collection uses try_lock and must stay nonblocking.
                 warn!(
                     "Chunk {} near capacity ({} writer segment(s) left), emergency {} GC",
                     self.id,
@@ -6929,6 +6912,66 @@ mod tests {
         );
         finish_tx.send(()).unwrap();
         pinning.join().expect("pinning thread");
+    }
+
+    /// A best-effort allocation must return while another cleaner owns the
+    /// GC lock. The caller holds a cell-index lock that the cleaner needs.
+    #[test]
+    fn an_update_does_not_wait_for_gc_while_holding_the_cell_index() {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("gc_index_lock_cycle", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let before = chunks.write_cell(&mut cell).unwrap();
+        while chunk.allocator.writer_headroom() > 1 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            chunk.put_segment(seg);
+        }
+        assert_eq!(chunk.allocator.writer_headroom(), 1);
+        for slot in chunk.head_pool.iter() {
+            let id = slot.load(Ordering::Acquire);
+            if let Some(seg) = chunk.segs.get(&(id as usize)) {
+                seg.retire_tail();
+            }
+        }
+
+        // Model the cleaner's GC lock. Keep it held until the update has
+        // returned. A cleaner can need the same cell-index lock during combine.
+        let gc = chunk.gc_lock.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let schema_id = schema.vid;
+        let writer = std::thread::spawn(move || {
+            let result =
+                writer_chunks.update_cell_by(&id, |_| Some(payload_cell(schema_id.get(), &id, 64)));
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(gc);
+        writer.join().unwrap();
+        let updated = result
+            .expect("the update waited for GC while holding the cell-index lock")
+            .expect("the last writer segment can hold the update");
+        assert_eq!(updated.header.version, before.version + 1);
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().header.version,
+            updated.header.version
+        );
     }
 
     /// A chunk whose allocator is empty must refuse the write, not wedge.
