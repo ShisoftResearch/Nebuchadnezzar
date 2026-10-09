@@ -23,7 +23,10 @@ const SCHEMA: u32 = 9401;
 const BATCH: u64 = 100;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn options(base: &str, recover: bool) -> ServerOptions {
@@ -91,6 +94,7 @@ async fn populate(base: &str, cells: u64) {
     let server = NebServer::new_from_opts(&options(base, false), &addr, "perf_probe", async |_| {})
         .await
         .expect("server start");
+    server.cleaner().pause();
     server.meta().schemas.register_internal_schema(schema());
     let client = Arc::new(server.data_client(&vec![addr]).await.expect("data client"));
     let chunks = server.chunks();
@@ -116,7 +120,11 @@ async fn populate(base: &str, cells: u64) {
     // bracketed write path and its recovery are exercised too.
     let batched = cells / 10;
     let base_index = cells;
-    for (name, phase) in [("batched_insert", 0u8), ("batched_update", 1), ("batched_delete", 2)] {
+    for (name, phase) in [
+        ("batched_insert", 0u8),
+        ("batched_update", 1),
+        ("batched_delete", 2),
+    ] {
         let started = Instant::now();
         let mut done = 0u64;
         let mut at = 0u64;
@@ -146,8 +154,16 @@ async fn populate(base: &str, cells: u64) {
     }
 
     let started = Instant::now();
+    for chunk in &chunks.list {
+        neb::ram::cleaner::Cleaner::clean(chunk, true, true);
+    }
+    println!("METRIC cleaner_secs {:.3}", started.elapsed().as_secs_f64());
+    let started = Instant::now();
     server.shutdown().await;
-    println!("METRIC shutdown_secs {:.3}", started.elapsed().as_secs_f64());
+    println!(
+        "METRIC shutdown_secs {:.3}",
+        started.elapsed().as_secs_f64()
+    );
     println!("METRIC populate_peak_rss_kb {}", peak_rss_kb());
 }
 
@@ -157,7 +173,10 @@ async fn recover(base: &str, cells: u64) {
     let server = NebServer::new_from_opts(&options(base, true), &addr, "perf_probe", async |_| {})
         .await
         .expect("server start");
-    println!("METRIC recovery_secs {:.3}", started.elapsed().as_secs_f64());
+    println!(
+        "METRIC recovery_secs {:.3}",
+        started.elapsed().as_secs_f64()
+    );
     println!("METRIC recover_peak_rss_kb {}", peak_rss_kb());
     server.meta().schemas.register_internal_schema(schema());
     // Sanity, not a benchmark: single ranges are deleted / live as populated.
@@ -174,7 +193,9 @@ async fn recover(base: &str, cells: u64) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let base = arg(&args, "--base").expect("--base DIR");
-    let cells: u64 = arg(&args, "--cells").and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let cells: u64 = arg(&args, "--cells")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
