@@ -249,9 +249,9 @@ fn phase_snapshot_uses_zero_ratios_for_zero_denominators() {
 
 #[cfg(feature = "occ_phase_profile")]
 #[test]
-fn run_report_deserializes_legacy_scenario_json_without_phases_field() {
+fn run_report_requires_phases_field() {
     let report_json = json!({
-        "label": "occ-legacy",
+        "label": "occ-required-phases",
         "revision": "deadbeef",
         "scenarios": {
             "repeatable-read": {
@@ -269,12 +269,7 @@ fn run_report_deserializes_legacy_scenario_json_without_phases_field() {
         }
     });
 
-    let report: RunReport = serde_json::from_value(report_json).expect("deserialize legacy report");
-    let scenario = report
-        .scenarios
-        .get("repeatable-read")
-        .expect("repeatable-read scenario");
-    assert!(scenario.phases.is_empty());
+    assert!(serde_json::from_value::<RunReport>(report_json).is_err());
 }
 
 #[test]
