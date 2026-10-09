@@ -84,6 +84,19 @@ fn cell(id: &Id, data: u64, pad: usize) -> OwnedCell {
 enum Mode {
     Direct,
     Txn,
+    /// Bracketed writes, plain deletes: a delete written AFTER the bracket.
+    TxnWritesDirectDeletes,
+    /// Plain writes, bracketed deletes.
+    DirectWritesTxnDeletes,
+}
+
+impl Mode {
+    fn writes_in_txn(self) -> bool {
+        matches!(self, Mode::Txn | Mode::TxnWritesDirectDeletes)
+    }
+    fn deletes_in_txn(self) -> bool {
+        matches!(self, Mode::Txn | Mode::DirectWritesTxnDeletes)
+    }
 }
 
 struct Store {
@@ -112,12 +125,12 @@ impl Store {
     }
 
     async fn write(&self, c: OwnedCell) {
-        match self.mode {
-            Mode::Direct => {
+        match self.mode.writes_in_txn() {
+            false => {
                 let mut c = c;
                 self.server.chunks().write_cell(&mut c).expect("write");
             }
-            Mode::Txn => self
+            true => self
                 .client
                 .transaction(move |t| {
                     let c = c.clone();
@@ -129,12 +142,12 @@ impl Store {
     }
 
     async fn update(&self, c: OwnedCell) {
-        match self.mode {
-            Mode::Direct => {
+        match self.mode.writes_in_txn() {
+            false => {
                 let mut c = c;
                 self.server.chunks().update_cell(&mut c).expect("update");
             }
-            Mode::Txn => self
+            true => self
                 .client
                 .transaction(move |t| {
                     let c = c.clone();
@@ -146,9 +159,9 @@ impl Store {
     }
 
     async fn remove(&self, id: Id) {
-        match self.mode {
-            Mode::Direct => self.server.chunks().remove_cell(&id).expect("remove"),
-            Mode::Txn => self
+        match self.mode.deletes_in_txn() {
+            false => self.server.chunks().remove_cell(&id).expect("remove"),
+            true => self
                 .client
                 .transaction(move |t| async move { t.remove(id).await })
                 .await
@@ -270,6 +283,35 @@ async fn deleted_from_sealed_segments(class: IdClass, mode: Mode, group: &str) {
     store.server.shutdown().await;
 }
 
+/// A re-created id restarts at version 1 while the tombstone of the previous
+/// incarnation carries its last version (here 3): the re-create must win.
+async fn recreated_after_updates(class: IdClass, mode: Mode, group: &str) {
+    let _ = env_logger::try_init();
+    let dir = scratch_dir();
+    let mut store = Store::start(dir.path(), group, mode).await;
+    let mut model = HashMap::new();
+    for index in 0..100u64 {
+        let id = class.id(index);
+        store.write(cell(&id, 1, 8)).await;
+        store.update(cell(&id, 2, 8)).await;
+        store.update(cell(&id, 3, 8)).await;
+        store.remove(id).await;
+        store.write(cell(&id, 10 + index, 8)).await;
+        // Every third id is deleted for good after its second life.
+        let last = if index % 3 == 0 {
+            store.remove(id).await;
+            None
+        } else {
+            Some(10 + index)
+        };
+        model.insert(index, (id, last));
+    }
+    check(&store.server, &model, "before the restart");
+    store = store.restart(dir.path(), group).await;
+    check(&store.server, &model, &format!("after a graceful restart ({class:?}, {mode:?})"));
+    store.server.shutdown().await;
+}
+
 macro_rules! scenarios {
     ($($name:ident: $runner:ident($class:expr, $mode:expr, $group:expr);)*) => {
         $(
@@ -294,4 +336,10 @@ scenarios! {
     sealed_deletes_hashed_direct: deleted_from_sealed_segments(IdClass::Hashed, Mode::Direct, "rd_c_hd");
     sealed_deletes_allocated_txn: deleted_from_sealed_segments(IdClass::Allocated, Mode::Txn, "rd_c_at");
     sealed_deletes_hashed_txn: deleted_from_sealed_segments(IdClass::Hashed, Mode::Txn, "rd_c_ht");
+    after_updates_allocated_direct: recreated_after_updates(IdClass::Allocated, Mode::Direct, "rd_d_ad");
+    after_updates_hashed_txn: recreated_after_updates(IdClass::Hashed, Mode::Txn, "rd_d_ht");
+    after_updates_allocated_txn_then_plain_deletes: recreated_after_updates(IdClass::Allocated, Mode::TxnWritesDirectDeletes, "rd_d_atp");
+    after_updates_hashed_plain_then_txn_deletes: recreated_after_updates(IdClass::Hashed, Mode::DirectWritesTxnDeletes, "rd_d_hpt");
+    mixed_updated_deleted_txn_then_plain: updated_then_deleted(IdClass::Hashed, Mode::TxnWritesDirectDeletes, "rd_a_htp");
+    mixed_updated_deleted_plain_then_txn: updated_then_deleted(IdClass::Allocated, Mode::DirectWritesTxnDeletes, "rd_a_apt");
 }

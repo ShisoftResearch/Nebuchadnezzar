@@ -447,6 +447,12 @@ pub struct BracketLedger {
     /// does. Removed again when a later plain write re-creates the id.
     plain_deletes: Mutex<HashMap<(usize, u64), usize>>,
     plain_deletes_len: std::sync::atomic::AtomicUsize,
+    /// Plain cells the scan discarded for carrying a LOWER version than what
+    /// was already installed although they sit LATER in write order. That is
+    /// either a stale copy, or a re-created id (versions restart at 1) whose
+    /// predecessor was deleted by a bracket the scan could not yet apply.
+    /// Settled after the brackets, when the deletes are known.
+    late_losers: Mutex<Vec<PendingBracketCell>>,
 }
 
 pub struct PendingBracketCell {
@@ -482,7 +488,12 @@ impl BracketLedger {
             commits: Mutex::new(HashMap::new()),
             plain_deletes: Mutex::new(HashMap::new()),
             plain_deletes_len: std::sync::atomic::AtomicUsize::new(0),
+            late_losers: Mutex::new(Vec::new()),
         }
+    }
+
+    fn note_late_loser(&self, cell: PendingBracketCell) {
+        self.late_losers.lock().push(cell);
     }
 
     fn note_plain_delete(&self, chunk_id: usize, hash: u64, tombstone_addr: usize) {
@@ -587,6 +598,10 @@ impl BracketLedger {
         // lost).
         let mut plain_deletes = std::mem::take(&mut *self.plain_deletes.lock());
         apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes));
+        // A late loser comes back only if a committed delete removed what
+        // beat it; otherwise the same version rule keeps it out.
+        let late_losers = std::mem::take(&mut *self.late_losers.lock());
+        apply_bracketed_cells(chunks, late_losers, Some(&mut plain_deletes));
         // What is left has no COMMIT anywhere, and that now means exactly one
         // thing: the transaction was in flight when the store stopped.
         //
@@ -678,7 +693,7 @@ pub(crate) fn apply_bracketed_cells(
     mut cells: Vec<PendingBracketCell>,
     mut plain_deletes: Option<&mut PlainDeletes>,
 ) {
-    cells.sort_by_key(|cell| {
+    cells.sort_by_cached_key(|cell| {
         let order = chunks
             .get(cell.chunk_id)
             .map(|chunk| write_order(chunk, cell.addr))
@@ -1547,6 +1562,14 @@ fn scan_segment_from_data(
             } else {
                 // Existing version is newer, this entry is dead
                 dead_space += entry_header.content_length as u64;
+                ledger.note_late_loser(PendingBracketCell {
+                    chunk_id: chunk.id,
+                    hash,
+                    tombstone: false,
+                    addr: virtual_cursor,
+                    version: new_version,
+                    content_length: entry_header.content_length,
+                });
             }
         } else if entry_header.entry_type == EntryType::TOMBSTONE {
             let content_addr = Entry::content_pos(cursor);
