@@ -423,11 +423,18 @@ async fn recreated_in_another_segment_below_the_tombstone_version(mode: Mode, gr
     assert!(store.server.chunks().list[0].seg_count() > tombstone_segments);
     store = store.restart(dir.path(), group).await;
     {
-        let floors = store.server.chunks().list[0].deleted_versions.read();
-        assert_eq!(floors.len(), 20, "recovery must rebuild the deleted versions");
-        println!("deleted-version map: ids={}, capacity={}, entry_bytes={}",
-            floors.len(), floors.capacity(),
-            std::mem::size_of::<(u64, crate::ram::chunk::DeletedVersion)>());
+        let floors = &store.server.chunks().list[0].deleted_versions;
+        assert_eq!(
+            floors.len(),
+            20,
+            "recovery must rebuild the deleted versions"
+        );
+        println!(
+            "deleted-version map: ids={}, capacity={}, entry_bytes={}",
+            floors.len(),
+            floors.capacity(),
+            std::mem::size_of::<(u64, crate::ram::chunk::DeletedVersion)>()
+        );
     }
     for index in 0..20u64 {
         let id = model[&index].0;

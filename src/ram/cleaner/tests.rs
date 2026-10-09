@@ -94,7 +94,7 @@ pub fn full_clean_cycle_without_compact() {
         chunk.put_segment(empty);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
-        assert!(chunk.deleted_versions.read().is_empty());
+        assert!(chunk.deleted_versions.is_empty());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {

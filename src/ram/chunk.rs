@@ -1097,14 +1097,87 @@ pub(crate) struct DeletedVersion {
     pub tombstones: usize,
 }
 
+/// Floors and physical tombstone counts share a shard, so reclamation and
+/// recreation observe each update atomically without a chunk-wide lock.
+pub(crate) struct DeletedVersions {
+    shards: [parking_lot::Mutex<std::collections::HashMap<u64, DeletedVersion, ahash::RandomState>>;
+        64],
+}
+
+impl DeletedVersions {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| {
+                parking_lot::Mutex::new(std::collections::HashMap::with_hasher(
+                    ahash::RandomState::new(),
+                ))
+            }),
+        }
+    }
+
+    fn shard(
+        &self,
+        id: u64,
+    ) -> &parking_lot::Mutex<std::collections::HashMap<u64, DeletedVersion, ahash::RandomState>>
+    {
+        // Fold locality and origin as well as the sequence for allocated ids.
+        &self.shards[((id ^ (id >> 32)) as usize) & (self.shards.len() - 1)]
+    }
+
+    fn note(&self, id: u64, version: u64) {
+        let mut shard = self.shard(id).lock();
+        let floor = shard.entry(id).or_default();
+        floor.version = floor.version.max(version);
+        floor.tombstones += 1;
+    }
+
+    fn version(&self, id: u64) -> u64 {
+        self.shard(id)
+            .lock()
+            .get(&id)
+            .map_or(0, |floor| floor.version)
+    }
+
+    fn reclaim(&self, id: u64, count: usize) {
+        let mut shard = self.shard(id).lock();
+        if let std::collections::hash_map::Entry::Occupied(mut floor) = shard.entry(id) {
+            if floor.get().tombstones <= count {
+                floor.remove();
+            } else {
+                floor.get_mut().tombstones -= count;
+            }
+        }
+        if shard.is_empty() {
+            shard.shrink_to_fit();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.lock().len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().capacity())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub struct Chunk {
     pub id: usize,
     /// Shared with every chunk of the store and drained by the sealer thread.
     pub seal_queue: Arc<SealQueue>,
     pub cell_index: WordMap,
     /// Last deleted version and number of physical tombstones, per id.
-    pub(crate) deleted_versions:
-        parking_lot::RwLock<std::collections::HashMap<u64, DeletedVersion, ahash::RandomState>>,
+    pub(crate) deleted_versions: DeletedVersions,
     /// Live bytes per slot, shared across every chunk of this store. See
     /// [`crate::slots::SlotLiveBytes`] for the contract; the hooks live on the
     /// logical transitions of `cell_index` -- insert, replace, remove -- so
@@ -1401,9 +1474,7 @@ impl Chunk {
             id,
             segs,
             cell_index: index,
-            deleted_versions: parking_lot::RwLock::new(std::collections::HashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
+            deleted_versions: DeletedVersions::new(),
             slot_bytes,
             seal_queue,
             meta,
@@ -2996,19 +3067,13 @@ impl Chunk {
     }
 
     pub(crate) fn note_deleted_version(&self, hash: u64, version: u64) {
-        let mut versions = self.deleted_versions.write();
-        let floor = versions.entry(hash).or_default();
-        floor.version = floor.version.max(version);
-        floor.tombstones += 1;
+        self.deleted_versions.note(hash, version);
     }
 
     fn create_version(&self, cell: &OwnedCell) -> u64 {
-        self.deleted_versions
-            .read()
-            .get(&cell.header.id.bits())
-            .map_or(cell.header.version, |floor| {
-                cell.header.version.max(floor.version)
-            })
+        cell.header
+            .version
+            .max(self.deleted_versions.version(cell.header.id.bits()))
     }
 
     pub fn write_cell_to_chunk<'a>(
@@ -3808,22 +3873,8 @@ impl Chunk {
             if quiesced && unreferenced {
                 entry.segment.free_memory();
                 entry.segment.dispense();
-                {
-                    let mut floors = self.deleted_versions.write();
-                    for (hash, count) in entry.deleted_ids {
-                        if let std::collections::hash_map::Entry::Occupied(mut floor) =
-                            floors.entry(hash)
-                        {
-                            if floor.get().tombstones <= count {
-                                floor.remove();
-                            } else {
-                                floor.get_mut().tombstones -= count;
-                            }
-                        }
-                    }
-                    if floors.is_empty() {
-                        floors.shrink_to_fit();
-                    }
+                for (hash, count) in entry.deleted_ids {
+                    self.deleted_versions.reclaim(hash, count);
                 }
                 self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
                 entry.segment.mem_drop(self);
