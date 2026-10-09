@@ -3974,6 +3974,137 @@ mod tests {
         );
     }
 
+    /// H1 variants beyond the lease-release one. `how`:
+    ///  - "panic":    the writer panics between BEGIN and COMMIT. `set_transaction_id`
+    ///                is a thread-local that is not reset on unwind, so the NEXT
+    ///                ordinary write on that thread is leased to the dead
+    ///                transaction and recovered as a member of its bracket.
+    ///  - "no_room":  the head cannot hold the COMMIT. `close_transaction_bracket`
+    ///                only warns, `commit_transaction_brackets` returns Ok, the
+    ///                caller is told the transaction committed, and the bracket
+    ///                has no COMMIT at all.
+    /// Returns (txn cell present, ordinary-after present).
+    fn run_unowned_begin_variant(how: &str) -> (bool, bool) {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let schema = schema_with_id(432, "recovery_unowned_begin", false);
+        let txn_cell = Id::allocated(32, 0, 1);
+        let after = Id::allocated(32, 0, 2);
+        let txn = crate::server::transactions::test_hlc(8282, 9);
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mk = |id: &Id, n: i32| OwnedCell {
+                header: CellHeader::new(schema.vid, id),
+                data: data_map_value!(id: n, data: vec![0x44_u8; 64]),
+            };
+            let range = chunks.address_range();
+            match how {
+                "panic" => {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::ram::chunk::set_transaction_id(Some(txn.clone()));
+                        chunks.write_cell(&mut mk(&txn_cell, 1)).unwrap();
+                        panic!("writer died between BEGIN and COMMIT");
+                    }));
+                    assert!(r.is_err());
+                    // The thread-local is still set: an ORDINARY write follows.
+                    assert!(
+                        crate::ram::chunk::transaction_has_leases(&txn, &range),
+                        "the lease should still be held"
+                    );
+                    chunks.write_cell(&mut mk(&after, 2)).unwrap();
+                    assert_eq!(
+                        crate::ram::chunk::transaction_lease_count(&txn, &range),
+                        1,
+                        "the ordinary write joined the dead transaction's lease"
+                    );
+                    crate::ram::chunk::set_transaction_id(None);
+                    // The expiry sweeper eventually releases it.
+                    crate::ram::chunk::release_transaction_leases(&txn, &range);
+                }
+                "no_room" => {
+                    crate::ram::chunk::set_transaction_id(Some(txn.clone()));
+                    chunks.write_cell(&mut mk(&txn_cell, 1)).unwrap();
+                    // Use up the head so the COMMIT cannot fit behind the entry.
+                    let chunk = &chunks.list[0];
+                    let seg = chunk
+                        .locate_segment(chunks.address_of(&txn_cell))
+                        .expect("segment");
+                    let remaining = seg
+                        .bound()
+                        .saturating_sub(seg.append_header.load(Ordering::Acquire));
+                    let filler = (remaining - 16) & !7;
+                    let pending = chunk.try_acquire(filler as u32, false).expect("filler");
+                    crate::ram::entry::stamp_reservation_padding(pending.addr, filler as u32);
+                    drop(pending);
+                    crate::ram::chunk::set_transaction_id(None);
+                    // The caller is told this succeeded.
+                    let committed = {
+                        crate::ram::chunk::set_transaction_id(Some(txn.clone()));
+                        let r = chunks.commit_transaction_brackets(&txn);
+                        crate::ram::chunk::set_transaction_id(None);
+                        r
+                    };
+                    eprintln!("H1 no_room: commit_transaction_brackets -> {:?}", committed);
+                    drop(crate::ram::chunk::take_transactional_segments());
+                    crate::ram::chunk::release_transaction_leases(&txn, &range);
+                    chunks.write_cell(&mut mk(&after, 2)).unwrap();
+                }
+                other => panic!("unknown variant {other}"),
+            }
+            drop(crate::ram::chunk::take_transactional_segments());
+            chunks.sync_all();
+        }
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        let a = chunks.read_cell(&txn_cell).is_ok();
+        let b = chunks.read_cell(&after).is_ok();
+        (a, b)
+    }
+
+    #[test]
+    fn h1_panic_between_begin_and_commit_must_not_swallow_the_next_ordinary_write() {
+        let (txn_cell, after) = run_unowned_begin_variant("panic");
+        eprintln!("H1 panic: txn={txn_cell} after={after}");
+        assert!(!txn_cell, "an undecided transaction's cell must not recover");
+        assert!(after, "H1: an ACKNOWLEDGED ordinary write after a panicked transaction was dropped");
+    }
+
+    #[test]
+    fn h1_a_commit_that_finds_no_room_must_not_report_success() {
+        let (txn_cell, after) = run_unowned_begin_variant("no_room");
+        eprintln!("H1 no_room: txn={txn_cell} after={after}");
+        assert!(
+            txn_cell,
+            "H1: commit_transaction_brackets returned Ok but the transaction did not survive recovery"
+        );
+        assert!(after);
+    }
+
     /// The crash this format exists for: a record's frame reached disk, its
     /// body did not.
     ///
