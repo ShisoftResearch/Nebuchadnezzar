@@ -1401,6 +1401,7 @@ impl Drop for CellIdScan<'_> {
 /// Write fences engaged on every member. See [`AsyncClient::engage_write_fence`].
 pub struct ClusterFence {
     holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)>,
+    lease_ms: u64,
     stop: Arc<tokio::sync::Notify>,
     renewal: Option<tokio::task::JoinHandle<()>>,
     lost: Arc<std::sync::atomic::AtomicBool>,
@@ -1434,16 +1435,61 @@ impl ClusterFence {
         };
         ClusterFence {
             holds,
+            lease_ms,
             stop,
             renewal: Some(renewal),
             lost,
         }
     }
 
+    /// Prove, right now, that every member has held the fence continuously
+    /// since it was engaged.
+    ///
+    /// [`Self::is_lost`] only knows what the background renewals have seen so
+    /// far, and a lease can lapse between two of them (a stalled renewal task,
+    /// a slow network) with nobody told yet. A member drops a lease's token
+    /// when, and only when, it lifts that fence, so a renewal answered `true`
+    /// means the fence has been up there the whole time. A copy calls this
+    /// after its last read and before it declares itself complete.
+    pub async fn confirm(&self) -> Result<(), String> {
+        let lost = |reason: String| {
+            self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(reason)
+        };
+        if self.is_lost() {
+            return Err("a renewal already found the fence lifted on a member".to_string());
+        }
+        for (rpc, token) in &self.holds {
+            match rpc.fence_renew(*token, self.lease_ms).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return lost(format!(
+                        "the fence lease {token} lapsed on a member and the fence was lifted there"
+                    ))
+                }
+                Err(e) => {
+                    return lost(format!(
+                        "cannot confirm the fence lease {token} on a member: {e:?}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether any member lost the fence (a missed renewal) since it was engaged.
     /// A copy taken while this is true is not consistent.
     pub fn is_lost(&self) -> bool {
         self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stop renewing without releasing, as a holder whose renewal task stalls
+    /// (a starved runtime, a slow network) would.
+    #[cfg(test)]
+    pub(crate) fn stop_renewing_for_test(&mut self) {
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
     }
 
     pub async fn release(mut self) {

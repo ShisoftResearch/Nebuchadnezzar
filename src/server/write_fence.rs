@@ -23,8 +23,8 @@
 //! the classic store-then-load handshake over sequentially consistent atomics:
 //!
 //! * a writer publishes "I am in flight" in a counter, **then** reads the
-//!   fenced flag;
-//! * the fencer publishes the fenced flag, **then** waits for the counters to
+//!   gate;
+//! * the fencer publishes the gate (turns it odd), **then** waits for the counters to
 //!   reach zero.
 //!
 //! Whichever side's store comes second in the total order sees the other: a
@@ -33,13 +33,16 @@
 //! set and is refused. There is no window in which a write is neither.
 //!
 //! The counters are sharded across cache lines so the common case -- no fence
-//! engaged -- costs one uncontended `fetch_add` and one load per write.
+//! engaged -- costs one `fetch_add` on the writer's own cache line, one load of
+//! the shared gate (read-mostly, so it stays in every core's cache), and one
+//! `fetch_sub` when the write leaves: two uncontended atomic read-modify-writes and
+//! one load. Measured end to end in `benches/write_path.rs`.
 
 use crate::ram::cell::WriteError;
 use crate::ram::schema::SchemaUid;
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,13 +81,102 @@ impl std::fmt::Display for FenceError {
 
 impl std::error::Error for FenceError {}
 
+/// Which families an engaged fence refuses writes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protection {
+    /// These families and no others: a dump protects what it copies and lets
+    /// derived state (index write-back, statistics) keep flowing.
+    Only(HashSet<SchemaUid>),
+    /// Every family except these, including families created after the fence
+    /// went up: a database that must not take writes at all (an unfinished
+    /// restore) still lets the engine's own derived writers flush.
+    AllExcept(HashSet<SchemaUid>),
+}
+
+impl Protection {
+    pub fn covers(&self, family: SchemaUid) -> bool {
+        match self {
+            Protection::Only(families) => families.contains(&family),
+            Protection::AllExcept(exempt) => !exempt.contains(&family),
+        }
+    }
+}
+
+/// What a write that names only a cell id (a remove, a field set) learned about
+/// the cell, for [`WriteFence::enter_keyed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedFamily {
+    /// The cell exists and belongs to this family.
+    Family(SchemaUid),
+    /// There is no such cell right now.
+    Missing,
+    /// The cell could not be examined.
+    Unknown,
+}
+
 pub struct WriteFence {
-    fenced: AtomicBool,
+    /// Odd while a fence is engaged, even otherwise, and it only ever goes up:
+    /// engaging adds one (even -> odd), releasing adds one (odd -> even). A flag
+    /// that counts engagements instead of just saying "engaged" lets an
+    /// admission record WHICH fence it saw, which is what makes the ordering
+    /// between a write's decision and a fence's publication checkable after the
+    /// fact (see the trace under `cfg(test)`).
+    gate: AtomicU64,
     shards: Box<[Shard; SHARDS]>,
-    /// The families being protected. Written before `fenced` is set and read
-    /// only after it is seen set, so the flag's ordering publishes it.
-    protected: RwLock<Arc<HashSet<SchemaUid>>>,
+    /// The families being protected. Written before `gate` turns odd and read
+    /// only after it is seen odd, so the gate's ordering publishes it.
+    protected: RwLock<Arc<Protection>>,
     refused: AtomicU64,
+    #[cfg(test)]
+    trace: trace::Trace,
+}
+
+/// A record of the fence's decisions, in a single total order, for tests that
+/// must prove the handshake rather than observe it from outside.
+#[cfg(test)]
+pub mod trace {
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Event {
+        /// A write's admission decision. `seen` is the gate value its decision
+        /// read; `counted` means it entered the in-flight count; `refused` means
+        /// it got `DatabaseFenced`.
+        Admit {
+            note: u64,
+            seen: u64,
+            counted: bool,
+            refused: bool,
+            tick: u64,
+        },
+        /// A counted write finished (recorded BEFORE it leaves the count).
+        Done { note: u64, seen: u64, tick: u64 },
+        /// The gate turned odd: the fence is published.
+        Published { gate: u64, tick: u64 },
+        /// `engage` observed nothing in flight and returned.
+        Returned { gate: u64, tick: u64 },
+        /// The hold dropped: the gate turned even.
+        Released { gate: u64, tick: u64 },
+    }
+
+    #[derive(Default)]
+    pub struct Trace {
+        clock: AtomicU64,
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl Trace {
+        pub fn tick(&self) -> u64 {
+            self.clock.fetch_add(1, Ordering::SeqCst)
+        }
+        pub fn push(&self, event: Event) {
+            self.events.lock().push(event);
+        }
+        pub fn take(&self) -> Vec<Event> {
+            std::mem::take(&mut *self.events.lock())
+        }
+    }
 }
 
 impl Default for WriteFence {
@@ -97,11 +189,26 @@ impl Default for WriteFence {
 /// the fence's drain.
 pub struct WriteGuard<'a> {
     counted: Option<(&'a WriteFence, usize)>,
+    #[cfg(test)]
+    note: u64,
+    #[cfg(test)]
+    seen: u64,
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         if let Some((fence, shard)) = self.counted.take() {
+            #[cfg(test)]
+            {
+                // Before the decrement: if the drain returned while this write
+                // was still running, its Done tick would be after the drain's.
+                let tick = fence.trace.tick();
+                fence.trace.push(trace::Event::Done {
+                    note: self.note,
+                    seen: self.seen,
+                    tick,
+                });
+            }
             fence.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -121,7 +228,14 @@ impl FenceHold {
 
 impl Drop for FenceHold {
     fn drop(&mut self) {
-        self.fence.fenced.store(false, Ordering::SeqCst);
+        let gate = self.fence.gate.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        {
+            let tick = self.fence.trace.tick();
+            self.fence.trace.push(trace::Event::Released { gate, tick });
+        }
+        #[cfg(not(test))]
+        let _ = gate;
     }
 }
 
@@ -140,15 +254,29 @@ fn shard_of_current_thread() -> usize {
 impl WriteFence {
     pub fn new() -> Self {
         Self {
-            fenced: AtomicBool::new(false),
+            gate: AtomicU64::new(0),
             shards: Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0)))),
-            protected: RwLock::new(Arc::new(HashSet::new())),
+            protected: RwLock::new(Arc::new(Protection::Only(HashSet::new()))),
             refused: AtomicU64::new(0),
+            #[cfg(test)]
+            trace: Default::default(),
         }
     }
 
     pub fn is_engaged(&self) -> bool {
-        self.fenced.load(Ordering::SeqCst)
+        self.gate.load(Ordering::SeqCst) & 1 == 1
+    }
+
+    /// The trace of admissions and fence transitions so far, drained.
+    #[cfg(test)]
+    pub fn take_trace(&self) -> Vec<trace::Event> {
+        self.trace.take()
+    }
+
+    /// A tick in the trace's clock, for correlating outside observations.
+    #[cfg(test)]
+    pub fn trace_tick(&self) -> u64 {
+        self.trace.tick()
     }
 
     /// Writes refused by the fence since it was created.
@@ -166,38 +294,162 @@ impl WriteFence {
     /// `family` is only consulted when a fence is engaged, so the caller can
     /// pass a closure that does a lookup (a header read for a remove, say)
     /// without paying for it on the normal path. `None` means the schema could
-    /// not be determined -- a cell that does not exist, which the write will
-    /// reject on its own -- and is admitted.
+    /// not be determined, and is refused while the fence is engaged.
     pub fn enter(
         &self,
         family: impl FnOnce() -> Option<SchemaUid>,
     ) -> Result<WriteGuard<'_>, WriteError> {
+        self.enter_noted(0, family)
+    }
+
+    /// [`Self::enter`] with a caller-chosen `note` (a cell id, say) carried into
+    /// the test trace so an admission can be matched to the write it admitted.
+    pub fn enter_noted(
+        &self,
+        note: u64,
+        family: impl FnOnce() -> Option<SchemaUid>,
+    ) -> Result<WriteGuard<'_>, WriteError> {
+        #[cfg(not(test))]
+        let _ = note;
         let shard = shard_of_current_thread();
         self.shards[shard].0.fetch_add(1, Ordering::SeqCst);
-        if !self.fenced.load(Ordering::SeqCst) {
+        // THE decision: one SeqCst load of the gate. What it returns is what
+        // this write saw of the fence, and everything below follows from it.
+        let seen = self.gate.load(Ordering::SeqCst);
+        if seen & 1 == 0 {
+            #[cfg(test)]
+            {
+                let tick = self.trace.tick();
+                self.trace.push(trace::Event::Admit {
+                    note,
+                    seen,
+                    counted: true,
+                    refused: false,
+                    tick,
+                });
+            }
             return Ok(WriteGuard {
                 counted: Some((self, shard)),
+                #[cfg(test)]
+                note,
+                #[cfg(test)]
+                seen,
             });
         }
         // Fenced: this write is not going to count, whatever the verdict.
         self.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+        // A family that cannot be determined is refused, not admitted. For a
+        // write that carries its cell the only way to get here is a schema this
+        // server's cache does not know yet -- and the write path refreshes the
+        // cache and retries, so admitting it unguarded would let a write to a
+        // protected family through the retry.
         let protected = match family() {
-            Some(uid) => self.protected.read().contains(&uid),
-            None => false,
+            Some(uid) => self.protected.read().covers(uid),
+            None => true,
         };
+        #[cfg(test)]
+        {
+            let tick = self.trace.tick();
+            self.trace.push(trace::Event::Admit {
+                note,
+                seen,
+                counted: false,
+                refused: protected,
+                tick,
+            });
+        }
         if protected {
             self.refused.fetch_add(1, Ordering::Relaxed);
             Err(WriteError::DatabaseFenced)
         } else {
-            Ok(WriteGuard { counted: None })
+            Ok(WriteGuard {
+                counted: None,
+                #[cfg(test)]
+                note,
+                #[cfg(test)]
+                seen,
+            })
+        }
+    }
+
+    /// Count an operation that decides for itself whether the fence applies to
+    /// it (a transaction's prepare or commit): `Some(guard)` if no fence is
+    /// engaged, so a fencer that engages afterwards waits for it; `None` if one
+    /// is, in which case the caller applies its own rule. Never a refusal.
+    pub fn count_if_open(&self) -> Option<WriteGuard<'_>> {
+        let shard = shard_of_current_thread();
+        self.shards[shard].0.fetch_add(1, Ordering::SeqCst);
+        let seen = self.gate.load(Ordering::SeqCst);
+        if seen & 1 == 0 {
+            #[cfg(test)]
+            {
+                let tick = self.trace.tick();
+                self.trace.push(trace::Event::Admit {
+                    note: 0,
+                    seen,
+                    counted: true,
+                    refused: false,
+                    tick,
+                });
+            }
+            return Some(WriteGuard {
+                counted: Some((self, shard)),
+                #[cfg(test)]
+                note: 0,
+                #[cfg(test)]
+                seen,
+            });
+        }
+        self.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+        None
+    }
+
+    /// Admission for a write that names only a cell id.
+    ///
+    /// `lookup` runs only while a fence is engaged. The result is `Ok(guard)`
+    /// to proceed, or an error the caller returns INSTEAD of performing the
+    /// write:
+    ///
+    /// * the cell belongs to a protected family: `DatabaseFenced`;
+    /// * the cell is missing: `CellDoesNotExisted`, and the write is NOT
+    ///   performed. Proceeding "because there is nothing to protect" is a
+    ///   check-then-act race: a write admitted before the fence can create the
+    ///   cell between this lookup and the removal, and the removal would then
+    ///   delete a protected cell under an engaged fence. Answering at the
+    ///   lookup makes the write take effect at the instant it looked, when the
+    ///   cell really was absent;
+    /// * the cell could not be examined: `DatabaseFenced`.
+    pub fn enter_keyed(
+        &self,
+        note: u64,
+        lookup: impl FnOnce() -> KeyedFamily,
+    ) -> Result<WriteGuard<'_>, WriteError> {
+        let missing = std::cell::Cell::new(false);
+        let result = self.enter_noted(note, || match lookup() {
+            KeyedFamily::Family(uid) => Some(uid),
+            KeyedFamily::Missing => {
+                missing.set(true);
+                None
+            }
+            KeyedFamily::Unknown => None,
+        });
+        match result {
+            Err(WriteError::DatabaseFenced) if missing.get() => Err(WriteError::CellDoesNotExisted),
+            other => other,
         }
     }
 
     /// Whether a write to `family` would be refused right now. For callers that
     /// need the verdict without a guard (a prepare that is about to hold one).
     pub fn would_refuse(&self, family: Option<SchemaUid>) -> bool {
-        self.is_engaged()
-            && family.is_some_and(|uid| self.protected.read().contains(&uid))
+        self.is_engaged() && family.is_some_and(|uid| self.protects(uid))
+    }
+
+    /// Whether the current protection covers `family`. Meaningful only while
+    /// a fence is engaged; for use inside the `family` lookup of [`Self::enter`],
+    /// which runs only then.
+    pub fn protects(&self, family: SchemaUid) -> bool {
+        self.protected.read().covers(family)
     }
 
     /// Engage the fence over `protected` and wait for writes already in flight
@@ -208,13 +460,34 @@ impl WriteFence {
         protected: HashSet<SchemaUid>,
         drain_timeout: Duration,
     ) -> Result<FenceHold, FenceError> {
-        *self.protected.write() = Arc::new(protected);
-        if self
-            .fenced
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        self.engage_with(Protection::Only(protected), drain_timeout).await
+    }
+
+    /// [`Self::engage`] with any [`Protection`].
+    pub async fn engage_with(
+        self: &Arc<Self>,
+        protected: Protection,
+        drain_timeout: Duration,
+    ) -> Result<FenceHold, FenceError> {
+        // Decide and publish under the write lock, so a second `engage` that is
+        // refused cannot overwrite the protected set of the fence already up.
+        let published = {
+            let mut set = self.protected.write();
+            let current = self.gate.load(Ordering::SeqCst);
+            if current & 1 == 1 {
+                return Err(FenceError::AlreadyEngaged);
+            }
+            *set = Arc::new(protected);
+            // The set is in place before the gate turns odd.
+            self.gate
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| FenceError::AlreadyEngaged)?;
+            current + 1
+        };
+        #[cfg(test)]
         {
-            return Err(FenceError::AlreadyEngaged);
+            let tick = self.trace.tick();
+            self.trace.push(trace::Event::Published { gate: published, tick });
         }
         let hold = FenceHold {
             fence: Arc::clone(self),
@@ -223,6 +496,11 @@ impl WriteFence {
         loop {
             let in_flight = self.in_flight();
             if in_flight <= 0 {
+                #[cfg(test)]
+                {
+                    let tick = self.trace.tick();
+                    self.trace.push(trace::Event::Returned { gate: published, tick });
+                }
                 return Ok(hold);
             }
             if started.elapsed() >= drain_timeout {
@@ -240,6 +518,7 @@ impl WriteFence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn protect(ids: &[u32]) -> HashSet<SchemaUid> {
         ids.iter().map(|id| SchemaUid(*id)).collect()
@@ -265,13 +544,66 @@ mod tests {
             fence.enter(|| Some(SchemaUid(7))).err(),
             Some(WriteError::DatabaseFenced)
         );
-        // Derived state keeps flowing, and an unknown cell is the write's own
-        // problem to report.
+        // Derived state keeps flowing.
         assert!(fence.enter(|| Some(SchemaUid(8))).is_ok());
-        assert!(fence.enter(|| None).is_ok());
-        assert_eq!(fence.refused_writes(), 1);
+        // A family that cannot be determined is not let through: the cache
+        // refresh-and-retry in the write path would carry it past the fence.
+        assert_eq!(fence.enter(|| None).err(), Some(WriteError::DatabaseFenced));
+        assert_eq!(fence.refused_writes(), 2);
         drop(hold);
         assert!(fence.enter(|| Some(SchemaUid(7))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_all_except_fence_refuses_every_family_but_the_exempt_ones() {
+        let fence = Arc::new(WriteFence::new());
+        let _hold = fence
+            .engage_with(Protection::AllExcept(protect(&[9])), Duration::from_secs(1))
+            .await
+            .unwrap();
+        // Known or not, every family is refused...
+        assert_eq!(fence.enter(|| Some(SchemaUid(7))).err(), Some(WriteError::DatabaseFenced));
+        assert_eq!(fence.enter(|| Some(SchemaUid(12345))).err(), Some(WriteError::DatabaseFenced));
+        assert!(fence.would_refuse(Some(SchemaUid(7))));
+        // ...but the exempt ones.
+        assert!(fence.enter(|| Some(SchemaUid(9))).is_ok());
+        assert!(!fence.would_refuse(Some(SchemaUid(9))));
+    }
+
+    #[tokio::test]
+    async fn a_keyed_write_on_a_missing_cell_is_answered_not_performed() {
+        let fence = Arc::new(WriteFence::new());
+        let _hold = fence.engage(protect(&[7]), Duration::from_secs(1)).await.unwrap();
+        // Missing: the write does not run, and says so the way it would have.
+        assert_eq!(
+            fence.enter_keyed(1, || KeyedFamily::Missing).err(),
+            Some(WriteError::CellDoesNotExisted)
+        );
+        // Unexaminable: refused. Protected: refused. Unprotected: proceeds.
+        assert_eq!(
+            fence.enter_keyed(1, || KeyedFamily::Unknown).err(),
+            Some(WriteError::DatabaseFenced)
+        );
+        assert_eq!(
+            fence.enter_keyed(1, || KeyedFamily::Family(SchemaUid(7))).err(),
+            Some(WriteError::DatabaseFenced)
+        );
+        assert!(fence.enter_keyed(1, || KeyedFamily::Family(SchemaUid(8))).is_ok());
+        // The lookup is not consulted when nothing is engaged.
+        drop(_hold);
+        assert!(fence.enter_keyed(1, || panic!("no lookup without a fence")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn count_if_open_counts_only_without_a_fence() {
+        let fence = Arc::new(WriteFence::new());
+        let guard = fence.count_if_open().expect("no fence");
+        assert_eq!(fence.in_flight(), 1);
+        drop(guard);
+        let _hold = fence.engage(protect(&[7]), Duration::from_secs(1)).await.unwrap();
+        assert!(fence.count_if_open().is_none());
+        assert_eq!(fence.in_flight(), 0);
+        assert_eq!(fence.refused_writes(), 0, "never a refusal");
     }
 
     #[tokio::test]

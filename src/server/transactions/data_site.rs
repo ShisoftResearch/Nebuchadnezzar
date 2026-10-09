@@ -523,12 +523,19 @@ impl DataManager {
             .any(|op| match op.expectation {
                 CellExpectation::Absent => true,
                 CellExpectation::Present(_) => {
-                    let family = self
+                    // A cell that cannot be examined (it vanished since the
+                    // transaction read it, or its schema is unknown here) is
+                    // refused like an insert: it would fail certification
+                    // anyway, and "nothing to protect" is a check-then-act race.
+                    match self
                         .chunks()
                         .head_cell(&op.id)
                         .ok()
-                        .and_then(|header| self.database_runtime.schemas().uid_of_vid(&header.schema));
-                    fence.would_refuse(family)
+                        .and_then(|header| self.database_runtime.schemas().uid_of_vid(&header.schema))
+                    {
+                        Some(family) => fence.would_refuse(Some(family)),
+                        None => true,
+                    }
                 }
             })
     }
@@ -4599,7 +4606,7 @@ impl Service for DataManager {
             // through `prepared_writer_count`). A prepare that is fenced out is
             // refused before it takes any cell lock.
             let fence = self.database_runtime.write_fence();
-            let _fence_guard = fence.enter(|| None).ok();
+            let _fence_guard = fence.count_if_open();
             if fence.is_engaged() && self.prepare_writes_fenced_cell(&prepared_ops) {
                 return self.response_with(DMPrepareResult::DatabaseFenced).await;
             }
@@ -4714,7 +4721,7 @@ impl Service for DataManager {
         // (the transaction prepared before the fence, and aborting a prepared
         // transaction here would leave its coordinator in doubt), but it is
         // counted, so the fencer's drain waits for it.
-        let fence_guard = self.database_runtime.write_fence().enter(|| None).ok();
+        let fence_guard = self.database_runtime.write_fence().count_if_open();
 
         let effective_ts = clock.max(tid);
 

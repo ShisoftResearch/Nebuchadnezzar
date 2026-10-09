@@ -1195,8 +1195,18 @@ impl DatabaseRuntime {
         protected: std::collections::HashSet<crate::ram::schema::SchemaUid>,
         drain_timeout: std::time::Duration,
     ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
+        self.engage_write_fence_with(write_fence::Protection::Only(protected), drain_timeout)
+            .await
+    }
+
+    /// [`Self::engage_write_fence`] with any [`write_fence::Protection`].
+    pub async fn engage_write_fence_with(
+        &self,
+        protected: write_fence::Protection,
+        drain_timeout: std::time::Duration,
+    ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
         let started = std::time::Instant::now();
-        let hold = self.write_fence.engage(protected, drain_timeout).await?;
+        let hold = self.write_fence.engage_with(protected, drain_timeout).await?;
         // A transaction that prepared before the flag was set may still commit
         // afterwards, and a commit is a write. `prepare` is itself fenced, so
         // the set of such transactions only shrinks from here.

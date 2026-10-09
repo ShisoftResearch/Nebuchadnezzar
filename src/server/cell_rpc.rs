@@ -1248,15 +1248,30 @@ impl NebRPCService {
     /// Admit a write of `cell` through the database's write fence.
     ///
     /// The cell names its own generation, which resolves to the family the
-    /// fence protects.
+    /// fence protects. A write replaces whatever cell has its id, of whatever
+    /// family, so while a fence is engaged the stored cell's family counts
+    /// too: a body of an unprotected family must not overwrite a protected
+    /// cell. Both lookups run only while a fence is engaged.
     fn fence_for_cell_body(
         &self,
         cell: &OwnedCell,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
-        self.database_runtime.write_fence().enter(|| {
-            self.database_runtime
-                .schemas()
-                .uid_of_vid(&cell.header.schema)
+        let fence = self.database_runtime.write_fence();
+        fence.enter_noted(cell.header.id.bits(), || {
+            let schemas = self.database_runtime.schemas();
+            let body = schemas.uid_of_vid(&cell.header.schema);
+            match self.database_runtime.chunks().head_cell(&cell.header.id) {
+                Ok(stored) => match schemas.uid_of_vid(&stored.schema) {
+                    Some(stored) if fence.protects(stored) => Some(stored),
+                    Some(_) => body,
+                    // A stored cell whose family cannot be told: refused, as
+                    // an undeterminable family always is.
+                    None => None,
+                },
+                // Nothing stored: the body alone decides.
+                Err(ReadError::CellDoesNotExisted) => body,
+                Err(_) => None,
+            }
         })
     }
 
@@ -1267,9 +1282,16 @@ impl NebRPCService {
         &self,
         id: &Id,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
-        self.database_runtime.write_fence().enter(|| {
-            let header = self.database_runtime.chunks().head_cell(id).ok()?;
-            self.database_runtime.schemas().uid_of_vid(&header.schema)
+        use crate::server::write_fence::KeyedFamily;
+        self.database_runtime.write_fence().enter_keyed(id.bits(), || {
+            match self.database_runtime.chunks().head_cell(id) {
+                Ok(header) => match self.database_runtime.schemas().uid_of_vid(&header.schema) {
+                    Some(uid) => KeyedFamily::Family(uid),
+                    None => KeyedFamily::Unknown,
+                },
+                Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
+                Err(_) => KeyedFamily::Unknown,
+            }
         })
     }
 

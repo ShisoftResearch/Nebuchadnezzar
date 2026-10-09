@@ -2735,69 +2735,295 @@ mod write_fence_server_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn a_writer_racing_the_fence_is_refused_and_never_slips_through() {
+        use crate::server::write_fence::trace::Event;
         let _ = env_logger::try_init();
+        let rounds: usize = env::var("NEB_FENCE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        // `NEB_FENCE_UNBOUNDED=1`: the insert lane never evicts, so a fast build
+        // fills the (small) store. Used to measure that exhaustion, not by default.
+        let unbounded = env::var("NEB_FENCE_UNBOUNDED").as_deref() == Ok("1");
         let (server, client, runtime) = fenced_fixture("fence_race").await;
-        let held = Arc::new(AtomicBool::new(false));
+        let fence = runtime.write_fence().clone();
+
+        const WRITERS: u64 = 6;
+        // Lane by writer: 0,3 insert fresh ids (and evict old ones, so the live
+        // set stays bounded while every attempt still names a NEW id); 1,4 update
+        // a cell of their own in place; 2,5 remove and re-put the SAME four
+        // shared ids, so a remove and a create race on one id from two writers --
+        // the shape of the check-then-act hole.
+        let own = |w: u64| Id::from_parts(4, 100 + w);
+        let shared = |n: u64| Id::from_parts(4, 200 + (n % 4));
+        let snapshot_ids: Vec<Id> = vec![own(1), own(4), shared(0), shared(1), shared(2), shared(3)];
+        for id in &snapshot_ids {
+            client.write_cell(cell(PROTECTED_SCHEMA, id, 0)).await.unwrap().unwrap();
+        }
+        const EVICT_BEHIND: u64 = 1_500;
+
         let stop = Arc::new(AtomicBool::new(false));
-        let admitted_while_held = Arc::new(AtomicU64::new(0));
+        let observed_ok: Arc<parking_lot::Mutex<Vec<(u64, u64, &'static str)>>> = Arc::default();
         let refused = Arc::new(AtomicU64::new(0));
-        let admitted = Arc::new(AtomicU64::new(0));
+        let succeeded = Arc::new(AtomicU64::new(0));
+        let space_exhausted = Arc::new(AtomicU64::new(0));
+        let inserts_ok = Arc::new(AtomicU64::new(0));
 
         let mut writers = Vec::new();
-        for w in 0..6u64 {
+        for w in 0..WRITERS {
             let client = client.clone();
-            let held = held.clone();
+            let fence = fence.clone();
             let stop = stop.clone();
-            let admitted_while_held = admitted_while_held.clone();
+            let observed_ok = observed_ok.clone();
             let refused = refused.clone();
-            let admitted = admitted.clone();
+            let succeeded = succeeded.clone();
+            let space_exhausted = space_exhausted.clone();
+            let inserts_ok = inserts_ok.clone();
             writers.push(tokio::spawn(async move {
                 let mut n = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     n += 1;
-                    let id = Id::from_parts(3, w * 1_000_000 + n);
-                    // `held` is read AFTER the write returns Ok: a write that
-                    // started before the hold may legitimately finish just
-                    // after `engage` reports... no -- engage waits for it. So an
-                    // Ok observed while the hold is flagged is a slip-through.
-                    match client.write_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap() {
-                        Ok(_) => {
-                            admitted.fetch_add(1, Ordering::Relaxed);
-                            if held.load(Ordering::SeqCst) {
-                                admitted_while_held.fetch_add(1, Ordering::Relaxed);
+                    let (lane, note, outcome) = match w % 3 {
+                        0 => {
+                            // A NEW id on every attempt, refused or not.
+                            let id = Id::from_parts(3, w * 10_000_000 + n);
+                            let put = client.write_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap().map(|_| ());
+                            if put.is_ok() {
+                                inserts_ok.fetch_add(1, Ordering::Relaxed);
+                                if !unbounded && n > EVICT_BEHIND {
+                                    let old = Id::from_parts(3, w * 10_000_000 + n - EVICT_BEHIND);
+                                    // A delete of a cell created a moment ago;
+                                    // refused or absent is fine, both are recorded.
+                                    match client.remove_cell(old).await.unwrap() {
+                                        Ok(()) => observed_ok.lock().push((old.bits(), fence.trace_tick(), "evict")),
+                                        Err(WriteError::DatabaseFenced) | Err(WriteError::CellDoesNotExisted) => {}
+                                        Err(other) => panic!("unexpected evict error {other:?}"),
+                                    }
+                                }
                             }
+                            ("insert", id.bits(), put)
+                        }
+                        1 => {
+                            let id = own(w);
+                            ("update", id.bits(), client.update_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap().map(|_| ()))
+                        }
+                        _ => {
+                            let id = shared(n + w);
+                            match client.remove_cell(id).await.unwrap() {
+                                Ok(()) => {
+                                    observed_ok.lock().push((id.bits(), fence.trace_tick(), "remove"));
+                                    let put = client.upsert_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap().map(|_| ());
+                                    ("put-after-remove", id.bits(), put)
+                                }
+                                // Absent: create it (fresh create), the other writer may be
+                                // racing to do the same.
+                                Err(WriteError::CellDoesNotExisted) => {
+                                    let put = client.upsert_cell(cell(PROTECTED_SCHEMA, &id, n)).await.unwrap().map(|_| ());
+                                    ("create-absent", id.bits(), put)
+                                }
+                                Err(e) => ("remove", id.bits(), Err(e)),
+                            }
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            succeeded.fetch_add(1, Ordering::Relaxed);
+                            observed_ok.lock().push((note, fence.trace_tick(), lane));
                         }
                         Err(WriteError::DatabaseFenced) => {
                             refused.fetch_add(1, Ordering::Relaxed);
                             tokio::task::yield_now().await;
                         }
-                        Err(other) => panic!("unexpected write error {other:?}"),
+                        Err(WriteError::CellDoesNotExisted) if lane == "update" || lane == "put-after-remove" => {
+                            tokio::task::yield_now().await;
+                        }
+                        // A release build outruns the segment compactor on this small
+                        // store (every update leaves a dead version behind). The typed
+                        // error is a legitimate answer: nothing was written, the trace
+                        // still records the admission, and the invariants below hold.
+                        Err(WriteError::CannotAllocateSpace) => {
+                            space_exhausted.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(other) => panic!("unexpected write error in lane {lane}: {other:?}"),
                     }
                 }
             }));
         }
 
-        for round in 0..30 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        async fn snapshot(
+            client: &Arc<client::AsyncClient>,
+            runtime: &Arc<DatabaseRuntime>,
+            ids: &[Id],
+        ) -> (usize, Vec<Option<(u64, u64)>>) {
+            let mut cells = Vec::new();
+            for id in ids {
+                cells.push(match client.read_cell(*id).await.unwrap() {
+                    Ok(c) => Some((c.header.version, *c.data[DATA].u64().unwrap())),
+                    Err(_) => None,
+                });
+            }
+            (runtime.chunks().count(), cells)
+        }
+
+        let mut changed_under_fence = 0usize;
+        for round in 0..rounds {
+            tokio::time::sleep(Duration::from_millis(3)).await;
             let hold = runtime
                 .engage_write_fence(protected(), Duration::from_secs(10))
                 .await
                 .unwrap();
-            let before = runtime.chunks().count();
-            held.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            let after = runtime.chunks().count();
-            held.store(false, Ordering::SeqCst);
-            assert_eq!(before, after, "round {round}: the store changed under an engaged fence");
+            let before = snapshot(&client, &runtime, &snapshot_ids).await;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            let after = snapshot(&client, &runtime, &snapshot_ids).await;
+            if before != after {
+                changed_under_fence += 1;
+                eprintln!("round {round}: the store changed under an engaged fence: {before:?} -> {after:?}");
+            }
             drop(hold);
         }
         stop.store(true, Ordering::Relaxed);
         for w in writers {
             w.await.unwrap();
         }
-        assert_eq!(admitted_while_held.load(Ordering::Relaxed), 0);
-        assert!(admitted.load(Ordering::Relaxed) > 0, "writers made progress between fences");
-        assert!(refused.load(Ordering::Relaxed) > 0, "the fence refused writers");
+        let final_cells = runtime.chunks().count();
+        let live_bytes = runtime.chunks().total_live_bytes();
+
+        // ---- the proof, from the fence's own record ---------------------------------
+        let mut events = fence.take_trace();
+        events.sort_by_key(|e| match e {
+            Event::Admit { tick, .. } | Event::Done { tick, .. } | Event::Published { tick, .. }
+            | Event::Returned { tick, .. } | Event::Released { tick, .. } => *tick,
+        });
+        let mut published = std::collections::BTreeMap::new();
+        let mut returned = std::collections::BTreeMap::new();
+        let mut released = std::collections::BTreeMap::new();
+        for e in &events {
+            match e {
+                Event::Published { gate, tick } => { published.insert(*gate, *tick); }
+                Event::Returned { gate, tick } => { returned.insert(*gate, *tick); }
+                Event::Released { gate, tick } => { released.insert(*gate - 1, *tick); }
+                _ => {}
+            }
+        }
+        assert_eq!(published.len(), rounds, "every round published a fence");
+        assert_eq!(returned.len(), rounds, "every engage returned");
+        let mut done_tick: std::collections::HashMap<(u64, u64), Vec<u64>> = Default::default();
+        for e in &events {
+            if let Event::Done { note, seen, tick } = e {
+                done_tick.entry((*note, *seen)).or_default().push(*tick);
+            }
+        }
+        let is_fresh_insert = |note: u64| {
+            let id = Id::from_bits(note);
+            id.locality() == 3
+        };
+        let mut admits = 0usize;
+        let mut post_flag_refused = 0usize;
+        let mut pre_flag_counted = 0usize;
+        let mut in_flight_at_publication = 0usize;
+        // Fresh-id inserts around each publication: ticks within +-WINDOW of it.
+        const WINDOW: u64 = 600;
+        let mut fresh_before: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut fresh_after: std::collections::BTreeMap<u64, usize> = Default::default();
+        for e in &events {
+            let Event::Admit { note, seen, counted, refused: was_refused, tick } = *e else { continue };
+            admits += 1;
+            if is_fresh_insert(note) {
+                // The round this admission is nearest to.
+                for (&gate, &publish) in &published {
+                    if tick.abs_diff(publish) <= WINDOW {
+                        if tick < publish && counted { *fresh_before.entry(gate).or_default() += 1; }
+                        if tick >= publish && was_refused { *fresh_after.entry(gate).or_default() += 1; }
+                        break;
+                    }
+                }
+            }
+            if seen & 1 == 1 {
+                // I1: the decision read a published fence => it was refused.
+                assert!(was_refused && !counted, "a write whose decision saw fence {seen} was not refused: {e:?}");
+                post_flag_refused += 1;
+            } else {
+                // I2: the decision read the gate before the next fence was
+                // published => the write finished before that fence's drain
+                // returned.
+                assert!(counted && !was_refused);
+                pre_flag_counted += 1;
+                let next_fence = seen + 1;
+                if let (Some(&publish), Some(&ret)) = (published.get(&next_fence), returned.get(&next_fence)) {
+                    let done = done_tick
+                        .get(&(note, seen))
+                        .and_then(|ticks| ticks.iter().copied().filter(|t| *t > tick).min())
+                        .unwrap_or_else(|| panic!("a counted write never finished: {e:?}"));
+                    assert!(
+                        done < ret,
+                        "FENCE HOLE: a write admitted at tick {tick} (decision saw gate {seen}, before fence {next_fence} \
+                         was published at {publish}) finished at {done}, after engage returned at {ret}: {e:?}"
+                    );
+                    if done > publish {
+                        in_flight_at_publication += 1;
+                    }
+                }
+            }
+        }
+
+        // Observations by the writer tasks while a fence was held: each must trace
+        // back to an admission BEFORE that fence's publication.
+        let mut late_observations = 0usize;
+        let mut by_admit: std::collections::HashMap<u64, Vec<(u64, u64)>> = Default::default();
+        for e in &events {
+            if let Event::Admit { note, seen, counted: true, tick, .. } = e {
+                by_admit.entry(*note).or_default().push((*seen, *tick));
+            }
+        }
+        for (note, observed_at, lane) in observed_ok.lock().iter() {
+            for (&gate, &ret) in &returned {
+                let rel = released.get(&gate).copied().unwrap_or(u64::MAX);
+                if ret < *observed_at && *observed_at < rel {
+                    late_observations += 1;
+                    let (seen, admit_tick) = by_admit
+                        .get(note)
+                        .and_then(|a| a.iter().filter(|(_, t)| *t < *observed_at).max_by_key(|(_, t)| *t))
+                        .copied()
+                        .expect("an ok write has an admission");
+                    let publish = published[&gate];
+                    assert!(
+                        seen < gate,
+                        "{lane} write of {note:#x} observed ok at {observed_at} under fence {gate}: admitted at {admit_tick} \
+                         seeing gate {seen}, fence published at {publish}: a write admitted AFTER publication succeeded"
+                    );
+                    if late_observations == 1 {
+                        let finished = done_tick
+                            .get(&(*note, seen))
+                            .and_then(|t| t.iter().copied().filter(|t| *t > admit_tick).min());
+                        eprintln!(
+                            "FENCE_RACE_TIMELINE first late observation: {lane} {note:#x}: admitted(saw gate {seen}) tick {admit_tick} \
+                             < published(gate {gate}) tick {publish} < finished {finished:?} < engage returned {ret} \
+                             < observed by its task {observed_at} < released {rel}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let fresh_b: Vec<usize> = (0..rounds as u64).map(|r| fresh_before.get(&(2 * r + 1)).copied().unwrap_or(0)).collect();
+        let fresh_a: Vec<usize> = (0..rounds as u64).map(|r| fresh_after.get(&(2 * r + 1)).copied().unwrap_or(0)).collect();
+        let (b_min, a_min) = (fresh_b.iter().min().copied().unwrap_or(0), fresh_a.iter().min().copied().unwrap_or(0));
+        let (b_sum, a_sum): (usize, usize) = (fresh_b.iter().sum(), fresh_a.iter().sum());
+        eprintln!(
+            "FENCE_RACE rounds={rounds} admits={admits} post_flag_refused={post_flag_refused} pre_flag_counted={pre_flag_counted} \
+             in_flight_at_publication={in_flight_at_publication} late_observations={late_observations} \
+             task_refused={} task_succeeded={} content_changed_rounds={changed_under_fence} \
+             fresh_insert_admits_within_{WINDOW}_ticks_before_publish(min/mean)={b_min}/{:.1} \
+             fresh_insert_refusals_within_{WINDOW}_ticks_after_publish(min/mean)={a_min}/{:.1} \
+             inserts_ok={} space_exhausted={} final_cells={final_cells} live_bytes={live_bytes} unbounded={unbounded}",
+            refused.load(Ordering::Relaxed),
+            succeeded.load(Ordering::Relaxed),
+            b_sum as f64 / rounds as f64,
+            a_sum as f64 / rounds as f64,
+            inserts_ok.load(Ordering::Relaxed),
+            space_exhausted.load(Ordering::Relaxed),
+        );
+        assert_eq!(changed_under_fence, 0, "the store (count, version or value) changed under an engaged fence");
+        assert!(post_flag_refused > 0, "the fence refused writers");
+        assert!(pre_flag_counted > 0 && succeeded.load(Ordering::Relaxed) > 0, "writers made progress between fences");
+        assert!(b_sum > 0 && a_sum > 0, "fresh-id inserts must straddle the publication (before: {b_sum}, after: {a_sum})");
         server.shutdown().await;
     }
 
@@ -2957,6 +3183,7 @@ mod write_fence_server_tests {
             Err(WriteError::DatabaseFenced)
         );
         assert!(!fence.is_lost());
+        fence.confirm().await.expect("a fence renewed all along confirms");
         // A second fence on the same database is refused, not stacked.
         assert!(client
             .engage_write_fence(&families, Duration::from_secs(1), Duration::from_secs(1))
@@ -2973,6 +3200,64 @@ mod write_fence_server_tests {
         drop(fence);
         tokio::time::sleep(Duration::from_millis(900)).await;
         client.update_cell(cell(PROTECTED_SCHEMA, &id, 4)).await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    /// A lease can lapse between two renewals: the member lifts the fence, writes
+    /// land, and the holder has not been told yet. The check a copy makes before
+    /// it trusts itself must see that, not only what a renewal noticed so far.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_that_lapses_unnoticed_is_caught_before_the_copy_is_trusted() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("fence_lapse_unnoticed").await;
+        let id = Id::from_parts(1, 1);
+        client.write_cell(cell(PROTECTED_SCHEMA, &id, 1)).await.unwrap().unwrap();
+        let mut fence = client
+            .engage_write_fence(&[PROTECTED_SCHEMA], Duration::from_secs(5), Duration::from_millis(300))
+            .await
+            .unwrap();
+        fence.stop_renewing_for_test();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        // The member lifted it: a write to the copied family lands.
+        client.update_cell(cell(PROTECTED_SCHEMA, &id, 2)).await.unwrap().unwrap();
+        // No renewal ran, so the background flag cannot know...
+        assert!(!fence.is_lost());
+        // ...and the check a copy makes before trusting itself asks the members.
+        let refused = fence.confirm().await;
+        assert!(refused.is_err(), "a lapsed lease was confirmed: {refused:?}");
+        assert!(fence.is_lost(), "a failed confirmation is remembered");
+        server.shutdown().await;
+    }
+
+    /// The fence names families by the body a write carries. A body of an
+    /// unprotected family written over the id of a protected cell replaces that
+    /// cell all the same, so the stored cell's family has to count too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_write_cannot_replace_a_protected_cell_with_another_family() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_cross_family").await;
+        let id = Id::from_parts(1, 7);
+        client.write_cell(cell(PROTECTED_SCHEMA, &id, 1)).await.unwrap().unwrap();
+        let version = client.head_cell(id).await.unwrap().unwrap().version;
+        let hold = runtime
+            .engage_write_fence(protected(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let fenced: Result<(), WriteError> = Err(WriteError::DatabaseFenced);
+        assert_eq!(client.upsert_cell(cell(OTHER_SCHEMA, &id, 9)).await.unwrap().map(|_| ()), fenced);
+        assert_eq!(client.update_cell(cell(OTHER_SCHEMA, &id, 9)).await.unwrap().map(|_| ()), fenced);
+        assert_eq!(
+            client
+                .compare_version_and_update_cell(id, version, cell(OTHER_SCHEMA, &id, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced
+        );
+        let stored = client.read_cell(id).await.unwrap().unwrap();
+        assert_eq!(stored.header.schema, SchemaVid(PROTECTED_SCHEMA));
+        assert_eq!(*stored.data[DATA].u64().unwrap(), 1);
+        drop(hold);
         server.shutdown().await;
     }
 
