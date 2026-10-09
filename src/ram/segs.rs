@@ -940,56 +940,6 @@ impl Segment {
         true
     }
 
-    /// Where a chain link lives: the last `TXN_CONT_ENTRY_SIZE` bytes of the
-    /// segment's usable space.
-    ///
-    /// A FIXED position is the whole point. Recovery reads it without
-    /// scanning, so deciding whether a segment belongs to a chain -- and
-    /// discarding an aborted chain's parts without ever walking them -- costs
-    /// one read per segment instead of a full pass.
-    pub fn chain_link_offset(&self) -> usize {
-        let usable = self.bound() - self.addr;
-        let tail = usable.saturating_sub(crate::ram::bracket::TXN_CONT_ENTRY_SIZE);
-        // Entries are 8-byte aligned and so is the link.
-        tail - (tail % crate::ram::entry::ENTRY_HEAD_SIZE)
-    }
-
-    /// Close this segment as a full chain part: zero the gap, stamp the link
-    /// at the fixed tail, and take the segment out of use.
-    ///
-    /// Zeros are safe here in a way they are not in a shared segment: the
-    /// link bounds the live region from OUTSIDE, so recovery knows where the
-    /// entries stop before it reads a single one. That is what removes the
-    /// ambiguity that forces PADDING entries elsewhere.
-    ///
-    /// Only the transaction that owns this head may call this.
-    pub fn seal_as_chain_part(&self, link: &[u8]) -> bool {
-        let tail_offset = self.chain_link_offset();
-        let tail_addr = self.addr + tail_offset;
-        let cursor = self.append_header.load(Ordering::Acquire);
-        if cursor > tail_addr {
-            // No room for the link. The caller must not chain from here.
-            return false;
-        }
-        unsafe {
-            std::ptr::write_bytes(cursor as *mut u8, 0, tail_addr - cursor);
-        }
-        crate::ram::entry::Entry::encode_to(
-            tail_addr,
-            crate::ram::entry::EntryType::TXN_CONT,
-            link.len() as u32,
-            |content_addr| unsafe {
-                std::ptr::copy_nonoverlapping(link.as_ptr(), content_addr as *mut u8, link.len());
-            },
-        );
-        // Nothing may follow the link, so the segment is full from here.
-        self.append_header.store(
-            self.addr + tail_offset + crate::ram::bracket::TXN_CONT_ENTRY_SIZE,
-            Ordering::Release,
-        );
-        true
-    }
-
     /// Write a bare PADDING header covering `span` bytes at `addr`, as ONE
     /// 8-byte store, so a concurrent walker reads either the old header or
     /// the new one -- never the type of one and the length of the other.
