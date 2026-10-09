@@ -29,11 +29,12 @@ fn scratch_dir() -> tempfile::TempDir {
 
 /// Chunk size in MiB. Several chunks (the default) make ids spread over
 /// chunks the way a real store's do; `NEB_RD_CHUNK_MB=128` gives one.
+/// The default has 4 segments so transactions can own a separate write head.
 fn chunk_mb() -> usize {
     std::env::var("NEB_RD_CHUNK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+        .unwrap_or(32)
 }
 
 fn options(dir: &std::path::Path, chunk_mb: usize) -> ServerOptions {
