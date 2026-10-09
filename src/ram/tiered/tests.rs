@@ -230,14 +230,6 @@ fn test_eviction_on_memory_overflow() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
 
-    // Configure tiered memory with a small physical memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7"); // 70% threshold
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 3 * SEGMENT_SIZE),
-    ); // 3 segments = 24MB
-
     let chunk_capacity = 10 * SEGMENT_SIZE; // 80MB virtual capacity
     let fields = default_fields();
     let schema = Schema::new("test_overflow", None, fields, false, false);
@@ -250,6 +242,13 @@ fn test_eviction_on_memory_overflow() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 3 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 2000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -257,11 +256,9 @@ fn test_eviction_on_memory_overflow() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     // Verify tiered manager is enabled in at least one chunk
@@ -397,11 +394,6 @@ fn test_eviction_on_memory_overflow() {
         }
     }
 
-    // Clean up environment variables
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-
     // Clean up test directories
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
@@ -414,14 +406,6 @@ fn test_cold_segment_promotion() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
 
-    // Configure with tight memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.6");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 2 * SEGMENT_SIZE),
-    );
-
     let chunk_capacity = 8 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("test_promotion", None, fields, false, false);
@@ -433,6 +417,13 @@ fn test_cold_segment_promotion() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.6,
+        lower_watermark: 0.72,
+        physical_memory_limit: 2 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 2000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -440,11 +431,9 @@ fn test_cold_segment_promotion() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     // Write cells
@@ -529,9 +518,6 @@ fn test_cold_segment_promotion() {
     info!("Successfully read all cells, promotion working correctly");
 
     // Clean up
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_dir_all(temp_path("neb_test_promotion_schema"));
@@ -542,15 +528,6 @@ fn test_cold_segment_promotion() {
 fn test_metrics_and_churn_counters() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
-
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.75");
-    std::env::set_var("NEB_TIERED_MEMORY_LOWER_WATERMARK", "0.50");
-    std::env::set_var("NEB_TIERED_PROMOTION_COOLDOWN_MS", "5000");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 2 * SEGMENT_SIZE),
-    );
 
     let chunk_capacity = 4 * SEGMENT_SIZE;
     let fields = default_fields();
@@ -563,6 +540,13 @@ fn test_metrics_and_churn_counters() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.75,
+        lower_watermark: 0.50,
+        physical_memory_limit: 2 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 5000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -570,11 +554,9 @@ fn test_metrics_and_churn_counters() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     let manager = chunks
@@ -641,11 +623,6 @@ fn test_metrics_and_churn_counters() {
     );
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_MEMORY_LOWER_WATERMARK");
-    std::env::remove_var("NEB_TIERED_PROMOTION_COOLDOWN_MS");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_dir_all(temp_path("neb_test_metrics_schema"));
@@ -2200,21 +2177,22 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Configure: 64MB physical limit, 1GB virtual capacity
     let physical_limit = 64 * 1024 * 1024; // 64MB = 8 segments
     let virtual_capacity = 1024 * 1024 * 1024; // 1GB = 128 segments
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.75"); // 75% threshold
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", physical_limit),
-    );
 
     // Start server
     let server_addr = crate::utils::test_port::unique_localhost_addr();
+
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.75,
+        lower_watermark: 0.72,
+        physical_memory_limit: physical_limit,
+        promotion_cooldown_ms: 2000,
+    };
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: virtual_capacity,
             db_size: virtual_capacity,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             raft_storage: None,
@@ -2543,9 +2521,6 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     }
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
 
     // Drop server first to ensure all operations complete
     drop(server);
@@ -2569,12 +2544,6 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     info!("=== Starting Stress Test: Mixed Concurrent Workload ===");
 
     // Reduced configuration: 16MB physical, 64MB virtual (reduced for faster test)
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 16 * 1024 * 1024),
-    );
 
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let backup_dir = temp_path("neb_stress_test_bk");
@@ -2582,11 +2551,18 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 16 * 1024 * 1024,
+        promotion_cooldown_ms: 2000,
+    };
+
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024, // Reduced from 256MB
             db_size: 64 * 1024 * 1024,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             raft_storage: None,
@@ -2763,9 +2739,6 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     info!("Verified {} cells successfully", verified);
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
@@ -3059,12 +3032,6 @@ async fn test_direct_writes_with_tiered_memory() {
     info!("=== Starting Direct Write Test WITH Tiered Memory ===");
 
     // Configure tiered memory with a small physical memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 32 * 1024 * 1024),
-    ); // 32MB physical
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "100"); // Faster cleaner for testing
 
     let chunk_capacity = 512 * 1024 * 1024; // 512MB virtual capacity (more space for updates)
@@ -3080,11 +3047,18 @@ async fn test_direct_writes_with_tiered_memory() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 32 * 1024 * 1024,
+        promotion_cooldown_ms: 2000,
+    };
+
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: chunk_capacity,
             db_size: chunk_capacity,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             index_enabled: false,
@@ -3394,9 +3368,6 @@ async fn test_direct_writes_with_tiered_memory() {
     // 2. Resetting here can cause SIGSEGV if signal handlers are still active
     // 3. The TEST_MUTEX ensures tests run serially, so new_with_recovery() will clean up properly
 
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
