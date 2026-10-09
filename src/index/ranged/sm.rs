@@ -228,16 +228,37 @@ impl StateMachineCmds for MasterTreeSM {
     }
 }
 
+/// Snapshot wire form of the placement map: ordered `(key, placement)` pairs.
+fn tree_snapshot_entries(
+    tree: &BTreeMap<EntryKey, TreePlacement>,
+) -> Vec<(&EntryKey, &TreePlacement)> {
+    tree.iter().collect()
+}
+
+/// Decode a placement snapshot: the pair-list form, or the legacy map form
+/// that release (CBOR) builds persisted before the pair list existed.
+fn decode_tree_snapshot(data: &[u8]) -> Option<BTreeMap<EntryKey, TreePlacement>> {
+    if let Some(entries) = utils::serde::deserialize::<Vec<(EntryKey, TreePlacement)>>(data) {
+        return Some(entries.into_iter().collect());
+    }
+    utils::serde::deserialize::<BTreeMap<EntryKey, TreePlacement>>(data)
+}
+
 impl StateMachineCtl for MasterTreeSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
         self.sm_id
     }
     fn snapshot(&self) -> Vec<u8> {
-        utils::serde::serialize(&self.tree)
+        // A vector of pairs, never the map itself: `EntryKey` serialises as a
+        // sequence, and a map with sequence keys is not representable in JSON
+        // ("key must be a string"). Debug builds use serde_json, so the map
+        // form panicked inside `take_snapshot` on the first snapshot taken
+        // after any tree placement existed.
+        utils::serde::serialize(&tree_snapshot_entries(&self.tree))
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        let tree = utils::serde::deserialize(&data).unwrap();
+        let tree = decode_tree_snapshot(&data).unwrap();
         self.tree = tree;
         // Load the trees these placements name. `try_initialize` does this at
         // startup, but it runs BEFORE registration, so on a runtime reload it
@@ -633,6 +654,58 @@ mod tests {
     use bifrost::rpc::Server;
     use std::fs;
     use tempfile::TempDir;
+
+    fn sample_tree() -> BTreeMap<EntryKey, TreePlacement> {
+        let mut tree = BTreeMap::new();
+        for lead in [0x00u8, 0x20, 0x30] {
+            let mut bytes = vec![lead];
+            bytes.extend(vec![0; 31]);
+            tree.insert(
+                EntryKey::from_slice(&bytes),
+                TreePlacement {
+                    id: Id::rand(),
+                    epoch: lead as u64 + 1,
+                },
+            );
+        }
+        tree
+    }
+
+    /// The placement snapshot must round-trip under BOTH codecs (serde_json in
+    /// debug, serde_cbor in release). `cargo test` in each profile covers both.
+    #[test]
+    fn placement_snapshot_round_trips_under_the_active_codec() {
+        let tree = sample_tree();
+        let bytes = utils::serde::serialize(&tree_snapshot_entries(&tree));
+        let restored = decode_tree_snapshot(&bytes).expect("snapshot decodes");
+        assert_eq!(restored.len(), tree.len());
+        for (key, placement) in &tree {
+            let got = restored.get(key).expect("key survives");
+            assert_eq!(got.id, placement.id);
+            assert_eq!(got.epoch, placement.epoch);
+        }
+    }
+
+    /// Root cause of the debug-build snapshot panic: a map keyed by
+    /// `EntryKey` (a sequence) is not representable in JSON.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn map_keyed_by_entry_key_is_not_json_representable() {
+        let tree = sample_tree();
+        assert!(serde_json::to_vec(&tree).is_err());
+        assert!(serde_json::to_vec(&tree_snapshot_entries(&tree)).is_ok());
+    }
+
+    /// Release (CBOR) builds persisted the map form before the pair list
+    /// existed; recovery must still read it.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn legacy_map_form_snapshot_still_recovers() {
+        let tree = sample_tree();
+        let legacy = utils::serde::serialize(&tree);
+        let restored = decode_tree_snapshot(&legacy).expect("legacy snapshot decodes");
+        assert_eq!(restored.len(), tree.len());
+    }
 
     #[test]
     fn test_master_tree_persistence_and_recovery() {
