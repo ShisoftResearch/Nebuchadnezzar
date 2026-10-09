@@ -29,12 +29,12 @@ fn scratch_dir() -> tempfile::TempDir {
 
 /// Chunk size in MiB. Several chunks (the default) make ids spread over
 /// chunks the way a real store's do; `NEB_RD_CHUNK_MB=128` gives one.
-/// The default has 4 segments so transactions can own a separate write head.
+/// The default has 2 segments: one leased head and one ordinary head.
 fn chunk_mb() -> usize {
     std::env::var("NEB_RD_CHUNK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
+        .unwrap_or(16)
 }
 
 fn options(dir: &std::path::Path, chunk_mb: usize) -> ServerOptions {
@@ -423,11 +423,18 @@ async fn recreated_in_another_segment_below_the_tombstone_version(mode: Mode, gr
     assert!(store.server.chunks().list[0].seg_count() > tombstone_segments);
     store = store.restart(dir.path(), group).await;
     {
-        let floors = store.server.chunks().list[0].deleted_versions.read();
-        assert_eq!(floors.len(), 20, "recovery must rebuild the deleted versions");
-        println!("deleted-version map: ids={}, capacity={}, entry_bytes={}",
-            floors.len(), floors.capacity(),
-            std::mem::size_of::<(u64, crate::ram::chunk::DeletedVersion)>());
+        let floors = &store.server.chunks().list[0].deleted_versions;
+        assert_eq!(
+            floors.len(),
+            20,
+            "recovery must rebuild the deleted versions"
+        );
+        println!(
+            "deleted-version map: ids={}, capacity={}, entry_bytes={}",
+            floors.len(),
+            floors.capacity(),
+            std::mem::size_of::<(u64, crate::ram::chunk::DeletedVersion)>()
+        );
     }
     for index in 0..20u64 {
         let id = model[&index].0;
