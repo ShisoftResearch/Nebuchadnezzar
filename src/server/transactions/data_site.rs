@@ -350,7 +350,7 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
+    cells: parking_lot::RwLock<HashMap<Id, CellMetaMutex>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
@@ -424,7 +424,7 @@ impl DataManager {
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: LFMap::with_capacity(256),
+            cells: parking_lot::RwLock::new(HashMap::with_capacity(256)),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
@@ -543,22 +543,27 @@ impl DataManager {
             })
     }
 
+    fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
+        self.cells.read().get(id).cloned()
+    }
+
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        // Check if entry exists to avoid duplicate list insertions
-        let is_new = self.cells.get(id).is_none();
-        let arc = self.cells.get_or_insert(*id, || {
-            Arc::new(Mutex::new(CellMeta {
-                read: TxnId::default(),
-                write: TxnId::default(),
-                owner: None,
-                lock_acquired_at: None,
-            }))
-        });
-        // Only push to list if this was a new insertion
-        if is_new {
-            self.cell_list.push_back(*id);
+        if let Some(meta) = self.existing_cell_meta_mutex(id) {
+            return meta;
         }
-        arc
+        let mut cells = self.cells.write();
+        cells
+            .entry(*id)
+            .or_insert_with(|| {
+                self.cell_list.push_back(*id);
+                Arc::new(Mutex::new(CellMeta {
+                    read: TxnId::default(),
+                    write: TxnId::default(),
+                    owner: None,
+                    lock_acquired_at: None,
+                }))
+            })
+            .clone()
     }
     fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
@@ -1226,7 +1231,7 @@ impl DataManager {
         // First pass: collect cells with their metadata (while holding locks)
         for cell_id_ref in self.cell_list.iter_front() {
             let cell_id = cell_id_ref.deref();
-            if let Some(cell_meta) = self.cells.get(&cell_id) {
+            if let Some(cell_meta) = self.existing_cell_meta_mutex(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction && meta.read < oldest_transaction {
                     cells_to_evict.push((cell_id_ref, cell_meta.clone()));
@@ -1240,35 +1245,33 @@ impl DataManager {
             }
         }
 
-        // Second pass: re-check and remove (prevents TOCTOU race)
-        let empty_clock = TxnId::default();
+        // Reference acquisition and removal share the map lock. A reference
+        // borrowed before prepare must stay mapped even before it has an owner.
         for (cell_id_ref, cell_meta) in cells_to_evict {
             let cell_id = cell_id_ref.deref();
-
-            // Re-check timestamps while holding lock before removal
-            // This prevents evicting cells that became active after first check
-            let should_evict = {
-                let meta = cell_meta.lock();
-                meta.write < oldest_transaction
-                    && meta.read < oldest_transaction
-                    && meta.owner.is_none() // Don't evict if locked by a transaction
-                    // Skip metas that have never been stamped (both clocks still
-                    // empty). Such a meta belongs to an in-flight prepare that has
-                    // created it via `cell_meta_mutex` but not yet assigned its
-                    // owner (an insert prepare stamps neither `read` nor `write`
-                    // before acquiring the owner). The owner check above cannot see
-                    // that pending acquisition, and the removal below runs after
-                    // this lock is released, so evicting here would race the
-                    // prepare and orphan the lock it is about to take. Read/observe
-                    // paths stamp `read` before prepare, so update/remove metas are
-                    // never empty at this point; the only cost is that a genuinely
-                    // abandoned empty meta is reclaimed on a later pass (once it is
-                    // stamped or re-accessed) rather than now.
-                    && !(meta.read == empty_clock && meta.write == empty_clock)
-            };
-
-            if should_evict {
-                self.cells.remove(&cell_id);
+            #[cfg(test)]
+            {
+                let delay = prepare_delay_hooks()
+                    .lock()
+                    .remove(&(TxnId::default(), cell_id));
+                if let Some(delay) = delay {
+                    Self::await_prepare_delay(&delay).await;
+                }
+            }
+            let meta = cell_meta.lock();
+            let mut cells = self.cells.write();
+            let same_meta = cells
+                .get(&cell_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell_meta));
+            // These 2 references belong to the map and this cleanup candidate.
+            // Any other reference belongs to an operation that can acquire an owner.
+            if same_meta
+                && Arc::strong_count(&cell_meta) == 2
+                && meta.write < oldest_transaction
+                && meta.read < oldest_transaction
+                && meta.owner.is_none()
+            {
+                cells.remove(&cell_id);
                 cell_id_ref.remove();
             }
         }
@@ -1408,7 +1411,7 @@ impl DataManager {
         let current_time = get_time();
 
         for cell_id in affected_cell_ids {
-            if let Some(cell_mutex) = self.cells.get(cell_id) {
+            if let Some(cell_mutex) = self.existing_cell_meta_mutex(cell_id) {
                 let mut meta = cell_mutex.lock();
 
                 match (expected_owner, &meta.owner) {
@@ -3436,7 +3439,7 @@ mod tests {
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
-        assert_eq!(manager.cells.len(), 0);
+        assert_eq!(manager.cells.read().len(), 0);
         server.shutdown().await;
     }
 
@@ -3508,8 +3511,7 @@ mod tests {
         );
         assert_eq!(
             manager
-                .cells
-                .get(&cell_b)
+                .existing_cell_meta_mutex(&cell_b)
                 .map(|meta| meta.lock().owner.clone()),
             None
         );
@@ -5120,26 +5122,91 @@ mod tests {
         server.shutdown().await;
     }
 
-    // Regression guard for the `cell_meta_cleanup` orphan race.
-    //
-    // `cell_meta_cleanup`'s second pass checks `owner.is_none()` under the meta
-    // lock but then calls `self.cells.remove` AFTER releasing that lock. An
-    // in-flight INSERT prepare creates its cell meta via `cell_meta_mutex` (empty
-    // read/write clocks, `owner = None`, pushed onto `cell_list`) and only later,
-    // in the same synchronous region, assigns `owner = Some(..)`. Because the
-    // background cleanup task runs on another worker thread (it is signalled on
-    // every transaction `end`, see `cleanup_signal.store(true, ..)`), it could
-    // lock the fresh meta first, evict it, and remove it from `self.cells` before
-    // the prepare acquires the owner — orphaning the acquired lock (the cell map
-    // would then hold no entry, and the next `cell_meta_mutex` would mint a fresh
-    // unowned meta). The orphan is fail-safe rather than a lost update (`write_cell`
-    // rejects a duplicate insert with `CellAlreadyExisted` and the participant
-    // `commit` re-checks `owner`, so the orphaned transaction spuriously aborts
-    // with `CannotEnd`), but it is still an incorrect spurious abort.
-    //
-    // The fix leaves metas whose `read` and `write` clocks are both still empty
-    // (the in-flight-insert window) for a later pass. This test drives the window
-    // deterministically and asserts the owned meta stays map-resident.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cell_meta_cleanup_must_not_remove_an_update_prepared_after_its_check() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_cleanup_update_race";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 90502);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 0, 0);
+        {
+            let meta = manager.cell_meta_mutex(&id);
+            meta.lock().read = test_hlc(1, 1);
+        }
+        // The empty transaction ID reserves this hook for metadata cleanup.
+        let delay = install_prepare_delay_for_cell(TxnId::default(), id);
+        let cleaning = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.cell_meta_cleanup().await }
+        });
+        delay.wait_until_entered().await;
+        let tid = manager.hlc.now();
+        let prepared = prepare_ops_local(
+            &manager,
+            0,
+            &tid,
+            vec![PrepareOp {
+                id,
+                expectation: CellExpectation::Present(version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        delay.release();
+        cleaning.await.unwrap();
+        assert_eq!(prepared, DMPrepareResult::Success);
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    id,
+                    1,
+                    "cleanup_update"
+                ),)]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            *runtime.chunks().read_cell(&id).unwrap().data["score"]
+                .u64()
+                .unwrap(),
+            1
+        );
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cell_meta_cleanup_must_not_orphan_a_borrowed_update_meta() {
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_cleanup_borrowed_update";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 90503);
+        let borrowed = manager.cell_meta_mutex(&id);
+        borrowed.lock().read = test_hlc(1, 1);
+        manager.cell_meta_cleanup().await;
+        let visible = manager.cell_meta_mutex(&id);
+        assert!(
+            Arc::ptr_eq(&borrowed, &visible),
+            "cleanup orphaned the metadata borrowed before prepare"
+        );
+        drop(visible);
+        drop(borrowed);
+        manager.cell_meta_cleanup().await;
+        assert!(manager.existing_cell_meta_mutex(&id).is_none());
+        server.shutdown().await;
+    }
+
+    // A prepare borrows metadata before it acquires ownership. Cleanup must
+    // retain that reference for both inserts and updates.
     #[tokio::test(flavor = "multi_thread")]
     async fn cell_meta_cleanup_must_not_orphan_a_lock_being_acquired_by_insert_prepare() {
         let _ = env_logger::try_init();
@@ -5150,9 +5217,9 @@ mod tests {
 
         // The preparing insert transaction is registered exactly as real prepare
         // does via `get_or_create_transaction`, so the cleanup watermark `oldest`
-        // is this (non-empty) clock. A freshly created insert meta carries empty
-        // read/write clocks, which sort strictly below `oldest`, so only the
-        // racy `owner.is_none()` check stands between it and eviction.
+        // is this (non-empty) clock. A freshly created insert meta has empty
+        // clocks that sort below the watermark. Its borrowed reference must
+        // protect it until prepare publishes the owner.
         let insert_tid = test_hlc(9, 7);
         let _txn = manager.get_or_create_transaction(&insert_tid);
 
@@ -5160,7 +5227,7 @@ mod tests {
         let insert_id = Id::allocated(0, 0, 90501);
         let meta_in_prepare = manager.cell_meta_mutex(&insert_id);
         assert!(
-            manager.cells.get(&insert_id).is_some(),
+            manager.existing_cell_meta_mutex(&insert_id).is_some(),
             "precondition: the in-flight insert meta is registered in the cell map"
         );
         assert!(
@@ -5182,7 +5249,7 @@ mod tests {
         // acquired its owner on. If cleanup removed the entry during the window,
         // a subsequent `cell_meta_mutex` would mint a fresh, unowned meta and the
         // acquired lock is orphaned.
-        let visible = manager.cells.get(&insert_id);
+        let visible = manager.existing_cell_meta_mutex(&insert_id);
         let same_meta = visible
             .as_ref()
             .is_some_and(|m| Arc::ptr_eq(m, &meta_in_prepare));
