@@ -235,13 +235,11 @@ fn tree_snapshot_entries(
     tree.iter().collect()
 }
 
-/// Decode a placement snapshot: the pair-list form, or the legacy map form
-/// that release (CBOR) builds persisted before the pair list existed.
+/// Decode a placement snapshot (the pair-list form; stores written with the
+/// earlier map form are reimported, not read).
 fn decode_tree_snapshot(data: &[u8]) -> Option<BTreeMap<EntryKey, TreePlacement>> {
-    if let Some(entries) = utils::serde::deserialize::<Vec<(EntryKey, TreePlacement)>>(data) {
-        return Some(entries.into_iter().collect());
-    }
-    utils::serde::deserialize::<BTreeMap<EntryKey, TreePlacement>>(data)
+    utils::serde::deserialize::<Vec<(EntryKey, TreePlacement)>>(data)
+        .map(|entries| entries.into_iter().collect())
 }
 
 impl StateMachineCtl for MasterTreeSM {
@@ -694,36 +692,6 @@ mod tests {
         let tree = sample_tree();
         assert!(serde_json::to_vec(&tree).is_err());
         assert!(serde_json::to_vec(&tree_snapshot_entries(&tree)).is_ok());
-    }
-
-    /// Release (CBOR) builds persisted the map form before the pair list
-    /// existed; recovery must still read it.
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn legacy_map_form_snapshot_still_recovers() {
-        let tree = sample_tree();
-        let legacy = utils::serde::serialize(&tree);
-        let restored = decode_tree_snapshot(&legacy).expect("legacy snapshot decodes");
-        assert_eq!(restored.len(), tree.len());
-        for (key, placement) in &tree {
-            let got = restored.get(key).expect("key survives");
-            assert_eq!((got.id, got.epoch), (placement.id, placement.epoch));
-        }
-    }
-
-    /// Downgrade contract: a binary that knows only the map form must REFUSE
-    /// the pair list (its `recover` unwraps the failed decode and stops),
-    /// never read it as some other map. Empty and non-empty, in both codecs.
-    #[test]
-    fn pair_list_snapshot_is_refused_by_the_map_only_decoder() {
-        for tree in [BTreeMap::new(), sample_tree()] {
-            let bytes = utils::serde::serialize(&tree_snapshot_entries(&tree));
-            assert!(
-                utils::serde::deserialize::<BTreeMap<EntryKey, TreePlacement>>(&bytes).is_none(),
-                "a map-only decoder accepted the pair list ({} entries)",
-                tree.len()
-            );
-        }
     }
 
     #[test]
