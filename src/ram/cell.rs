@@ -109,6 +109,18 @@ pub enum WriteError {
     /// error instead would lie the other way, telling a caller nothing was
     /// stored when the cell is right there.
     IndexIncomplete(String),
+    /// The transaction this write belongs to was ended -- aborted, or its
+    /// lease expired and it was presumed aborted -- while its thread was
+    /// still writing. Nothing was written: the segments it owned have been
+    /// rewound and may already belong to another writer, and a stale owner's
+    /// write must not land in them.
+    TransactionRevoked,
+    /// A transaction's write needed a write head of its own (a bracket part)
+    /// and none came free within the bounded wait. Nothing was written. The
+    /// transaction must fail rather than write outside its bracket, which
+    /// would make that entry survive a crash the rest of the transaction does
+    /// not.
+    TransactionHeadUnavailable,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]

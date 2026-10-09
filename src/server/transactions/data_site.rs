@@ -2146,8 +2146,8 @@ mod tests {
     ) -> Arc<crate::server::NebServer> {
         NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: SEGMENT_SIZE,
-                db_size: SEGMENT_SIZE,
+                chunk_size: 4 * SEGMENT_SIZE,
+                db_size: 4 * SEGMENT_SIZE,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2443,6 +2443,205 @@ mod tests {
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// An abort restores what every kind of write replaced: an updated cell
+    /// reads its old value, a removed cell is back, an inserted cell is gone
+    /// -- and the transaction's span is rewound, not left open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abort_restores_updates_removes_and_inserts() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_abort_restores";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let updated = Id::allocated(0, 0, 9201);
+        let removed = Id::allocated(0, 0, 9202);
+        let inserted = Id::allocated(0, 0, 9203);
+        let updated_version = seed_cell_version(&runtime, schema.vid.get(), updated, 5, 0);
+        let removed_version = seed_cell_version(&runtime, schema.vid.get(), removed, 6, 0);
+        let tid = test_hlc(1, 9201);
+        let prepare = prepare_ops_local(
+            &manager,
+            9201,
+            &tid,
+            vec![
+                PrepareOp {
+                    id: updated,
+                    expectation: CellExpectation::Present(updated_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: removed,
+                    expectation: CellExpectation::Present(removed_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: inserted,
+                    expectation: CellExpectation::Absent,
+                    intent: PrepareIntent::Write,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![
+                CommitOp::Update(counter_cell(schema.vid.get(), updated, 50, "new")),
+                CommitOp::Remove(removed),
+                CommitOp::Write(counter_cell(schema.vid.get(), inserted, 70, "new")),
+            ],
+        )
+        .await;
+        assert_eq!(commit, DMCommitResult::Success);
+        let store = runtime.chunks().address_range();
+        assert!(crate::ram::chunk::transaction_lease_count(&tid, &store) >= 1);
+
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        let chunks = runtime.chunks();
+        assert_eq!(
+            chunks.read_cell(&updated).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(5),
+            "the update must be undone"
+        );
+        assert_eq!(
+            chunks.read_cell(&removed).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(6),
+            "the remove must be undone"
+        );
+        assert!(
+            chunks.read_cell(&inserted).is_err(),
+            "the insert must be undone"
+        );
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        assert_no_open_bracket(&runtime);
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// The deadlock that made abort release its heads first, as a regression
+    /// test: the aborting transaction holds its heads through the rollback,
+    /// with every head the chunk can spare taken by transactions, and the
+    /// abort still completes at once. A lease never takes the last head that
+    /// is not a transaction's, so the rollback always has one to write to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abort_under_head_pressure_completes_without_waiting() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_abort_pressure";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let victim_cell = Id::allocated(0, 0, 9301);
+        let victim_version = seed_cell_version(&runtime, schema.vid.get(), victim_cell, 7, 0);
+        let victim = test_hlc(1, 9301);
+        let prepare = prepare_ops_local(
+            &manager,
+            9301,
+            &victim,
+            vec![PrepareOp {
+                id: victim_cell,
+                expectation: CellExpectation::Present(victim_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &victim,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    victim_cell,
+                    70,
+                    "new"
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // Others take every head the chunk can spare; the first one refused
+        // marks the pressure point.
+        let mut holders = Vec::new();
+        for k in 0..16u64 {
+            let tid = test_hlc(2, 9400 + k);
+            let cell = Id::allocated(0, 0, 9400 + k);
+            prepare_local_txn(&manager, &tid, vec![cell]);
+            let applied = commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Write(counter_cell(
+                    schema.vid.get(),
+                    cell,
+                    1,
+                    "holder",
+                ))],
+            )
+            .await;
+            if applied != DMCommitResult::Success {
+                assert_eq!(
+                    applied,
+                    DMCommitResult::WriteError(cell, WriteError::TransactionHeadUnavailable),
+                    "under head pressure a transaction must fail typed, not go unbracketed"
+                );
+                abort_and_end_local(&manager, &tid).await;
+                break;
+            }
+            holders.push(tid);
+        }
+        assert!(!holders.is_empty());
+
+        let started = std::time::Instant::now();
+        let abort = <DataManager as Service>::abort(&manager, victim.clone(), victim.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the abort waited {:?} for a head",
+            started.elapsed()
+        );
+        assert_eq!(
+            runtime
+                .chunks()
+                .read_cell(&victim_cell)
+                .unwrap()
+                .to_owned()
+                .data["score"]
+                .u64()
+                .copied(),
+            Some(7)
+        );
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&victim, &store),
+            0
+        );
+        for tid in &holders {
+            abort_and_end_local(&manager, tid).await;
+        }
+        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        assert_no_open_bracket(&runtime);
         server.shutdown().await;
     }
 

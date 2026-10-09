@@ -2158,8 +2158,8 @@ mod tests {
     async fn start_manager_test_server(address: &str, group: &str) -> Arc<NebServer> {
         NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: crate::ram::segs::SEGMENT_SIZE,
-                db_size: crate::ram::segs::SEGMENT_SIZE,
+                chunk_size: 4 * crate::ram::segs::SEGMENT_SIZE,
+                db_size: 4 * crate::ram::segs::SEGMENT_SIZE,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2553,8 +2553,21 @@ mod tests {
                                 );
                             }
                             TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable) => {}
+                            // 48 transactions on one 4-segment chunk: more
+                            // than it has heads for. A transaction that cannot
+                            // own a head of its own fails, typed, rather than
+                            // writing outside its bracket.
+                            TMPrepareResult::DMCommitError(DMCommitResult::WriteError(
+                                _,
+                                WriteError::TransactionHeadUnavailable,
+                            )) => {}
                             other => panic!("unexpected prepare result: {:?}", other),
                         }
+                    }
+                    // Wait-Die: the ones queued behind a head hold their
+                    // locks longer, so a younger reader may be told to die.
+                    TxnExecResult::Rejected => {
+                        let _ = txn_client.abort(txn_id.clone()).await;
                     }
                     other => panic!("unexpected read result: {:?}", other),
                 }
@@ -2566,6 +2579,13 @@ mod tests {
             result;
         }
 
+        // Whatever each transaction's fate, none may linger.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while runtime.txn_manager().unwrap().transaction_count() != 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(
             runtime.txn_manager().unwrap().transaction_count(),
             0,

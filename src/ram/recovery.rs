@@ -4373,6 +4373,262 @@ mod tests {
         }
     }
 
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// What is on disk right now, as a crash at this instant would leave it.
+    struct DiskSnapshot {
+        wal: TempDir,
+        backup: TempDir,
+        raft: TempDir,
+    }
+
+    impl BracketCleanerStore {
+        fn snapshot(&self) -> DiskSnapshot {
+            let snap = DiskSnapshot {
+                wal: TempDir::new().unwrap(),
+                backup: TempDir::new().unwrap(),
+                raft: TempDir::new().unwrap(),
+            };
+            copy_dir(self.wal_dir.path(), snap.wal.path());
+            copy_dir(self.backup_dir.path(), snap.backup.path());
+            copy_dir(Path::new(&self.raft_path), snap.raft.path());
+            snap
+        }
+
+        fn recover_snapshot(&self, snap: &DiskSnapshot) -> Arc<Chunks> {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(self.schema.clone());
+            Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 8,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(snap.backup.path().to_str().unwrap().to_string()),
+                Some(snap.wal.path().to_str().unwrap().to_string()),
+                None,
+                true,
+                Some(snap.raft.path().to_str().unwrap().to_string()),
+            )
+        }
+    }
+
+    /// A crash at every point of an abort's rewind recovers the same thing:
+    /// the aborted transaction gone, everything else intact -- and the
+    /// ordinary write that reuses the head after the rewind survives.
+    ///
+    /// Points: (0) entries journaled, no rewind yet (an open BEGIN); (1) the
+    /// padding journaled and synced, head not yet reused; (2) another writer
+    /// appended behind the padding in the same head.
+    #[test]
+    fn a_crash_at_any_point_of_a_rewind_recovers_the_abort() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(435, "rewind_crash_points");
+        let txn = crate::server::transactions::test_hlc(8585, 9);
+        let before = Id::allocated(36, 0, 1);
+        let aborted = [Id::allocated(36, 0, 2), Id::allocated(36, 0, 3)];
+        let after = Id::allocated(36, 0, 4);
+        let chunks = store.open(false);
+        chunks.write_cell(&mut store.cell(&before, 128)).unwrap();
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            for id in &aborted {
+                chunks.write_cell(&mut store.cell(id, 128)).unwrap();
+            }
+        }
+        let part = segment_of(&chunks, &aborted[0]);
+        let point0 = store.snapshot();
+        for id in &aborted {
+            chunks.remove_cell(id).unwrap();
+        }
+        assert_eq!(
+            crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+            Ok(1)
+        );
+        let point1 = store.snapshot();
+        // Reuse: make the rewound head the only live head in the pool, so the
+        // next ordinary write lands in it whatever this thread's affinity.
+        let chunk = &chunks.list[0];
+        assert!(chunk.is_active_head(part.id), "the rewound head stays in the pool");
+        for slot in chunk.head_pool.iter() {
+            if slot.load(Ordering::Acquire) != part.id {
+                slot.store(u64::MAX, Ordering::Release);
+            }
+        }
+        let mut reused = None;
+        for n in 0..64u64 {
+            let id = Id::allocated(36, 1, n);
+            chunks.write_cell(&mut store.cell(&id, 128)).unwrap();
+            if segment_of(&chunks, &id).id == part.id {
+                reused = Some(id);
+                break;
+            }
+        }
+        let reused = reused.unwrap_or_else(|| {
+            panic!(
+                "the rewound head must be reusable: can_append={} owned={} open={} active={}",
+                part.can_still_append(),
+                part.is_head_owned(),
+                part.bracket_is_open(),
+                chunk.is_active_head(part.id)
+            )
+        });
+        chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
+        chunks.sync_all();
+        let point2 = store.snapshot();
+        drop(chunks);
+
+        for (name, snap, reuse_expected) in
+            [("0", &point0, false), ("1", &point1, false), ("2", &point2, true)]
+        {
+            let recovered = store.recover_snapshot(snap);
+            assert!(recovered.read_cell(&before).is_ok(), "point {name}: before");
+            for id in &aborted {
+                assert!(
+                    recovered.read_cell(id).is_err(),
+                    "point {name}: an aborted cell came back"
+                );
+            }
+            assert_eq!(
+                recovered.read_cell(&reused).is_ok(),
+                reuse_expected,
+                "point {name}: the write that reused the head"
+            );
+        }
+    }
+
+    /// H1 across a restart cannot happen: recovery resumes no segment as a
+    /// write head, so a crash mid-transaction leaves its open BEGIN in a
+    /// SEALED segment and the first write after the restart lands in a fresh
+    /// one -- which a second restart keeps.
+    #[test]
+    fn an_open_bracket_left_by_a_crash_never_swallows_writes_after_the_restart() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(436, "open_bracket_restart");
+        let txn = crate::server::transactions::test_hlc(8686, 9);
+        let in_flight = Id::allocated(37, 0, 1);
+        let after = Id::allocated(37, 0, 2);
+        let open_seg;
+        {
+            let chunks = store.open(false);
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&in_flight, 128)).unwrap();
+            open_seg = segment_of(&chunks, &in_flight).seq_id;
+            chunks.sync_all();
+            // Crash: no decision ever arrives.
+        }
+        {
+            let chunks = store.open(true);
+            assert!(chunks.read_cell(&in_flight).is_err());
+            chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
+            assert_ne!(
+                segment_of(&chunks, &after).seq_id,
+                open_seg,
+                "a recovered segment holding an open BEGIN must never take a write"
+            );
+            chunks.sync_all();
+        }
+        let chunks = store.open(true);
+        assert!(chunks.read_cell(&in_flight).is_err());
+        assert!(chunks.read_cell(&after).is_ok(), "the write after the restart survives");
+    }
+
+    /// Item 34: a transaction must never write outside its bracket. Before
+    /// the fix, a transaction whose part filled up while every other head was
+    /// busy with a plain write in flight sent its next cell out UNBRACKETED,
+    /// so a crash before the decision kept that cell and discarded the first:
+    /// a half-applied transaction.
+    #[test]
+    fn head_pressure_never_half_applies_a_transaction() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(437, "head_pressure_atomicity");
+        let victim = crate::server::transactions::test_hlc(8787, 9);
+        let first = Id::allocated(38, 0, 1);
+        let second = Id::allocated(38, 0, 2);
+        let mut second_written = false;
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(store.schema.clone());
+            // Plenty of segments: what runs out is the head pool (8 slots),
+            // which is what a busy production chunk runs out of too.
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 16,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(store.backup_dir.path().to_str().unwrap().to_string()),
+                Some(store.wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(store.raft_path.clone()),
+            );
+            // The victim fills most of its own part.
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(victim.clone());
+                chunks.write_cell(&mut store.cell(&first, 512 * 1024)).unwrap();
+                let part = segment_of(&chunks, &first);
+                let mut n = 10;
+                while part.bound() - part.append_header.load(Ordering::Acquire) > 900 * 1024 {
+                    let id = Id::allocated(38, 0, n);
+                    chunks.write_cell(&mut store.cell(&id, 512 * 1024)).unwrap();
+                    n += 1;
+                }
+            }
+            // Every other head is busy with a PLAIN write in flight (held
+            // here, as a concurrent writer would hold it for a few
+            // microseconds), and exactly one is free when the victim needs
+            // its next part. A head owned by a plain writer is back in
+            // microseconds; the old spare-count read it as gone, found
+            // nothing to spare, and sent the transaction's entry out
+            // unbracketed into the one free head.
+            let chunk = &chunks.list[0];
+            let mut in_flight = Vec::new();
+            while chunk
+                .head_pool
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == u64::MAX)
+            {
+                in_flight.push(chunk.try_acquire(64, false).expect("plain claim"));
+                assert!(in_flight.len() < 16, "test setup: the pool never filled");
+            }
+            drop(in_flight.pop());
+            eprintln!(
+                "head_pressure: {} plain write(s) in flight, one head free",
+                in_flight.len()
+            );
+            // The victim's next cell needs a new part, and none can be had.
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(victim.clone());
+                let result = chunks.write_cell(&mut store.cell(&second, 900 * 1024));
+                eprintln!("head_pressure: the second write returned {:?}", result.as_ref().err());
+                second_written = result.is_ok();
+                drop(in_flight);
+            }
+            chunks.sync_all();
+            // Crash: nobody decides.
+        }
+        let chunks = store.open(true);
+        let first_back = chunks.read_cell(&first).is_ok();
+        let second_back = chunks.read_cell(&second).is_ok();
+        eprintln!("head_pressure: second_written={second_written} first={first_back} second={second_back}");
+        assert_eq!(
+            first_back, second_back,
+            "a transaction came back half-applied after a crash (first={first_back}, \
+             second={second_back})"
+        );
+        assert!(!first_back, "an undecided transaction must not survive the crash");
+    }
+
     /// The cleaner must never resurrect an aborted span.
     ///
     /// The participant rolls the index back first, then pads over the span
