@@ -203,8 +203,7 @@ impl RangedTree {
                                      untouched.",
                                     id, error
                                 );
-                                let deletion_set =
-                                    Arc::new(DeletionSet::with_capacity(0));
+                                let deletion_set = Arc::new(DeletionSet::with_capacity(0));
                                 Self {
                                     tree: DiskTree::new(&deletion_set),
                                 }
@@ -576,9 +575,6 @@ impl RangedTree {
     pub fn head_id(&self) -> Id {
         self.tree.head_id()
     }
-
-    // Legacy methods for compatibility - these are no-ops in the simplified design
-
 }
 
 /// Schema for ranged tree persistence
@@ -612,11 +608,7 @@ fn ranged_tree_cell(head_id: &Id, id: &Id) -> OwnedCell {
 /// load re-arms them. Self-GCing, because compaction removes a tombstone
 /// from the set the moment its key physically leaves the page, so the next
 /// checkpoint simply does not write it.
-fn ranged_tree_cell_with_tombstones(
-    head_id: &Id,
-    id: &Id,
-    tombstones: &[EntryKey],
-) -> OwnedCell {
+fn ranged_tree_cell_with_tombstones(head_id: &Id, id: &Id, tombstones: &[EntryKey]) -> OwnedCell {
     let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(*head_id));
     cell_map.insert_key_id(
@@ -703,20 +695,29 @@ mod tests {
                 let mut i = 0u64;
                 while !stop.load(AO::Acquire) {
                     let stable = make_key(base + i % (1 << 20));
-                    assert!(set.insert(stable.clone()), "t{} i{}: stable insert refused", t, i);
+                    assert!(
+                        set.insert(stable.clone()),
+                        "t{} i{}: stable insert refused",
+                        t,
+                        i
+                    );
                     for j in 1..64u64 {
                         let churn = make_key(base + (1 << 30) + j);
                         set.insert(churn.clone());
                         assert!(
                             set.contains(&stable),
                             "t{} i{} j{}: contains lost a present key after insert churn",
-                            t, i, j
+                            t,
+                            i,
+                            j
                         );
                         set.remove(&churn);
                         assert!(
                             set.contains(&stable),
                             "t{} i{} j{}: contains lost a present key after remove churn",
-                            t, i, j
+                            t,
+                            i,
+                            j
                         );
                     }
                     // Bulk phases: swell then drain, forcing growth and
@@ -725,11 +726,21 @@ mod tests {
                         for j in 0..4096u64 {
                             set.insert(make_key(base + (1 << 31) + j));
                         }
-                        assert!(set.contains(&stable), "t{} i{}: lost across bulk insert", t, i);
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{}: lost across bulk insert",
+                            t,
+                            i
+                        );
                         for j in 0..4096u64 {
                             set.remove(&make_key(base + (1 << 31) + j));
                         }
-                        assert!(set.contains(&stable), "t{} i{}: lost across bulk drain", t, i);
+                        assert!(
+                            set.contains(&stable),
+                            "t{} i{}: lost across bulk drain",
+                            t,
+                            i
+                        );
                     }
                     assert!(set.remove(&stable), "t{} i{}: stable remove refused", t, i);
                     i += 1;
@@ -1129,7 +1140,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
         client
             .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
             .await
