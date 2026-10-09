@@ -219,28 +219,34 @@ async fn txn_lifecycle(base: &str, txns: u64, task_counts: &[u64]) {
             expectation: CellExpectation::Absent,
             intent: PrepareIntent::Write,
         };
-        let prepared = DataSite::prepare(manager, 0, tid, tid, vec![op], vec![]).await;
+        let prepared =
+            <DataManager as DataSite>::prepare(manager, 0, tid, tid, vec![op], vec![]).await;
         assert!(
             format!("{:?}", prepared.payload).contains("Success"),
             "prepare: {:?}",
             prepared.payload
         );
-        let committed =
-            DataSite::commit(manager, tid, tid, vec![CommitOp::Write(cell(index, index))]).await;
+        let committed = <DataManager as DataSite>::commit(
+            manager,
+            tid,
+            tid,
+            vec![CommitOp::Write(cell(index, index))],
+        )
+        .await;
         assert!(
             format!("{:?}", committed.payload).contains("Success"),
             "apply: {:?}",
             committed.payload
         );
         if abort {
-            let aborted = DataSite::abort(manager, tid, tid).await;
+            let aborted = <DataManager as DataSite>::abort(manager, tid, tid).await;
             assert!(
                 format!("{:?}", aborted.payload).contains("Success"),
                 "abort: {:?}",
                 aborted.payload
             );
         }
-        let ended = DataSite::end(manager, tid, tid).await;
+        let ended = <DataManager as DataSite>::end(manager, tid, tid).await;
         assert!(
             format!("{:?}", ended.payload).contains("Success"),
             "end: {:?}",
@@ -336,8 +342,8 @@ async fn abort_mix(base: &str, txns: u64, abort_every: u64) {
             expectation: CellExpectation::Absent,
             intent: PrepareIntent::Write,
         };
-        DataSite::prepare(&manager, 0, tid, tid, vec![op], vec![]).await;
-        DataSite::commit(
+        <DataManager as DataSite>::prepare(&manager, 0, tid, tid, vec![op], vec![]).await;
+        <DataManager as DataSite>::commit(
             &manager,
             tid,
             tid,
@@ -345,9 +351,9 @@ async fn abort_mix(base: &str, txns: u64, abort_every: u64) {
         )
         .await;
         if abort_every > 0 && i % abort_every == 0 {
-            DataSite::abort(&manager, tid, tid).await;
+            <DataManager as DataSite>::abort(&manager, tid, tid).await;
         }
-        DataSite::end(&manager, tid, tid).await;
+        <DataManager as DataSite>::end(&manager, tid, tid).await;
     }
     rate(&format!("mix_abort_every{abort_every}"), txns, started);
     let report = |stage: &str| {
