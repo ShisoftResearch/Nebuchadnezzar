@@ -20,8 +20,8 @@ pub async fn database_catalog() {
     let database_name = "testdb_database_catalog";
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -86,8 +86,8 @@ pub async fn general() {
     debug!("Creating new neb server");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -242,8 +242,8 @@ pub async fn multi_cell_update() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -412,8 +412,8 @@ pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
 
 fn schema_validation_server_options() -> ServerOptions {
     ServerOptions {
-        chunk_size: 16 * 1024 * 1024,
-        db_size: 16 * 1024 * 1024,
+        chunk_size: 32 * 1024 * 1024,
+        db_size: 32 * 1024 * 1024,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -769,8 +769,8 @@ pub async fn write_skew() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -874,8 +874,8 @@ pub async fn server_isolation() {
 
     let server_1 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -904,8 +904,8 @@ pub async fn server_isolation() {
 
     let server_2 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -1061,8 +1061,8 @@ pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -1149,8 +1149,8 @@ pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -1265,8 +1265,8 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -1394,8 +1394,8 @@ pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
         crate::utils::test_port::unique_localhost_addr(),
     ];
     let opts = ServerOptions {
-        chunk_size: 16 * 1024 * 1024,
-        db_size: 16 * 1024 * 1024,
+        chunk_size: 32 * 1024 * 1024,
+        db_size: 32 * 1024 * 1024,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -1587,8 +1587,8 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
         crate::utils::test_port::unique_localhost_addr(),
     ];
     let opts = ServerOptions {
-        chunk_size: 16 * 1024 * 1024,
-        db_size: 16 * 1024 * 1024,
+        chunk_size: 32 * 1024 * 1024,
+        db_size: 32 * 1024 * 1024,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -1844,8 +1844,8 @@ pub async fn a_joining_member_is_filled_automatically() {
         crate::utils::test_port::unique_localhost_addr(),
     ];
     let opts = ServerOptions {
-        chunk_size: 16 * 1024 * 1024,
-        db_size: 16 * 1024 * 1024,
+        chunk_size: 32 * 1024 * 1024,
+        db_size: 32 * 1024 * 1024,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,

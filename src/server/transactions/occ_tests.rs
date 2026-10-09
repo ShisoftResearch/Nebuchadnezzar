@@ -25,8 +25,8 @@ async fn scoped_txn_client_for_database(
 async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: crate::ram::segs::SEGMENT_SIZE,
-            db_size: crate::ram::segs::SEGMENT_SIZE,
+            chunk_size: 4 * crate::ram::segs::SEGMENT_SIZE,
+            db_size: 4 * crate::ram::segs::SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -46,8 +46,8 @@ async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
 
 async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebServer>> {
     let opts = ServerOptions {
-        chunk_size: crate::ram::segs::SEGMENT_SIZE,
-        db_size: crate::ram::segs::SEGMENT_SIZE,
+        chunk_size: 4 * crate::ram::segs::SEGMENT_SIZE,
+        db_size: 4 * crate::ram::segs::SEGMENT_SIZE,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
