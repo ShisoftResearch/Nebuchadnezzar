@@ -5465,6 +5465,44 @@ mod tests {
     use dovahkiin::types::Type;
     use env_logger;
 
+    #[test]
+    fn deleted_version_map_memory_cost() {
+        fn rss_kb() -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let before = rss_kb();
+        let mut map = std::collections::HashMap::with_hasher(ahash::RandomState::new());
+        for id in 0..1_000_000u64 {
+            map.insert(
+                id,
+                DeletedVersion {
+                    version: 4,
+                    tombstones: 1,
+                },
+            );
+        }
+        let after = rss_kb();
+        println!(
+            "METRIC deleted_id_entry_bytes {}",
+            std::mem::size_of::<(u64, DeletedVersion)>()
+        );
+        println!(
+            "METRIC deleted_id_rss_bytes {:.2}",
+            (after - before) as f64 * 1024.0 / map.len() as f64
+        );
+        println!("METRIC deleted_id_map_capacity {}", map.capacity());
+        std::hint::black_box(map);
+    }
+
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
     /// A chunk with room for several segments.
     ///
