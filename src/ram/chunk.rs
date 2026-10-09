@@ -750,11 +750,20 @@ impl SealQueue {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeletedVersion {
+    pub version: u64,
+    pub tombstones: usize,
+}
+
 pub struct Chunk {
     pub id: usize,
     /// Shared with every chunk of the store and drained by the sealer thread.
     pub seal_queue: Arc<SealQueue>,
     pub cell_index: WordMap,
+    /// Last deleted version and number of physical tombstones, per id.
+    pub(crate) deleted_versions:
+        parking_lot::RwLock<std::collections::HashMap<u64, DeletedVersion, ahash::RandomState>>,
     /// Live bytes per slot, shared across every chunk of this store. See
     /// [`crate::slots::SlotLiveBytes`] for the contract; the hooks live on the
     /// logical transitions of `cell_index` -- insert, replace, remove -- so
@@ -1049,6 +1058,9 @@ impl Chunk {
             id,
             segs,
             cell_index: index,
+            deleted_versions: parking_lot::RwLock::new(std::collections::HashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             slot_bytes,
             seal_queue,
             meta,
@@ -2491,6 +2503,22 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    pub(crate) fn note_deleted_version(&self, hash: u64, version: u64) {
+        let mut versions = self.deleted_versions.write();
+        let floor = versions.entry(hash).or_default();
+        floor.version = floor.version.max(version);
+        floor.tombstones += 1;
+    }
+
+    fn create_version(&self, cell: &OwnedCell) -> u64 {
+        self.deleted_versions
+            .read()
+            .get(&cell.header.id.bits())
+            .map_or(cell.header.version, |floor| {
+                cell.header.version.max(floor.version)
+            })
+    }
+
     pub fn write_cell_to_chunk<'a>(
         &self,
         cell: &OwnedCell,
@@ -2586,7 +2614,7 @@ impl Chunk {
 
         let t_copy = std::time::Instant::now();
         let write_result =
-            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, self.create_version(cell))?;
         WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let cell_loc = write_result.addr;
         #[cfg(debug_assertions)]
@@ -2708,8 +2736,12 @@ impl Chunk {
             cell.header.schema = write_result.new_schema;
         } else {
             // Optimistic update will remove the new inserted one
-            let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            let write_result = self.write_cell_to_chunk(
+                cell,
+                &write_plan,
+                &pending_entry,
+                self.create_version(cell),
+            )?;
             let new_cell_loc = write_result.addr;
             // The image carries `old_version + 1`: recovery would pick it
             // over the tombstone of a deleted cell and resurrect the data.
@@ -2806,7 +2838,7 @@ impl Chunk {
                         let loc = guard.get_ptr();
                         (cell_version_from_chunk_raw(loc).unwrap_or(0), Some(loc))
                     }
-                    None => (cells[j].header.version, None),
+                    None => (self.create_version(&cells[j]), None),
                 };
 
                 let entry_addr = addr;
@@ -2955,7 +2987,7 @@ impl Chunk {
                         cell,
                         &write_plan,
                         &pending_entry,
-                        cell.header.version,
+                        self.create_version(cell),
                     )?;
                     WRITE_COPY_NANOS
                         .fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3442,6 +3474,7 @@ impl Chunk {
             cell_header.version,
             cell_header.id,
         );
+        self.note_deleted_version(cell_header.id.bits(), cell_header.version);
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
         Ok(())
@@ -5318,7 +5351,11 @@ impl<'a> CellGuard<'a> {
             cell,
             &write_plan,
             &pending_entry,
-            cell.header.version,
+            if old_cell_loc == 0 {
+                self.chunk.create_version(cell)
+            } else {
+                cell.header.version
+            },
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;

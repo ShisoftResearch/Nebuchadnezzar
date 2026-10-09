@@ -433,7 +433,7 @@ async fn recreated_in_another_segment_below_the_tombstone_version(mode: Mode, gr
             .into_iter()
             .find(|s| s.contains_address(location))
             .unwrap();
-        assert_eq!(version, 2, "a re-create must restart at version 2");
+        assert_eq!(version, 5, "a re-create must exceed the deleted version");
         assert!(
             segment.seq_id > tombstones[0].0,
             "the re-create must follow the tombstone segment"
@@ -454,7 +454,6 @@ macro_rules! other_segment_scenarios {
     ($($name:ident: $mode:expr, $group:expr;)*) => {
         $(
             // Recovery loses a lower-version re-create in a later segment.
-            #[ignore = "recovery loses a lower-version re-create in another segment"]
             #[tokio::test(flavor = "multi_thread")]
             async fn $name() {
                 recreated_in_another_segment_below_the_tombstone_version($mode, $group).await;
@@ -472,7 +471,6 @@ other_segment_scenarios! {
 /// tombstone, while an older version of the same cell still sits in another
 /// segment.
 // Recovery resurrects an older cell after the cleaner removes its tombstone.
-#[ignore = "recovery resurrects an older cell after tombstone removal"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cleaned_tombstone_does_not_bring_back_an_older_version() {
     use crate::ram::cleaner::combine::CombinedCleaner;

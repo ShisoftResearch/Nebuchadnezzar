@@ -530,7 +530,6 @@ impl BracketLedger {
         self.commits.lock().insert(txn.clone(), manifest);
     }
 
-
     /// Apply every committed bracket and report the rest.
     ///
     /// Called once, after every segment has been scanned. Applying here rather
@@ -597,6 +596,9 @@ impl BracketLedger {
             std::mem::take(&mut *self.plain_deletes.lock()),
             std::mem::take(&mut *self.ties.lock()),
         );
+        for &((chunk_id, hash), mark) in &plain_deletes.plain {
+            chunks[chunk_id].note_deleted_version(hash, mark.version);
+        }
         revalidate_plain_deletes(chunks, &plain_deletes);
         apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes));
         // A late loser comes back only if it is provably a re-create (see
@@ -679,18 +681,6 @@ fn segment_of(chunk: &Chunk, addr: usize) -> Option<(u64, u64)> {
         .map(|segment| (segment.seq_id, segment.id))
 }
 
-/// Order of two entries, only meaningful when they share a segment: a
-/// segment is appended by one writer at a time, so its offsets are time.
-/// ACROSS segments neither `seq_id` nor address is time -- a chunk keeps
-/// several heads open and a transaction leases one for its whole life -- so
-/// no cross-segment order is ever inferred here.
-fn same_segment_after(chunk: &Chunk, later: usize, earlier: usize) -> bool {
-    match (segment_of(chunk, later), segment_of(chunk, earlier)) {
-        (Some((_, a)), Some((_, b))) => a == b && later > earlier,
-        _ => false,
-    }
-}
-
 /// What a tombstone says about the entry for its id.
 #[derive(Clone, Copy)]
 struct DeleteMark {
@@ -701,7 +691,7 @@ struct DeleteMark {
     /// `seq_id` of the segment that cell lived in.
     target_seq: u64,
     /// How many tombstones name exactly this victim `(segment, version)`.
-    /// An id deleted and re-created at version 1 several times leaves several.
+    /// Equal-version copies can name the same victim more than once.
     count: u32,
 }
 
@@ -802,7 +792,9 @@ impl DeleteBook {
                 }
             }
         }
-        merged.map(|m| m.iter().copied().collect()).unwrap_or_default()
+        merged
+            .map(|m| m.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -811,22 +803,9 @@ impl DeleteMark {
     /// where `rank` counts the entries of the same id, version and segment
     /// that were written before this one.
     ///
-    /// A tombstone kills the cell it names -- same version, in the segment it
-    /// recorded -- and every OLDER version of the id. It does not kill a
-    /// newer version, nor an equal version living elsewhere (a re-create:
-    /// versions restart at 1, so the tombstone's version alone cannot tell the
-    /// two lives apart). When several entries share the victim's version and
-    /// segment, the tombstones kill them in write order: `count` tombstones
-    /// kill the first `count` entries. An entry provably written after the
-    /// tombstone, in the same segment, is a re-create whatever its version.
-    ///
-    /// Known limit: a re-create that lands in ANOTHER segment than the
-    /// tombstone, at a version below it, cannot be told from a leftover older
-    /// version of the deleted cell, and is treated as one.
+    /// A re-create continues above the deleted version. Segment identity and
+    /// write order still resolve equal-version copies of the victim.
     fn kills(&self, chunk: &Chunk, addr: usize, version: u64, rank: u32) -> bool {
-        if same_segment_after(chunk, addr, self.addr) {
-            return false;
-        }
         if version < self.version {
             return true;
         }
@@ -863,8 +842,7 @@ fn revalidate_plain_deletes(chunks: &[Chunk], book: &DeleteBook) {
         if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let existing = *guard;
             if existing != 0 {
-                let version =
-                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
                 // The index holds the LAST of the entries that tied.
                 let rank = book.ties.get(&key).copied().unwrap_or(0);
                 if any_kills(chunk, book.marks_for(key).iter(), existing, version, rank) {
@@ -929,8 +907,12 @@ fn apply_bracketed_group(
         .and_then(|b| b.ties.get(&key).copied())
         .unwrap_or(0);
     // Plain tombstones already known for this id, then this group's own.
-    let mut known = book.as_deref().map(|b| b.marks_for(key)).unwrap_or_default();
+    let mut known = book
+        .as_deref()
+        .map(|b| b.marks_for(key))
+        .unwrap_or_default();
     for tombstone in group.iter().filter(|cell| cell.tombstone) {
+        chunk.note_deleted_version(hash, tombstone.version);
         let mark = DeleteMark {
             addr: tombstone.addr,
             version: tombstone.version,
@@ -958,8 +940,7 @@ fn apply_bracketed_group(
         if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let existing = *guard;
             if existing != 0 {
-                let version =
-                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
                 if any_kills(chunk, marks.iter(), existing, version, plain_ties) {
                     guard.remove();
                 }
@@ -1009,8 +990,7 @@ fn apply_bracketed_group(
     // Something else already claims this id and no delete took it away: the
     // higher version wins, and the later address breaks a tie.
     let existing_version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
-    if cell.version > existing_version
-        || (cell.version == existing_version && cell.addr > existing)
+    if cell.version > existing_version || (cell.version == existing_version && cell.addr > existing)
     {
         *guard = cell.addr;
         chunk.slot_bytes.add(hash, cell.content_length);
@@ -1970,10 +1950,10 @@ fn apply_stashed_tombstones(
                     }
                 }
                 guard.remove(); // Delete cell, key and all, so the live-cell count is right
-                            // The header at this address was already read just above, so
-                            // decoding the entry touches nothing new. The slot counter was
-                            // seeded with this cell counted (its scan saw no newer
-                            // tombstone), so the deletion must be reflected there too.
+                                // The header at this address was already read just above, so
+                                // decoding the entry touches nothing new. The slot counter was
+                                // seeded with this cell counted (its scan saw no newer
+                                // tombstone), so the deletion must be reflected there too.
                 let (removed_entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                 chunk
                     .slot_bytes
