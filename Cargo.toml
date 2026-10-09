@@ -103,3 +103,7 @@ harness = false
 [[bench]]
 name = "occ_transactions"
 harness = false
+
+[[bench]]
+name = "write_path"
+harness = false
