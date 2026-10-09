@@ -3841,6 +3841,139 @@ mod tests {
         }
     }
 
+    /// H1 (Morpheus docs/EDGE_INTENT_LOG.md): a head returned to the pool with
+    /// its BEGIN still open.
+    ///
+    /// `release_transaction_leases` is what the lease-expiry sweeper calls, and
+    /// it hands the head back WITHOUT a COMMIT and WITHOUT a rewind. The next
+    /// ordinary writer then appends behind the open BEGIN in the same segment,
+    /// is acknowledged, and the recovery state machine buffers that entry as
+    /// part of the bracket and discards it. This test writes exactly that
+    /// sequence through the live write path and recovers it from the WAL.
+    ///
+    /// `closed` is the control: the same sequence with a proper
+    /// `commit_transaction_brackets` keeps everything.
+    fn run_open_bracket_then_ordinary_write(how: &str) -> (bool, bool, bool) {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let schema = schema_with_id(431, "recovery_open_bracket", false);
+        let before_id = Id::allocated(31, 0, 1);
+        let txn_id_cell = Id::allocated(31, 0, 2);
+        let after_id = Id::allocated(31, 0, 3);
+        let txn = crate::server::transactions::test_hlc(8181, 9);
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mk = |id: &Id, n: i32| OwnedCell {
+                header: CellHeader::new(schema.vid, id),
+                data: data_map_value!(id: n, data: vec![0x33_u8; 64]),
+            };
+            chunks.write_cell(&mut mk(&before_id, 1)).unwrap();
+
+            crate::ram::chunk::set_transaction_id(Some(txn.clone()));
+            chunks.write_cell(&mut mk(&txn_id_cell, 2)).unwrap();
+            crate::ram::chunk::set_transaction_id(None);
+            let range = chunks.address_range();
+            match how {
+                "closed" => {
+                    crate::ram::chunk::set_transaction_id(Some(txn.clone()));
+                    chunks.commit_transaction_brackets(&txn).unwrap();
+                    crate::ram::chunk::set_transaction_id(None);
+                    crate::ram::chunk::release_transaction_leases(&txn, &range);
+                }
+                "release" => {
+                    crate::ram::chunk::release_transaction_leases(&txn, &range);
+                }
+                "expire" => {
+                    let expired = crate::ram::chunk::expire_transaction_leases(
+                        std::time::Duration::ZERO,
+                        &range,
+                        &Default::default(),
+                    );
+                    assert_eq!(expired, vec![txn.clone()]);
+                }
+                other => panic!("unknown variant {other}"),
+            }
+            drop(crate::ram::chunk::take_transactional_segments());
+
+            // The ordinary, ACKNOWLEDGED write that follows.
+            chunks.write_cell(&mut mk(&after_id, 3)).unwrap();
+            let seg_of = |id: &Id| {
+                chunks.list[0]
+                    .locate_segment(chunks.address_of(id))
+                    .expect("segment")
+                    .id
+            };
+            assert_eq!(
+                seg_of(&txn_id_cell),
+                seg_of(&after_id),
+                "the ordinary write must land in the segment holding the bracket"
+            );
+            chunks.sync_all();
+        }
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        let before = chunks.read_cell(&before_id).is_ok();
+        let in_txn = chunks.read_cell(&txn_id_cell).is_ok();
+        let after = chunks.read_cell(&after_id).is_ok();
+        (before, in_txn, after)
+    }
+
+    #[test]
+    fn h1_control_a_closed_bracket_keeps_the_ordinary_write_behind_it() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("closed");
+        eprintln!("H1 closed: before={before} txn={txn_cell} after={after}");
+        assert!(before && txn_cell && after);
+    }
+
+    #[test]
+    fn h1_ordinary_write_behind_a_released_open_bracket_survives_recovery() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("release");
+        eprintln!("H1 release: before={before} txn={txn_cell} after={after}");
+        assert!(before);
+        assert!(!txn_cell, "the undecided transaction's cell must not recover");
+        assert!(
+            after,
+            "H1: an ACKNOWLEDGED ordinary write behind an open BEGIN was dropped by recovery"
+        );
+    }
+
+    #[test]
+    fn h1_ordinary_write_behind_an_expired_open_bracket_survives_recovery() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("expire");
+        eprintln!("H1 expire: before={before} txn={txn_cell} after={after}");
+        assert!(before);
+        assert!(!txn_cell);
+        assert!(
+            after,
+            "H1: an ACKNOWLEDGED ordinary write behind an expired bracket was dropped by recovery"
+        );
+    }
+
     /// The crash this format exists for: a record's frame reached disk, its
     /// body did not.
     ///
