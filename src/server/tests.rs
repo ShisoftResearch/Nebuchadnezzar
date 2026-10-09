@@ -3202,6 +3202,62 @@ mod write_fence_server_tests {
         server.shutdown().await;
     }
 
+    /// A lease can lapse between two renewals: the member lifts the fence, writes
+    /// land, and the holder has not been told yet. The check a copy makes before
+    /// it trusts itself must see that, not only what a renewal noticed so far.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_that_lapses_unnoticed_is_caught_before_the_copy_is_trusted() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("fence_lapse_unnoticed").await;
+        let id = Id::from_parts(1, 1);
+        client.write_cell(cell(PROTECTED_SCHEMA, &id, 1)).await.unwrap().unwrap();
+        let mut fence = client
+            .engage_write_fence(&[PROTECTED_SCHEMA], Duration::from_secs(5), Duration::from_millis(300))
+            .await
+            .unwrap();
+        fence.stop_renewing_for_test();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        // The member lifted it: a write to the copied family lands.
+        client.update_cell(cell(PROTECTED_SCHEMA, &id, 2)).await.unwrap().unwrap();
+        assert!(
+            fence.is_lost(),
+            "the fence lapsed and a protected write landed, but the holder still believes it holds it"
+        );
+        server.shutdown().await;
+    }
+
+    /// The fence names families by the body a write carries. A body of an
+    /// unprotected family written over the id of a protected cell replaces that
+    /// cell all the same, so the stored cell's family has to count too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_write_cannot_replace_a_protected_cell_with_another_family() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_cross_family").await;
+        let id = Id::from_parts(1, 7);
+        client.write_cell(cell(PROTECTED_SCHEMA, &id, 1)).await.unwrap().unwrap();
+        let version = client.head_cell(id).await.unwrap().unwrap().version;
+        let hold = runtime
+            .engage_write_fence(protected(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let fenced: Result<(), WriteError> = Err(WriteError::DatabaseFenced);
+        assert_eq!(client.upsert_cell(cell(OTHER_SCHEMA, &id, 9)).await.unwrap().map(|_| ()), fenced);
+        assert_eq!(client.update_cell(cell(OTHER_SCHEMA, &id, 9)).await.unwrap().map(|_| ()), fenced);
+        assert_eq!(
+            client
+                .compare_version_and_update_cell(id, version, cell(OTHER_SCHEMA, &id, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced
+        );
+        let stored = client.read_cell(id).await.unwrap().unwrap();
+        assert_eq!(stored.header.schema, SchemaVid(PROTECTED_SCHEMA));
+        assert_eq!(*stored.data[DATA].u64().unwrap(), 1);
+        drop(hold);
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_cell_count_matches_the_walk() {
         let _ = env_logger::try_init();

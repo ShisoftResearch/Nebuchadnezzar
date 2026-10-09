@@ -1432,6 +1432,15 @@ impl ClusterFence {
         self.lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Stop renewing without releasing, as a holder whose renewal task stalls
+    /// (a starved runtime, a slow network) would.
+    #[cfg(test)]
+    pub(crate) fn stop_renewing_for_test(&mut self) {
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
+    }
+
     pub async fn release(mut self) {
         self.stop.notify_one();
         if let Some(task) = self.renewal.take() {
