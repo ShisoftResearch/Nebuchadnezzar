@@ -3551,7 +3551,12 @@ fn apply_resolved_commit(
         );
     }
     for cell in &bracket.cells {
-        crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);
+        if let Err(error) =
+            crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell)
+        {
+            error!("cannot install resolved transaction {:?}: {}", bracket.txn, error);
+            return;
+        }
     }
     warn!(
         "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \

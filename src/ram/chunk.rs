@@ -7033,7 +7033,9 @@ mod tests {
             0,
             "inside our own section the retirement must still be blocked -- by us"
         );
-        let freed = crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        let freed = crate::ram::qsbr::segment_qsbr().suspended(|| {
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5))
+        });
         assert_eq!(freed, 1, "suspended, the same thread's collection reclaims");
         assert_eq!(chunk.retired_segment_count(), 0);
     }

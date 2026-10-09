@@ -89,11 +89,25 @@ pub fn full_clean_cycle_without_compact() {
         chunk.head_pool[0].store(1234, std::sync::atomic::Ordering::Relaxed);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         // The first pass removes the old cells. A later pass can remove their tombstones.
-        crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        crate::ram::qsbr::segment_qsbr().suspended(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
+                chunk.drain_retired_segments();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(chunk.retired_segment_count(), 0);
+        });
         let empty = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
         chunk.put_segment(empty);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
-        crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        crate::ram::qsbr::segment_qsbr().suspended(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
+                chunk.drain_retired_segments();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(chunk.retired_segment_count(), 0);
+        });
         assert!(chunk.deleted_versions.is_empty());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
