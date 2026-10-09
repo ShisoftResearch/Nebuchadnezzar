@@ -1,4 +1,5 @@
 use super::ServerOptions;
+use crate::utils::persisted::decode_persisted_or_halt;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
@@ -93,10 +94,10 @@ impl StateMachineCtl for DatabaseCatalogSM {
     }
 
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        if let Some(map) = utils::serde::deserialize::<HashMap<String, DatabaseCatalogEntry>>(&data)
-        {
-            self.map = map;
-        }
+        self.map = decode_persisted_or_halt::<HashMap<String, DatabaseCatalogEntry>>(
+            "database catalog snapshot",
+            &data,
+        );
         future::ready(()).boxed()
     }
 
@@ -176,6 +177,32 @@ pub fn sanitize_database_name(database_name: &str) -> String {
 mod tests {
     use crate::utils::test_temp::temp_path;
     use super::*;
+
+    #[test]
+    fn catalog_recover_round_trips_a_snapshot() {
+        let mut sm = DatabaseCatalogSM::new("g");
+        assert!(sm.map.is_empty(), "an absent snapshot starts empty");
+        sm.map
+            .insert("db".into(), DatabaseCatalogEntry { name: "db".into() });
+        let expected = sm.map.clone();
+        let snapshot = sm.snapshot();
+        let mut restored = DatabaseCatalogSM::new("g");
+        restored.recover(snapshot).now_or_never().unwrap();
+        assert_eq!(restored.map, expected);
+    }
+
+    #[test]
+    fn catalog_recover_halts_on_an_undecodable_snapshot() {
+        let mut sm = DatabaseCatalogSM::new("g");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sm.recover(b"{\"db\":{}}".to_vec()));
+        }))
+        .unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "database catalog snapshot");
+    }
 
     fn base_opts() -> ServerOptions {
         ServerOptions {

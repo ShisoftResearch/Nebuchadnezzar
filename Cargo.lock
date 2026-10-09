@@ -279,7 +279,6 @@ dependencies = [
  "rand 0.10.0",
  "serde",
  "serde_cbor",
- "serde_json",
  "thread-id",
  "threadpool",
  "tokio",

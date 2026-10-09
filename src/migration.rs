@@ -1304,9 +1304,8 @@ mod tests {
     /// answer decides whether the next optimisation belongs in the RPC layer or in
     /// the storage path.
     ///
-    /// **Must be run in release.** bifrost picks its codec by build profile --
-    /// `serde_cbor` in release, `serde_json` under `debug_assertions` -- so a debug
-    /// measurement is measuring JSON and is not a statement about production.
+    /// **Must be run in release.** The codec is CBOR in every profile, but a debug
+    /// build is unoptimised, so a debug timing is not a statement about production.
     #[test]
     #[ignore]
     fn codec_share_of_transfer_cost() {
@@ -1318,9 +1317,8 @@ mod tests {
 
         assert!(
             !cfg!(debug_assertions),
-            "run this with --release: bifrost serializes with JSON under \
-             debug_assertions and CBOR otherwise, so a debug number says nothing \
-             about production"
+            "run this with --release: a debug build is unoptimised, so a debug \
+             number says nothing about production"
         );
 
         let payload = "x".repeat(PAYLOAD);
@@ -3376,9 +3374,8 @@ mod cluster_tests {
     /// cargo test --release --lib drain_throughput -- --ignored --nocapture
     /// ```
     ///
-    /// **Release only.** bifrost picks its codec by build profile -- `serde_cbor`
-    /// in release, `serde_json` under `debug_assertions` -- so a debug number is a
-    /// statement about JSON and nothing else.
+    /// **Release only.** The codec is CBOR in every profile, but a debug build is
+    /// unoptimised, so a debug number says nothing about production.
     ///
     /// A drain is the operator-facing operation of this whole campaign: it is what
     /// runs when a machine has to leave. `reshard_slots` has a measured number and

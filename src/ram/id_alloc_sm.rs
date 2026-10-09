@@ -14,6 +14,7 @@
 //!   a granted lease is replicated before the caller sees it — at
 //!   least as durable as any data that can reference the ids.
 
+use crate::utils::persisted::decode_persisted_or_halt;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
@@ -186,7 +187,7 @@ impl StateMachineCtl for IdAllocSM {
         utils::serde::serialize(&self.state)
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        self.state = utils::serde::deserialize(&data).unwrap();
+        self.state = decode_persisted_or_halt("id allocator snapshot", &data);
         future::ready(()).boxed()
     }
     fn recoverable(&self) -> bool {
@@ -207,6 +208,31 @@ impl IdAllocSM {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn recover_round_trips_a_snapshot() {
+        let mut sm = IdAllocSM::new(1);
+        let (slot, epoch) = block_on(sm.claim_origin(5)).unwrap();
+        let snapshot = sm.snapshot();
+        let mut restored = IdAllocSM::new(1);
+        block_on(restored.recover(snapshot));
+        assert_eq!(restored.state.origins.len(), 1);
+        assert!(restored.state.origins.contains_key(&slot));
+        assert_eq!(restored.state.origins[&slot].epoch, epoch);
+    }
+
+    #[test]
+    fn recover_halts_on_an_undecodable_snapshot() {
+        let mut sm = IdAllocSM::new(1);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(sm.recover(b"{\"origins\":{}}".to_vec()));
+        }))
+        .unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "id allocator snapshot");
+    }
 
     #[test]
     fn origin_zero_is_reserved_for_the_shim_plane() {

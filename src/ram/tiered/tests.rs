@@ -4987,9 +4987,8 @@ async fn every_cell_survives_being_written_past_the_tier_limit() {
         false,
     );
     // `register_internal_schema`, not `debug_only_new_schema`: this test has to
-    // run in RELEASE. bifrost picks its codec by build profile and the tier's
-    // pacing is entirely different under a debug build, so a debug-only run
-    // would be measuring a store that nobody ships. The id is fixed, which is
+    // run in RELEASE. The tier's pacing is entirely different under a debug
+    // build, so a debug-only run would measure a store that nobody ships. The id is fixed, which is
     // what that entry point requires.
     server
         .meta()
