@@ -36,6 +36,8 @@ pub mod status;
 mod storage_lock;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod restart_delete_tests;
 pub mod transactions;
 
 // Re-export status types for convenience
