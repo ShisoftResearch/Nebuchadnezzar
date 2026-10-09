@@ -199,7 +199,6 @@ pub struct Schema {
     /// describes and cannot disagree with it after a crash. Neb never
     /// interprets them. They belong to the family: an evolution inherits them,
     /// and only `set_app_meta` changes them.
-    #[serde(default)]
     pub app_meta: Vec<u8>,
 }
 
@@ -2471,6 +2470,19 @@ mod tests {
         second.generation = 1;
         map.new_schema(first.clone());
         (map, first, second)
+    }
+
+    #[test]
+    fn serialized_schema_records_require_app_meta() {
+        for app_meta in [vec![], vec![1, 2, 3]] {
+            let schema = schema_of(base_fields()).with_app_meta(app_meta.clone());
+            let mut record = serde_json::to_value(&schema).unwrap();
+            let decoded: Schema = serde_json::from_value(record.clone()).unwrap();
+            assert_eq!(decoded.app_meta, app_meta);
+            record.as_object_mut().unwrap().remove("app_meta");
+            let error = serde_json::from_value::<Schema>(record).unwrap_err();
+            assert!(error.to_string().contains("missing field `app_meta`"));
+        }
     }
 
     #[test]
