@@ -1088,11 +1088,20 @@ impl SealQueue {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeletedVersion {
+    pub version: u64,
+    pub tombstones: usize,
+}
+
 pub struct Chunk {
     pub id: usize,
     /// Shared with every chunk of the store and drained by the sealer thread.
     pub seal_queue: Arc<SealQueue>,
     pub cell_index: WordMap,
+    /// Last deleted version and number of physical tombstones, per id.
+    pub(crate) deleted_versions:
+        parking_lot::RwLock<std::collections::HashMap<u64, DeletedVersion, ahash::RandomState>>,
     /// Live bytes per slot, shared across every chunk of this store. See
     /// [`crate::slots::SlotLiveBytes`] for the contract; the hooks live on the
     /// logical transitions of `cell_index` -- insert, replace, remove -- so
@@ -1143,6 +1152,7 @@ pub struct Chunk {
     /// quiescent state since. Holding 8 MiB longer than necessary is the cost;
     /// the alternative is silent corruption with no durable copy left.
     pub retired_segments: Mutex<Vec<RetiredSegment>>,
+    pub(crate) retired_segment_files: AtomicUsize,
     /// Set once shutdown has begun archiving; no entry may be acquired after.
     ///
     /// Shutdown archives every dirty segment and only then stops the RPC
@@ -1179,6 +1189,7 @@ pub struct RetiredSegment {
     /// Drain passes this entry has survived, for reporting one that never
     /// drains rather than retaining it in silence.
     pub attempts: usize,
+    deleted_ids: Vec<(u64, usize)>,
 }
 
 impl Chunk {
@@ -1387,6 +1398,9 @@ impl Chunk {
             id,
             segs,
             cell_index: index,
+            deleted_versions: parking_lot::RwLock::new(std::collections::HashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             slot_bytes,
             seal_queue,
             meta,
@@ -1418,6 +1432,7 @@ impl Chunk {
             tiered_manager,
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
+            retired_segment_files: AtomicUsize::new(0),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
@@ -2975,6 +2990,22 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    pub(crate) fn note_deleted_version(&self, hash: u64, version: u64) {
+        let mut versions = self.deleted_versions.write();
+        let floor = versions.entry(hash).or_default();
+        floor.version = floor.version.max(version);
+        floor.tombstones += 1;
+    }
+
+    fn create_version(&self, cell: &OwnedCell) -> u64 {
+        self.deleted_versions
+            .read()
+            .get(&cell.header.id.bits())
+            .map_or(cell.header.version, |floor| {
+                cell.header.version.max(floor.version)
+            })
+    }
+
     pub fn write_cell_to_chunk<'a>(
         &self,
         cell: &OwnedCell,
@@ -3070,7 +3101,7 @@ impl Chunk {
 
         let t_copy = std::time::Instant::now();
         let write_result =
-            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, self.create_version(cell))?;
         WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let cell_loc = write_result.addr;
         #[cfg(debug_assertions)]
@@ -3192,8 +3223,12 @@ impl Chunk {
             cell.header.schema = write_result.new_schema;
         } else {
             // Optimistic update will remove the new inserted one
-            let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            let write_result = self.write_cell_to_chunk(
+                cell,
+                &write_plan,
+                &pending_entry,
+                cell.header.version,
+            )?;
             let new_cell_loc = write_result.addr;
             // The image carries `old_version + 1`: recovery would pick it
             // over the tombstone of a deleted cell and resurrect the data.
@@ -3290,7 +3325,7 @@ impl Chunk {
                         let loc = guard.get_ptr();
                         (cell_version_from_chunk_raw(loc).unwrap_or(0), Some(loc))
                     }
-                    None => (cells[j].header.version, None),
+                    None => (self.create_version(&cells[j]), None),
                 };
 
                 let entry_addr = addr;
@@ -3439,7 +3474,7 @@ impl Chunk {
                         cell,
                         &write_plan,
                         &pending_entry,
-                        cell.header.version,
+                        self.create_version(cell),
                     )?;
                     WRITE_COPY_NANOS
                         .fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3707,7 +3742,15 @@ impl Chunk {
         // already inside hold pointers into this memory, and `segs.remove`
         // only stops the ones that have not looked it up yet. The segment is
         // stamped and reclaimed once every thread has been quiescent since.
+        self.retired_segment_files.fetch_add(1, Ordering::AcqRel);
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
+            let mut deleted_ids = std::collections::HashMap::<u64, usize>::new();
+            for entry in seg.entry_iter() {
+                if entry.entry_header.entry_type == EntryType::TOMBSTONE {
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    *deleted_ids.entry(tombstone.id.bits()).or_default() += 1;
+                }
+            }
             if let Some(ref tiered) = self.tiered_manager {
                 tiered.release_cold_resident(seg.take_block_resident_bytes());
             }
@@ -3719,8 +3762,10 @@ impl Chunk {
                 segment: seg,
                 stamp,
                 attempts: 0,
+                deleted_ids: deleted_ids.into_iter().collect(),
             });
         } else {
+            self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
             error!(
                 "Segment {} not found in chunk {} to remove",
                 segment_id, self.id
@@ -3758,6 +3803,24 @@ impl Chunk {
             if quiesced && unreferenced {
                 entry.segment.free_memory();
                 entry.segment.dispense();
+                {
+                    let mut floors = self.deleted_versions.write();
+                    for (hash, count) in entry.deleted_ids {
+                        if let std::collections::hash_map::Entry::Occupied(mut floor) =
+                            floors.entry(hash)
+                        {
+                            if floor.get().tombstones <= count {
+                                floor.remove();
+                            } else {
+                                floor.get_mut().tombstones -= count;
+                            }
+                        }
+                    }
+                    if floors.is_empty() {
+                        floors.shrink_to_fit();
+                    }
+                }
+                self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
                 entry.segment.mem_drop(self);
                 freed += 1;
                 continue;
@@ -3926,6 +3989,7 @@ impl Chunk {
             cell_header.version,
             cell_header.id,
         );
+        self.note_deleted_version(cell_header.id.bits(), cell_header.version);
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
         Ok(())
@@ -4134,7 +4198,6 @@ impl Chunk {
             .filter_map(move |entry_meta| {
                 let chunk_id = &self.id;
                 let chunk_index = &self.cell_index;
-                let chunk_segs = &self.segs;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
                 trace!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
@@ -4188,17 +4251,11 @@ impl Chunk {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        let contains_seg = chunk_segs.contains_seq_id(tombstone.segment_seq_id);
-                        if contains_seg {
-                            trace!("Tomestone entry {:?} at seq_id {} is valid",
-                                   tombstone.id.bits(), tombstone.segment_seq_id);
-                            return Some(Entry {
-                                meta: entry_meta,
-                                content: EntryContent::Tombstone(tombstone)
-                            });
-                        } else {
-                            trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
-                        }
+                        // Combine decides retention after it checks every other segment.
+                        return Some(Entry {
+                            meta: entry_meta,
+                            content: EntryContent::Tombstone(tombstone)
+                        });
                 } else if matches!(
                     entry_header.entry_type,
                     EntryType::BEGIN | EntryType::COMMIT | EntryType::TXN_CONT
@@ -5853,7 +5910,11 @@ impl<'a> CellGuard<'a> {
             cell,
             &write_plan,
             &pending_entry,
-            cell.header.version,
+            if old_cell_loc == 0 {
+                self.chunk.create_version(cell)
+            } else {
+                cell.header.version
+            },
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
@@ -5941,6 +6002,44 @@ mod tests {
     use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
+
+    #[test]
+    fn deleted_version_map_memory_cost() {
+        fn rss_kb() -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let before = rss_kb();
+        let mut map = std::collections::HashMap::with_hasher(ahash::RandomState::new());
+        for id in 0..1_000_000u64 {
+            map.insert(
+                id,
+                DeletedVersion {
+                    version: 4,
+                    tombstones: 1,
+                },
+            );
+        }
+        let after = rss_kb();
+        println!(
+            "METRIC deleted_id_entry_bytes {}",
+            std::mem::size_of::<(u64, DeletedVersion)>()
+        );
+        println!(
+            "METRIC deleted_id_rss_bytes {:.2}",
+            (after - before) as f64 * 1024.0 / map.len() as f64
+        );
+        println!("METRIC deleted_id_map_capacity {}", map.capacity());
+        std::hint::black_box(map);
+    }
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
     /// A chunk with room for several segments.

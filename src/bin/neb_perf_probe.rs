@@ -101,6 +101,7 @@ async fn populate(base: &str, cells: u64) {
     let server = NebServer::new_from_opts(&options(base, false), &addr, "perf_probe", async |_| {})
         .await
         .expect("server start");
+    server.cleaner().pause();
     server.meta().schemas.register_internal_schema(schema());
     let client = Arc::new(server.data_client(&vec![addr]).await.expect("data client"));
     let chunks = server.chunks();
@@ -159,6 +160,11 @@ async fn populate(base: &str, cells: u64) {
         rate(name, done, started);
     }
 
+    let started = Instant::now();
+    for chunk in &chunks.list {
+        neb::ram::cleaner::Cleaner::clean(chunk, true, true);
+    }
+    println!("METRIC cleaner_secs {:.3}", started.elapsed().as_secs_f64());
     let started = Instant::now();
     server.shutdown().await;
     println!(

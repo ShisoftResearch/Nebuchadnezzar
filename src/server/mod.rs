@@ -37,6 +37,8 @@ mod storage_lock;
 pub mod write_fence;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod restart_delete_tests;
 pub mod transactions;
 
 // Re-export status types for convenience
