@@ -168,11 +168,6 @@ impl IndexerClients {
                 limit, 
                 true // rerank with global stats
             ).await
-        } else {
-            // Fall back to legacy transactional mode
-            self.inverted_client
-                .bm25_search(schema_id, field_id, query, limit)
-                .await
         }
     }
 }
@@ -213,63 +208,6 @@ impl IndexBuilder {
             clients: Arc::new(clients),
             local_hybrid_indexer: Some(local_hybrid_indexer),
         })
-    }
-}
-```
-
-### Step 5: Update InvertedIndexClient to Support Hybrid Mode
-
-Add a hybrid variant to `InvertedIndexClient`:
-
-```rust
-// In src/index/inverted/mod.rs
-
-pub enum InvertedIndexClient {
-    /// Legacy transactional mode
-    Transactional {
-        neb_client: Arc<AsyncClient>,
-        indexer: InvertedIndexer,
-    },
-    /// New hybrid mode (partition-aware, no transactions)
-    Hybrid {
-        local_indexer: Arc<HybridInvertedIndexer>,
-    },
-}
-
-impl InvertedIndexClient {
-    /// Create client in transactional mode (legacy)
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
-        Self::Transactional {
-            neb_client: neb_client.clone(),
-            indexer: InvertedIndexer::new(neb_client),
-        }
-    }
-    
-    /// Create client in hybrid mode
-    pub fn new_hybrid(local_indexer: Arc<HybridInvertedIndexer>) -> Self {
-        Self::Hybrid { local_indexer }
-    }
-    
-    pub async fn insert(&self, meta: &InvertedIndexMeta) -> Result<(), IndexError> {
-        match self {
-            Self::Transactional { indexer, .. } => {
-                indexer.add_document(meta).await.map_err(IndexError::TxnError)
-            }
-            Self::Hybrid { local_indexer } => {
-                local_indexer.add_document(meta).await
-            }
-        }
-    }
-    
-    pub async fn remove(&self, meta: &InvertedIndexMeta) -> Result<(), IndexError> {
-        match self {
-            Self::Transactional { indexer, .. } => {
-                indexer.remove_document(meta).await.map_err(IndexError::TxnError)
-            }
-            Self::Hybrid { local_indexer } => {
-                local_indexer.remove_document(meta).await
-            }
-        }
     }
 }
 ```
@@ -365,24 +303,6 @@ println!("Total documents: {}", stats.doc_count);
 println!("Total length: {}", stats.total_length);
 ```
 
-## Migration Path
-
-### Phase 1: Dual Mode (Recommended)
-
-Run both legacy and hybrid indexers side-by-side:
-
-1. Keep legacy `InvertedIndexClient` for reads
-2. Write to both legacy and hybrid indexers
-3. Verify results match
-4. Switch reads to hybrid mode
-5. Disable legacy indexer
-
-### Phase 2: Hybrid Only
-
-1. Stop legacy indexer
-2. Use only hybrid mode
-3. Remove legacy code
-
 ## Performance Comparison
 
 | Operation | Legacy (Transactional) | Hybrid (Coordinator) | Improvement |
@@ -465,11 +385,9 @@ match indexer_clients.bm25_search(schema_id, field_id, query, limit).await {
 
 The coordinator seamlessly integrates with the existing `IndexerClients` API while providing:
 
-- ✅ **Drop-in replacement** for legacy transactional indexer
 - ✅ **Distributed search** across all partitions
 - ✅ **Global BM25 scoring** with accurate IDF
 - ✅ **10-100x faster writes** with no transactions
-- ✅ **Backward compatible** with existing code
 - ✅ **Partition-aware** ownership checking
 - ✅ **Fault tolerant** with partial result handling
 

@@ -285,42 +285,6 @@ Some chunks may have more data than others. With per-chunk limits:
 
 **Future improvement**: Global coordinator could balance eviction across chunks
 
-## Backward Compatibility
-
-### Configuration Changes
-
-**None required!** Existing configurations work as-is:
-
-Before fix:
-```
-NEB_TIERED_PHYSICAL_MEMORY_LIMIT=1073741824
-```
-
-After fix:
-```
-NEB_TIERED_PHYSICAL_MEMORY_LIMIT=1073741824  # Same, but now correctly divided
-```
-
-### Behavior Changes
-
-Users may notice:
-- **Lower per-chunk limits**: This is correct! Previous behavior was buggy
-- **More frequent eviction**: This is correct! Previous behavior delayed eviction
-- **Lower peak memory**: This is the goal!
-
-### Migration Path
-
-If users want to maintain previous (buggy) per-chunk memory:
-```
-# If you had 4 chunks and previously set 128GB limit
-# (which gave 512GB total due to bug)
-
-# To maintain same per-chunk memory after fix:
-export NEB_TIERED_PHYSICAL_MEMORY_LIMIT=$((128 * 4 * 1024 * 1024 * 1024))  # 512GB
-
-# Now each chunk gets 128GB (512/4), same as before
-```
-
 ## Related Issues
 
 This fix also resolves:
