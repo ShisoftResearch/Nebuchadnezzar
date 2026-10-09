@@ -530,6 +530,7 @@ impl BracketLedger {
         self.commits.lock().insert(txn.clone(), manifest);
     }
 
+
     /// Apply every committed bracket and report the rest.
     ///
     /// Called once, after every segment has been scanned. Applying here rather
@@ -545,6 +546,13 @@ impl BracketLedger {
     pub fn settle(&self, chunks: &[Chunk]) -> RecoveredBrackets {
         let commits = std::mem::take(&mut *self.commits.lock());
         let mut pending = std::mem::take(&mut *self.pending.lock());
+        // Floors count physical tombstones, including undecided brackets.
+        // Their versions constrain a future create without deciding the bracket.
+        for cells in pending.values() {
+            for tombstone in cells.iter().filter(|cell| cell.tombstone) {
+                chunks[tombstone.chunk_id].note_deleted_version(tombstone.hash, tombstone.version);
+            }
+        }
         let mut committed_txns = Vec::with_capacity(commits.len());
         let mut committed_cells: Vec<PendingBracketCell> = Vec::new();
         for (txn, manifest) in commits {
@@ -792,9 +800,7 @@ impl DeleteBook {
                 }
             }
         }
-        merged
-            .map(|m| m.iter().copied().collect())
-            .unwrap_or_default()
+        merged.map(|m| m.iter().copied().collect()).unwrap_or_default()
     }
 }
 
@@ -833,7 +839,8 @@ fn revalidate_plain_deletes(chunks: &[Chunk], book: &DeleteBook) {
         if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let existing = *guard;
             if existing != 0 {
-                let version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version =
+                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
                 // The index holds the LAST of the entries that tied.
                 let rank = book.ties.get(&key).copied().unwrap_or(0);
                 if any_kills(chunk, book.marks_for(key).iter(), existing, version, rank) {
@@ -898,12 +905,8 @@ fn apply_bracketed_group(
         .and_then(|b| b.ties.get(&key).copied())
         .unwrap_or(0);
     // Plain tombstones already known for this id, then this group's own.
-    let mut known = book
-        .as_deref()
-        .map(|b| b.marks_for(key))
-        .unwrap_or_default();
+    let mut known = book.as_deref().map(|b| b.marks_for(key)).unwrap_or_default();
     for tombstone in group.iter().filter(|cell| cell.tombstone) {
-        chunk.note_deleted_version(hash, tombstone.version);
         let mark = DeleteMark {
             addr: tombstone.addr,
             version: tombstone.version,
@@ -931,7 +934,8 @@ fn apply_bracketed_group(
         if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let existing = *guard;
             if existing != 0 {
-                let version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version =
+                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
                 if any_kills(chunk, marks.iter(), existing, version, plain_ties) {
                     guard.remove();
                 }
@@ -981,7 +985,8 @@ fn apply_bracketed_group(
     // Something else already claims this id and no delete took it away: the
     // higher version wins, and the later address breaks a tie.
     let existing_version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
-    if cell.version > existing_version || (cell.version == existing_version && cell.addr > existing)
+    if cell.version > existing_version
+        || (cell.version == existing_version && cell.addr > existing)
     {
         *guard = cell.addr;
         chunk.slot_bytes.add(hash, cell.content_length);
@@ -1941,10 +1946,10 @@ fn apply_stashed_tombstones(
                     }
                 }
                 guard.remove(); // Delete cell, key and all, so the live-cell count is right
-                                // The header at this address was already read just above, so
-                                // decoding the entry touches nothing new. The slot counter was
-                                // seeded with this cell counted (its scan saw no newer
-                                // tombstone), so the deletion must be reflected there too.
+                            // The header at this address was already read just above, so
+                            // decoding the entry touches nothing new. The slot counter was
+                            // seeded with this cell counted (its scan saw no newer
+                            // tombstone), so the deletion must be reflected there too.
                 let (removed_entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                 chunk
                     .slot_bytes

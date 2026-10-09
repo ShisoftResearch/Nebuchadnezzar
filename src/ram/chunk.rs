@@ -2743,7 +2743,7 @@ impl Chunk {
                 cell,
                 &write_plan,
                 &pending_entry,
-                self.create_version(cell),
+                cell.header.version,
             )?;
             let new_cell_loc = write_result.addr;
             // The image carries `old_version + 1`: recovery would pick it
