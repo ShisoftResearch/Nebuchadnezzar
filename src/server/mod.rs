@@ -603,6 +603,32 @@ async fn ensure_type2_meta_plane(
     Err(last_transient_error.unwrap_or_else(|| "unknown transient bootstrap error".to_string()))
 }
 
+async fn initialize_database_catalog<F>(mut ensure: F) -> Result<(), sm_master::ExecError>
+where
+    F: AsyncFnMut() -> Result<(), sm_master::ExecError>,
+{
+    // A recovered plane needs up to 30 s to elect a leader. A command's
+    // 2 s discovery budget does not cover that startup phase.
+    let budget = tokio::time::Duration::from_millis(
+        META_PLANE_BOOTSTRAP_MAX_RETRIES as u64 * META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+    );
+    tokio::time::timeout(budget, async {
+        loop {
+            match ensure().await {
+                Err(sm_master::ExecError::TooManyRetry) => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .unwrap_or(Err(sm_master::ExecError::TooManyRetry))
+}
+
 async fn ensure_shared_meta_plane(
     raft_service: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
@@ -1731,8 +1757,7 @@ impl NebServer {
             .await
             .unwrap(),
         );
-        neb_client
-            .ensure_database()
+        initialize_database_catalog(async || neb_client.ensure_database().await)
             .await
             .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
 

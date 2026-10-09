@@ -3300,3 +3300,66 @@ fn server_options_require_storage_lock_choice() {
         .remove("disable_storage_locks");
     assert!(serde_json::from_value::<ServerOptions>(wire).is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn database_catalog_initialization_retries_election_retry_exhaustion() {
+    let group = "catalog_election_retry";
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &address,
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let client = client::AsyncClient::new(&server.rpc, &server.membership, &vec![address], group)
+        .await
+        .unwrap();
+    let mut attempts = 0;
+    initialize_database_catalog(async || {
+        attempts += 1;
+        // Model the command's exhausted leader-discovery window. The next
+        // attempt uses the real catalog command after the plane is ready.
+        if attempts == 1 {
+            Err(sm_master::ExecError::TooManyRetry)
+        } else {
+            client.ensure_database().await
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        client.get_database(group).await.unwrap().unwrap().name,
+        group
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn database_catalog_initialization_preserves_storage_errors() {
+    let mut attempts = 0;
+    let result = initialize_database_catalog(async || {
+        attempts += 1;
+        Err(sm_master::ExecError::StorageFailure(
+            "persist failed".into(),
+        ))
+    })
+    .await;
+    assert!(
+        matches!(result, Err(sm_master::ExecError::StorageFailure(reason)) if reason == "persist failed")
+    );
+    assert_eq!(attempts, 1);
+}
