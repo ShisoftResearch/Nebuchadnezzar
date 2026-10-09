@@ -19,7 +19,7 @@ const SCHEMA: u32 = 9301;
 /// Scratch space on the big disk, never /tmp: a restart test leaves WAL and
 /// backup files of several segments each.
 fn scratch_dir() -> tempfile::TempDir {
-    let base = PathBuf::from("/mnt/ext/morpheus-fixes/restart-bugs");
+    let base = PathBuf::from("/mnt/ext/morpheus-fixes/sharedloss/restart-tests");
     std::fs::create_dir_all(&base).expect("scratch base");
     tempfile::Builder::new()
         .prefix("neb-restart-")
@@ -114,6 +114,7 @@ struct Store {
     client: Arc<client::AsyncClient>,
     mode: Mode,
     chunk_mb: usize,
+    tiered_config: Option<crate::ram::tiered::TieredConfig>,
 }
 
 impl Store {
@@ -123,21 +124,33 @@ impl Store {
 
     /// Use one chunk when the chunk size equals the database size (128 MiB).
     async fn start_in(dir: &std::path::Path, group: &str, mode: Mode, chunk_mb: usize) -> Store {
+        Store::start_with_tiered_config(dir, group, mode, chunk_mb, None).await
+    }
+
+    async fn start_with_tiered_config(
+        dir: &std::path::Path,
+        group: &str,
+        mode: Mode,
+        chunk_mb: usize,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+    ) -> Store {
         let addr = crate::utils::test_port::unique_localhost_addr();
-        let server = NebServer::new_from_opts(&options(dir, chunk_mb), &addr, group, async |_| {})
+        let mut opts = options(dir, chunk_mb);
+        opts.tiered_config = tiered_config.clone();
+        let server = NebServer::new_from_opts(&opts, &addr, group, async |_| {})
             .await
             .expect("server start");
         server.meta().schemas.register_internal_schema(schema());
         let client = Arc::new(server.data_client(&vec![addr]).await.expect("data client"));
-        Store { server, client, mode, chunk_mb }
+        Store { server, client, mode, chunk_mb, tiered_config }
     }
 
     async fn restart(self, dir: &std::path::Path, group: &str) -> Store {
-        let (mode, chunk_mb) = (self.mode, self.chunk_mb);
+        let (mode, chunk_mb, tiered_config) = (self.mode, self.chunk_mb, self.tiered_config.clone());
         self.server.shutdown().await;
         drop(self.client);
         drop(self.server);
-        Store::start_in(dir, group, mode, chunk_mb).await
+        Store::start_with_tiered_config(dir, group, mode, chunk_mb, tiered_config).await
     }
 
     async fn write(&self, c: OwnedCell) {
@@ -302,9 +315,26 @@ async fn deleted_from_sealed_segments(class: IdClass, mode: Mode, group: &str) {
 /// A re-created id restarts at version 1 while the tombstone of the previous
 /// incarnation carries its last version (here 3): the re-create must win.
 async fn recreated_after_updates(class: IdClass, mode: Mode, group: &str) {
+    recreated_after_updates_with_tiering(class, mode, group, false).await;
+}
+
+async fn recreated_after_updates_with_tiering(
+    class: IdClass,
+    mode: Mode,
+    group: &str,
+    cold: bool,
+) {
     let _ = env_logger::try_init();
     let dir = scratch_dir();
-    let mut store = Store::start(dir.path(), group, mode).await;
+    let tiered = cold.then(|| crate::ram::tiered::TieredConfig {
+        physical_memory_limit: 3 * crate::ram::segs::SEGMENT_SIZE,
+        threshold: 0.7,
+        lower_watermark: 0.5,
+        promotion_cooldown_ms: 0,
+    });
+    let mut store = Store::start_with_tiered_config(
+        dir.path(), group, mode, if cold { 16 } else { chunk_mb() }, tiered,
+    ).await;
     let mut model = HashMap::new();
     for index in 0..100u64 {
         let id = class.id(index);
@@ -324,6 +354,13 @@ async fn recreated_after_updates(class: IdClass, mode: Mode, group: &str) {
     }
     check(&store.server, &model, "before the restart");
     store = store.restart(dir.path(), group).await;
+    if cold {
+        assert!(
+            store.server.chunks().list.iter().flat_map(|chunk| chunk.segments())
+                .any(|segment| segment.is_cold()),
+            "the restart must recover cold segments"
+        );
+    }
     check(&store.server, &model, &format!("after a graceful restart ({class:?}, {mode:?})"));
     store.server.shutdown().await;
 }
@@ -609,4 +646,16 @@ async fn a_cleaned_tombstone_does_not_bring_back_an_older_version() {
     store = store.restart(dir.path(), group).await;
     check(&store.server, &model, "after a graceful restart");
     store.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_after_updates_allocated_direct() {
+    recreated_after_updates_with_tiering(IdClass::Allocated, Mode::Direct, "rd_cold_ad", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_after_updates_hashed_plain_then_txn_deletes() {
+    recreated_after_updates_with_tiering(
+        IdClass::Hashed, Mode::DirectWritesTxnDeletes, "rd_cold_hpt", true,
+    ).await;
 }

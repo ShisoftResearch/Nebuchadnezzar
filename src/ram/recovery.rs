@@ -1,5 +1,5 @@
 use super::cell::cell_header_from_entry_content_addr;
-use super::chunk::Chunk;
+use super::chunk::{CellGuard, Chunk};
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::schema::SchemaVid;
@@ -542,7 +542,7 @@ impl BracketLedger {
     /// "this transaction aborted", because another participant may have been
     /// told to commit. Both halves are handed back so the store can ask its
     /// peers before deciding: see [`RecoveredBrackets`].
-    pub fn settle(&self, chunks: &[Chunk]) -> RecoveredBrackets {
+    pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, RecoveryCellReadError> {
         let commits = std::mem::take(&mut *self.commits.lock());
         let mut pending = std::mem::take(&mut *self.pending.lock());
         // Floors count physical tombstones, including undecided brackets.
@@ -606,12 +606,12 @@ impl BracketLedger {
         for &((chunk_id, hash), mark) in &plain_deletes.plain {
             chunks[chunk_id].note_deleted_version(hash, mark.version);
         }
-        revalidate_plain_deletes(chunks, &plain_deletes);
-        apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes));
+        revalidate_plain_deletes(chunks, &plain_deletes)?;
+        apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes))?;
         // A late loser comes back only if it is provably a re-create (see
         // `DeleteMark::kills`); otherwise the version rule keeps it out.
         let late_losers = std::mem::take(&mut *self.late_losers.lock());
-        apply_bracketed_cells(chunks, late_losers, Some(&mut plain_deletes));
+        apply_bracketed_cells(chunks, late_losers, Some(&mut plain_deletes))?;
         // What is left has no COMMIT anywhere, and that now means exactly one
         // thing: the transaction was in flight when the store stopped.
         //
@@ -638,10 +638,10 @@ impl BracketLedger {
                 InDoubtBracket { txn, cells, chunks }
             })
             .collect();
-        RecoveredBrackets {
+        Ok(RecoveredBrackets {
             committed: committed_txns,
             in_doubt,
-        }
+        })
     }
 }
 
@@ -821,10 +821,35 @@ fn any_kills<'a>(
     marks.any(|mark| mark.kills(chunk, addr, version, rank))
 }
 
-/// Re-decide, with every segment installed, each plain tombstone against what
-/// the scan left in the index. The scan decides a tombstone when it meets it,
-/// but the cell it killed may sit in a segment scanned LATER.
-fn revalidate_plain_deletes(chunks: &[Chunk], book: &DeleteBook) {
+#[derive(Debug)]
+pub(crate) struct RecoveryCellReadError(super::cell::ReadError);
+
+impl std::fmt::Display for RecoveryCellReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot read a recovered cell: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for RecoveryCellReadError {}
+
+// Recovery can install cold segments without resident cell bytes. Use the
+// normal read guard to load and pin the block before reading its header.
+fn recovered_cell_guard(
+    chunk: &Chunk,
+    hash: u64,
+) -> Result<Option<CellGuard<'_>>, RecoveryCellReadError> {
+    match chunk.lock_cell_for_read(hash) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(super::cell::ReadError::CellDoesNotExisted | super::cell::ReadError::CellIdIsUnitId) => Ok(None),
+        Err(error) => Err(RecoveryCellReadError(error)),
+    }
+}
+
+/// Revalidate deletes after the scan installs every segment.
+fn revalidate_plain_deletes(
+    chunks: &[Chunk],
+    book: &DeleteBook,
+) -> Result<(), RecoveryCellReadError> {
     let mut at = 0;
     while at < book.plain.len() {
         let key = book.plain[at].0;
@@ -835,19 +860,19 @@ fn revalidate_plain_deletes(chunks: &[Chunk], book: &DeleteBook) {
         let Some(chunk) = chunks.get(chunk_id) else {
             continue;
         };
-        if let Some(guard) = chunk.cell_index.lock(hash as usize) {
+        if let Some(mut guard) = recovered_cell_guard(chunk, hash)? {
             let existing = *guard;
             if existing != 0 {
-                let version =
-                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version = guard.cell_version().map_err(RecoveryCellReadError)?;
                 // The index holds the LAST of the entries that tied.
                 let rank = book.ties.get(&key).copied().unwrap_or(0);
                 if any_kills(chunk, book.marks_for(key).iter(), existing, version, rank) {
-                    guard.remove();
+                    guard.remove_cell();
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Install committed bracket entries, grouped per id. `book` is what the
@@ -857,7 +882,7 @@ pub(crate) fn apply_bracketed_cells(
     chunks: &[Chunk],
     mut cells: Vec<PendingBracketCell>,
     mut book: Option<&mut DeleteBook>,
-) {
+) -> Result<(), RecoveryCellReadError> {
     cells.sort_by_key(|cell| (cell.chunk_id, cell.hash, cell.addr));
     let mut start = 0;
     while start < cells.len() {
@@ -868,14 +893,18 @@ pub(crate) fn apply_bracketed_cells(
         {
             end += 1;
         }
-        apply_bracketed_group(chunks, &cells[start..end], book.as_deref_mut());
+        apply_bracketed_group(chunks, &cells[start..end], book.as_deref_mut())?;
         start = end;
     }
+    Ok(())
 }
 
 /// Install one cell from a committed bracket.
-pub(crate) fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
-    apply_bracketed_group(chunks, std::slice::from_ref(cell), None);
+pub(crate) fn apply_bracketed_cell(
+    chunks: &[Chunk],
+    cell: &PendingBracketCell,
+) -> Result<(), RecoveryCellReadError> {
+    apply_bracketed_group(chunks, std::slice::from_ref(cell), None)
 }
 
 /// All committed bracket entries of ONE id, oldest address first.
@@ -887,14 +916,14 @@ fn apply_bracketed_group(
     chunks: &[Chunk],
     group: &[PendingBracketCell],
     mut book: Option<&mut DeleteBook>,
-) {
+) -> Result<(), RecoveryCellReadError> {
     let first = &group[0];
     let Some(chunk) = chunks.get(first.chunk_id) else {
         error!(
             "a committed bracket names chunk {} which this store does not have",
             first.chunk_id
         );
-        return;
+        return Ok(());
     };
     let hash = first.hash;
     let key = (first.chunk_id, hash);
@@ -930,13 +959,12 @@ fn apply_bracketed_group(
 
     // The installed entry first: a delete in this group may be for it.
     if !marks.is_empty() {
-        if let Some(guard) = chunk.cell_index.lock(hash as usize) {
+        if let Some(mut guard) = recovered_cell_guard(chunk, hash)? {
             let existing = *guard;
             if existing != 0 {
-                let version =
-                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                let version = guard.cell_version().map_err(RecoveryCellReadError)?;
                 if any_kills(chunk, marks.iter(), existing, version, plain_ties) {
-                    guard.remove();
+                    guard.remove_cell();
                 }
             }
         }
@@ -967,29 +995,30 @@ fn apply_bracketed_group(
         .map(|(_, cell)| *cell)
         .last();
     let Some(cell) = survivor else {
-        return;
+        return Ok(());
     };
 
-    let mut guard = chunk.cell_index.lock_or_insert(hash as usize, cell.addr);
+    let mut guard = chunk.lock_or_insert_cell(hash);
     let existing = *guard;
     if existing == cell.addr {
         chunk.slot_bytes.add(hash, cell.content_length);
-        return;
+        return Ok(());
     }
     if existing == 0 {
-        *guard = cell.addr;
+        **guard.word_mutex_guard() = cell.addr;
         chunk.slot_bytes.add(hash, cell.content_length);
-        return;
+        return Ok(());
     }
     // Something else already claims this id and no delete took it away: the
     // higher version wins, and the later address breaks a tie.
-    let existing_version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+    let existing_version = guard.cell_version().map_err(RecoveryCellReadError)?;
     if cell.version > existing_version
         || (cell.version == existing_version && cell.addr > existing)
     {
-        *guard = cell.addr;
+        **guard.word_mutex_guard() = cell.addr;
         chunk.slot_bytes.add(hash, cell.content_length);
     }
+    Ok(())
 }
 
 /// Entries a scan stepped over because they failed their own checksum.
@@ -1921,7 +1950,7 @@ fn apply_stashed_tombstones(
     stashed: &[StashedTombstone],
     chunks: &[Chunk],
     origin_floors: &[std::sync::atomic::AtomicU64],
-) {
+) -> Result<(), RecoveryCellReadError> {
     info!("Applying {} stashed tombstones...", stashed.len());
 
     let mut applied_count = 0;
@@ -1929,7 +1958,7 @@ fn apply_stashed_tombstones(
     for tombstone in stashed {
         let chunk = &chunks[tombstone.chunk_id];
 
-        if let Some(mut guard) = chunk.cell_index.lock(tombstone.hash as usize) {
+        if let Some(guard) = recovered_cell_guard(chunk, tombstone.hash)? {
             let existing_addr = *guard;
             if existing_addr == 0 {
                 continue;
@@ -1944,11 +1973,8 @@ fn apply_stashed_tombstones(
                         floor.fetch_max(removed.sequence(), std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                guard.remove(); // Delete cell, key and all, so the live-cell count is right
-                            // The header at this address was already read just above, so
-                            // decoding the entry touches nothing new. The slot counter was
-                            // seeded with this cell counted (its scan saw no newer
-                            // tombstone), so the deletion must be reflected there too.
+                // Decode the entry before removing the guard that pins its bytes.
+                // The scan counted this cell in the slot, so subtract its size.
                 let (removed_entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                 chunk
                     .slot_bytes
@@ -1958,6 +1984,7 @@ fn apply_stashed_tombstones(
                         .fetch_add(removed_entry.content_length, Ordering::Relaxed);
                     seg.note_dead_bytes_change();
                 }
+                guard.remove_cell();
                 applied_count += 1;
                 debug!(
                 "Applied stashed tombstone: deleted cell hash={} version={} with tombstone version={}",
@@ -1968,6 +1995,7 @@ fn apply_stashed_tombstones(
     }
 
     info!("Applied {} stashed tombstones", applied_count);
+    Ok(())
 }
 
 /// Count total cells recovered across all chunks
@@ -2378,7 +2406,8 @@ pub fn recover_chunks(
     // transactions. This is where a cross-chunk transaction becomes atomic --
     // the chunk whose own COMMIT was lost still applies its part, because the
     // decision came from the transaction rather than from that chunk's bytes.
-    let recovered_brackets = bracket_ledger.settle(chunks);
+    let recovered_brackets = bracket_ledger.settle(chunks)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
     for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
@@ -2438,7 +2467,8 @@ pub fn recover_chunks(
     // Merge and apply stashed tombstones
     let stashed = all_stashed_tombstones.into_inner();
     let merged_tombstones = merge_stashed_tombstones(vec![stashed]);
-    apply_stashed_tombstones(&merged_tombstones, chunks, origin_floors);
+    apply_stashed_tombstones(&merged_tombstones, chunks, origin_floors)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
