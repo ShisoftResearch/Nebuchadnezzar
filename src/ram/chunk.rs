@@ -814,6 +814,7 @@ pub struct Chunk {
     /// quiescent state since. Holding 8 MiB longer than necessary is the cost;
     /// the alternative is silent corruption with no durable copy left.
     pub retired_segments: Mutex<Vec<RetiredSegment>>,
+    pub(crate) retired_segment_files: AtomicUsize,
     /// Set once shutdown has begun archiving; no entry may be acquired after.
     ///
     /// Shutdown archives every dirty segment and only then stops the RPC
@@ -850,6 +851,7 @@ pub struct RetiredSegment {
     /// Drain passes this entry has survived, for reporting one that never
     /// drains rather than retaining it in silence.
     pub attempts: usize,
+    deleted_ids: Vec<(u64, usize)>,
 }
 
 impl Chunk {
@@ -1092,6 +1094,7 @@ impl Chunk {
             tiered_manager,
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
+            retired_segment_files: AtomicUsize::new(0),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3255,7 +3258,15 @@ impl Chunk {
         // already inside hold pointers into this memory, and `segs.remove`
         // only stops the ones that have not looked it up yet. The segment is
         // stamped and reclaimed once every thread has been quiescent since.
+        self.retired_segment_files.fetch_add(1, Ordering::AcqRel);
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
+            let mut deleted_ids = std::collections::HashMap::<u64, usize>::new();
+            for entry in seg.entry_iter() {
+                if entry.entry_header.entry_type == EntryType::TOMBSTONE {
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    *deleted_ids.entry(tombstone.id.bits()).or_default() += 1;
+                }
+            }
             if let Some(ref tiered) = self.tiered_manager {
                 tiered.release_cold_resident(seg.take_block_resident_bytes());
             }
@@ -3267,8 +3278,10 @@ impl Chunk {
                 segment: seg,
                 stamp,
                 attempts: 0,
+                deleted_ids: deleted_ids.into_iter().collect(),
             });
         } else {
+            self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
             error!(
                 "Segment {} not found in chunk {} to remove",
                 segment_id, self.id
@@ -3306,6 +3319,21 @@ impl Chunk {
             if quiesced && unreferenced {
                 entry.segment.free_memory();
                 entry.segment.dispense();
+                {
+                    let mut floors = self.deleted_versions.write();
+                    for (hash, count) in entry.deleted_ids {
+                        if let std::collections::hash_map::Entry::Occupied(mut floor) =
+                            floors.entry(hash)
+                        {
+                            if floor.get().tombstones <= count {
+                                floor.remove();
+                            } else {
+                                floor.get_mut().tombstones -= count;
+                            }
+                        }
+                    }
+                }
+                self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
                 entry.segment.mem_drop(self);
                 freed += 1;
                 continue;
@@ -3683,7 +3711,6 @@ impl Chunk {
             .filter_map(move |entry_meta| {
                 let chunk_id = &self.id;
                 let chunk_index = &self.cell_index;
-                let chunk_segs = &self.segs;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
                 trace!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
@@ -3737,17 +3764,11 @@ impl Chunk {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        let contains_seg = chunk_segs.contains_seq_id(tombstone.segment_seq_id);
-                        if contains_seg {
-                            trace!("Tomestone entry {:?} at seq_id {} is valid",
-                                   tombstone.id.bits(), tombstone.segment_seq_id);
-                            return Some(Entry {
-                                meta: entry_meta,
-                                content: EntryContent::Tombstone(tombstone)
-                            });
-                        } else {
-                            trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
-                        }
+                        // Combine decides retention after it checks every other segment.
+                        return Some(Entry {
+                            meta: entry_meta,
+                            content: EntryContent::Tombstone(tombstone)
+                        });
                 } else if matches!(
                     entry_header.entry_type,
                     EntryType::BEGIN | EntryType::COMMIT | EntryType::TXN_CONT

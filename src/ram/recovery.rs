@@ -799,19 +799,10 @@ impl DeleteBook {
 }
 
 impl DeleteMark {
-    /// Whether this tombstone deleted the entry at `addr` (version `version`),
-    /// where `rank` counts the entries of the same id, version and segment
-    /// that were written before this one.
-    ///
-    /// A re-create continues above the deleted version. Segment identity and
-    /// write order still resolve equal-version copies of the victim.
-    fn kills(&self, chunk: &Chunk, addr: usize, version: u64, rank: u32) -> bool {
-        if version < self.version {
-            return true;
-        }
-        version == self.version
-            && rank < self.count
-            && segment_of(chunk, addr).map_or(false, |(seq, _)| seq == self.target_seq)
+    /// A re-create continues above the deleted version. Copies at or below
+    /// that version belong to the deleted life, wherever the cleaner put them.
+    fn kills(&self, _chunk: &Chunk, _addr: usize, version: u64, _rank: u32) -> bool {
+        version <= self.version
     }
 }
 

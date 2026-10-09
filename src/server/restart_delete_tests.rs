@@ -420,6 +420,14 @@ async fn recreated_in_another_segment_below_the_tombstone_version(mode: Mode, gr
     let tombstone_segments = store.server.chunks().list[0].seg_count();
     fill_until_new_segment(&store, "r", &mut counter);
     assert!(store.server.chunks().list[0].seg_count() > tombstone_segments);
+    store = store.restart(dir.path(), group).await;
+    {
+        let floors = store.server.chunks().list[0].deleted_versions.read();
+        assert_eq!(floors.len(), 20, "recovery must rebuild the deleted versions");
+        println!("deleted-version map: ids={}, capacity={}, entry_bytes={}",
+            floors.len(), floors.capacity(),
+            std::mem::size_of::<(u64, crate::ram::chunk::DeletedVersion)>());
+    }
     for index in 0..20u64 {
         let id = model[&index].0;
         let tombstones = tombstones_for(&store, id);
@@ -567,8 +575,8 @@ async fn a_cleaned_tombstone_does_not_bring_back_an_older_version() {
         "segment B must be gone, or the test proves nothing"
     );
     assert!(
-        tombstones_for(&store, key).is_empty(),
-        "the cleaner must remove the key's tombstone"
+        !tombstones_for(&store, key).is_empty(),
+        "the cleaner must retain the tombstone while an older entry exists"
     );
     let old_versions: Vec<_> = by_seq[0]
         .entry_iter()

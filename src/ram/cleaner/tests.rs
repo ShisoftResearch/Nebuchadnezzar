@@ -88,6 +88,13 @@ pub fn full_clean_cycle_without_compact() {
         // Cleaner refuses to work on head segment; set head to dummy to include both segments
         chunk.head_pool[0].store(1234, std::sync::atomic::Ordering::Relaxed);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+        // The first pass removes the old cells. A later pass can remove their tombstones.
+        crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        let empty = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        chunk.put_segment(empty);
+        combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+        crate::ram::qsbr::segment_qsbr().suspended(|| chunk.drain_retired_segments());
+        assert!(chunk.deleted_versions.read().is_empty());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {
