@@ -3183,6 +3183,7 @@ mod write_fence_server_tests {
             Err(WriteError::DatabaseFenced)
         );
         assert!(!fence.is_lost());
+        fence.confirm().await.expect("a fence renewed all along confirms");
         // A second fence on the same database is refused, not stacked.
         assert!(client
             .engage_write_fence(&families, Duration::from_secs(1), Duration::from_secs(1))
@@ -3219,10 +3220,12 @@ mod write_fence_server_tests {
         tokio::time::sleep(Duration::from_millis(900)).await;
         // The member lifted it: a write to the copied family lands.
         client.update_cell(cell(PROTECTED_SCHEMA, &id, 2)).await.unwrap().unwrap();
-        assert!(
-            fence.is_lost(),
-            "the fence lapsed and a protected write landed, but the holder still believes it holds it"
-        );
+        // No renewal ran, so the background flag cannot know...
+        assert!(!fence.is_lost());
+        // ...and the check a copy makes before trusting itself asks the members.
+        let refused = fence.confirm().await;
+        assert!(refused.is_err(), "a lapsed lease was confirmed: {refused:?}");
+        assert!(fence.is_lost(), "a failed confirmation is remembered");
         server.shutdown().await;
     }
 

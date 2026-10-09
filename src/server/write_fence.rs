@@ -81,6 +81,27 @@ impl std::fmt::Display for FenceError {
 
 impl std::error::Error for FenceError {}
 
+/// Which families an engaged fence refuses writes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protection {
+    /// These families and no others: a dump protects what it copies and lets
+    /// derived state (index write-back, statistics) keep flowing.
+    Only(HashSet<SchemaUid>),
+    /// Every family except these, including families created after the fence
+    /// went up: a database that must not take writes at all (an unfinished
+    /// restore) still lets the engine's own derived writers flush.
+    AllExcept(HashSet<SchemaUid>),
+}
+
+impl Protection {
+    pub fn covers(&self, family: SchemaUid) -> bool {
+        match self {
+            Protection::Only(families) => families.contains(&family),
+            Protection::AllExcept(exempt) => !exempt.contains(&family),
+        }
+    }
+}
+
 /// What a write that names only a cell id (a remove, a field set) learned about
 /// the cell, for [`WriteFence::enter_keyed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +125,7 @@ pub struct WriteFence {
     shards: Box<[Shard; SHARDS]>,
     /// The families being protected. Written before `gate` turns odd and read
     /// only after it is seen odd, so the gate's ordering publishes it.
-    protected: RwLock<Arc<HashSet<SchemaUid>>>,
+    protected: RwLock<Arc<Protection>>,
     refused: AtomicU64,
     #[cfg(test)]
     trace: trace::Trace,
@@ -235,7 +256,7 @@ impl WriteFence {
         Self {
             gate: AtomicU64::new(0),
             shards: Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0)))),
-            protected: RwLock::new(Arc::new(HashSet::new())),
+            protected: RwLock::new(Arc::new(Protection::Only(HashSet::new()))),
             refused: AtomicU64::new(0),
             #[cfg(test)]
             trace: Default::default(),
@@ -273,8 +294,7 @@ impl WriteFence {
     /// `family` is only consulted when a fence is engaged, so the caller can
     /// pass a closure that does a lookup (a header read for a remove, say)
     /// without paying for it on the normal path. `None` means the schema could
-    /// not be determined -- a cell that does not exist, which the write will
-    /// reject on its own -- and is admitted.
+    /// not be determined, and is refused while the fence is engaged.
     pub fn enter(
         &self,
         family: impl FnOnce() -> Option<SchemaUid>,
@@ -324,7 +344,7 @@ impl WriteFence {
         // cache and retries, so admitting it unguarded would let a write to a
         // protected family through the retry.
         let protected = match family() {
-            Some(uid) => self.protected.read().contains(&uid),
+            Some(uid) => self.protected.read().covers(uid),
             None => true,
         };
         #[cfg(test)]
@@ -422,8 +442,14 @@ impl WriteFence {
     /// Whether a write to `family` would be refused right now. For callers that
     /// need the verdict without a guard (a prepare that is about to hold one).
     pub fn would_refuse(&self, family: Option<SchemaUid>) -> bool {
-        self.is_engaged()
-            && family.is_some_and(|uid| self.protected.read().contains(&uid))
+        self.is_engaged() && family.is_some_and(|uid| self.protects(uid))
+    }
+
+    /// Whether the current protection covers `family`. Meaningful only while
+    /// a fence is engaged; for use inside the `family` lookup of [`Self::enter`],
+    /// which runs only then.
+    pub fn protects(&self, family: SchemaUid) -> bool {
+        self.protected.read().covers(family)
     }
 
     /// Engage the fence over `protected` and wait for writes already in flight
@@ -432,6 +458,15 @@ impl WriteFence {
     pub async fn engage(
         self: &Arc<Self>,
         protected: HashSet<SchemaUid>,
+        drain_timeout: Duration,
+    ) -> Result<FenceHold, FenceError> {
+        self.engage_with(Protection::Only(protected), drain_timeout).await
+    }
+
+    /// [`Self::engage`] with any [`Protection`].
+    pub async fn engage_with(
+        self: &Arc<Self>,
+        protected: Protection,
         drain_timeout: Duration,
     ) -> Result<FenceHold, FenceError> {
         // Decide and publish under the write lock, so a second `engage` that is
@@ -517,6 +552,22 @@ mod tests {
         assert_eq!(fence.refused_writes(), 2);
         drop(hold);
         assert!(fence.enter(|| Some(SchemaUid(7))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_all_except_fence_refuses_every_family_but_the_exempt_ones() {
+        let fence = Arc::new(WriteFence::new());
+        let _hold = fence
+            .engage_with(Protection::AllExcept(protect(&[9])), Duration::from_secs(1))
+            .await
+            .unwrap();
+        // Known or not, every family is refused...
+        assert_eq!(fence.enter(|| Some(SchemaUid(7))).err(), Some(WriteError::DatabaseFenced));
+        assert_eq!(fence.enter(|| Some(SchemaUid(12345))).err(), Some(WriteError::DatabaseFenced));
+        assert!(fence.would_refuse(Some(SchemaUid(7))));
+        // ...but the exempt ones.
+        assert!(fence.enter(|| Some(SchemaUid(9))).is_ok());
+        assert!(!fence.would_refuse(Some(SchemaUid(9))));
     }
 
     #[tokio::test]
