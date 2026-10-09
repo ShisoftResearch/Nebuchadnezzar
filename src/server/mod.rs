@@ -2718,8 +2718,8 @@ impl NebServer {
                 take_snapshots: true,
                 append_logs: true,
                 trim_logs: true,
-                snapshot_log_threshold: 1000,
-                log_compaction_threshold: 2000,
+                snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
+                log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
             })
         } else {
             raft::Storage::MEMORY
@@ -3541,4 +3541,16 @@ fn apply_resolved_commit(
     );
     crate::ram::recovery::BRACKETS_APPLIED
         .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000
+/// applied entries, compact once the in-memory log passes 2000) are rarely
+/// reached by a short test lifetime, so the compaction paths stay unexercised;
+/// these variables let a test or a campaign lower them without a rebuild.
+fn raft_threshold_from_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
