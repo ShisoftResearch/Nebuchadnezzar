@@ -151,25 +151,7 @@ impl IndexerClients {
         })
     }
     
-    /// BM25 search using distributed coordinator
-    pub async fn bm25_search(
-        &self,
-        schema_id: u32,
-        field_id: u64,
-        query: &str,
-        limit: usize,
-    ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
-        // Use coordinator if available (hybrid mode)
-        if let Some(coordinator) = &self.inverted_coordinator {
-            coordinator.distributed_search(
-                schema_id, 
-                field_id, 
-                query, 
-                limit, 
-                true // rerank with global stats
-            ).await
-        }
-    }
+
 }
 ```
 
