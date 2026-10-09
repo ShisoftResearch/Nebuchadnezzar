@@ -3,6 +3,7 @@ use super::tree::{service::AsyncServiceClient as LSMServiceClient, tree::INITIAL
 use super::trees::*;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
+use crate::utils::persisted::{decode_persisted, decode_persisted_or_halt};
 use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::PlaneId;
@@ -13,8 +14,8 @@ use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::ops::Bound::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -237,7 +238,7 @@ impl StateMachineCtl for MasterTreeSM {
         utils::serde::serialize(&self.tree)
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        let tree = utils::serde::deserialize(&data).unwrap();
+        let tree = decode_persisted_or_halt("ranged tree placement snapshot", &data);
         self.tree = tree;
         // Load the trees these placements name. `try_initialize` does this at
         // startup, but it runs BEFORE registration, so on a runtime reload it
@@ -267,6 +268,24 @@ impl StateMachineCtl for MasterTreeSM {
     }
 }
 
+/// Reads the persisted placement file. A missing file is a fresh store
+/// (`Ok(None)`); a file that exists but cannot be read or decoded is an error,
+/// because starting with an empty placement map would rewind split epochs and
+/// strand every index entry.
+fn read_placement_file(path: &Path) -> io::Result<Option<Vec<(EntryKey, TreePlacement)>>> {
+    let buffer = match fs::read(path) {
+        Ok(buffer) => buffer,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    info!(
+        "[RANGED INDEX LOAD] Read {} bytes from persistence file {:?}",
+        buffer.len(),
+        path
+    );
+    Ok(Some(decode_persisted("ranged tree placement file", &buffer)?))
+}
+
 impl MasterTreeSM {
     pub fn new_with_id_and_persistence_on_plane(
         sm_id: u64,
@@ -275,7 +294,7 @@ impl MasterTreeSM {
         plane_id: PlaneId,
         conshash: &Arc<ConsistentHashing>,
         persistence_path: Option<PathBuf>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         info!(
             "[RANGED INDEX LOAD] Creating MasterTreeSM with persistence_path={:?}",
             persistence_path
@@ -296,22 +315,24 @@ impl MasterTreeSM {
                 "[RANGED INDEX LOAD] Attempting to load persisted tree map from: {:?}",
                 path
             );
-            if let Err(e) = sm.recover_from_disk(path) {
-                info!(
-                    "[RANGED INDEX LOAD] No existing persisted tree map or failed to load: {:?}",
-                    e
-                );
-            } else {
-                info!(
-                    "[RANGED INDEX LOAD] Successfully loaded MasterTreeSM from disk with {} tree entries",
-                    sm.tree.len()
-                );
+            match read_placement_file(path)? {
+                Some(entries) => {
+                    sm.tree = entries.into_iter().collect();
+                    info!(
+                        "[RANGED INDEX LOAD] Successfully loaded MasterTreeSM from disk with {} tree entries",
+                        sm.tree.len()
+                    );
+                }
+                None => info!(
+                    "[RANGED INDEX LOAD] No persisted tree map at {:?}, starting with empty tree",
+                    path
+                ),
             }
         } else {
             info!("[RANGED INDEX LOAD] No persistence path provided, starting with empty tree");
         }
 
-        sm
+        Ok(sm)
     }
 
     async fn is_plane_leader(&self) -> bool {
@@ -483,61 +504,6 @@ impl MasterTreeSM {
             if let Ok(dir) = fs::File::open(parent) {
                 let _ = dir.sync_all();
             }
-        }
-
-        Ok(())
-    }
-
-    fn recover_from_disk(&mut self, path: &Path) -> io::Result<()> {
-        info!(
-            "[RANGED INDEX LOAD] Attempting to load MasterTreeSM from disk: {:?}",
-            path
-        );
-        if !path.exists() {
-            info!(
-                "[RANGED INDEX LOAD] Tree persistence file not found at {:?}",
-                path
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Tree persistence file not found",
-            ));
-        }
-
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer)?;
-        info!(
-            "[RANGED INDEX LOAD] Read {} bytes from persistence file",
-            buffer.len()
-        );
-
-        if buffer.is_empty() {
-            info!("[RANGED INDEX LOAD] Persistence file is empty");
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty persistence file",
-            ));
-        }
-
-        let entries: Vec<(EntryKey, TreePlacement)> = utils::serde::deserialize(&buffer)
-            .ok_or_else(|| {
-                error!("[RANGED INDEX LOAD] Failed to deserialize tree data");
-                io::Error::new(io::ErrorKind::InvalidData, "Failed to deserialize tree")
-            })?;
-
-        // Convert Vec back to BTreeMap
-        self.tree = entries.into_iter().collect();
-        info!(
-            "[RANGED INDEX LOAD] Successfully loaded tree map with {} entries",
-            self.tree.len()
-        );
-        for (key, placement) in &self.tree {
-            info!(
-                "[RANGED INDEX LOAD]   Tree entry: key={:?}, tree_id={:?}, epoch={}",
-                key, placement.id, placement.epoch
-            );
         }
 
         Ok(())
@@ -736,16 +702,19 @@ mod tests {
         info!("Tree persistence and recovery test passed!");
     }
 
-    #[tokio::test]
-    async fn test_master_tree_no_persistence() {
-        let _ = env_logger::try_init();
-
+    /// A live single-node raft service and consistent hashing, enough to build
+    /// a `MasterTreeSM`. The returned guards keep the node alive.
+    async fn placement_fixture(
+        group_name: &str,
+    ) -> (
+        TempDir,
+        Arc<Server>,
+        Arc<RaftService>,
+        Arc<bifrost::conshash::ConsistentHashing>,
+    ) {
         let temp_dir = TempDir::new().unwrap();
         let raft_path = temp_dir.path().join("raft");
         let server_addr = &crate::utils::test_port::unique_localhost_addr();
-        let group_name = "tree_no_persist_test";
-
-        info!("=== Testing MasterTreeSM without persistence ===");
 
         let rpc_server = Server::new(&server_addr.to_string());
         let storage = raft::Storage::DISK(DiskOptions {
@@ -797,6 +766,16 @@ mod tests {
             .unwrap();
         conshash.init_table().await.unwrap();
 
+        (temp_dir, rpc_server, raft_service, conshash)
+    }
+
+    #[tokio::test]
+    async fn test_master_tree_no_persistence() {
+        let _ = env_logger::try_init();
+        info!("=== Testing MasterTreeSM without persistence ===");
+        let (temp_dir, _rpc_server, raft_service, conshash) =
+            placement_fixture("tree_no_persist_test").await;
+
         // Create MasterTreeSM without persistence on the root plane.
         let mut tree_sm = MasterTreeSM::new_with_id_and_persistence_on_plane(
             DEFAULT_SM_ID,
@@ -805,7 +784,8 @@ mod tests {
             PlaneId::type1(),
             &conshash,
             None,
-        );
+        )
+        .unwrap();
 
         // Add an entry
         let mut key_bytes = vec![0x40];
@@ -832,6 +812,94 @@ mod tests {
         );
 
         info!("No-persistence test passed!");
+    }
+
+    fn corrupt_placement_file(dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("master_tree.dat");
+        // JSON text: what a debug build wrote before the codec was unified.
+        fs::write(&path, br#"[[[1,2],{"id":1,"epoch":1}]]"#).unwrap();
+        path
+    }
+
+    #[test]
+    fn missing_placement_file_is_a_fresh_store() {
+        let dir = TempDir::new().unwrap();
+        assert!(read_placement_file(&dir.path().join("master_tree.dat"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn undecodable_placement_file_is_an_error_not_an_empty_map() {
+        let dir = TempDir::new().unwrap();
+        let path = corrupt_placement_file(&dir);
+        let err = read_placement_file(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_error = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(decode_error.what, "ranged tree placement file");
+        assert!(err.to_string().contains("cannot be decoded"), "{err}");
+
+        let empty = dir.path().join("empty.dat");
+        fs::write(&empty, b"").unwrap();
+        assert!(read_placement_file(&empty).is_err());
+    }
+
+    #[test]
+    fn valid_placement_file_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("master_tree.dat");
+        let entries = vec![(
+            min_entry_key(),
+            TreePlacement {
+                id: Id::rand(),
+                epoch: 3,
+            },
+        )];
+        fs::write(&path, utils::serde::serialize(&entries)).unwrap();
+        let read = read_placement_file(&path).unwrap().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].1.epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn master_tree_sm_refuses_an_undecodable_persistence_file_and_snapshot() {
+        let _ = env_logger::try_init();
+        let (dir, _rpc_server, raft_service, conshash) =
+            placement_fixture("tree_corrupt_persist_test").await;
+        let path = corrupt_placement_file(&dir);
+
+        let built = MasterTreeSM::new_with_id_and_persistence_on_plane(
+            DEFAULT_SM_ID,
+            DEFAULT_SERVICE_ID,
+            &raft_service,
+            PlaneId::type1(),
+            &conshash,
+            Some(path),
+        );
+        assert_eq!(built.err().unwrap().kind(), io::ErrorKind::InvalidData);
+
+        let mut sm = MasterTreeSM::new_with_id_and_persistence_on_plane(
+            DEFAULT_SM_ID,
+            DEFAULT_SERVICE_ID,
+            &raft_service,
+            PlaneId::type1(),
+            &conshash,
+            Some(dir.path().join("absent.dat")),
+        )
+        .unwrap();
+        assert!(sm.tree.is_empty(), "an absent file is a fresh store");
+        let halted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sm.recover(b"{\"not\":\"cbor\"}".to_vec()));
+        }));
+        let error = halted.unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "ranged tree placement snapshot");
     }
 
     #[test]

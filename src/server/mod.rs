@@ -899,6 +899,8 @@ pub enum ServerError {
     CannotInitializeDatabaseServices(String),
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
+    /// Persisted state is present but cannot be read or decoded.
+    CannotRecoverPersistedState(std::io::Error),
     StandaloneMustAlsoBeMetaServer,
     /// `tiered_config` is set but `backup_storage` is not. Eviction frees
     /// memory by archiving a segment to its backup file and dropping the
@@ -941,6 +943,9 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::CannotInitializeSchemaPlane(error) => {
                 write!(f, "cannot initialize schema plane: {error}")
+            }
+            ServerError::CannotRecoverPersistedState(error) => {
+                write!(f, "cannot recover persisted state: {error}")
             }
             ServerError::StandaloneMustAlsoBeMetaServer => {
                 write!(f, "standalone server must also be a meta server")
@@ -1776,7 +1781,7 @@ impl NebServer {
                         database_name,
                         tree_path,
                     )
-                    .await
+                    .await?;
                 }
                 Service::Query => {}
             }
@@ -2966,7 +2971,8 @@ pub async fn init_ranged_indexer_service<C>(
     group_name: &str,
     database_name: &str,
     tree_persistence_path: Option<String>,
-) where
+) -> Result<(), ServerError>
+where
     C: bifrost::raft::client::AsRaftPlaneClient + 'static,
 {
     info!("Initializing range indexer service");
@@ -3009,7 +3015,8 @@ pub async fn init_ranged_indexer_service<C>(
         meta_plane.id(),
         cons_hash,
         persistence_path,
-    );
+    )
+    .map_err(ServerError::CannotRecoverPersistedState)?;
     tree_sm.try_initialize().await;
     meta_plane
         .register_state_machine(Box::new(tree_sm))
@@ -3190,6 +3197,7 @@ pub async fn init_ranged_indexer_service<C>(
         }
     }
     }
+    Ok(())
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
