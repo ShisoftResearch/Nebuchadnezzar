@@ -3548,9 +3548,18 @@ fn apply_resolved_commit(
 /// reached by a short test lifetime, so the compaction paths stay unexercised;
 /// these variables let a test or a campaign lower them without a rebuild.
 fn raft_threshold_from_env(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            // Set but unusable: say so, or a typo silently runs the defaults.
+            warn!(
+                "{}={:?} is not a positive integer; using the default {}",
+                name, raw, default
+            );
+            default
+        }
+    }
 }
