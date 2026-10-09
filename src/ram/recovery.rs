@@ -4265,6 +4265,9 @@ mod tests {
                         crate::ram::chunk::rewind_transaction_writes(&txn, &range),
                         Ok(1)
                     );
+                    // This variant checks reuse after durability, not the
+                    // new deferred-release window (covered separately).
+                    chunks.sync_all();
                 }
                 "expire" => {
                     let expired = crate::ram::chunk::expire_transaction_leases(
@@ -5139,6 +5142,7 @@ mod tests {
                 crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
                 Ok(1)
             );
+            chunks.sync_all();
             // The head is back in the pool; an ordinary write follows (which
             // head it picks is the pool's affinity, not this test's business).
             assert!(!part.is_head_owned() && !part.bracket_is_open());

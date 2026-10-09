@@ -53,6 +53,9 @@ pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 /// segment syncs as a no-op (its WAL file handle is gone) and drops.
 static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
     parking_lot::Mutex::new(Vec::new());
+static WAL_READY: parking_lot::Condvar = parking_lot::Condvar::new();
+// Protected by WAL_DIRTY while publishing and consuming the notification.
+static REWIND_SYNC_READY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
@@ -79,47 +82,76 @@ impl Drop for PauseRewindSync {
 
 /// Enqueue a segment for the syncer's next pass and lazily start the syncer.
 pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
-    if seg
+    let enqueue = seg
         .wal_sync_queued
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
+        .is_ok();
+    let urgent = seg.rewind_release_pending();
+    if !enqueue && !urgent {
         return;
     }
-    WAL_DIRTY.lock().push(seg.clone());
+    {
+        let mut dirty = WAL_DIRTY.lock();
+        if enqueue {
+            dirty.push(seg.clone());
+        }
+        if urgent {
+            REWIND_SYNC_READY.store(true, Ordering::Relaxed);
+            WAL_READY.notify_one();
+        }
+    }
 
     static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SYNCER.get_or_init(|| {
         std::thread::Builder::new()
             .name("wal-syncer".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    wal_sync_interval_ms().max(1) as u64,
-                ));
-                let dirty = std::mem::take(&mut *WAL_DIRTY.lock());
-                for seg in dirty {
-                    // Clear the flag BEFORE syncing: bytes that land during
-                    // the sync re-enqueue for the next pass instead of being
-                    // silently absorbed into a sync that may miss them.
-                    seg.wal_sync_queued.store(false, Ordering::Release);
-                    #[cfg(test)]
-                    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) {
-                        queue_wal_sync(&seg);
-                        continue;
-                    }
-                    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0
-                        || seg.rewind_release_pending()
-                    {
-                        if let Err(e) = seg.force_wal_sync() {
-                            error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
-                            queue_wal_sync(&seg);
+            .spawn(|| {
+                use rayon::prelude::*;
+                // Fsyncs for independent segments can run together, as they
+                // do for committing writers. A single sync thread otherwise
+                // becomes the throughput limit for deferred aborts.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(8)
+                    .thread_name(|n| format!("wal-sync-{n}"))
+                    .build()
+                    .expect("spawn WAL sync workers");
+                loop {
+                    let dirty = {
+                        let mut queued = WAL_DIRTY.lock();
+                        if !REWIND_SYNC_READY.swap(false, Ordering::Relaxed) {
+                            WAL_READY.wait_for(
+                                &mut queued,
+                                std::time::Duration::from_millis(
+                                    wal_sync_interval_ms().max(1) as u64
+                                ),
+                            );
+                            REWIND_SYNC_READY.store(false, Ordering::Relaxed);
                         }
-                    }
+                        std::mem::take(&mut *queued)
+                    };
+                    pool.install(|| dirty.into_par_iter().for_each(sync_dirty_segment));
                 }
             })
             .expect("spawn wal-syncer");
     });
 }
+fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
+    // Bytes journaled during this sync must enqueue another pass.
+    seg.wal_sync_queued.store(false, Ordering::Release);
+    #[cfg(test)]
+    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) {
+        seg.wal_sync_queued.store(true, Ordering::Release);
+        WAL_DIRTY.lock().push(seg.clone());
+        return;
+    }
+    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0 || seg.rewind_release_pending() {
+        if let Err(e) = seg.force_wal_sync() {
+            error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
+            queue_wal_sync(&seg);
+        }
+    }
+}
+
 /// Entries written to the WAL. Against the number of live cells this gives the
 /// rewrite factor: how many times the average cell's bytes are journalled,
 /// which is write amplification the tier has no part in.
