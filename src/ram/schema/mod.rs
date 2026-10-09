@@ -1107,7 +1107,24 @@ pub struct LocalSchemasMap {
     /// Advanced after every completed mutation. A reader that derives state
     /// from records (Morpheus's graph kind, decoded from `app_meta`) keys its
     /// derivation by this value: an unchanged epoch means no record changed.
-    epoch: std::sync::atomic::AtomicU64,
+    epoch: SchemaEpoch,
+}
+
+/// A handle on a local schema cache's change epoch (see
+/// [`LocalSchemasCache::epoch`]). Holding the handle makes reading the epoch a
+/// single load, for a reader that checks it on every call.
+#[derive(Clone, Default)]
+pub struct SchemaEpoch(Arc<std::sync::atomic::AtomicU64>);
+
+impl SchemaEpoch {
+    #[inline]
+    pub fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub struct LocalSchemasCache {
@@ -1212,7 +1229,11 @@ impl LocalSchemasCache {
     /// from the records can be cached under it and is current exactly while
     /// the epoch is unchanged.
     pub fn epoch(&self) -> u64 {
-        self.map.epoch.load(std::sync::atomic::Ordering::Acquire)
+        self.map.epoch.current()
+    }
+    /// The same epoch as a handle that can be kept and read with one load.
+    pub fn epoch_handle(&self) -> SchemaEpoch {
+        self.map.epoch.clone()
     }
     /// Replace the owner metadata of one installed generation, keeping
     /// everything else about the record (status, name) as this node has it.
@@ -1911,13 +1932,12 @@ impl LocalSchemasMap {
             name_map: LFHashMap::with_capacity(32),
             handles: LFHashMap::with_capacity(32),
             writer: parking_lot::Mutex::new(()),
-            epoch: std::sync::atomic::AtomicU64::new(0),
+            epoch: SchemaEpoch::default(),
         }
     }
 
     fn advance_epoch(&self) {
-        self.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.epoch.advance();
     }
 
     fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
@@ -2456,9 +2476,9 @@ mod tests {
     #[test]
     fn every_local_record_change_advances_the_epoch() {
         let (map, first, second) = local_family(40);
-        let mut seen = map.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let mut seen = map.epoch.current();
         let mut advanced = |map: &LocalSchemasMap, what: &str| {
-            let now = map.epoch.load(std::sync::atomic::Ordering::Acquire);
+            let now = map.epoch.current();
             assert!(now > seen, "{what} must advance the epoch");
             seen = now;
         };
