@@ -27,10 +27,19 @@ fn scratch_dir() -> tempfile::TempDir {
         .expect("scratch dir")
 }
 
+/// Chunk size in MiB. Several chunks (the default) make ids spread over
+/// chunks the way a real store's do; `NEB_RD_CHUNK_MB=128` gives one.
+fn chunk_mb() -> usize {
+    std::env::var("NEB_RD_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
+}
+
 fn options(dir: &std::path::Path) -> ServerOptions {
     ServerOptions {
-        chunk_size: 64 * 1024 * 1024,
-        db_size: 64 * 1024 * 1024,
+        chunk_size: chunk_mb() * 1024 * 1024,
+        db_size: 128 * 1024 * 1024,
         tiered_config: None,
         backup_storage: Some(dir.join("backup").to_string_lossy().to_string()),
         wal_storage: Some(dir.join("wal").to_string_lossy().to_string()),
