@@ -63,6 +63,52 @@ entries were durable, and a missing member means compacted rather than lost.
 Both were written before the two-round fsync ordering was settled, and the
 soak showed the member check was itself tearing transactions.
 
+### H1 (2026-10-08): an open bracket must never reach another writer
+
+Found from the Morpheus side (EDGE_INTENT_LOG H1): every transaction EXIT that
+did not write a COMMIT -- abort after apply, lease expiry, a panic between
+BEGIN and COMMIT -- handed the head back to the pool with its BEGIN still open.
+Recovery correctly reads everything after an unclosed BEGIN as part of that
+transaction, so the next owner's ACKNOWLEDGED ordinary writes were discarded
+with it. And a COMMIT that found no room returned `Ok` with no COMMIT at all.
+The fix, by exit:
+
+- **Invariant, at the single release point.** `Segment::try_release_own`
+  refuses (typed `OpenBracketRefused`, counted) to release a head whose
+  bracket is open while it can still take an append. A bracket is closed by
+  its COMMIT, disowned by a rewind, or its head is retired (full).
+- **Abort** (`DataManager::rollback_and_rewind`): roll the index back while the
+  heads are still leased, THEN rewind (`rewind_transaction_writes`: one PADDING
+  entry over the span, BEGIN included, header journaled), THEN release.
+- **Rewind does not move the cursor back** (a deviation from Step 4 above):
+  the per-segment dead bitmap is keyed by address and would mark the next
+  live cell written there dead (compaction then drops it); a reader that
+  resolved an address in the span could read another writer's bytes; and the
+  WAL would hold new records over old ones, so a crash part-way through the
+  refill leaves old transaction bytes where a walk can read them as ordinary
+  entries. The span is dead space until compaction.
+- **Rollback failed, rewind not journaled, or a sweeper that cannot vouch for
+  the index**: RETIRE the head (`Segment::retire_tail`: cursor to the end,
+  in-memory padding, not journaled -- the rebuilt image simply ends where the
+  last entry did). The bracket stays uncommitted (discarded by recovery);
+  the next writer rotates the full head out, which seals it.
+- **Lease expiry**: the participant presumes abort under the transaction lock
+  (rollback, rewind, release); a still-running apply holds that lock, so the
+  sweep waits for it, and a late `end` finds the transaction gone and is
+  refused. Leases nobody knows are retired.
+- **Panic**: `TransactionScope` restores the thread's transaction naming on
+  every exit; `apply_commit_ops` catches the unwind, aborts (rollback, rewind)
+  and resumes it.
+- **Commit**: every part keeps `MIN_COMMIT_ENTRY_SIZE` (32 bytes) free behind
+  its entries, so each part ALWAYS closes with its own COMMIT (full manifest
+  where it fits, empty manifest otherwise -- recovery decides on the id alone).
+  The writer no longer seals a full part with a TXN_CONT link: that consumed
+  the part's COMMIT room, and a part relying on another part's COMMIT is
+  orphaned when the cleaner compacts that other part. A COMMIT that cannot be
+  placed or journaled fails the commit; `end` marks the transaction
+  `decided_commit` before the first record, and no abort path may touch it
+  after that.
+
 STILL OPEN, deliberately: the undo log has NOT left the write path (abort is
 physical now, so it can — but that retirement needs its own validation);
 blob-class writes are outside the bracket (they are a separate segment class
