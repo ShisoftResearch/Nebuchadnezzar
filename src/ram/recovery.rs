@@ -3841,6 +3841,865 @@ mod tests {
         }
     }
 
+    /// H1 (Morpheus docs/EDGE_INTENT_LOG.md): a head returned to the pool with
+    /// its BEGIN still open.
+    ///
+    /// `release_transaction_leases` is what the lease-expiry sweeper calls, and
+    /// it hands the head back WITHOUT a COMMIT and WITHOUT a rewind. The next
+    /// ordinary writer then appends behind the open BEGIN in the same segment,
+    /// is acknowledged, and the recovery state machine buffers that entry as
+    /// part of the bracket and discards it. This test writes exactly that
+    /// sequence through the live write path and recovers it from the WAL.
+    ///
+    /// `closed` is the control: the same sequence with a proper
+    /// `commit_transaction_brackets` keeps everything.
+    fn run_open_bracket_then_ordinary_write(how: &str) -> (bool, bool, bool) {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let schema = schema_with_id(431, "recovery_open_bracket", false);
+        let before_id = Id::allocated(31, 0, 1);
+        let txn_id_cell = Id::allocated(31, 0, 2);
+        let after_id = Id::allocated(31, 0, 3);
+        let txn = crate::server::transactions::test_hlc(8181, 9);
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mk = |id: &Id, n: i32| OwnedCell {
+                header: CellHeader::new(schema.vid, id),
+                data: data_map_value!(id: n, data: vec![0x33_u8; 64]),
+            };
+            chunks.write_cell(&mut mk(&before_id, 1)).unwrap();
+
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+                chunks.write_cell(&mut mk(&txn_id_cell, 2)).unwrap();
+            }
+            let range = chunks.address_range();
+            match how {
+                "closed" => {
+                    chunks.commit_transaction_brackets(&txn).unwrap();
+                    crate::ram::chunk::release_transaction_leases(&txn, &range).unwrap();
+                }
+                "release" => {
+                    // The class-closing invariant: handing back a head whose
+                    // BEGIN is still open is REFUSED, and the lease is kept.
+                    let released = crate::ram::chunk::release_transaction_leases(&txn, &range);
+                    assert!(
+                        matches!(
+                            released,
+                            Err(crate::ram::chunk::LeaseExitError::OpenBracket(_))
+                        ),
+                        "releasing an open bracket must be refused, got {released:?}"
+                    );
+                    assert_eq!(crate::ram::chunk::transaction_lease_count(&txn, &range), 1);
+                }
+                "rewind" => {
+                    // The abort's physical half. (The participant rolls the
+                    // index back first; this test only reads the log.)
+                    assert_eq!(
+                        crate::ram::chunk::rewind_transaction_writes(&txn, &range),
+                        Ok(1)
+                    );
+                }
+                "expire" => {
+                    let expired = crate::ram::chunk::expire_transaction_leases(
+                        std::time::Duration::ZERO,
+                        &range,
+                        &Default::default(),
+                    );
+                    assert_eq!(expired, vec![txn.clone()]);
+                }
+                other => panic!("unknown variant {other}"),
+            }
+            drop(crate::ram::chunk::take_transactional_segments());
+
+            // The ordinary, ACKNOWLEDGED write that follows.
+            chunks.write_cell(&mut mk(&after_id, 3)).unwrap();
+            let seg_of = |id: &Id| {
+                chunks.list[0]
+                    .locate_segment(chunks.address_of(id))
+                    .expect("segment")
+                    .id
+            };
+            match how {
+                // A closed or disowned bracket gives its head back, and the
+                // ordinary write lands BEHIND it in the same segment -- the
+                // exact layout that lost data while the bracket stayed open.
+                "closed" | "rewind" => assert_eq!(
+                    seg_of(&txn_id_cell),
+                    seg_of(&after_id),
+                    "the ordinary write must land in the segment holding the bracket"
+                ),
+                // An open one never reaches another writer: refused, or
+                // retired (full) by the expiry sweeper.
+                _ => assert_ne!(
+                    seg_of(&txn_id_cell),
+                    seg_of(&after_id),
+                    "an ordinary write must never land behind an open BEGIN"
+                ),
+            }
+            chunks.sync_all();
+        }
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        let before = chunks.read_cell(&before_id).is_ok();
+        let in_txn = chunks.read_cell(&txn_id_cell).is_ok();
+        let after = chunks.read_cell(&after_id).is_ok();
+        (before, in_txn, after)
+    }
+
+    #[test]
+    fn h1_control_a_closed_bracket_keeps_the_ordinary_write_behind_it() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("closed");
+        eprintln!("H1 closed: before={before} txn={txn_cell} after={after}");
+        assert!(before && txn_cell && after);
+    }
+
+    #[test]
+    fn h1_ordinary_write_behind_a_released_open_bracket_survives_recovery() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("release");
+        eprintln!("H1 release: before={before} txn={txn_cell} after={after}");
+        assert!(before);
+        assert!(!txn_cell, "the undecided transaction's cell must not recover");
+        assert!(
+            after,
+            "H1: an ACKNOWLEDGED ordinary write behind an open BEGIN was dropped by recovery"
+        );
+    }
+
+    #[test]
+    fn h1_ordinary_write_behind_a_rewound_bracket_survives_recovery() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("rewind");
+        eprintln!("H1 rewind: before={before} txn={txn_cell} after={after}");
+        assert!(before);
+        assert!(!txn_cell, "the aborted transaction's cell must not recover");
+        assert!(
+            after,
+            "H1: an ACKNOWLEDGED ordinary write behind a rewound bracket was dropped by recovery"
+        );
+    }
+
+    #[test]
+    fn h1_ordinary_write_behind_an_expired_open_bracket_survives_recovery() {
+        let (before, txn_cell, after) = run_open_bracket_then_ordinary_write("expire");
+        eprintln!("H1 expire: before={before} txn={txn_cell} after={after}");
+        assert!(before);
+        assert!(!txn_cell);
+        assert!(
+            after,
+            "H1: an ACKNOWLEDGED ordinary write behind an expired bracket was dropped by recovery"
+        );
+    }
+
+    /// H1 variants beyond the lease-release one. `how`:
+    ///  - "panic":    the writer panics between BEGIN and COMMIT. `set_transaction_id`
+    ///                is a thread-local that is not reset on unwind, so the NEXT
+    ///                ordinary write on that thread is leased to the dead
+    ///                transaction and recovered as a member of its bracket.
+    ///  - "no_room":  the head cannot hold the COMMIT. `close_transaction_bracket`
+    ///                only warns, `commit_transaction_brackets` returns Ok, the
+    ///                caller is told the transaction committed, and the bracket
+    ///                has no COMMIT at all.
+    /// Returns (txn cell present, ordinary-after present).
+    fn run_unowned_begin_variant(how: &str) -> (bool, bool) {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let schema = schema_with_id(432, "recovery_unowned_begin", false);
+        let txn_cell = Id::allocated(32, 0, 1);
+        let after = Id::allocated(32, 0, 2);
+        let txn = crate::server::transactions::test_hlc(8282, 9);
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mk = |id: &Id, n: i32| OwnedCell {
+                header: CellHeader::new(schema.vid, id),
+                data: data_map_value!(id: n, data: vec![0x44_u8; 64]),
+            };
+            let range = chunks.address_range();
+            match how {
+                "panic" => {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+                        chunks.write_cell(&mut mk(&txn_cell, 1)).unwrap();
+                        panic!("writer died between BEGIN and COMMIT");
+                    }));
+                    assert!(r.is_err());
+                    // The unwind ended the scope: this thread names nothing.
+                    assert!(
+                        !crate::ram::chunk::is_in_transaction(),
+                        "an unwind must not leave the thread naming the dead transaction"
+                    );
+                    assert!(
+                        crate::ram::chunk::transaction_has_leases(&txn, &range),
+                        "the lease should still be held"
+                    );
+                    // An ORDINARY write follows on the same thread.
+                    chunks.write_cell(&mut mk(&after, 2)).unwrap();
+                    assert_eq!(
+                        crate::ram::chunk::transaction_lease_count(&txn, &range),
+                        1,
+                        "the ordinary write must not join the dead transaction's lease"
+                    );
+                    assert_ne!(
+                        chunks.list[0].locate_segment(chunks.address_of(&after)).map(|s| s.id),
+                        chunks.list[0].locate_segment(chunks.address_of(&txn_cell)).map(|s| s.id),
+                        "nor land behind its BEGIN"
+                    );
+                    // A panicked transaction is an aborted one; its decider
+                    // rewinds it (the participant does this in `apply`).
+                    assert_eq!(
+                        crate::ram::chunk::rewind_transaction_writes(&txn, &range),
+                        Ok(1)
+                    );
+                }
+                "no_room" => {
+                    let scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+                    chunks.write_cell(&mut mk(&txn_cell, 1)).unwrap();
+                    // Use up the head so the COMMIT cannot fit behind the entry.
+                    let chunk = &chunks.list[0];
+                    let seg = chunk
+                        .locate_segment(chunks.address_of(&txn_cell))
+                        .expect("segment");
+                    let remaining = seg
+                        .bound()
+                        .saturating_sub(seg.append_header.load(Ordering::Acquire));
+                    let filler = (remaining - 16) & !7;
+                    let pending = chunk.try_acquire(filler as u32, false).expect("filler");
+                    crate::ram::entry::stamp_reservation_padding(pending.addr, filler as u32);
+                    drop(pending);
+                    drop(scope);
+                    // The caller is told this succeeded.
+                    let committed = chunks.commit_transaction_brackets(&txn);
+                    eprintln!("H1 no_room: commit_transaction_brackets -> {:?}", committed);
+                    assert!(committed.is_ok());
+                    drop(crate::ram::chunk::take_transactional_segments());
+                    crate::ram::chunk::release_transaction_leases(&txn, &range).unwrap();
+                    chunks.write_cell(&mut mk(&after, 2)).unwrap();
+                }
+                other => panic!("unknown variant {other}"),
+            }
+            drop(crate::ram::chunk::take_transactional_segments());
+            chunks.sync_all();
+        }
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        let a = chunks.read_cell(&txn_cell).is_ok();
+        let b = chunks.read_cell(&after).is_ok();
+        (a, b)
+    }
+
+    #[test]
+    fn h1_panic_between_begin_and_commit_must_not_swallow_the_next_ordinary_write() {
+        let (txn_cell, after) = run_unowned_begin_variant("panic");
+        eprintln!("H1 panic: txn={txn_cell} after={after}");
+        assert!(!txn_cell, "an undecided transaction's cell must not recover");
+        assert!(after, "H1: an ACKNOWLEDGED ordinary write after a panicked transaction was dropped");
+    }
+
+    #[test]
+    fn h1_a_commit_that_finds_no_room_must_not_report_success() {
+        let (txn_cell, after) = run_unowned_begin_variant("no_room");
+        eprintln!("H1 no_room: txn={txn_cell} after={after}");
+        assert!(
+            txn_cell,
+            "H1: commit_transaction_brackets returned Ok but the transaction did not survive recovery"
+        );
+        assert!(after);
+    }
+
+    /// A store with WAL and backups, sized for several segments, plus the
+    /// helpers the bracket/cleaner tests share.
+    struct BracketCleanerStore {
+        wal_dir: TempDir,
+        backup_dir: TempDir,
+        _raft_dir: TempDir,
+        raft_path: String,
+        schema: Schema,
+    }
+
+    impl BracketCleanerStore {
+        fn new(schema_id: u32, name: &str) -> Self {
+            let (raft_dir, raft_path) = temp_raft_dir();
+            BracketCleanerStore {
+                wal_dir: TempDir::new().unwrap(),
+                backup_dir: TempDir::new().unwrap(),
+                _raft_dir: raft_dir,
+                raft_path,
+                schema: schema_with_id(schema_id, name, false),
+            }
+        }
+
+        fn open(&self, recover: bool) -> Arc<Chunks> {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(self.schema.clone());
+            Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 8,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(self.backup_dir.path().to_str().unwrap().to_string()),
+                Some(self.wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                recover,
+                Some(self.raft_path.clone()),
+            )
+        }
+
+        fn cell(&self, id: &Id, payload: usize) -> OwnedCell {
+            OwnedCell {
+                header: CellHeader::new(self.schema.vid, id),
+                data: data_map_value!(id: id.bits() as i32, data: vec![0x5a_u8; payload]),
+            }
+        }
+    }
+
+    fn segment_of(chunks: &Chunks, id: &Id) -> lightning::aarc::Arc<crate::ram::segs::Segment> {
+        chunks.list[0]
+            .locate_segment(chunks.address_of(id))
+            .expect("segment of a written cell")
+    }
+
+    /// Take a head out of the pool the way rotation does -- slot emptied,
+    /// then drained, synced, archived and sealed -- so the cleaner may pick it.
+    fn rotate_out(chunk: &Chunk, seg_id: u64) {
+        for slot in chunk.head_pool.iter().chain(chunk.blob_head_pool.iter()) {
+            let _ = slot.compare_exchange(
+                seg_id,
+                u64::MAX,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        assert!(!chunk.is_active_head(seg_id));
+        chunk.finish_rotated_head(seg_id);
+    }
+
+    /// Fill and rotate the head with ORDINARY cells, so the cleaner has a
+    /// second candidate that has nothing to do with the transaction.
+    fn ordinary_rotated_segment(
+        store: &BracketCleanerStore,
+        chunks: &Chunks,
+        first_id: u64,
+    ) -> (Vec<Id>, u64) {
+        let chunk = &chunks.list[0];
+        let mut ids = Vec::new();
+        let start = chunk.get_head_seg_id();
+        let mut n = first_id;
+        // One thread, one affinity slot: these fill the same head until it
+        // rotates.
+        let first = Id::allocated(34, 0, n);
+        chunks.write_cell(&mut store.cell(&first, 512 * 1024)).unwrap();
+        let seg = segment_of(chunks, &first).id;
+        ids.push(first);
+        while chunk.get_head_seg_id() == start || chunk.is_active_head(seg) {
+            n += 1;
+            let id = Id::allocated(34, 0, n);
+            chunks.write_cell(&mut store.cell(&id, 512 * 1024)).unwrap();
+            if segment_of(chunks, &id).id == seg {
+                ids.push(id);
+            }
+            assert!(n - first_id < 64, "the ordinary head never rotated");
+        }
+        // Let the background sealer finish with it before anything compacts
+        // it, or the two race over its files.
+        let rotated = chunk.segments().into_iter().find(|s| s.id == seg).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !rotated.is_sealed() {
+            assert!(std::time::Instant::now() < deadline, "the rotated head was never sealed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Mostly dead, so combining it with a small segment saves one: the
+        // combiner refuses a round that would not reduce the segment count.
+        let survivor = ids[0];
+        for id in &ids[1..] {
+            chunks.remove_cell(id).unwrap();
+        }
+        (vec![survivor], seg)
+    }
+
+    /// The cleaner must never drop a COMMIT that another part of the same
+    /// transaction still needs.
+    ///
+    /// Parts of one transaction are decided together but compacted
+    /// INDEPENDENTLY, and compaction drops a segment's bracket markers. The
+    /// old writer sealed a part that filled to within 48 bytes of its end
+    /// with a TXN_CONT chain link, which took the room its own COMMIT needed,
+    /// so that part relied on a later part's record. Compacting the later
+    /// part alone then left the earlier part's BEGIN closed by nothing, and
+    /// its committed cells came back from the restart as an undecided
+    /// transaction. Every part now keeps room for its own COMMIT.
+    #[test]
+    fn compacting_one_part_never_orphans_another_parts_committed_cells() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(433, "cleaner_bracket_parts");
+        let txn = crate::server::transactions::test_hlc(8383, 9);
+        let small = Id::allocated(33, 0, 1);
+        let sized = Id::allocated(33, 0, 2);
+        let spill = Id::allocated(33, 0, 3);
+        let mut fillers = Vec::new();
+        let ordinary;
+        {
+            let chunks = store.open(false);
+            let chunk = &chunks.list[0];
+            let (ids, ordinary_seg) = ordinary_rotated_segment(&store, &chunks, 100);
+            ordinary = ids;
+
+            let scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&small, 64)).unwrap();
+            let part1 = segment_of(&chunks, &small);
+            assert_ne!(part1.id, ordinary_seg);
+            // Size the next cell to leave EXACTLY 40 bytes in the first part:
+            // under the 48 at which the old writer chain-sealed a full part,
+            // over the 32-byte minimal COMMIT.
+            let entry_of = |id: &Id| {
+                let addr = chunks.address_of(id);
+                let (header, _) = Entry::decode_from(addr, |_, header| header);
+                ENTRY_HEAD_SIZE + header.content_length as usize
+            };
+            let overhead = entry_of(&small) - 64;
+            let remaining = |seg: &crate::ram::segs::Segment| {
+                seg.bound() - seg.append_header.load(Ordering::Acquire)
+            };
+            // Cells have a size cap, so fill most of the part with several.
+            while remaining(&part1) > 768 * 1024 {
+                let id = Id::allocated(33, 0, 10 + fillers.len() as u64);
+                chunks.write_cell(&mut store.cell(&id, 512 * 1024)).unwrap();
+                assert_eq!(segment_of(&chunks, &id).id, part1.id);
+                fillers.push(id);
+            }
+            let remaining = remaining(&part1);
+            chunks
+                .write_cell(&mut store.cell(&sized, remaining - 40 - overhead))
+                .unwrap();
+            assert_eq!(segment_of(&chunks, &sized).id, part1.id);
+            assert_eq!(
+                part1.bound() - part1.append_header.load(Ordering::Acquire),
+                40,
+                "test setup: the first part must be left 40 bytes short of full"
+            );
+            // Does not fit: the transaction continues in a second part.
+            chunks.write_cell(&mut store.cell(&spill, 64)).unwrap();
+            let part2 = segment_of(&chunks, &spill);
+            assert_ne!(part2.id, part1.id, "test setup: a second part must open");
+            drop(scope);
+
+            chunks.commit_transaction_brackets(&txn).expect("commit");
+            crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range())
+                .expect("release after commit");
+
+            // Compact the SECOND part only -- with an unrelated segment, as
+            // the combiner wants two -- and leave the first one where it is.
+            rotate_out(chunk, part2.id);
+            let candidates: Vec<_> = chunk
+                .segments()
+                .into_iter()
+                .filter(|seg| seg.id == part2.id || seg.id == ordinary_seg)
+                .collect();
+            assert_eq!(candidates.len(), 2);
+            let (_, collected) =
+                crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+            assert!(collected > 0, "test setup: the combine must actually run");
+            assert!(
+                chunk.segments().iter().all(|seg| seg.id != part2.id),
+                "test setup: the second part must be gone"
+            );
+            assert!(
+                chunk.segments().iter().any(|seg| seg.id == part1.id),
+                "test setup: the first part must still be there"
+            );
+            for id in [&small, &sized, &spill].into_iter().chain(fillers.iter()) {
+                assert!(chunks.read_cell(id).is_ok(), "{id:?} before restart");
+            }
+            chunks.sync_all();
+        }
+        let chunks = store.open(true);
+        for id in [&small, &sized, &spill].into_iter().chain(fillers.iter()) {
+            assert!(
+                chunks.read_cell(id).is_ok(),
+                "{id:?}: a committed transaction's cell was lost after one of its parts was \
+                 compacted"
+            );
+        }
+        for id in &ordinary {
+            assert!(chunks.read_cell(id).is_ok(), "ordinary cell {id:?}");
+        }
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// What is on disk right now, as a crash at this instant would leave it.
+    struct DiskSnapshot {
+        wal: TempDir,
+        backup: TempDir,
+        raft: TempDir,
+    }
+
+    impl BracketCleanerStore {
+        fn snapshot(&self) -> DiskSnapshot {
+            let snap = DiskSnapshot {
+                wal: TempDir::new().unwrap(),
+                backup: TempDir::new().unwrap(),
+                raft: TempDir::new().unwrap(),
+            };
+            copy_dir(self.wal_dir.path(), snap.wal.path());
+            copy_dir(self.backup_dir.path(), snap.backup.path());
+            copy_dir(Path::new(&self.raft_path), snap.raft.path());
+            snap
+        }
+
+        fn recover_snapshot(&self, snap: &DiskSnapshot) -> Arc<Chunks> {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(self.schema.clone());
+            Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 8,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(snap.backup.path().to_str().unwrap().to_string()),
+                Some(snap.wal.path().to_str().unwrap().to_string()),
+                None,
+                true,
+                Some(snap.raft.path().to_str().unwrap().to_string()),
+            )
+        }
+    }
+
+    /// A crash at every point of an abort's rewind recovers the same thing:
+    /// the aborted transaction gone, everything else intact -- and the
+    /// ordinary write that reuses the head after the rewind survives.
+    ///
+    /// Points: (0) entries journaled, no rewind yet (an open BEGIN); (1) the
+    /// padding journaled and synced, head not yet reused; (2) another writer
+    /// appended behind the padding in the same head.
+    #[test]
+    fn a_crash_at_any_point_of_a_rewind_recovers_the_abort() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(435, "rewind_crash_points");
+        let txn = crate::server::transactions::test_hlc(8585, 9);
+        let before = Id::allocated(36, 0, 1);
+        let aborted = [Id::allocated(36, 0, 2), Id::allocated(36, 0, 3)];
+        let after = Id::allocated(36, 0, 4);
+        let chunks = store.open(false);
+        chunks.write_cell(&mut store.cell(&before, 128)).unwrap();
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            for id in &aborted {
+                chunks.write_cell(&mut store.cell(id, 128)).unwrap();
+            }
+        }
+        let part = segment_of(&chunks, &aborted[0]);
+        let point0 = store.snapshot();
+        for id in &aborted {
+            chunks.remove_cell(id).unwrap();
+        }
+        assert_eq!(
+            crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+            Ok(1)
+        );
+        let point1 = store.snapshot();
+        // Reuse: make the rewound head the only live head in the pool, so the
+        // next ordinary write lands in it whatever this thread's affinity.
+        let chunk = &chunks.list[0];
+        assert!(chunk.is_active_head(part.id), "the rewound head stays in the pool");
+        for slot in chunk.head_pool.iter() {
+            if slot.load(Ordering::Acquire) != part.id {
+                slot.store(u64::MAX, Ordering::Release);
+            }
+        }
+        let mut reused = None;
+        for n in 0..64u64 {
+            let id = Id::allocated(36, 1, n);
+            chunks.write_cell(&mut store.cell(&id, 128)).unwrap();
+            if segment_of(&chunks, &id).id == part.id {
+                reused = Some(id);
+                break;
+            }
+        }
+        let reused = reused.unwrap_or_else(|| {
+            panic!(
+                "the rewound head must be reusable: can_append={} owned={} open={} active={}",
+                part.can_still_append(),
+                part.is_head_owned(),
+                part.bracket_is_open(),
+                chunk.is_active_head(part.id)
+            )
+        });
+        chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
+        chunks.sync_all();
+        let point2 = store.snapshot();
+        drop(chunks);
+
+        for (name, snap, reuse_expected) in
+            [("0", &point0, false), ("1", &point1, false), ("2", &point2, true)]
+        {
+            let recovered = store.recover_snapshot(snap);
+            assert!(recovered.read_cell(&before).is_ok(), "point {name}: before");
+            for id in &aborted {
+                assert!(
+                    recovered.read_cell(id).is_err(),
+                    "point {name}: an aborted cell came back"
+                );
+            }
+            assert_eq!(
+                recovered.read_cell(&reused).is_ok(),
+                reuse_expected,
+                "point {name}: the write that reused the head"
+            );
+        }
+    }
+
+    /// H1 across a restart cannot happen: recovery resumes no segment as a
+    /// write head, so a crash mid-transaction leaves its open BEGIN in a
+    /// SEALED segment and the first write after the restart lands in a fresh
+    /// one -- which a second restart keeps.
+    #[test]
+    fn an_open_bracket_left_by_a_crash_never_swallows_writes_after_the_restart() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(436, "open_bracket_restart");
+        let txn = crate::server::transactions::test_hlc(8686, 9);
+        let in_flight = Id::allocated(37, 0, 1);
+        let after = Id::allocated(37, 0, 2);
+        let open_seg;
+        {
+            let chunks = store.open(false);
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&in_flight, 128)).unwrap();
+            open_seg = segment_of(&chunks, &in_flight).seq_id;
+            chunks.sync_all();
+            // Crash: no decision ever arrives.
+        }
+        {
+            let chunks = store.open(true);
+            assert!(chunks.read_cell(&in_flight).is_err());
+            chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
+            assert_ne!(
+                segment_of(&chunks, &after).seq_id,
+                open_seg,
+                "a recovered segment holding an open BEGIN must never take a write"
+            );
+            chunks.sync_all();
+        }
+        let chunks = store.open(true);
+        assert!(chunks.read_cell(&in_flight).is_err());
+        assert!(chunks.read_cell(&after).is_ok(), "the write after the restart survives");
+    }
+
+    /// Item 34: a transaction must never write outside its bracket. Before
+    /// the fix, a transaction whose part filled up while every other head was
+    /// busy with a plain write in flight sent its next cell out UNBRACKETED,
+    /// so a crash before the decision kept that cell and discarded the first:
+    /// a half-applied transaction.
+    #[test]
+    fn head_pressure_never_half_applies_a_transaction() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(437, "head_pressure_atomicity");
+        let victim = crate::server::transactions::test_hlc(8787, 9);
+        let first = Id::allocated(38, 0, 1);
+        let second = Id::allocated(38, 0, 2);
+        let mut second_written = false;
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(store.schema.clone());
+            // Plenty of segments: what runs out is the head pool (8 slots),
+            // which is what a busy production chunk runs out of too.
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 16,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(store.backup_dir.path().to_str().unwrap().to_string()),
+                Some(store.wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(store.raft_path.clone()),
+            );
+            // The victim fills most of its own part.
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(victim.clone());
+                chunks.write_cell(&mut store.cell(&first, 512 * 1024)).unwrap();
+                let part = segment_of(&chunks, &first);
+                let mut n = 10;
+                while part.bound() - part.append_header.load(Ordering::Acquire) > 900 * 1024 {
+                    let id = Id::allocated(38, 0, n);
+                    chunks.write_cell(&mut store.cell(&id, 512 * 1024)).unwrap();
+                    n += 1;
+                }
+            }
+            // Every other head is busy with a PLAIN write in flight (held
+            // here, as a concurrent writer would hold it for a few
+            // microseconds), and exactly one is free when the victim needs
+            // its next part. A head owned by a plain writer is back in
+            // microseconds; the old spare-count read it as gone, found
+            // nothing to spare, and sent the transaction's entry out
+            // unbracketed into the one free head.
+            let chunk = &chunks.list[0];
+            let mut in_flight = Vec::new();
+            while chunk
+                .head_pool
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == u64::MAX)
+            {
+                in_flight.push(chunk.try_acquire(64, false).expect("plain claim"));
+                assert!(in_flight.len() < 16, "test setup: the pool never filled");
+            }
+            drop(in_flight.pop());
+            eprintln!(
+                "head_pressure: {} plain write(s) in flight, one head free",
+                in_flight.len()
+            );
+            // The victim's next cell needs a new part, and none can be had.
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(victim.clone());
+                let result = chunks.write_cell(&mut store.cell(&second, 900 * 1024));
+                eprintln!("head_pressure: the second write returned {:?}", result.as_ref().err());
+                second_written = result.is_ok();
+                drop(in_flight);
+            }
+            chunks.sync_all();
+            // Crash: nobody decides.
+        }
+        let chunks = store.open(true);
+        let first_back = chunks.read_cell(&first).is_ok();
+        let second_back = chunks.read_cell(&second).is_ok();
+        eprintln!("head_pressure: second_written={second_written} first={first_back} second={second_back}");
+        assert_eq!(
+            first_back, second_back,
+            "a transaction came back half-applied after a crash (first={first_back}, \
+             second={second_back})"
+        );
+        assert!(!first_back, "an undecided transaction must not survive the crash");
+    }
+
+    /// The cleaner must never resurrect an aborted span.
+    ///
+    /// The participant rolls the index back first, then pads over the span
+    /// (journaled). Compaction only carries entries the index names, so the
+    /// span's cells stay gone -- in memory now, and from the log after a
+    /// restart, with the ordinary cells compacted alongside intact.
+    #[test]
+    fn compacting_a_rewound_span_never_resurrects_it() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(434, "cleaner_rewound_span");
+        let txn = crate::server::transactions::test_hlc(8484, 9);
+        let gone = [Id::allocated(35, 0, 1), Id::allocated(35, 0, 2)];
+        let after = Id::allocated(35, 0, 3);
+        let ordinary;
+        {
+            let chunks = store.open(false);
+            let chunk = &chunks.list[0];
+            let (ids, ordinary_seg) = ordinary_rotated_segment(&store, &chunks, 200);
+            ordinary = ids;
+
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+                for id in &gone {
+                    chunks.write_cell(&mut store.cell(id, 256)).unwrap();
+                }
+            }
+            let part = segment_of(&chunks, &gone[0]);
+            // The participant's rollback: the transaction created these, so
+            // undoing it removes them (ordinary writes, other heads).
+            for id in &gone {
+                chunks.remove_cell(id).unwrap();
+            }
+            assert_eq!(
+                crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+                Ok(1)
+            );
+            // The head is back in the pool; an ordinary write follows (which
+            // head it picks is the pool's affinity, not this test's business).
+            assert!(!part.is_head_owned() && !part.bracket_is_open());
+            chunks.write_cell(&mut store.cell(&after, 256)).unwrap();
+
+            rotate_out(chunk, part.id);
+            let candidates: Vec<_> = chunk
+                .segments()
+                .into_iter()
+                .filter(|seg| seg.id == part.id || seg.id == ordinary_seg)
+                .collect();
+            assert_eq!(candidates.len(), 2);
+            let (_, collected) =
+                crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+            assert!(collected > 0, "test setup: the combine must actually run");
+            assert!(chunk.segments().iter().all(|seg| seg.id != part.id));
+            for id in &gone {
+                assert!(chunks.read_cell(id).is_err(), "{id:?} resurrected in memory");
+            }
+            assert!(chunks.read_cell(&after).is_ok());
+            chunks.sync_all();
+        }
+        let chunks = store.open(true);
+        for id in &gone {
+            assert!(
+                chunks.read_cell(id).is_err(),
+                "{id:?}: an aborted transaction's cell came back after compaction and restart"
+            );
+        }
+        assert!(chunks.read_cell(&after).is_ok(), "the ordinary write behind the padding");
+        for id in &ordinary {
+            assert!(chunks.read_cell(id).is_ok(), "ordinary cell {id:?}");
+        }
+    }
+
     /// The crash this format exists for: a record's frame reached disk, its
     /// body did not.
     ///

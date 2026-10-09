@@ -1477,8 +1477,8 @@ mod cluster_tests {
             .map(|_| crate::utils::test_port::unique_localhost_addr())
             .collect();
         let opts = ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -2634,8 +2634,8 @@ mod cluster_tests {
             crate::utils::test_port::unique_localhost_addr(),
         ];
         let opts = ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

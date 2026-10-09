@@ -25,6 +25,13 @@ pub const TXN_CONT_CONTENT_SIZE: usize = 2 * size_of::<u64>();
 /// more entries remain to be written.
 pub const TXN_CONT_ENTRY_SIZE: usize = crate::ram::entry::ENTRY_HEAD_SIZE + TXN_CONT_CONTENT_SIZE;
 
+/// The smallest COMMIT entry, header included: an empty manifest, padded to
+/// alignment. Every bracket part keeps this much free behind its entries, so
+/// that it can always be closed by a COMMIT of its own -- see
+/// `Chunk::close_transaction_bracket`.
+pub const MIN_COMMIT_ENTRY_SIZE: usize = crate::ram::entry::ENTRY_HEAD_SIZE
+    + (TXN_ID_SIZE + size_of::<u16>()).next_multiple_of(crate::ram::entry::ENTRY_HEAD_SIZE);
+
 /// One member of a commit manifest: a chunk and the seq id of the segment the
 /// transaction's bracket lives in there.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -216,6 +223,21 @@ mod tests {
             assert_eq!(decoded_txn, txn);
             assert_eq!(decoded, manifest);
         }
+    }
+
+    /// The reserve every bracket part keeps must hold the minimal COMMIT
+    /// exactly, or a part can fill up with no way left to close it.
+    #[test]
+    fn the_commit_reserve_is_exactly_a_minimal_commit() {
+        let txn = test_hlc(3, 4);
+        assert_eq!(
+            crate::ram::entry::ENTRY_HEAD_SIZE + encode_commit(&txn, &[]).len(),
+            MIN_COMMIT_ENTRY_SIZE
+        );
+        assert_eq!(MIN_COMMIT_ENTRY_SIZE, 32);
+        let (decoded, manifest) = decode_commit(&encode_commit(&txn, &[])).unwrap();
+        assert_eq!(decoded, txn);
+        assert!(manifest.is_empty());
     }
 
     /// The whole point of the fixed tail: the entry is exactly 24 bytes, so

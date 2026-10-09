@@ -24,8 +24,8 @@ pub async fn workspace_wr() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: SEGMENT_SIZE,
-            db_size: SEGMENT_SIZE,
+            chunk_size: 4 * SEGMENT_SIZE,
+            db_size: 4 * SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -168,8 +168,8 @@ pub async fn data_site_wr() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -270,8 +270,8 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
     let server_group = "txn_hash_commit";
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -352,8 +352,8 @@ pub async fn multi_transaction() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -478,8 +478,8 @@ pub async fn smoke_rw() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -561,8 +561,8 @@ pub async fn head_then_remove_commits() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

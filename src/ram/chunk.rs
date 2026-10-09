@@ -161,10 +161,6 @@ static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
-/// How many in-progress GC passes an allocation at the wall will wait out
-/// before running its own emergency pass. Each wait is bounded by one pass.
-const MAX_EMERGENCY_GC_WAITS: usize = 4;
-
 /// Ceiling on one chunk's cell index, in slots. Only guards against a nonsense
 /// estimate; a legitimate 16 GB chunk of 8 MiB segments wants ~17 M.
 const MAX_CELL_INDEX_CAPACITY: usize = 1 << 26;
@@ -333,6 +329,10 @@ enum LeasedPlacement {
     Full,
     Unusable,
     NoLease,
+    /// The transaction was ended (aborted, expired) while this thread was
+    /// still writing for it. Its segments are rewound and may belong to
+    /// someone else; the write must fail.
+    Revoked,
 }
 
 /// One transaction's exclusive hold on a chunk write head.
@@ -369,6 +369,34 @@ struct TransactionLeases {
     /// a transaction's entries sharing one segment.
     per_chunk: std::collections::HashMap<(usize, usize), Vec<HeadLease>>,
     opened_at: std::time::Instant,
+    /// `TransactionScope`s currently naming this transaction. While any is
+    /// live a thread may still write for it, so ending its leases must leave
+    /// a REVOKED record here rather than nothing: a thread that found no
+    /// record would open a fresh bracket and carry on writing for a
+    /// transaction that no longer exists.
+    live_scopes: usize,
+    /// The ownership fence: the stores in which this transaction's leases
+    /// were ended by an abort or an expiry. Every placement checks it under
+    /// the registry lock, so a stale owner's write fails instead of landing
+    /// in a segment that has been rewound and handed to another writer.
+    /// Per STORE, like everything else here: one process hosts a store per
+    /// database, and ending a transaction in one says nothing about another.
+    revoked: Vec<StoreRange>,
+}
+
+impl TransactionLeases {
+    fn is_revoked_in(&self, chunk_base: usize) -> bool {
+        self.revoked.iter().any(|store| store.contains(&chunk_base))
+    }
+
+    fn new() -> Self {
+        TransactionLeases {
+            per_chunk: std::collections::HashMap::new(),
+            opened_at: std::time::Instant::now(),
+            live_scopes: 0,
+            revoked: Vec::new(),
+        }
+    }
 }
 
 lazy_static! {
@@ -383,10 +411,6 @@ lazy_static! {
 /// Guard acquisitions abandoned at the deadline. Non-zero means a cell index
 /// entry outlived its segment: real damage, and previously a hang.
 pub static CELL_GUARD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-/// Transactional writes that could not be bracketed because their chunk had
-/// no head to spare. Non-zero means some transaction's entries are outside
-/// its own atomicity, so it is worth seeing rather than inferring.
-pub static UNBRACKETED_TXN_WRITES: AtomicU64 = AtomicU64::new(0);
 /// Writes refused because no head came free in time.
 pub static HEAD_QUEUE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// How long a write may queue for a head before refusing. Generous next to
@@ -396,6 +420,36 @@ const HEAD_QUEUE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 pub static TXN_LEASES_OPENED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_EXPIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Leases ended by padding over the transaction's span (an abort).
+pub static TXN_SPANS_REWOUND: AtomicU64 = AtomicU64::new(0);
+/// Heads retired (padded to their end and left full) because their bracket
+/// had to stay as it was: a sweeper that cannot vouch for the cell index, an
+/// abort whose rollback failed, or a rewind that could not be journaled.
+pub static TXN_HEADS_RETIRED: AtomicU64 = AtomicU64::new(0);
+/// Rewinds that could not be journaled. Each one retired its head instead.
+pub static TXN_REWIND_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Writes refused because their transaction had already been ended (the
+/// ownership fence caught a stale owner).
+pub static TXN_STALE_OWNER_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Transactional writes refused because no head could be spared for the
+/// transaction within the bounded wait. Each one failed its transaction
+/// instead of writing outside the bracket.
+pub static TXN_HEAD_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+/// How long a transactional write waits for a head of its own before the
+/// transaction fails. Long next to a plain writer's microsecond hold, short
+/// next to a client's patience.
+fn txn_head_wait() -> std::time::Duration {
+    static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("NEB_TXN_HEAD_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(2))
+    })
+}
 
 thread_local! {
     /// The transaction whose apply burst is running on this thread, if any.
@@ -409,33 +463,74 @@ fn current_txn() -> Option<crate::server::transactions::TxnId> {
     CURRENT_TXN.with(|t| t.borrow().clone())
 }
 
-/// Set the transaction context for the current thread
-pub fn set_transaction_context(in_txn: bool) {
-    IN_TRANSACTION.with(|flag| flag.set(in_txn));
-    if !in_txn {
-        CURRENT_TXN.with(|t| *t.borrow_mut() = None);
+/// Name (or un-name) the transaction whose writes this thread is making.
+///
+/// Private on purpose: the only way in is [`TransactionScope`], which puts
+/// the previous value back on every exit, unwinding included.
+fn set_transaction_id(
+    txn: Option<crate::server::transactions::TxnId>,
+) -> Option<crate::server::transactions::TxnId> {
+    IN_TRANSACTION.with(|flag| flag.set(txn.is_some()));
+    CURRENT_TXN.with(|t| t.replace(txn))
+}
+
+/// The region of a thread's work that writes on behalf of one transaction.
+///
+/// While it lives, every write on this thread is leased to `txn`: it lands in
+/// the head the transaction holds in its chunk, behind the transaction's
+/// BEGIN. Dropping it restores whatever was named before, on EVERY exit.
+///
+/// It replaces a bare set/reset pair, which an unwind skipped: a panic
+/// between BEGIN and COMMIT left the thread still naming the dead
+/// transaction, so the next ORDINARY write on that thread was leased to it,
+/// landed inside its bracket, and was recovered as one of its uncommitted
+/// entries -- discarded although it had been acknowledged.
+///
+/// The scope only names. Ending the transaction's leases is the decision's
+/// job (commit, or abort with its rollback), because only the decider knows
+/// whether the cell index still names the span. A panicking apply is aborted
+/// by its caller, which holds that knowledge (see `DataManager`).
+#[must_use = "the transaction is named only while the scope lives"]
+pub struct TransactionScope {
+    previous: Option<crate::server::transactions::TxnId>,
+    /// Thread-bound: dropping it on another thread would reset the wrong
+    /// thread's naming.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl TransactionScope {
+    pub fn enter(txn: crate::server::transactions::TxnId) -> Self {
+        TXN_LEASES
+            .lock()
+            .entry(txn.clone())
+            .or_insert_with(TransactionLeases::new)
+            .live_scopes += 1;
+        TransactionScope {
+            previous: set_transaction_id(Some(txn)),
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
-/// Enter a transaction's apply burst, naming the transaction so its writes
-/// can find (and keep) the head it leases in each chunk.
-pub fn set_transaction_id(txn: Option<crate::server::transactions::TxnId>) {
-    IN_TRANSACTION.with(|flag| flag.set(txn.is_some()));
-    CURRENT_TXN.with(|t| *t.borrow_mut() = txn);
+impl Drop for TransactionScope {
+    fn drop(&mut self) {
+        if let Some(txn) = set_transaction_id(self.previous.take()) {
+            let mut held = TXN_LEASES.lock();
+            if let Some(leases) = held.get_mut(&txn) {
+                leases.live_scopes = leases.live_scopes.saturating_sub(1);
+                if leases.live_scopes == 0 && leases.per_chunk.is_empty() {
+                    held.remove(&txn);
+                }
+            }
+        }
+        if std::thread::panicking() {
+            // The commit that would have synced these is not going to run;
+            // the next transaction on this thread must not inherit them.
+            drop(take_transactional_segments());
+        }
+    }
 }
 
-/// Make an aborted transaction's writes vanish.
-///
-/// Ownership is what makes this expressible: nobody appended behind the
-/// transaction's entries, so its span can be padded over and the cursor put
-/// back. No undo records to replay, no junk for the cleaner to collect, and
-/// -- because the padding is journaled with everything else -- recovery walks
-/// straight over the span instead of reading entries the store has disowned.
-///
-/// Keyed on the transaction's STATE, never on whether a COMMIT record exists:
-/// TLC found that the cleaner legitimately drops COMMIT records below the
-/// decided watermark, so "no COMMIT present" is not the same question as "not
-/// committed" and deciding an abort on it rolls back committed work.
 /// A store identifies itself by the address window its chunks live in.
 ///
 /// `TXN_LEASES` is process-global while a store is not: one process hosts a
@@ -452,11 +547,28 @@ pub type StoreRange = std::ops::Range<usize>;
 fn take_store_leases(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
+    revoke: bool,
 ) -> Vec<((usize, usize), Vec<HeadLease>)> {
     let mut held = TXN_LEASES.lock();
+    take_store_leases_locked(&mut held, txn, store, revoke)
+}
+
+/// `revoke`: the transaction is being ENDED without a commit, so any thread
+/// still writing for it must be fenced off from here on. Done under the same
+/// lock every placement takes, which is what makes the fence atomic with
+/// respect to a stale owner's next write.
+fn take_store_leases_locked(
+    held: &mut std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>,
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+    revoke: bool,
+) -> Vec<((usize, usize), Vec<HeadLease>)> {
     let Some(leases) = held.get_mut(txn) else {
         return Vec::new();
     };
+    if revoke && !leases.revoked.contains(store) {
+        leases.revoked.push(store.clone());
+    }
     let mine: Vec<(usize, usize)> = leases
         .per_chunk
         .keys()
@@ -467,81 +579,293 @@ fn take_store_leases(
         .into_iter()
         .filter_map(|key| leases.per_chunk.remove(&key).map(|heads| (key, heads)))
         .collect();
-    if leases.per_chunk.is_empty() {
+    if leases.per_chunk.is_empty() && leases.live_scopes == 0 {
         held.remove(txn);
     }
     taken
 }
 
+/// Why a transaction's leases did not end cleanly. Never a silent
+/// fallthrough: each variant says which promise failed, and what the lease
+/// code did instead so that no head with an open bracket reaches a writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseExitError {
+    /// A plain release found a bracket still open on a head that could take
+    /// more appends. NOTHING was released: the leases are still held, and
+    /// the caller must close the bracket (commit) or end it (rewind/retire).
+    OpenBracket(crate::ram::segs::OpenBracketRefused),
+    /// The aborted span could not be padded over in the log. The head was
+    /// RETIRED instead -- full, so nothing can land behind its BEGIN, and
+    /// rotated out and sealed by the next writer to find it -- and the span
+    /// stays an uncommitted bracket, which recovery discards.
+    RewindFailed {
+        chunk_id: usize,
+        segment_id: u64,
+        reason: String,
+    },
+    /// A rewind was asked for a bracket that already carries its COMMIT. The
+    /// span is left as it is: padding over a committed bracket loses a
+    /// decided transaction. This is the TLA+ rule from the other side -- the
+    /// abort path keys on transaction STATE, and the state said abort while
+    /// the log says commit.
+    RewindOfCommitted { chunk_id: usize, segment_id: u64 },
+}
+
+impl std::fmt::Display for LeaseExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseExitError::OpenBracket(refused) => write!(f, "{refused}"),
+            LeaseExitError::RewindFailed {
+                chunk_id,
+                segment_id,
+                reason,
+            } => write!(
+                f,
+                "could not rewind the aborted span in segment {segment_id} (chunk {chunk_id}): \
+                 {reason}; the head was retired and the span stays an uncommitted bracket"
+            ),
+            LeaseExitError::RewindOfCommitted {
+                chunk_id,
+                segment_id,
+            } => write!(
+                f,
+                "refused to rewind segment {segment_id} (chunk {chunk_id}): its bracket is \
+                 already committed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LeaseExitError {}
+
+/// How a transaction's leases end.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LeaseExit {
+    /// Abort, AFTER the caller rolled the cell index back: pad over each span
+    /// (journaled), then release.
+    Rewind,
+    /// Leave every bracket exactly as it is and make each head that still
+    /// holds an open one full, then release. For callers that cannot vouch
+    /// that nothing in the index names the span.
+    Retire,
+}
+
+/// End one lease so that the head can go back to the pool. Never hands over
+/// a head with an open bracket and room behind it.
+fn end_lease(
+    txn: &crate::server::transactions::TxnId,
+    chunk_id: usize,
+    lease: HeadLease,
+    exit: LeaseExit,
+    first_error: &mut Option<LeaseExitError>,
+) {
+    let seg = &lease.seg;
+    match exit {
+        LeaseExit::Rewind if seg.bracket_is_committed() => {
+            error!(
+                "transaction {:?}: asked to rewind segment {} (chunk {}) whose bracket already \
+                 carries its COMMIT; leaving it committed",
+                txn, seg.id, chunk_id
+            );
+            first_error.get_or_insert(LeaseExitError::RewindOfCommitted {
+                chunk_id,
+                segment_id: seg.id,
+            });
+        }
+        LeaseExit::Rewind => {
+            // Everything from where the transaction found the cursor to where
+            // the cursor is now is the transaction's own: it owned the head the
+            // whole time. Includes a span with no BEGIN (a lease taken by the
+            // unbracketed fallback), whose entries must vanish just the same.
+            // A stale owner may still be inside a write it claimed before
+            // the revocation (claims are taken under the lock that revoked
+            // it). Let that entry land first, so the padding covers it.
+            let drained = seg.drain_pending_journals(std::time::Duration::from_secs(5));
+            let end = seg.append_header.load(Ordering::Acquire);
+            let outcome = if !drained {
+                Err(io::Error::other(
+                    "a write into the span did not finish; its extent is unknown",
+                ))
+            } else if lease.pre_cursor < end {
+                // Durable BEFORE the head can be reassigned: once another
+                // writer appends, a crash must find the padding, not the open
+                // BEGIN, or that writer's entries are read as this
+                // transaction's.
+                seg.disown_span(lease.pre_cursor, end)
+                    .and_then(|()| seg.force_wal_sync())
+            } else {
+                Ok(())
+            };
+            match outcome {
+                Ok(()) => {
+                    seg.mark_bracket_disowned();
+                    TXN_SPANS_REWOUND.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    TXN_REWIND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "transaction {:?}: could not rewind its span in segment {} (chunk {}): \
+                         {}; retiring the head instead",
+                        txn, seg.id, chunk_id, error
+                    );
+                    seg.retire_tail();
+                    TXN_HEADS_RETIRED.fetch_add(1, Ordering::Relaxed);
+                    first_error.get_or_insert(LeaseExitError::RewindFailed {
+                        chunk_id,
+                        segment_id: seg.id,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        LeaseExit::Retire => {
+            if seg.bracket_is_open() && seg.can_still_append() {
+                seg.retire_tail();
+                TXN_HEADS_RETIRED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    // Ownership first, then the reference: a segment that is still owned
+    // cannot be sealed, so dropping the reference first would briefly leave a
+    // head nobody can reclaim.
+    match seg.try_release_own() {
+        Ok(()) => seg.decr_references(),
+        Err(refused) => {
+            // Unreachable by construction -- every branch above leaves the
+            // bracket closed, disowned or the head full -- and kept out of the
+            // pool if it ever is reached: still owned, still referenced.
+            error!("transaction {:?}: {}", txn, refused);
+            first_error.get_or_insert(LeaseExitError::OpenBracket(refused));
+        }
+    }
+}
+
+fn end_transaction_leases(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+    exit: LeaseExit,
+) -> Result<usize, LeaseExitError> {
+    let leases = take_store_leases(txn, store, true);
+    let mut first_error = None;
+    let mut ended = 0usize;
+    for (key, heads) in leases {
+        // Newest first, so no moment exists where an earlier part is ended
+        // while a later part of the same transaction is still in use.
+        for lease in heads.into_iter().rev() {
+            end_lease(txn, key.1, lease, exit, &mut first_error);
+            ended += 1;
+        }
+    }
+    TXN_LEASES_RELEASED.fetch_add(ended as u64, Ordering::Relaxed);
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(ended),
+    }
+}
+
+/// Make an aborted transaction's writes vanish from the log, then give its
+/// heads back.
+///
+/// Call it AFTER the transaction's effects were rolled back in the cell
+/// index, and BEFORE anything else may write into its heads -- which, since
+/// the transaction owns them until this returns, is automatic. Each span is
+/// padded over and the padding journaled (see [`Segment::disown_span`]), so
+/// recovery walks straight past it and the next owner's entries are ordinary.
+///
+/// Keyed on the transaction's STATE, never on whether a COMMIT record exists:
+/// TLC found that the cleaner legitimately drops COMMIT records, so "no
+/// COMMIT present" is not the same question as "not committed". The one place
+/// the log is consulted is the other way round: a bracket already carrying
+/// its COMMIT is never padded over (`RewindOfCommitted`).
+///
+/// `Err` still ends every lease. A span that could not be rewound is left as
+/// an uncommitted bracket in a RETIRED head (`RewindFailed`): never reused,
+/// rotated out and sealed by the ordinary full-head path.
 pub fn rewind_transaction_writes(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
-) -> usize {
-    let leases = take_store_leases(txn, store);
-    let mut rewound = 0usize;
-    for (chunk_id, heads) in leases {
-        // Newest first: a chain's later parts are rewound before the part
-        // that points at them, so no moment exists where a link names a span
-        // that has already been disowned.
-        for lease in heads.into_iter().rev() {
-            if lease.seg.rewind_to(lease.pre_cursor) {
-                rewound += 1;
-            } else {
-                // The span could not be reclaimed -- it is already sealed, or
-                // the cursor moved past it. The entries stay, uncommitted,
-                // and recovery discards them for want of a COMMIT: correct,
-                // just not free.
-                debug!(
-                    "chunk {} could not rewind segment {} for aborted transaction {:?}; its \
-                     entries stay as dead space and recover as uncommitted",
-                    chunk_id.1, lease.seg.id, txn
-                );
-            }
-            lease.seg.release_own();
-            lease.seg.decr_references();
-        }
-    }
-    TXN_LEASES_RELEASED.fetch_add(rewound as u64, Ordering::Relaxed);
-    rewound
+) -> Result<usize, LeaseExitError> {
+    end_transaction_leases(txn, store, LeaseExit::Rewind)
 }
 
-/// Release every head a transaction holds. Called at the decision -- commit
-/// or abort -- and by the expiry sweeper for a coordinator that never came
-/// back.
+/// End a transaction's leases without touching what it wrote: every head
+/// still holding an open bracket is retired (padded to its end, full), then
+/// all are released.
+///
+/// The catch-all for a caller that cannot vouch for the cell index -- the
+/// lease-expiry sweeper for a transaction no participant object knows about,
+/// an abort whose rollback failed, the final cleanup of a transaction whose
+/// decision already closed or rewound everything. The open brackets stay
+/// uncommitted and recovery discards them, exactly what a crash in the same
+/// window gets; the full head guarantees nobody appends behind them.
+pub fn retire_transaction_leases(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> Result<usize, LeaseExitError> {
+    end_transaction_leases(txn, store, LeaseExit::Retire)
+}
+
+/// Release every head a transaction holds, refusing if any of them still has
+/// an open bracket it could append behind.
+///
+/// For the decision that CLOSED every bracket: after a commit, every bracket
+/// carries its COMMIT and the heads go back to the pool with their room
+/// intact. Anything still open means the caller skipped a step, and the
+/// refusal changes nothing -- the leases are still held for the right exit
+/// to end.
 pub fn release_transaction_leases(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
-) -> usize {
-    let leases = take_store_leases(txn, store);
+) -> Result<usize, LeaseExitError> {
+    let leases = {
+        let mut held = TXN_LEASES.lock();
+        let open = held.get(txn).and_then(|leases| {
+            leases
+                .per_chunk
+                .iter()
+                .filter(|(key, _)| store.contains(&key.0))
+                .flat_map(|(_, heads)| heads.iter())
+                .find(|lease| lease.seg.bracket_is_open() && lease.seg.can_still_append())
+                .map(|lease| crate::ram::segs::OpenBracketRefused {
+                    chunk_id: lease.seg.chunk_id,
+                    segment_id: lease.seg.id,
+                    seq_id: lease.seg.seq_id,
+                })
+        });
+        if let Some(refused) = open {
+            crate::ram::segs::OPEN_BRACKET_RELEASES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            error!(
+                "transaction {:?}: refusing to release its heads: {}",
+                txn, refused
+            );
+            return Err(LeaseExitError::OpenBracket(refused));
+        }
+        take_store_leases_locked(&mut held, txn, store, false)
+    };
+    let mut first_error = None;
     let mut released = 0usize;
-    for (_chunk, heads) in leases {
-        for lease in heads {
-            // Ownership first, then the reference: a segment that is still
-            // owned cannot be sealed, so dropping the reference first would
-            // briefly leave a head nobody can reclaim.
-            lease.seg.release_own();
-            lease.seg.decr_references();
+    for (key, heads) in leases {
+        for lease in heads.into_iter().rev() {
+            // Nothing is open, so Retire changes nothing; it is used for its
+            // release half and its backstop.
+            end_lease(txn, key.1, lease, LeaseExit::Retire, &mut first_error);
             released += 1;
         }
     }
     TXN_LEASES_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
-    released
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(released),
+    }
 }
 
-/// Release leases whose transaction has been silent longer than `idle`.
-///
-/// Mandatory, not a refinement: a coordinator that vanishes between prepare
-/// and decision otherwise holds its heads forever, and the pool has no
-/// refill path -- one hostage head is one less writer slot in that chunk,
-/// permanently. Returns the transactions whose leases were reclaimed so the
-/// caller can settle them discard-unless-COMMIT.
 /// Transactions whose leases have been idle longer than `idle`, WITHOUT
 /// releasing anything.
 ///
-/// The selection half of `expire_transaction_leases`, split out because
-/// cooperative termination has to run BEFORE the release: resolving a
-/// transaction to commit means closing its bracket, and closing a bracket
-/// needs the leases the release would have thrown away.
+/// The selection half of `expire_transaction_leases`, split out because the
+/// participant has to act BEFORE the release: resolving a transaction to
+/// commit means closing its bracket, presuming abort means rolling it back
+/// and rewinding its span, and both need the leases a release throws away.
 pub fn transactions_with_idle_leases(
     idle: std::time::Duration,
     store: &StoreRange,
@@ -555,32 +879,46 @@ pub fn transactions_with_idle_leases(
         .collect()
 }
 
+/// Reclaim leases whose transaction has been silent longer than `idle`.
+///
+/// Mandatory, not a refinement: a coordinator that vanishes between prepare
+/// and decision otherwise holds its heads forever, and the pool has no refill
+/// path -- one hostage head is one less writer slot in that chunk,
+/// permanently.
+///
+/// This is the LAST resort and knows nothing about the cell index, so it
+/// RETIRES: each head with an open bracket is padded to its end and left
+/// full -- never handed to a writer that would append behind the BEGIN --
+/// and the bracket stays uncommitted, which recovery discards. The
+/// participant aborts the transactions it knows about properly (rollback,
+/// then rewind) before calling this; what reaches here has no participant
+/// object to roll back. Returns the transactions whose leases were reclaimed.
 pub fn expire_transaction_leases(
     idle: std::time::Duration,
     store: &StoreRange,
     hold: &std::collections::BTreeSet<crate::server::transactions::TxnId>,
 ) -> Vec<crate::server::transactions::TxnId> {
-    let now = std::time::Instant::now();
-    let expired: Vec<_> = {
-        let held = TXN_LEASES.lock();
-        held.iter()
-            .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
-            .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
-            // Held back by cooperative termination: the question "did anyone
-            // commit this?" is still open, and closing a bracket needs the
-            // leases this release would throw away.
-            .filter(|(txn, _)| !hold.contains(*txn))
-            .map(|(txn, _)| txn.clone())
-            .collect()
-    };
+    let expired: Vec<_> = transactions_with_idle_leases(idle, store)
+        .into_iter()
+        // Held back by cooperative termination: the question "did anyone
+        // commit this?" is still open, and closing a bracket needs the
+        // leases this release would throw away.
+        .filter(|txn| !hold.contains(txn))
+        .collect();
     for txn in &expired {
-        let heads = release_transaction_leases(txn, store);
-        warn!(
-            "transaction {:?} held {} write head(s) for more than {:?} without a decision; \
-             releasing them. Its entries stay where they are and are settled \
-             discard-unless-COMMIT.",
-            txn, heads, idle
-        );
+        match retire_transaction_leases(txn, store) {
+            Ok(heads) => warn!(
+                "transaction {:?} held {} write head(s) for more than {:?} without a decision; \
+                 retired them. Its open brackets stay uncommitted and are discarded by \
+                 recovery.",
+                txn, heads, idle
+            ),
+            Err(error) => error!(
+                "transaction {:?} held write heads for more than {:?} without a decision and \
+                 they did not end cleanly: {}",
+                txn, idle, error
+            ),
+        }
     }
     TXN_LEASES_EXPIRED.fetch_add(expired.len() as u64, Ordering::Relaxed);
     expired
@@ -1186,6 +1524,12 @@ impl Chunk {
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
         }
+        // A run claims a head for one batch and lets it go: it cannot be
+        // bracketed. Inside a transaction, say "no run" and let the caller
+        // write cell by cell through the transactional path.
+        if is_in_transaction() {
+            return Ok(None);
+        }
         let slots = self.head_slots(segment_class);
         let start = head_affinity();
         // One pass over the pool: the first head this writer can OWN gets
@@ -1313,10 +1657,15 @@ impl Chunk {
             if id == HEAD_SEG_ID_ALLOCATING {
                 continue;
             }
+            // A head a TRANSACTION owns is gone until its decision; one a plain
+            // writer owns is back in microseconds and is counted. Counting
+            // only unowned heads read every concurrent plain write as
+            // scarcity, which used to push transactions out of their bracket
+            // and now would make them wait for nothing.
             if self
                 .segs
                 .get(&(id as usize))
-                .map(|seg| !seg.is_head_owned())
+                .map(|seg| !seg.bracket_is_open())
                 .unwrap_or(false)
             {
                 usable_or_growable += 1;
@@ -1331,31 +1680,28 @@ impl Chunk {
         let Some(txn) = current_txn() else {
             return false;
         };
+        // The caller checked before claiming; re-checked now that the head is
+        // owned, because other transactions lease concurrently. A refusal here
+        // is NOT an unbracketed write any more: the caller drops the claim
+        // and waits for a head, or fails the transaction.
         if !self.can_spare_a_head_for_lease(head.segment_class()) {
-            // Write it as an ordinary entry instead. The transaction loses its
-            // bracket in this chunk -- and with it, atomicity for these
-            // entries -- which is a real cost and is why this is a warning
-            // rather than a silent fallback. Deadlocking every writer in the
-            // chunk, including the ones this transaction is waiting on, is
-            // the alternative.
-            debug!(
-                "chunk {} cannot spare a head for transaction {:?}; its entries here are written \
-                 unbracketed and are NOT covered by the transaction's atomicity",
-                self.id, txn
-            );
-            UNBRACKETED_TXN_WRITES.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if !head.incr_references() {
-            // Being reclaimed underneath us: do not lease it, and let this
-            // entry finish as an ordinary one.
+            // Being reclaimed underneath us: do not lease it.
             return false;
         }
         let mut held = TXN_LEASES.lock();
-        let leases = held.entry(txn).or_insert_with(|| TransactionLeases {
-            per_chunk: std::collections::HashMap::new(),
-            opened_at: std::time::Instant::now(),
-        });
+        let leases = held.entry(txn).or_insert_with(TransactionLeases::new);
+        if leases.is_revoked_in(self.lease_key().0) {
+            drop(held);
+            head.decr_references();
+            return false;
+        }
+        if leases.per_chunk.is_empty() {
+            // Idle time for expiry counts from the first head held.
+            leases.opened_at = std::time::Instant::now();
+        }
         leases
             .per_chunk
             .entry(self.lease_key())
@@ -1364,41 +1710,48 @@ impl Chunk {
                 seg: head.clone(),
                 pre_cursor: addr,
             });
+        // From here a live transaction owns this segment: the release point
+        // refuses to hand it to anyone else until its bracket is closed by a
+        // COMMIT, rewound, or the head retired. Set while the head is still
+        // owned by this claim, so there is no moment it is held by nobody.
+        head.mark_bracket_open();
         TXN_LEASES_OPENED.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    /// Close this transaction's bracket in this chunk by writing its COMMIT.
+    /// Close every bracket this transaction opened in this chunk by writing
+    /// its COMMIT into it.
     ///
-    /// The bracket is committed IF AND ONLY IF this record is present, so
-    /// this is the commit point for everything the transaction wrote here.
-    /// It goes into the leased head, behind the transaction's own entries and
-    /// with nobody else's in between -- which is what the lease bought.
+    /// A bracket is committed IF AND ONLY IF a COMMIT for its transaction is
+    /// found, so this is the commit point for everything the transaction
+    /// wrote here. Each record goes into its own part, behind the part's own
+    /// entries, with nobody else's in between -- which is what the lease
+    /// bought.
+    ///
+    /// EVERY open part gets its own record, never "some other part's":
+    /// parts are decided together but COMPACTED INDEPENDENTLY, and compaction
+    /// drops a segment's bracket markers. If the only COMMIT lived in another
+    /// part, compacting that part would leave this part's BEGIN closed by
+    /// nothing, and its committed cells would come back from the next restart
+    /// as an undecided transaction. That is why parts are claimed with
+    /// `MIN_COMMIT_ENTRY_SIZE` kept free behind every entry: the full-manifest
+    /// record is written where it fits, and where it does not, the minimal
+    /// one (no manifest; recovery decides on the transaction id alone and uses
+    /// the manifest for nothing but a log line) always does.
+    ///
+    /// `Err` means some part of this chunk has NO COMMIT, and the caller must
+    /// not report the transaction committed. Parts closed by an earlier
+    /// attempt are skipped, so a retry finishes the job without duplicating.
     pub fn close_transaction_bracket(
         &self,
         txn: &crate::server::transactions::TxnId,
         manifest: &[crate::ram::bracket::ManifestEntry],
     ) -> Result<(), WriteError> {
-        let content = crate::ram::bracket::encode_commit(txn, manifest);
-        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
-        // EVERY bracket this transaction opened here gets its own COMMIT, not
-        // just the newest part.
-        //
-        // A bracket that has to look elsewhere for its COMMIT is a bracket the
-        // cleaner can orphan: parts are decided together but compacted
-        // INDEPENDENTLY, so compacting the part that held the only COMMIT
-        // leaves the earlier parts' BEGINs with nothing to close them, and
-        // their committed cells are then read as an in-flight transaction and
-        // dropped. Repeating the record per part costs 40-odd bytes and makes
-        // each bracket self-contained -- which is also what removes the need
-        // for a watermark to tell "cleaned" from "undecided".
         let heads: Vec<AArc<Segment>> = {
-            let txn_now = current_txn();
             let held = TXN_LEASES.lock();
-            match txn_now
-                .as_ref()
-                .and_then(|t| held.get(t))
-                .and_then(|l| l.per_chunk.get(&self.lease_key()))
+            match held
+                .get(txn)
+                .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             {
                 Some(heads) => heads.iter().map(|lease| lease.seg.clone()).collect(),
                 None => Vec::new(),
@@ -1407,51 +1760,98 @@ impl Chunk {
         if heads.is_empty() {
             return Err(WriteError::CannotAllocateSpace);
         }
+        let full = crate::ram::bracket::encode_commit(txn, manifest);
+        let minimal = crate::ram::bracket::encode_commit(txn, &[]);
+        debug_assert_eq!(
+            crate::ram::entry::ENTRY_HEAD_SIZE + minimal.len(),
+            crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE
+        );
         for head in heads {
-            if !head.incr_references() {
-                return Err(WriteError::CannotAllocateSpace);
-            }
-            if !head.begin_pending_journal() {
-                head.decr_references();
-                return Err(WriteError::CannotAllocateSpace);
-            }
-            let Some(addr) = head.try_acquire(size) else {
-                // A full part cannot hold its own COMMIT. Its entries are
-                // still committed -- a later part's COMMIT names them through
-                // the manifest -- but this part is not self-contained, so say
-                // so rather than pretend.
-                head.end_pending_journal();
-                head.decr_references();
-                warn!(
-                    "chunk {} could not place a COMMIT in segment {} for transaction {:?}; that \
-                     part relies on another part's record",
-                    self.id, head.id, txn
-                );
+            // A part with no BEGIN (a lease the unbracketed fallback took) has
+            // nothing to close, and one already closed must not be closed
+            // twice.
+            if !head.bracket_is_open() {
                 continue;
+            }
+            let placed = match Self::place_commit(&head, &full) {
+                Ok(true) => Ok(true),
+                Ok(false) => Self::place_commit(&head, &minimal),
+                Err(error) => Err(error),
             };
-            crate::ram::entry::stamp_reservation_padding(addr, size);
-            let pending = PendingEntry {
-                addr,
-                seg: head,
-                size,
-                skip_sync: true,
-                leased: true,
-            };
-            crate::ram::entry::Entry::encode_to(
-                pending.addr,
-                crate::ram::entry::EntryType::COMMIT,
-                content.len() as u32,
-                |content_addr| unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        content.as_ptr(),
-                        content_addr as *mut u8,
-                        content.len(),
+            match placed {
+                Ok(true) => head.mark_bracket_committed(),
+                Ok(false) => {
+                    error!(
+                        "chunk {} could not place even a minimal COMMIT in segment {} for \
+                         transaction {:?}: its reserve is gone (the segment was sealed or \
+                         retired underneath the lease). The commit FAILS rather than report a \
+                         transaction recovery would not find committed.",
+                        self.id, head.id, txn
                     );
-                },
-            );
-            drop(pending);
+                    return Err(WriteError::CannotAllocateSpace);
+                }
+                Err(error) => {
+                    error!(
+                        "chunk {} could not journal the COMMIT in segment {} for transaction \
+                         {:?}: {}. The commit FAILS.",
+                        self.id, head.id, txn, error
+                    );
+                    return Err(WriteError::CannotAllocateSpace);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Write `content` as a COMMIT behind the transaction's entries in `head`
+    /// and journal it, reporting the journal's outcome.
+    ///
+    /// Not through `PendingEntry`: its drop logs a failed journal write and
+    /// carries on, which is right for an entry whose caller has nothing
+    /// better to do, and wrong for the one record that decides whether a
+    /// transaction happened. `Ok(false)` means no room (nothing written).
+    fn place_commit(head: &AArc<Segment>, content: &[u8]) -> io::Result<bool> {
+        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        if !head.incr_references() {
+            return Err(io::Error::other(format!(
+                "segment {} is held exclusively",
+                head.id
+            )));
+        }
+        if !head.begin_pending_journal() {
+            head.decr_references();
+            return Err(io::Error::other(format!("segment {} is sealing", head.id)));
+        }
+        let Some(addr) = head.try_acquire(size) else {
+            head.end_pending_journal();
+            head.decr_references();
+            return Ok(false);
+        };
+        crate::ram::entry::stamp_reservation_padding(addr, size);
+        crate::ram::entry::Entry::encode_to(
+            addr,
+            crate::ram::entry::EntryType::COMMIT,
+            content.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    content_addr as *mut u8,
+                    content.len(),
+                );
+            },
+        );
+        // Synced by the caller with the rest of the decision, not here.
+        let journaled = head.write_wal(addr, size, true);
+        if journaled.is_err() {
+            // The record is in memory and not in the log: make it padding, so
+            // neither a walk of this image nor a later archive of it can find
+            // a COMMIT the log does not have.
+            crate::ram::entry::stamp_reservation_padding(addr, size);
+        }
+        head.end_pending_journal();
+        head.set_dirty();
+        head.decr_references();
+        journaled.map(|()| true)
     }
 
     /// Write a COMMIT for a transaction this chunk holds no lease for.
@@ -1493,25 +1893,6 @@ impl Chunk {
         );
         drop(pending);
         Ok(())
-    }
-
-    /// The newest head of `segment_class` this transaction holds in this
-    /// chunk, if any.
-    ///
-    /// Class-scoped because a transaction can hold one head per class here,
-    /// and the two are separate chains: a TXN_CONT link names the previous
-    /// part of the SAME chain, so stamping one across classes would join two
-    /// runs that were never contiguous.
-    fn newest_leased_head(&self, segment_class: SegmentClass) -> Option<AArc<Segment>> {
-        let txn = current_txn()?;
-        let held = TXN_LEASES.lock();
-        held.get(&txn)?
-            .per_chunk
-            .get(&self.lease_key())?
-            .iter()
-            .rev()
-            .find(|lease| lease.seg.segment_class() == segment_class)
-            .map(|lease| lease.seg.clone())
     }
 
     /// This chunk's lease key: unique across every store in the process.
@@ -1559,37 +1940,50 @@ impl Chunk {
         };
         let head = {
             let held = TXN_LEASES.lock();
+            let Some(leases) = held.get(&txn) else {
+                return LeasedPlacement::NoLease;
+            };
+            // The fence. Checked under the lock that ending the leases takes,
+            // and the journal claim below is taken under it too: an abort or
+            // expiry that revokes after this point finds the claim and waits
+            // for it, and any placement after the revocation is refused.
+            if leases.is_revoked_in(self.lease_key().0) {
+                return LeasedPlacement::Revoked;
+            }
             // Newest first: a rotation appended a fresh head, and that is
             // where the write set continues.
-            match held
-                .get(&txn)
-                .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
+            let Some(head) = leases
+                .per_chunk
+                .get(&self.lease_key())
                 .and_then(|heads| {
                     heads
                         .iter()
                         .rev()
                         .find(|lease| lease.seg.segment_class() == segment_class)
-                }) {
-                Some(lease) => lease.seg.clone(),
-                None => return LeasedPlacement::NoLease,
+                })
+                .map(|lease| lease.seg.clone())
+            else {
+                return LeasedPlacement::NoLease;
+            };
+            // Ownership is NOT re-taken -- this transaction already holds it.
+            // Everything else is exactly the ordinary path: the per-entry
+            // reference and journal claim still bracket this write, because
+            // sealing still has to see it.
+            if !head.incr_references() {
+                // Being reclaimed or held exclusively: not full, just not
+                // usable right now.
+                return LeasedPlacement::Unusable;
             }
+            if !head.begin_pending_journal() {
+                head.decr_references();
+                return LeasedPlacement::Unusable;
+            }
+            head
         };
-        // Ownership is NOT re-taken -- this transaction already holds it.
-        // Everything else is exactly the ordinary path: the per-entry
-        // reference and journal claim still bracket this write, because
-        // sealing still has to see it.
-        if !head.incr_references() {
-            // Being reclaimed or held exclusively: not full, just not usable
-            // right now. Sealing it as a chain part here would zero space it
-            // still owns and hand a live segment a tail link it never asked
-            // for -- which is how the first version of this corrupted stores.
-            return LeasedPlacement::Unusable;
-        }
-        if !head.begin_pending_journal() {
-            head.decr_references();
-            return LeasedPlacement::Unusable;
-        }
-        match head.try_acquire(size) {
+        // Keep a minimal COMMIT's worth free behind every entry: the part
+        // must be closable by its own record at the decision, whatever the
+        // write set does to it now.
+        match head.try_acquire_reserving(size, crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE) {
             Some(addr) => {
                 crate::ram::entry::stamp_reservation_padding(addr, size);
                 LeasedPlacement::Placed(PendingEntry {
@@ -1603,8 +1997,6 @@ impl Chunk {
             None => {
                 head.end_pending_journal();
                 head.decr_references();
-                // Genuinely out of room: THIS is the only case that may
-                // continue the transaction in a fresh part.
                 LeasedPlacement::Full
             }
         }
@@ -1624,102 +2016,208 @@ impl Chunk {
         // the manifest names them all, so the transaction is decided as a
         // whole -- which is what "outside the bracket" used to cost.
         if current_txn().is_some() {
-            // A transaction writes behind its own head, so its entries stay
-            // contiguous and an abort can rewind them.
-            match self.try_place_in_leased_head(size, segment_class) {
-                LeasedPlacement::Placed(entry) => return Ok(entry),
-                LeasedPlacement::NoLease | LeasedPlacement::Full
-                    if self.can_spare_a_head_for_lease(segment_class) =>
-                {
-                    // No head here yet, or the one we have is out of room.
-                    // Both open a new bracket PART: claim a head, link the
-                    // full one behind it, and put BEGIN in first so every
-                    // part is self-describing.
-                    //
-                    // Bounded retry, because the head that had room for a
-                    // 24-byte BEGIN need not have room for the entry that
-                    // follows it. When that happens the part just opened is
-                    // by definition nearly full, so the next round links it
-                    // and moves to a genuinely fresh segment. Without the
-                    // retry this failed the write outright -- and a
-                    // transaction whose writes fail for want of 40 bytes is
-                    // an outage, not a safety property.
-                    const PART_ATTEMPTS: usize = 3;
-                    for _ in 0..PART_ATTEMPTS {
-                        self.open_transaction_bracket(full_gc, segment_class, size)?;
-                        match self.try_place_in_leased_head(size, segment_class) {
-                            LeasedPlacement::Placed(entry) => return Ok(entry),
-                            LeasedPlacement::Full => continue,
-                            LeasedPlacement::Unusable | LeasedPlacement::NoLease => break,
-                        }
-                    }
-                    error!(
-                        "chunk {} could not place a {}-byte transactional entry after {} fresh \
-                         bracket part(s)",
-                        self.id, size, PART_ATTEMPTS
-                    );
-                    return Err(WriteError::CannotAllocateSpace);
-                }
-                LeasedPlacement::Unusable | LeasedPlacement::NoLease | LeasedPlacement::Full => {
-                    // Either the head is merely busy, or this chunk cannot
-                    // spare one to hold. Both take the ordinary path: a
-                    // transaction that cannot be given a head of its own
-                    // writes unbracketed rather than failing, which is what
-                    // it did before leases existed.
-                }
-            }
+            return self.acquire_for_transaction(size, full_gc, segment_class);
         }
         self.try_acquire_claim(size, full_gc, segment_class)
     }
 
+    /// Place a transactional entry INSIDE the transaction's bracket, or fail.
+    ///
+    /// There is no unbracketed fallback. An entry written outside the bracket
+    /// is an ordinary entry: it survives a crash that discards the rest of
+    /// its transaction, which is a half-applied transaction, and recovery
+    /// cannot tell it from any other write. So a write that cannot get a head
+    /// of its transaction's own WAITS for one -- bounded -- and then fails
+    /// with `TransactionHeadUnavailable`, so the transaction is not
+    /// acknowledged.
+    ///
+    /// The wait cannot deadlock, only time out: what it waits for is another
+    /// transaction's decision (or a chunk growing), and nothing here holds
+    /// anything that decision needs. It is bounded because the decision may be
+    /// slow, and the thread waiting may be one a decision needs to run on.
+    fn acquire_for_transaction(
+        &self,
+        size: u32,
+        full_gc: bool,
+        segment_class: SegmentClass,
+    ) -> Result<PendingEntry, WriteError> {
+        // The common case never waits: try once without.
+        match self.place_transactional(size, full_gc, segment_class, false) {
+            Err(WriteError::TransactionHeadUnavailable) if self.can_ever_spare_a_head() => {}
+            other => return other,
+        }
+        // Waiting for a head is waiting for ANOTHER transaction's decision,
+        // which arrives as an RPC this runtime has to run. A worker thread
+        // that sleeps here takes itself away from that, and enough of them
+        // starve the very decisions they wait on until every one times out.
+        // So the wait leaves the runtime's worker pool first; on a
+        // single-threaded runtime it cannot, and the write fails at once.
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+            Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.place_transactional(size, full_gc, segment_class, true)
+            }),
+            Ok(_) => {
+                TXN_HEAD_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "chunk {} has no head to spare for transaction {:?}, and waiting for one on \
+                     a single-threaded runtime would block the decisions it waits on; failing \
+                     the write",
+                    self.id,
+                    current_txn()
+                );
+                Err(WriteError::TransactionHeadUnavailable)
+            }
+            Err(_) => self.place_transactional(size, full_gc, segment_class, true),
+        }
+    }
+
+    /// One attempt at `acquire_for_transaction`; `may_wait` bounds a wait for
+    /// a head, otherwise "no head now" is answered at once (uncounted: the
+    /// caller decides whether that becomes a wait or a failure).
+    fn place_transactional(
+        &self,
+        size: u32,
+        full_gc: bool,
+        segment_class: SegmentClass,
+        may_wait: bool,
+    ) -> Result<PendingEntry, WriteError> {
+        // A part just opened can still refuse the entry (the head picked
+        // could hold BEGIN but not what follows); a few fresh parts settle
+        // that, and an entry no fresh part can hold is not going to fit.
+        const PART_ATTEMPTS: usize = 3;
+        let mut parts_opened = 0usize;
+        let mut waiting_since: Option<std::time::Instant> = None;
+        let backoff = Backoff::new();
+        let mut spins = 0usize;
+        loop {
+            match self.try_place_in_leased_head(size, segment_class) {
+                LeasedPlacement::Placed(entry) => return Ok(entry),
+                LeasedPlacement::Revoked => {
+                    TXN_STALE_OWNER_WRITES.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "chunk {} refused a write for transaction {:?}: it was ended while this \
+                         thread was still writing for it",
+                        self.id,
+                        current_txn()
+                    );
+                    return Err(WriteError::TransactionRevoked);
+                }
+                // No part here yet, the newest one is out of room, or it is
+                // busy: each continues in a new part of the same transaction.
+                LeasedPlacement::NoLease | LeasedPlacement::Full | LeasedPlacement::Unusable => {}
+            }
+            if parts_opened >= PART_ATTEMPTS {
+                error!(
+                    "chunk {} could not place a {}-byte transactional entry after {} fresh \
+                     bracket part(s)",
+                    self.id, size, PART_ATTEMPTS
+                );
+                return Err(WriteError::CannotAllocateSpace);
+            }
+            if self.can_spare_a_head_for_lease(segment_class) {
+                match self.open_transaction_bracket(full_gc, segment_class, size) {
+                    Ok(true) => {
+                        parts_opened += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    // The chunk counted room for another head, but the
+                    // allocator had no segment to give it (heads held by
+                    // transactions are not reclaimable). That is the same
+                    // scarcity as no spare head: wait for a decision.
+                    Err(WriteError::CannotAllocateSpace) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !self.can_ever_spare_a_head() {
+                TXN_HEAD_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "chunk {} can never give a transaction a head of its own (capacity {} bytes); \
+                     refusing the transactional write rather than writing it outside its \
+                     bracket",
+                    self.id, self.capacity
+                );
+                return Err(WriteError::TransactionHeadUnavailable);
+            }
+            if !may_wait {
+                return Err(WriteError::TransactionHeadUnavailable);
+            }
+            let since = waiting_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= txn_head_wait() {
+                TXN_HEAD_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "chunk {} had no head to spare for transaction {:?} within {:?}; failing the \
+                     write rather than writing it outside its bracket",
+                    self.id,
+                    current_txn(),
+                    txn_head_wait()
+                );
+                return Err(WriteError::TransactionHeadUnavailable);
+            }
+            // Spin briefly for a plain writer's microsecond hold; sleep
+            // through a transaction's.
+            if spins < 64 {
+                spins += 1;
+                backoff.spin();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+    }
+
+    /// Whether this chunk could EVER hold a head for a transaction while
+    /// leaving one for everyone else: it needs room for at least two live
+    /// heads plus the one being rotated out. A chunk smaller than that (one
+    /// segment is common in tests) refuses transactional writes at once
+    /// instead of waiting for something that cannot happen.
+    fn can_ever_spare_a_head(&self) -> bool {
+        self.capacity >= 3 * SEGMENT_SIZE
+    }
+
     /// Claim space for a transaction's BEGIN and write it, taking the lease.
     /// `first_entry_size` is what the caller is about to write. The part is
-    /// claimed with room for BEGIN *and* that entry, because a head that fits
-    /// a 24-byte marker need not fit the entry behind it -- and a bracket part
-    /// whose first entry does not fit is a part that has to be abandoned
-    /// immediately.
+    /// claimed with room for BEGIN, that entry AND a minimal COMMIT, because a
+    /// head that fits a 24-byte marker need not fit the entry behind it, and
+    /// a part that cannot hold its own COMMIT cannot be closed.
+    ///
+    /// The part being left behind (if any) is NOT sealed with a TXN_CONT
+    /// chain link any more. Sealing zeroed the space up to the fixed tail and
+    /// so took the room that part's own COMMIT needs: the part then depended
+    /// on another part's record, and the cleaner, which compacts parts
+    /// independently and drops their markers, could take that record away
+    /// and leave the earlier part's committed cells undecided at the next
+    /// restart. Every part is a self-contained `BEGIN .. entries .. COMMIT`
+    /// bracket instead; recovery still decides a transaction by id across
+    /// all its parts, and still reads a TXN_CONT if it finds one.
     fn open_transaction_bracket(
         &self,
         full_gc: bool,
         segment_class: SegmentClass,
         first_entry_size: u32,
-    ) -> Result<(), WriteError> {
+    ) -> Result<bool, WriteError> {
         let Some(txn) = current_txn() else {
-            return Ok(());
+            return Ok(false);
         };
-        // Link the part being left behind, at its fixed tail, BEFORE the new
-        // one exists: the link names the PREVIOUS part's seq, so it is
-        // verifiable the moment it is written and needs no forward reference
-        // to something not yet durable.
-        // Link ONLY a head with no room left. Anything else is still in use
-        // by this transaction, and stamping a tail link into it would zero
-        // space the segment still owns.
-        if let Some(previous) = self.newest_leased_head(segment_class).filter(|head| {
-            head.bound()
-                .saturating_sub(head.append_header.load(Ordering::Acquire))
-                < crate::ram::bracket::TXN_CONT_ENTRY_SIZE * 2
-        }) {
-            let link = crate::ram::bracket::encode_txn_cont(&txn, previous.seq_id);
-            if !previous.seal_as_chain_part(&link) {
-                warn!(
-                    "chunk {} could not stamp a chain link in segment {}; the transaction \
-                     continues in a fresh head and its parts are joined by the manifest alone",
-                    self.id, previous.id
-                );
-            }
-        }
         let content = crate::ram::bracket::encode_begin(&txn);
         let begin_size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
-        // Claim both, so the head chosen can hold the entry that follows.
-        let mut pending =
-            self.try_acquire_claim(begin_size + first_entry_size, full_gc, segment_class)?;
+        let commit_reserve = crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE as u32;
+        // Claim all three, so the head chosen can hold the entry that follows
+        // and still close.
+        let mut pending = self.try_acquire_claim(
+            begin_size + first_entry_size + commit_reserve,
+            full_gc,
+            segment_class,
+        )?;
         if !pending.leased {
             // The claim could not take a lease -- the head was being
-            // reclaimed underneath it. Without a lease there is no bracket to
-            // open: writing a BEGIN nobody owns would leave a marker with no
-            // COMMIT and make ordinary entries after it look transactional.
+            // reclaimed underneath it, the chunk could no longer spare it, or
+            // the transaction was revoked. Without a lease there is no bracket
+            // to open: writing a BEGIN nobody owns would leave a marker with
+            // no COMMIT and make ordinary entries after it look
+            // transactional. The claimed span is journaled as padding.
             drop(pending);
-            return Ok(());
+            return Ok(false);
         }
         crate::ram::entry::Entry::encode_to(
             pending.addr,
@@ -1734,12 +2232,11 @@ impl Chunk {
             },
         );
         // Hand the rest of the claim back so the caller's entry lands
-        // immediately behind the BEGIN. Rewinding is safe for the same reason
-        // an abort's rewind is: the head is leased, so nothing else can have
-        // taken the space between the claim and here.
+        // immediately behind the BEGIN. Those bytes were never journaled and
+        // the head is leased, so nothing else can have taken them.
         let entry_start = pending.addr + begin_size as usize;
         pending.size = begin_size;
-        if first_entry_size > 0 && !pending.seg.rewind_to(entry_start) {
+        if !pending.seg.rewind_to(entry_start) {
             warn!(
                 "chunk {} could not hand back the tail of a bracket claim in segment {}; the \
                  caller's entry takes fresh space and these bytes become padding",
@@ -1748,7 +2245,7 @@ impl Chunk {
         }
         // Dropping it journals the BEGIN, exactly like any other entry.
         drop(pending);
-        Ok(())
+        Ok(true)
     }
 
     fn try_acquire_claim(
@@ -1773,7 +2270,6 @@ impl Chunk {
             return Err(WriteError::ServerShuttingDown);
         }
         let mut tried_gc = false;
-        let mut gc_waits = 0usize;
         let mut queueing_since: Option<std::time::Instant> = None;
         let backoff = Backoff::new();
         let slots = self.head_slots(segment_class);
@@ -2018,21 +2514,9 @@ impl Chunk {
                 continue;
             }
             if near_wall && !tried_gc {
-                // A pass already holding this chunk's GC lock IS the reclaim
-                // this write is waiting for. Without `full_gc` the emergency
-                // pass steps aside from it (try_lock) and would count that
-                // no-op as the one attempt; wait for the running pass to
-                // finish instead and re-judge the headroom. Bounded, in case
-                // passes come back to back under pressure.
-                if !full_gc && self.gc_lock.is_locked() && gc_waits < MAX_EMERGENCY_GC_WAITS {
-                    gc_waits += 1;
-                    debug!(
-                        "Chunk {} near capacity with a GC pass in progress; waiting for it ({}/{})",
-                        self.id, gc_waits, MAX_EMERGENCY_GC_WAITS
-                    );
-                    drop(self.gc_lock.lock());
-                    continue;
-                }
+                // The caller can hold a cell-index lock that a running
+                // cleaner needs. Waiting for its GC lock creates a lock cycle.
+                // Best-effort collection uses try_lock and must stay nonblocking.
                 warn!(
                     "Chunk {} near capacity ({} writer segment(s) left), emergency {} GC",
                     self.id,
@@ -4476,17 +4960,6 @@ impl Chunks {
         chunks_arc
     }
 
-    /// Sync all buffered WAL data to disk across all chunks
-    /// Close every bracket this transaction opened, in every chunk it wrote.
-    ///
-    /// Called at commit BEFORE the transactional segments are fsynced, so the
-    /// COMMIT records ride the same sync as the entries they commit. Written
-    /// after them and synced with them is the ordering that makes "committed"
-    /// mean "durable": a COMMIT that reached disk while an entry it commits
-    /// did not would be a bracket claiming more than the log holds.
-    ///
-    /// A failure here is a failed commit, not a warning: the caller must not
-    /// acknowledge a transaction whose bracket could not be closed.
     /// The address window this store's chunks were carved out of. Used to
     /// tell this store's leases apart from another store's in the same
     /// process, where the process-global lease map holds both.
@@ -4494,16 +4967,35 @@ impl Chunks {
         self.base_addr..self.base_addr + self.total_size
     }
 
+    /// Close every bracket this transaction opened, in every chunk it wrote,
+    /// and make the COMMIT records durable.
+    ///
+    /// Runs at the DECISION, after the transaction's entries were fsynced at
+    /// apply. That two-round order is the cross-chunk rule: a surviving
+    /// COMMIT then proves every entry of the transaction was already durable,
+    /// so one COMMIT anywhere decides the whole transaction at recovery.
+    ///
+    /// `Ok` means every open part of the transaction carries its own COMMIT
+    /// and every one of those records is fsynced; nothing less. Any failure
+    /// is a failed commit the caller must not acknowledge, and a retry
+    /// finishes what an earlier attempt started (parts already closed are
+    /// skipped).
+    ///
+    /// A transaction holding no lease here has nothing bracketed to close: a
+    /// read-only one, one whose writes all failed, or one whose writes could
+    /// not be given a head and went out unbracketed (and were fsynced at
+    /// apply). That is answered `Ok`, which makes it the CALLER's job to know
+    /// that no other exit -- an abort, a sweeper -- already ended the leases
+    /// of a transaction that did write; `DataManager` keeps that knowledge in
+    /// the transaction object it serializes every decision through.
     pub fn commit_transaction_brackets(
         &self,
         txn: &crate::server::transactions::TxnId,
     ) -> Result<(), WriteError> {
-        if !transaction_has_leases(txn, &self.address_range()) {
-            // A read-only transaction, or one whose writes all failed. There
-            // is no bracket to close and nothing to commit.
+        let manifest = transaction_manifest(txn, &self.address_range());
+        if manifest.is_empty() {
             return Ok(());
         }
-        let manifest = transaction_manifest(txn, &self.address_range());
         let chunk_ids: Vec<u16> = {
             let mut ids: Vec<u16> = manifest.iter().map(|member| member.chunk_id).collect();
             ids.sort_unstable();
@@ -4537,6 +5029,7 @@ impl Chunks {
         Ok(())
     }
 
+    /// Sync all buffered WAL data to disk across all chunks.
     pub fn sync_all(&self) {
         info!("Syncing WAL for all chunks...");
         let mut failures = 0usize;
@@ -5536,7 +6029,7 @@ mod tests {
         );
         let txn = test_txn_id(77);
 
-        set_transaction_id(Some(txn.clone()));
+        let scope = TransactionScope::enter(txn.clone());
         let a = first.list[0]
             .try_acquire(64, false)
             .expect("lease in the first store");
@@ -5546,13 +6039,20 @@ mod tests {
         assert!(a.leased && b.leased);
         drop(a);
         drop(b);
-        set_transaction_id(None);
+        drop(scope);
 
         assert_eq!(transaction_lease_count(&txn, &first.address_range()), 1);
         assert_eq!(transaction_lease_count(&txn, &second.address_range()), 1);
 
-        // The first store decides. It must release ITS head and nothing else.
-        assert_eq!(release_transaction_leases(&txn, &first.address_range()), 1);
+        // The first store decides. It must close and release ITS head and
+        // nothing else.
+        first
+            .commit_transaction_brackets(&txn)
+            .expect("first store commits");
+        assert_eq!(
+            release_transaction_leases(&txn, &first.address_range()),
+            Ok(1)
+        );
         assert_eq!(transaction_lease_count(&txn, &first.address_range()), 0);
         assert_eq!(
             transaction_lease_count(&txn, &second.address_range()),
@@ -5573,7 +6073,13 @@ mod tests {
             "the manifest a store writes names only chunks it owns"
         );
 
-        assert_eq!(release_transaction_leases(&txn, &second.address_range()), 1);
+        second
+            .commit_transaction_brackets(&txn)
+            .expect("second store commits");
+        assert_eq!(
+            release_transaction_leases(&txn, &second.address_range()),
+            Ok(1)
+        );
         assert_eq!(transaction_lease_count(&txn, &second.address_range()), 0);
     }
 
@@ -5593,7 +6099,7 @@ mod tests {
         let chunk = &chunks.list[0];
         let txn = test_txn_id(41);
 
-        set_transaction_id(Some(txn.clone()));
+        let scope = TransactionScope::enter(txn.clone());
         let first = chunk.try_acquire(64, false).expect("first entry");
         let first_seg = first.seg.id;
         assert!(first.leased, "a transactional claim must take a lease");
@@ -5614,9 +6120,14 @@ mod tests {
             "reusing a leased head must not open a second lease"
         );
         drop(second);
-        set_transaction_id(None);
+        drop(scope);
 
-        assert_eq!(release_transaction_leases(&txn, &chunks.address_range()), 1);
+        // Decided: every bracket closed, so the heads may go back.
+        chunks.commit_transaction_brackets(&txn).expect("commit");
+        assert_eq!(
+            release_transaction_leases(&txn, &chunks.address_range()),
+            Ok(1)
+        );
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
 
         // Released: an ordinary writer can take the head again.
@@ -5628,13 +6139,17 @@ mod tests {
         );
     }
 
-    /// An aborted transaction's writes VANISH: the cursor goes back and the
-    /// span becomes padding a walk steps over.
+    /// An aborted transaction's writes VANISH: the span becomes ONE padding
+    /// entry a walk steps over, and the head goes back to the pool with no
+    /// bracket open in it.
     ///
     /// Only ownership makes this expressible. If another writer could have
     /// appended behind the transaction, its bytes would sit inside the span
     /// being disowned -- so the lease running to the decision is not a
     /// convenience here, it is the precondition.
+    ///
+    /// The cursor does NOT go back (see `Segment::disown_span`): the next
+    /// ordinary entry lands BEHIND the padding, in the same head.
     #[test]
     fn an_aborted_transaction_leaves_no_entries_behind() {
         let _ = env_logger::try_init();
@@ -5642,7 +6157,7 @@ mod tests {
         let chunk = &chunks.list[0];
         let txn = test_txn_id(77);
 
-        set_transaction_id(Some(txn.clone()));
+        let scope = TransactionScope::enter(txn.clone());
         let first = chunk.try_acquire(64, false).expect("first entry");
         let seg = first.seg.clone();
         // Where the transaction found the cursor. Its BEGIN is the first
@@ -5662,21 +6177,30 @@ mod tests {
         drop(first);
         let second = chunk.try_acquire(64, false).expect("second entry");
         drop(second);
+        drop(scope);
         let after = seg.append_header.load(Ordering::Acquire);
         assert!(
             after > before,
             "the transaction must have advanced the cursor before we undo it"
         );
-        set_transaction_id(None);
+        assert!(seg.bracket_is_open(), "the BEGIN must be marked open");
+        assert!(
+            seg.try_release_own().is_err(),
+            "a head with an open bracket and room behind it must never be released"
+        );
 
-        assert_eq!(rewind_transaction_writes(&txn, &chunks.address_range()), 1);
+        assert_eq!(
+            rewind_transaction_writes(&txn, &chunks.address_range()),
+            Ok(1)
+        );
         assert_eq!(
             seg.append_header.load(Ordering::Acquire),
-            before,
-            "the cursor must be back where the transaction found it"
+            after,
+            "the cursor stays: the span is disowned, not handed out again"
         );
         // The bytes are still in the WAL, so what matters is that a walk over
-        // them finds padding rather than entries.
+        // them finds padding rather than entries -- one entry, covering the
+        // whole span, BEGIN included.
         let (header, _) = crate::ram::entry::Entry::decode_from(before, |_, _| {});
         assert_eq!(
             header.entry_type,
@@ -5684,19 +6208,339 @@ mod tests {
             "the disowned span must read as padding, not as the entries it used to hold"
         );
         assert_eq!(
-            crate::ram::entry::verify_entry_at(before, seg.bound()),
-            Some(true),
-            "and that padding must vouch for itself like any other entry"
+            crate::ram::entry::ENTRY_HEAD_SIZE + header.content_length as usize,
+            after - before,
+            "one padding entry must cover the whole span"
         );
-        // The head is back in circulation.
+        assert_ne!(
+            crate::ram::entry::verify_entry_at(before, seg.bound()),
+            Some(false),
+            "and a walk must accept it"
+        );
+        assert!(!seg.bracket_is_open());
+        // The head is back in circulation, with the next entry behind the
+        // padding.
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
         let plain = chunk
             .try_acquire(64, false)
             .expect("plain entry after abort");
         assert_eq!(plain.seg.id, seg.id);
+        assert_eq!(plain.addr, after);
+    }
+
+    /// A rewind that cannot be journaled is a typed error, the head is never
+    /// reused, and nothing is ever appended behind the BEGIN it leaves.
+    ///
+    /// The failure injected is the real one: the head's journal gate closes,
+    /// which is what a shutdown archive does to a head it seals.
+    #[test]
+    fn a_rewind_that_cannot_be_journaled_retires_the_head() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(78);
+
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).expect("entry");
+        let seg = entry.seg.clone();
+        drop(entry);
+        drop(scope);
+        let begin_at = seg.addr;
+        let cursor = seg.append_header.load(Ordering::Acquire);
+
+        seg.close_journal_gate();
+        let failures = TXN_REWIND_FAILURES.load(Ordering::Relaxed);
+        match rewind_transaction_writes(&txn, &chunks.address_range()) {
+            Err(LeaseExitError::RewindFailed { segment_id, .. }) => {
+                assert_eq!(segment_id, seg.id)
+            }
+            other => panic!("expected a typed RewindFailed, got {other:?}"),
+        }
+        assert!(TXN_REWIND_FAILURES.load(Ordering::Relaxed) > failures);
+        // The memory still agrees with the log: the BEGIN stands, uncommitted.
+        let (header, _) = crate::ram::entry::Entry::decode_from(begin_at, |_, _| {});
+        assert_eq!(header.entry_type, crate::ram::entry::EntryType::BEGIN);
+        // And the head is RETIRED: full, so nothing lands behind that BEGIN.
+        assert!(!seg.can_still_append());
+        assert_eq!(seg.append_header.load(Ordering::Acquire), seg.bound());
+        let (tail, _) = crate::ram::entry::Entry::decode_from(cursor, |_, _| {});
+        assert_eq!(tail.entry_type, crate::ram::entry::EntryType::PADDING);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
+
+        seg.reopen_journal_gate();
+        let plain = chunk.try_acquire(64, false).expect("plain entry");
+        assert_ne!(
+            plain.seg.id, seg.id,
+            "a retired head must never take another writer's entry"
+        );
+    }
+
+    /// The class-closing invariant at the lease level: a plain release of a
+    /// transaction that still has an open bracket is REFUSED, and changes
+    /// nothing, so the right exit can still be taken afterwards.
+    #[test]
+    fn releasing_an_open_bracket_is_refused() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(79);
+
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).expect("entry");
+        let seg = entry.seg.clone();
+        drop(entry);
+        drop(scope);
+
+        let refused = crate::ram::segs::OPEN_BRACKET_RELEASES_REFUSED.load(Ordering::Relaxed);
+        match release_transaction_leases(&txn, &chunks.address_range()) {
+            Err(LeaseExitError::OpenBracket(open)) => assert_eq!(open.segment_id, seg.id),
+            other => panic!("expected the release to be refused, got {other:?}"),
+        }
+        assert!(crate::ram::segs::OPEN_BRACKET_RELEASES_REFUSED.load(Ordering::Relaxed) > refused);
         assert_eq!(
-            plain.addr, before,
-            "the reclaimed span is reused, so an abort costs no space at all"
+            transaction_lease_count(&txn, &chunks.address_range()),
+            1,
+            "a refused release must leave the lease exactly as it was"
+        );
+        assert!(seg.is_head_owned() && seg.bracket_is_open());
+
+        // The ordinary writer that would have appended behind the BEGIN goes
+        // elsewhere.
+        let plain = chunk.try_acquire(64, false).expect("plain entry");
+        assert_ne!(plain.seg.id, seg.id);
+        drop(plain);
+
+        // The single release point refuses on its own, too.
+        assert!(seg.try_release_own().is_err());
+        assert!(seg.is_head_owned());
+
+        // Closing the bracket is what makes the release legal.
+        chunks.commit_transaction_brackets(&txn).expect("commit");
+        assert!(seg.bracket_is_committed());
+        assert_eq!(
+            release_transaction_leases(&txn, &chunks.address_range()),
+            Ok(1)
+        );
+        assert!(!seg.is_head_owned());
+    }
+
+    /// INVARIANT B, the fence: a thread still writing for a transaction that
+    /// has been ended -- the slow owner of an expired lease -- must fail,
+    /// never land in the segment it used to own, which by then has been
+    /// rewound and handed to another writer.
+    #[test]
+    fn a_stale_owner_cannot_write_after_its_transaction_was_ended() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(81);
+        let range = chunks.address_range();
+
+        // The owner: its scope stays live throughout, as a slow thread's would.
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).expect("owner's first write");
+        let seg = entry.seg.clone();
+        drop(entry);
+
+        // Expiry (= abort) on another thread: rewind, then the head goes back.
+        std::thread::scope(|s| {
+            s.spawn(|| assert_eq!(rewind_transaction_writes(&txn, &range), Ok(1)))
+                .join()
+                .unwrap();
+            // Reassignment: an ordinary writer elsewhere takes the head.
+            s.spawn(|| {
+                let plain = chunks.list[0].try_acquire(64, false).expect("plain write");
+                drop(plain);
+            })
+            .join()
+            .unwrap();
+        });
+        assert!(!seg.bracket_is_open());
+
+        // The owner wakes up and writes.
+        let stale = TXN_STALE_OWNER_WRITES.load(Ordering::Relaxed);
+        assert!(
+            matches!(
+                chunk.try_acquire(64, false),
+                Err(WriteError::TransactionRevoked)
+            ),
+            "a stale owner's write must fail"
+        );
+        assert!(TXN_STALE_OWNER_WRITES.load(Ordering::Relaxed) > stale);
+        assert_eq!(
+            transaction_lease_count(&txn, &range),
+            0,
+            "and must not open a fresh bracket for a transaction that is gone"
+        );
+        drop(scope);
+        assert!(
+            TXN_LEASES.lock().get(&txn).is_none(),
+            "the fence record lives only while a scope can still write"
+        );
+    }
+
+    /// The fence also covers a write the stale owner had ALREADY claimed when
+    /// the revocation came: the rewind waits for it to land and pads over it.
+    #[test]
+    fn a_rewind_waits_for_the_stale_owners_write_in_flight() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(82);
+        let range = chunks.address_range();
+
+        let scope = TransactionScope::enter(txn.clone());
+        drop(chunk.try_acquire(64, false).expect("first write"));
+        let in_flight = chunk.try_acquire(64, false).expect("second write, claimed");
+        let seg = in_flight.seg.clone();
+        let in_flight_end = in_flight.addr + in_flight.size as usize;
+
+        std::thread::scope(|s| {
+            let rewind = s.spawn(|| rewind_transaction_writes(&txn, &range));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !rewind.is_finished(),
+                "the rewind must wait for the claimed write"
+            );
+            drop(in_flight);
+            assert_eq!(rewind.join().unwrap(), Ok(1));
+        });
+        let (header, _) = crate::ram::entry::Entry::decode_from(seg.addr, |_, _| {});
+        assert_eq!(header.entry_type, crate::ram::entry::EntryType::PADDING);
+        assert!(
+            seg.addr + crate::ram::entry::ENTRY_HEAD_SIZE + header.content_length as usize
+                >= in_flight_end,
+            "the padding must cover the write that was in flight"
+        );
+        drop(scope);
+    }
+
+    /// A transaction spanning chunks is rewound in every one of them, and
+    /// fenced in every one of them.
+    #[test]
+    fn a_multi_chunk_transaction_is_rewound_and_fenced_everywhere() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(2, 2 * TEST_CHUNK_SIZE_MULTI);
+        let txn = test_txn_id(83);
+        let range = chunks.address_range();
+
+        let scope = TransactionScope::enter(txn.clone());
+        let segs: Vec<_> = chunks
+            .list
+            .iter()
+            .map(|chunk| {
+                let entry = chunk.try_acquire(64, false).expect("write");
+                assert!(entry.leased);
+                entry.seg.clone()
+            })
+            .collect();
+        assert_eq!(transaction_lease_count(&txn, &range), 2);
+        assert_eq!(rewind_transaction_writes(&txn, &range), Ok(2));
+        for seg in &segs {
+            let (header, _) = crate::ram::entry::Entry::decode_from(seg.addr, |_, _| {});
+            assert_eq!(header.entry_type, crate::ram::entry::EntryType::PADDING);
+            assert!(!seg.bracket_is_open() && !seg.is_head_owned());
+        }
+        for chunk in chunks.list.iter() {
+            assert!(matches!(
+                chunk.try_acquire(64, false),
+                Err(WriteError::TransactionRevoked)
+            ));
+        }
+        drop(scope);
+    }
+
+    /// No unbracketed fallback: a chunk that can never spare a head refuses a
+    /// transactional write outright, typed, instead of writing it outside
+    /// the bracket (where it would survive a crash its transaction does not).
+    #[test]
+    fn a_transaction_with_no_head_to_spare_fails_instead_of_writing_unbracketed() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(84);
+        let scope = TransactionScope::enter(txn.clone());
+        assert!(matches!(
+            chunk.try_acquire(64, false),
+            Err(WriteError::TransactionHeadUnavailable)
+        ));
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
+        drop(scope);
+        // Ordinary writes are unaffected.
+        drop(chunk.try_acquire(64, false).expect("plain write"));
+    }
+
+    /// INVARIANT B at context exit: a scope restores what was named before,
+    /// on a normal exit and on an unwind alike.
+    #[test]
+    fn a_transaction_scope_never_outlives_its_region() {
+        let outer = test_txn_id(85);
+        let inner = test_txn_id(86);
+        {
+            let _outer = TransactionScope::enter(outer.clone());
+            {
+                let _inner = TransactionScope::enter(inner.clone());
+                assert_eq!(current_txn(), Some(inner.clone()));
+            }
+            assert_eq!(current_txn(), Some(outer.clone()));
+            let unwound = std::panic::catch_unwind(|| {
+                let _inner = TransactionScope::enter(inner.clone());
+                panic!("dies inside the transaction");
+            });
+            assert!(unwound.is_err());
+            assert_eq!(current_txn(), Some(outer.clone()), "restored on unwind");
+        }
+        assert_eq!(current_txn(), None);
+        assert!(!is_in_transaction());
+        assert!(TXN_LEASES.lock().get(&outer).is_none());
+        assert!(TXN_LEASES.lock().get(&inner).is_none());
+    }
+
+    /// The commit reserve: a part whose write set runs it to the last bytes
+    /// still closes with its OWN COMMIT, so no part ever depends on another
+    /// part's record (which the cleaner may compact away).
+    #[test]
+    fn a_full_part_still_closes_with_its_own_commit() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(80);
+
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).expect("entry");
+        let first_seg = entry.seg.clone();
+        drop(entry);
+        // Fill the part: ask for exactly what is left. The reserve refuses
+        // it, so it continues in a fresh part instead of eating the room the
+        // first part needs for its COMMIT.
+        let left = first_seg.bound() - first_seg.append_header.load(Ordering::Acquire);
+        let filler = chunk.try_acquire(left as u32, false).expect("filler");
+        assert_ne!(filler.seg.id, first_seg.id, "the reserve must not be spent");
+        let second_seg = filler.seg.clone();
+        drop(filler);
+        // And the largest entry the first part can still take leaves exactly
+        // the reserve.
+        let fits = first_seg.bound()
+            - first_seg.append_header.load(Ordering::Acquire)
+            - crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE;
+        assert!(first_seg
+            .try_acquire_reserving(fits as u32 + 8, crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE)
+            .is_none());
+        drop(scope);
+
+        chunks.commit_transaction_brackets(&txn).expect("commit");
+        for seg in [&first_seg, &second_seg] {
+            let types = entry_types_in(seg);
+            assert_eq!(types.first(), Some(&crate::ram::entry::EntryType::BEGIN));
+            assert_eq!(
+                types.last(),
+                Some(&crate::ram::entry::EntryType::COMMIT),
+                "every part must close with its own COMMIT: {types:?}"
+            );
+        }
+        assert_eq!(
+            release_transaction_leases(&txn, &chunks.address_range()),
+            Ok(2)
         );
     }
 
@@ -5772,7 +6616,7 @@ mod tests {
         let chunk = &chunks.list[0];
         let txn = test_txn_id(91);
 
-        set_transaction_id(Some(txn.clone()));
+        let scope = TransactionScope::enter(txn.clone());
         let regular = chunk
             .try_acquire_in_class(64, false, SegmentClass::Regular)
             .expect("regular entry");
@@ -5859,8 +6703,11 @@ mod tests {
             );
         }
 
-        set_transaction_id(None);
-        assert_eq!(release_transaction_leases(&txn, &chunks.address_range()), 2);
+        drop(scope);
+        assert_eq!(
+            release_transaction_leases(&txn, &chunks.address_range()),
+            Ok(2)
+        );
     }
 
     /// Walk a segment's live extent and report what kind of entry sits where.
@@ -5884,6 +6731,12 @@ mod tests {
     /// A head held past its transaction is a writer slot gone from the pool,
     /// and the pool has no refill path -- so a transaction that never
     /// reaches a decision must have its heads reclaimed on a timer.
+    ///
+    /// Reclaimed by RETIRING: the sweeper knows nothing about the cell index,
+    /// so it leaves the bracket exactly as it is (uncommitted, discarded by
+    /// recovery) and fills the head, which the next writer rotates out. The
+    /// slot comes back; the segment with the open BEGIN never takes another
+    /// writer's entry.
     #[test]
     fn an_undecided_transaction_has_its_heads_reclaimed() {
         let _ = env_logger::try_init();
@@ -5891,11 +6744,11 @@ mod tests {
         let chunk = &chunks.list[0];
         let txn = test_txn_id(42);
 
-        set_transaction_id(Some(txn.clone()));
+        let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("entry");
-        let seg = entry.seg.id;
+        let seg = entry.seg.clone();
         drop(entry);
-        set_transaction_id(None);
+        drop(scope);
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
 
         // Not yet: a transaction that is merely slow keeps its heads.
@@ -5922,11 +6775,16 @@ mod tests {
             "an undecided transaction must be reported so it can be settled"
         );
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
+        assert!(!seg.is_head_owned(), "the head must not stay a hostage");
+        assert!(
+            !seg.can_still_append(),
+            "the head still holds an open BEGIN, so it must be full"
+        );
 
         let plain = chunk.try_acquire(64, false).expect("entry after expiry");
-        assert_eq!(
-            plain.seg.id, seg,
-            "the reclaimed head must be usable again, not stranded"
+        assert_ne!(
+            plain.seg.id, seg.id,
+            "nothing may be appended behind the expired transaction's BEGIN"
         );
     }
 
@@ -6096,6 +6954,66 @@ mod tests {
         );
         finish_tx.send(()).unwrap();
         pinning.join().expect("pinning thread");
+    }
+
+    /// A best-effort allocation must return while another cleaner owns the
+    /// GC lock. The caller holds a cell-index lock that the cleaner needs.
+    #[test]
+    fn an_update_does_not_wait_for_gc_while_holding_the_cell_index() {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("gc_index_lock_cycle", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let before = chunks.write_cell(&mut cell).unwrap();
+        while chunk.allocator.writer_headroom() > 1 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            chunk.put_segment(seg);
+        }
+        assert_eq!(chunk.allocator.writer_headroom(), 1);
+        for slot in chunk.head_pool.iter() {
+            let id = slot.load(Ordering::Acquire);
+            if let Some(seg) = chunk.segs.get(&(id as usize)) {
+                seg.retire_tail();
+            }
+        }
+
+        // Model the cleaner's GC lock. Keep it held until the update has
+        // returned. A cleaner can need the same cell-index lock during combine.
+        let gc = chunk.gc_lock.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let schema_id = schema.vid;
+        let writer = std::thread::spawn(move || {
+            let result =
+                writer_chunks.update_cell_by(&id, |_| Some(payload_cell(schema_id.get(), &id, 64)));
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(gc);
+        writer.join().unwrap();
+        let updated = result
+            .expect("the update waited for GC while holding the cell-index lock")
+            .expect("the last writer segment can hold the update");
+        assert_eq!(updated.header.version, before.version + 1);
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().header.version,
+            updated.header.version
+        );
     }
 
     /// A chunk whose allocator is empty must refuse the write, not wedge.

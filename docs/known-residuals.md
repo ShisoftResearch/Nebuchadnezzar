@@ -208,3 +208,39 @@ lock actually needs; do not guess from the argument names.
 **Worth knowing generally:** whatever gate this project runs should include
 the integration binaries, or the next one to rot will also take months to
 notice.
+
+---
+
+## Startup trap in Lightning's RPC-client map (2026-10-09)
+
+**Status: open.** The H1 durability campaign records this finding only.
+The user excluded further investigation from this task.
+
+**Observed:** Two churn children exited during startup, before `SCANNED`.
+The kernel recorded a `trap stack segment` for each child:
+
+| Time (EDT) | PID | Binary | Offset | Churn cycle |
+|---|---:|---|---|---:|
+| 06:02:10 | 3890484 | `neb_crash_churn-fix` | `0x381bf2f` | 13 |
+| 06:08:09 | 3917855 | `neb_crash_churn-continue-head` | `0x381bb2f` | 5 |
+
+**Observed:** `addr2line -f -C` resolved both offsets to
+`lightning::map::base::Table::copy_slab_range`.
+The table stores `Arc<bifrost::rpc::RPCClient>` values through
+`lightning::map::ptr_map::PtrValAttachment`.
+The symbol lookup did not supply a source line.
+This identifies the instruction location. It does not establish the cause.
+
+**Observed:** The preceding 12 and 4 cycles reported `torn=0`.
+Neither campaign completed 100 cycles.
+The failed stores remain available for a separate investigation.
+
+Evidence is under `/mnt/ext/morpheus-fixes/txn-fix/`:
+
+- `runs/continue-startup-trap-kernel.txt`: kernel messages.
+- `runs/continue-startup-trap-symbol-{old,head}.txt`: symbol lookup results.
+- `churn-capacity/run.out`: cycle 13 stopped before `SCANNED`.
+- `churn-final/run.out`: cycle 5 stopped before `SCANNED`.
+- `churn-capacity/data` and `churn-final/data`: failed stores.
+
+No Lightning or bifrost code changed for this finding.

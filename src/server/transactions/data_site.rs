@@ -132,6 +132,26 @@ pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelay
     PrepareDelayHandle { key, state }
 }
 
+/// Test hook: panic inside the apply burst right after this cell is written,
+/// to drive the abort-on-unwind path through the real write loop.
+#[cfg(test)]
+static APPLY_PANIC_HOOKS: OnceLock<Mutex<BTreeSet<(TxnId, Id)>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_apply_panic_after_cell(tid: TxnId, id: Id) {
+    APPLY_PANIC_HOOKS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .insert((tid, id));
+}
+
+#[cfg(test)]
+fn take_apply_panic_hook(tid: &TxnId, id: &Id) -> bool {
+    APPLY_PANIC_HOOKS
+        .get()
+        .is_some_and(|hooks| hooks.lock().remove(&(tid.clone(), *id)))
+}
+
 #[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
@@ -280,6 +300,14 @@ struct Transaction {
     /// prepare path -- paid by every transaction, to serve a case that is
     /// already covered by the broadcast.
     participants: Vec<u64>,
+    /// This site was told to COMMIT and has started writing COMMIT records.
+    ///
+    /// From here the transaction can only be finished, never aborted: one
+    /// durable COMMIT anywhere decides the transaction at recovery, so a
+    /// presumed abort that rolled it back and padded over its spans would
+    /// tear it. Set under the transaction lock before the first record is
+    /// written, and checked by every abort path under the same lock.
+    decided_commit: bool,
 }
 
 #[derive(Debug)]
@@ -413,35 +441,9 @@ impl DataManager {
                     manager_clone.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
                 }
-                // Reclaim write heads from transactions that went silent.
-                //
-                // A participant that aborted keeps its transaction (and its
-                // heads) until `end` arrives; a coordinator that dies never
-                // sends one. Without this the head is held for the life of
-                // the process, and since the pool has no refill path that is
-                // one writer slot gone from that chunk permanently. The
-                // entries themselves stay exactly where they are and are
-                // settled discard-unless-COMMIT, which is the same rule a
-                // crash in the same window already gets.
-                // Ask the other participants before presuming abort.
-                //
-                // This runs FIRST, and the order is the whole point: the
-                // release below throws away the leases, and closing a
-                // bracket needs them.
-                let hold = manager_clone
-                    .terminate_in_doubt_transactions(
-                        txn_lease_timeout(),
-                        termination_answer_grace(),
-                    )
+                manager_clone
+                    .sweep_idle_transactions(txn_lease_timeout(), termination_answer_grace())
                     .await;
-
-                for tid in crate::ram::chunk::expire_transaction_leases(
-                    txn_lease_timeout(),
-                    &manager_clone.chunks().address_range(),
-                    &hold,
-                ) {
-                    manager_clone.wipe_out_transaction(&tid);
-                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -483,6 +485,7 @@ impl DataManager {
                 segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
                 pinned_reads: PinnedReadSet::default(),
                 participants: Vec::new(),
+                decided_commit: false,
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -705,10 +708,248 @@ impl DataManager {
         // transaction is a writer slot removed from its chunk's pool with no
         // refill path, so the release has to be impossible to forget on some
         // path nobody thought about.
-        crate::ram::chunk::release_transaction_leases(tid, &self.chunks().address_range());
+        //
+        // RETIRE, not a plain release: by now a commit has closed every
+        // bracket and an abort has rewound every span, so normally there is
+        // nothing left to do but hand the heads back. Anything still open is
+        // a path that ended the transaction without deciding it physically,
+        // and the one thing that must not happen to such a head is reaching
+        // another writer -- so it is filled instead, and its bracket left to
+        // recovery's discard.
+        if let Err(error) =
+            crate::ram::chunk::retire_transaction_leases(tid, &self.chunks().address_range())
+        {
+            error!(
+                "transaction {:?} did not give its write heads back cleanly: {}",
+                tid, error
+            );
+        }
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
+
+    /// Undo an applied transaction: restore the cell index from its history,
+    /// then rewind its spans, then let its heads go. The caller holds the
+    /// transaction lock and the cells' meta locks.
+    ///
+    /// In THAT order, and the order is the fix. The heads stay leased through
+    /// the rollback, so nothing can be appended behind the transaction's open
+    /// BEGIN while it runs; the rollback's own writes are ordinary and go to
+    /// other heads, which a lease can never all take
+    /// (`can_spare_a_head_for_lease`). Only once the index names nothing in
+    /// the spans are they padded over, journaled, and only then are the heads
+    /// released -- with no bracket left open in them.
+    ///
+    /// A rollback that failed for any cell may leave the index naming that
+    /// cell's entry inside the span, and padding over an indexed entry would
+    /// leave the index pointing into space the cleaner then frees. So the
+    /// spans are left as uncommitted brackets in RETIRED heads instead:
+    /// recovery discards them, and no writer appends behind them.
+    fn rollback_and_rewind(
+        &self,
+        tid: &TxnId,
+        txn: &mut Transaction,
+    ) -> Option<Vec<RollbackFailure>> {
+        debug!(
+            ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
+            txn.history.len(),
+            tid
+        );
+        let failures = self.rollback(&txn.history);
+        let failures = (!failures.is_empty()).then_some(failures);
+        txn.last_activity = get_time();
+        txn.state = TxnState::Aborted;
+        let store = self.chunks().address_range();
+        let ended = match failures {
+            None => crate::ram::chunk::rewind_transaction_writes(tid, &store),
+            Some(_) => crate::ram::chunk::retire_transaction_leases(tid, &store),
+        };
+        if let Err(error) = ended {
+            error!(
+                "transaction {:?} aborted but its write heads did not end cleanly: {}",
+                tid, error
+            );
+        }
+        failures
+    }
+
+    /// The abort decision, with the transaction lock held.
+    fn abort_locked(&self, tid: &TxnId, txn: &mut Transaction) -> AbortResult {
+        if txn.state == TxnState::Aborted {
+            return AbortResult::CheckFailed(CheckError::AlreadyAborted);
+        }
+        if txn.decided_commit {
+            // Told to commit, and possibly already durable as committed: an
+            // abort here would tear the transaction, whoever asks for it.
+            return AbortResult::CheckFailed(CheckError::AlreadyCommitted);
+        }
+        #[cfg(test)]
+        if Self::take_matching_abort_cannot_end(tid, &txn.affected_cells) {
+            return AbortResult::CheckFailed(CheckError::CannotEnd);
+        }
+
+        if txn.history.is_empty() {
+            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+            txn.last_activity = get_time();
+            txn.state = TxnState::Aborted;
+            // Nothing was applied, but a bracket may still have been OPENED:
+            // a write that failed after its BEGIN landed leaves a BEGIN-only
+            // span, and its head must not go back to the pool with it open.
+            // With nothing in the history, nothing in the index names the
+            // span, so it is rewound like any other.
+            if let Err(error) =
+                crate::ram::chunk::rewind_transaction_writes(tid, &self.chunks().address_range())
+            {
+                error!(
+                    "transaction {:?} aborted with nothing applied, but its write heads did not \
+                     end cleanly: {}",
+                    tid, error
+                );
+            }
+            drop(guards_to_drop);
+            return AbortResult::Success(None);
+        }
+
+        let Some(coordinator_id) = txn.coordinator_id else {
+            return AbortResult::CheckFailed(CheckError::CannotEnd);
+        };
+        let expected_owner = TxnPriority::new(tid.clone(), coordinator_id);
+        let guarded_cell_ids = Self::guarded_txn_cell_ids(txn);
+        let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
+        for cell_id in &guarded_cell_ids {
+            cell_mutexes.push(self.cell_meta_mutex(cell_id));
+        }
+        let mut cell_guards = Vec::with_capacity(cell_mutexes.len());
+        for cell_mutex in &cell_mutexes {
+            cell_guards.push(cell_mutex.lock());
+        }
+        if cell_guards
+            .iter()
+            .any(|meta| meta.owner.as_ref() != Some(&expected_owner))
+        {
+            return AbortResult::CheckFailed(CheckError::CannotEnd);
+        }
+
+        // Keep segment references and metadata guards alive throughout rollback so the owner
+        // cannot be reclaimed between validation and the storage mutations.
+        let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+        let rollback_failures = self.rollback_and_rewind(tid, txn);
+        drop(cell_guards);
+        drop(guards_to_drop);
+        AbortResult::Success(rollback_failures)
+    }
+
+    /// One pass of the participant's lease sweeper.
+    ///
+    /// A transaction holding write heads past `idle` has lost its
+    /// coordinator, or is about to be told something late. In order:
+    ///
+    /// 1. Ask the other participants (cooperative termination) and finish
+    ///    the ones a peer reports committed. Runs first because closing a
+    ///    bracket needs the leases every later step gives up.
+    /// 2. Presume abort for the rest this site knows: the same rollback,
+    ///    rewind and release an explicit abort performs, under the same
+    ///    transaction lock -- which is also what makes a slow owner safe. An
+    ///    apply still running holds that lock, so the sweep waits for it
+    ///    rather than padding over a span that is still growing; and a late
+    ///    `end` finds the transaction gone and is refused, rather than told
+    ///    it committed something whose spans were just disowned.
+    /// 3. Retire whatever is left: leases no participant object knows about.
+    pub(crate) async fn sweep_idle_transactions(
+        &self,
+        idle: std::time::Duration,
+        grace: std::time::Duration,
+    ) {
+        let hold = self.terminate_in_doubt_transactions(idle, grace).await;
+        let store = self.chunks().address_range();
+        for tid in crate::ram::chunk::transactions_with_idle_leases(idle, &store) {
+            if hold.contains(&tid) {
+                continue;
+            }
+            self.presume_abort(&tid);
+        }
+        for tid in crate::ram::chunk::expire_transaction_leases(idle, &store, &hold) {
+            self.wipe_out_transaction(&tid);
+        }
+    }
+
+    /// Presumed abort for a transaction whose coordinator went silent.
+    /// Returns whether the transaction was ended here.
+    fn presume_abort(&self, tid: &TxnId) -> bool {
+        let Some(txn_lock) = self.find_transaction(tid) else {
+            // Nothing to roll back here; the retire pass reclaims the heads.
+            return false;
+        };
+        let mut txn = txn_lock.lock();
+        if txn.decided_commit {
+            // Finishing it is the only option; termination retries the
+            // close, and the heads stay held until it succeeds.
+            return false;
+        }
+        let outcome = self.abort_locked(tid, &mut txn);
+        drop(txn);
+        match outcome {
+            AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
+                warn!(
+                    "transaction {:?} held its write heads past the lease timeout without a \
+                     decision; presumed ABORT, rolled back and rewound",
+                    tid
+                );
+            }
+            other => {
+                // Could not roll back (ownership moved, no coordinator, or a
+                // rollback failure). The wipe below retires whatever is still
+                // open, so no head leaves with its bracket open either way.
+                error!(
+                    "transaction {:?} held its write heads past the lease timeout; its presumed \
+                     abort ended with {:?}",
+                    tid, other
+                );
+            }
+        }
+        self.wipe_out_transaction(tid);
+        true
+    }
+    /// The commit decision's physical half: every bracket gets its COMMIT,
+    /// fsynced, and only then do the heads go back to the pool.
+    ///
+    /// Under the transaction lock, and re-checked there, because the decision
+    /// can race the lease sweeper: a sweep that already presumed abort has
+    /// rolled the transaction back and padded over its spans, and a COMMIT
+    /// written after that would commit nothing -- while a ram layer that finds
+    /// no leases answers `Ok`. So a transaction that is gone, or no longer in
+    /// the applied-and-undecided state, is refused here and the coordinator
+    /// is not told it committed. `decided_commit` is set before the first
+    /// record is written, which from then on keeps every abort path away.
+    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), String> {
+        let Some(txn_lock) = self.find_transaction(tid) else {
+            return Err("the transaction was ended here before its decision arrived".into());
+        };
+        let mut txn = txn_lock.lock();
+        if txn.state != TxnState::Committed {
+            return Err(format!(
+                "the transaction is {:?} here, not applied-and-undecided",
+                txn.state
+            ));
+        }
+        txn.decided_commit = true;
+        let store = self.chunks().address_range();
+        self.chunks()
+            .commit_transaction_brackets(tid)
+            .map_err(|error| format!("{error:?}"))?;
+        if let Err(error) = crate::ram::chunk::release_transaction_leases(tid, &store) {
+            // Every bracket carries its COMMIT, so this is unreachable; if it
+            // is reached, the final wipe retires the head rather than hand it
+            // over open.
+            error!(
+                "transaction {:?} committed but its heads could not be released: {}",
+                tid, error
+            );
+        }
+        drop(txn);
+        Ok(())
+    }
+
     /// Cooperative termination, participant side.
     ///
     /// A participant whose coordinator went silent knows its entries are
@@ -739,14 +980,34 @@ impl DataManager {
             // The transaction lock is READ and dropped before the network
             // call. Holding it across the await would also make this future
             // non-Send, which is how the first version announced itself.
-            let Some((state, participants)) = self.find_transaction(&tid).map(|txn_lock| {
-                let txn = txn_lock.lock();
-                (txn.state, txn.participants.clone())
-            }) else {
+            let Some((state, participants, decided_commit)) =
+                self.find_transaction(&tid).map(|txn_lock| {
+                    let txn = txn_lock.lock();
+                    (txn.state, txn.participants.clone(), txn.decided_commit)
+                })
+            else {
                 // No transaction object: this site cannot be the one holding
                 // a decision open, and the sweeper below reclaims the heads.
                 continue;
             };
+            if decided_commit {
+                // This site was TOLD to commit and could not finish closing
+                // its brackets. There is nothing to ask anyone: finish it.
+                // Until that succeeds the heads stay held -- presuming abort
+                // now would tear a transaction one COMMIT may already decide.
+                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                    .await
+                    .payload;
+                if !matches!(ended, EndResult::Success) {
+                    error!(
+                        "transaction {:?} was decided COMMIT here and still cannot close its \
+                         brackets: {:?}; holding its heads and retrying",
+                        tid, ended
+                    );
+                    hold.insert(tid);
+                }
+                continue;
+            }
             // `Committed` here means "entries durable", not "decided" -- see
             // `TxnOutcome`. Both it and `Prepared` are in doubt.
             if !matches!(state, TxnState::Prepared | TxnState::Committed) {
@@ -1309,195 +1570,224 @@ impl DataManager {
         // Name the transaction, not just "in a transaction": its writes lease
         // a head per chunk and hold it until the decision, so the write path
         // has to know WHOSE lease to write behind.
-        crate::ram::chunk::set_transaction_id(Some(tid.clone()));
-        let mut write_error: Option<(Id, WriteError)> = None;
-        {
-            for cell_op in cells {
-                match cell_op {
-                    CommitOp::Read(_, _) => continue,
-                    CommitOp::None => unreachable!("commit payload validation rejects None ops"),
-                    CommitOp::Write(mut cell) => {
-                        let cell_id = cell.id();
-                        let meta_index = guarded_cell_ids
-                            .binary_search(&cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
+        // A scope rather than a set/reset pair: an unwind skips a reset, and
+        // a thread left naming a dead transaction leases its next ORDINARY
+        // write into that transaction's bracket, where recovery discards it.
+        let txn_scope = crate::ram::chunk::TransactionScope::enter(tid.clone());
+        // A panic between BEGIN and the decision is an ABORT of this
+        // transaction, and is carried out as one -- index rolled back, spans
+        // rewound, heads released -- before the panic continues. Left to
+        // unwind on its own it held the heads with their BEGINs open until a
+        // sweeper came, while the index served cells recovery would discard.
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut write_error: Option<(Id, WriteError)> = None;
+            {
+                for cell_op in cells {
+                    match cell_op {
+                        CommitOp::Read(_, _) => continue,
+                        CommitOp::None => {
+                            unreachable!("commit payload validation rejects None ops")
                         }
+                        CommitOp::Write(mut cell) => {
+                            let cell_id = cell.id();
+                            let meta_index = guarded_cell_ids
+                                .binary_search(&cell_id)
+                                .expect("prepared cell metadata must exist");
+                            let meta = &mut cell_guards[meta_index];
+                            let should_skip = effective_ts < &meta.write;
+                            let write_ts = meta.write.clone();
 
-                        match self.chunks().write_cell(&mut cell) {
-                            Ok(header) => {
-                                txn.history
-                                    .insert(cell_id, CellHistory::new(None, header.version));
-                                meta.write = effective_ts.clone();
-                            }
-                            Err(error) => {
-                                write_error = Some((cell_id, error));
-                                break;
-                            }
-                        };
-                    }
-                    CommitOp::Remove(ref cell_id) => {
-                        let expected_version = txn
-                            .certified_present_version(cell_id)
-                            .expect("commit payload validation requires present certification");
-                        let meta_index = guarded_cell_ids
-                            .binary_search(cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
-
-                        let (cell_addr, old_cell_ref) = {
-                            let shared_cell = match self.chunks().read_cell(cell_id) {
-                                Ok(cell) => cell,
-                                Err(read_error) => {
-                                    write_error =
-                                        Some((*cell_id, WriteError::ReadError(read_error)));
-                                    break;
-                                }
-                            };
-                            if shared_cell.header.version != expected_version {
-                                write_error = Some((*cell_id, WriteError::CellVersionMismatch));
-                                break;
-                            }
-                            let addr = shared_cell.cell_guard().get_ptr();
-                            let cell_ref = shared_cell.to_owned().into_ref();
-                            (addr, cell_ref)
-                        };
-                        let chunk = self
-                            .chunks()
-                            .locate_chunk_by_partition(cell_id.locality() as u64);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(guard) => guard,
-                            None => {
-                                write_error = Some((
-                                    *cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
-                        };
-
-                        match self
-                            .chunks()
-                            .remove_cell_by(cell_id, |cell| cell.header.version == expected_version)
-                        {
-                            Ok(()) => {
-                                txn.history
-                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
-                                meta.write = effective_ts.clone();
-                                txn.segment_guards.push(guard);
-                            }
-                            Err(error) => {
-                                write_error = Some((*cell_id, error));
-                                break;
-                            }
-                        }
-                    }
-                    CommitOp::Update(mut cell) => {
-                        let cell_id = cell.id();
-                        let expected_version = txn
-                            .certified_present_version(&cell_id)
-                            .expect("commit payload validation requires present certification");
-                        let meta_index = guarded_cell_ids
-                            .binary_search(&cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
-
-                        let cell_addr = {
-                            let shared_cell = match self.chunks().read_cell(&cell_id) {
-                                Ok(cell) => cell,
-                                Err(read_error) => {
-                                    write_error =
-                                        Some((cell_id, WriteError::ReadError(read_error)));
-                                    break;
-                                }
-                            };
-                            if shared_cell.header.version != expected_version {
-                                write_error = Some((cell_id, WriteError::CellVersionMismatch));
-                                break;
-                            }
-                            shared_cell.cell_guard().get_ptr()
-                        };
-                        let chunk = self
-                            .chunks()
-                            .locate_chunk_by_partition(cell_id.locality() as u64);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(guard) => guard,
-                            None => {
-                                write_error = Some((
-                                    cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
-                        };
-
-                        let mut old_cell_ref = None;
-                        match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                            if cell_to_update.header.version == expected_version {
-                                old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
-                                cell.header.version = expected_version;
-                                Some(cell)
-                            } else {
-                                None
-                            }
-                        }) {
-                            Ok(updated_cell) => {
-                                debug_assert!(old_cell_ref.is_some());
-                                txn.history.insert(
-                                    cell_id,
-                                    CellHistory::new(old_cell_ref, updated_cell.header.version),
+                            if should_skip {
+                                debug!(
+                                    "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                    cell_id, effective_ts, write_ts
                                 );
-                                meta.write = effective_ts.clone();
-                                txn.segment_guards.push(guard);
+                                continue;
                             }
-                            Err(error) => {
-                                write_error = Some((cell_id, error));
-                                break;
+
+                            match self.chunks().write_cell(&mut cell) {
+                                Ok(header) => {
+                                    txn.history
+                                        .insert(cell_id, CellHistory::new(None, header.version));
+                                    meta.write = effective_ts.clone();
+                                    #[cfg(test)]
+                                    if take_apply_panic_hook(tid, &cell_id) {
+                                        panic!("test hook: apply panics after writing {cell_id:?}");
+                                    }
+                                }
+                                Err(error) => {
+                                    write_error = Some((cell_id, error));
+                                    break;
+                                }
+                            };
+                        }
+                        CommitOp::Remove(ref cell_id) => {
+                            let expected_version = txn
+                                .certified_present_version(cell_id)
+                                .expect("commit payload validation requires present certification");
+                            let meta_index = guarded_cell_ids
+                                .binary_search(cell_id)
+                                .expect("prepared cell metadata must exist");
+                            let meta = &mut cell_guards[meta_index];
+                            let should_skip = effective_ts < &meta.write;
+                            let write_ts = meta.write.clone();
+
+                            if should_skip {
+                                debug!(
+                                    "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                    cell_id, effective_ts, write_ts
+                                );
+                                continue;
+                            }
+
+                            let (cell_addr, old_cell_ref) = {
+                                let shared_cell = match self.chunks().read_cell(cell_id) {
+                                    Ok(cell) => cell,
+                                    Err(read_error) => {
+                                        write_error =
+                                            Some((*cell_id, WriteError::ReadError(read_error)));
+                                        break;
+                                    }
+                                };
+                                if shared_cell.header.version != expected_version {
+                                    write_error = Some((*cell_id, WriteError::CellVersionMismatch));
+                                    break;
+                                }
+                                let addr = shared_cell.cell_guard().get_ptr();
+                                let cell_ref = shared_cell.to_owned().into_ref();
+                                (addr, cell_ref)
+                            };
+                            let chunk = self
+                                .chunks()
+                                .locate_chunk_by_partition(cell_id.locality() as u64);
+                            let chunk_idx = chunk.id;
+                            let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                            let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                            let cell_offset = (cell_addr - segment_base_addr) as u64;
+                            let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                                Some(guard) => guard,
+                                None => {
+                                    write_error = Some((
+                                        *cell_id,
+                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                    ));
+                                    break;
+                                }
+                            };
+
+                            match self.chunks().remove_cell_by(cell_id, |cell| {
+                                cell.header.version == expected_version
+                            }) {
+                                Ok(()) => {
+                                    txn.history
+                                        .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
+                                    meta.write = effective_ts.clone();
+                                    txn.segment_guards.push(guard);
+                                }
+                                Err(error) => {
+                                    write_error = Some((*cell_id, error));
+                                    break;
+                                }
+                            }
+                        }
+                        CommitOp::Update(mut cell) => {
+                            let cell_id = cell.id();
+                            let expected_version = txn
+                                .certified_present_version(&cell_id)
+                                .expect("commit payload validation requires present certification");
+                            let meta_index = guarded_cell_ids
+                                .binary_search(&cell_id)
+                                .expect("prepared cell metadata must exist");
+                            let meta = &mut cell_guards[meta_index];
+                            let should_skip = effective_ts < &meta.write;
+                            let write_ts = meta.write.clone();
+
+                            if should_skip {
+                                debug!(
+                                    "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                    cell_id, effective_ts, write_ts
+                                );
+                                continue;
+                            }
+
+                            let cell_addr = {
+                                let shared_cell = match self.chunks().read_cell(&cell_id) {
+                                    Ok(cell) => cell,
+                                    Err(read_error) => {
+                                        write_error =
+                                            Some((cell_id, WriteError::ReadError(read_error)));
+                                        break;
+                                    }
+                                };
+                                if shared_cell.header.version != expected_version {
+                                    write_error = Some((cell_id, WriteError::CellVersionMismatch));
+                                    break;
+                                }
+                                shared_cell.cell_guard().get_ptr()
+                            };
+                            let chunk = self
+                                .chunks()
+                                .locate_chunk_by_partition(cell_id.locality() as u64);
+                            let chunk_idx = chunk.id;
+                            let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                            let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                            let cell_offset = (cell_addr - segment_base_addr) as u64;
+                            let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                                Some(guard) => guard,
+                                None => {
+                                    write_error = Some((
+                                        cell_id,
+                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                    ));
+                                    break;
+                                }
+                            };
+
+                            let mut old_cell_ref = None;
+                            match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
+                                if cell_to_update.header.version == expected_version {
+                                    old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
+                                    cell.header.version = expected_version;
+                                    Some(cell)
+                                } else {
+                                    None
+                                }
+                            }) {
+                                Ok(updated_cell) => {
+                                    debug_assert!(old_cell_ref.is_some());
+                                    txn.history.insert(
+                                        cell_id,
+                                        CellHistory::new(old_cell_ref, updated_cell.header.version),
+                                    );
+                                    meta.write = effective_ts.clone();
+                                    txn.segment_guards.push(guard);
+                                }
+                                Err(error) => {
+                                    write_error = Some((cell_id, error));
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+            write_error
+        }));
+        drop(txn_scope);
+        let write_error = match applied {
+            Ok(write_error) => write_error,
+            Err(panic) => {
+                error!(
+                    "transaction {:?} panicked while applying its writes; aborting it before \
+                     the panic continues",
+                    tid
+                );
+                let _ = self.rollback_and_rewind(tid, &mut txn);
+                drop(crate::ram::chunk::take_transactional_segments());
+                std::panic::resume_unwind(panic);
+            }
+        };
         txn.last_activity = get_time();
-        crate::ram::chunk::set_transaction_id(None);
 
         if let Some((id, error)) = write_error {
             // Drop what this attempt recorded: the next transaction on this
@@ -1562,15 +1852,19 @@ impl DataManager {
             // Reporting success here would promise durability that does not
             // exist: the writes are in memory and in the index, but their
             // log is not on disk, so a crash loses a committed transaction.
-            // The undo entries are still there and still incomplete, so
-            // recovery rolls this transaction back -- which is the outcome
-            // the caller is now told about.
+            //
+            // And this site now treats the transaction as ABORTED, so it is
+            // aborted for real, here: the index is rolled back and the spans
+            // rewound before the heads go. Setting the state alone left the
+            // writes visible in memory (a later `abort` answers
+            // AlreadyAborted and rolls nothing back) and the heads to be
+            // released with their BEGINs open.
             error!(
                 "Transaction {:?} could not be made durable at commit: {:?}. Reporting failure \
                  so it is not treated as committed.",
                 tid, error
             );
-            txn.state = TxnState::Aborted;
+            let _ = self.rollback_and_rewind(tid, &mut txn);
             return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
         }
 
@@ -1901,8 +2195,8 @@ mod tests {
     ) -> Arc<crate::server::NebServer> {
         NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: SEGMENT_SIZE,
-                db_size: SEGMENT_SIZE,
+                chunk_size: 4 * SEGMENT_SIZE,
+                db_size: 4 * SEGMENT_SIZE,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2070,6 +2364,500 @@ mod tests {
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
+    }
+
+    /// A server whose chunk has room for several segments. A transaction only
+    /// leases a head when its chunk can spare one, so the lease lifecycle is
+    /// untestable on the one-segment chunks the other tests use (there every
+    /// transactional write falls back to unbracketed).
+    async fn start_lease_test_server(address: &str, group: &str) -> Arc<NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 4 * SEGMENT_SIZE,
+                db_size: 4 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Prepare `cells` as inserts for `tid` and apply them: the participant's
+    /// state right before the decision, each write behind a leased head.
+    async fn apply_inserts(manager: &Arc<DataManager>, schema: &Schema, tid: &TxnId, cells: &[Id]) {
+        prepare_local_txn(manager, tid, cells.to_vec());
+        let ops = cells
+            .iter()
+            .map(|id| CommitOp::Write(counter_cell(schema.vid.get(), *id, 1, "lease")))
+            .collect();
+        assert_eq!(
+            commit_ops_local(manager, tid, ops).await,
+            DMCommitResult::Success
+        );
+    }
+
+    fn segment_holding(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        id: &Id,
+    ) -> lightning::aarc::Arc<crate::ram::segs::Segment> {
+        let chunks = runtime.chunks();
+        chunks.list[0]
+            .locate_segment(chunks.address_of(id))
+            .expect("segment of an indexed cell")
+    }
+
+    fn entry_type_at(addr: usize) -> (crate::ram::entry::EntryType, usize) {
+        let (header, _) = crate::ram::entry::Entry::decode_from(addr, |_, header| header);
+        (
+            header.entry_type,
+            crate::ram::entry::ENTRY_HEAD_SIZE + header.content_length as usize,
+        )
+    }
+
+    /// No head of this store may be owned with a BEGIN open in it once the
+    /// transactions touching it are decided.
+    fn assert_no_open_bracket(runtime: &Arc<crate::server::DatabaseRuntime>) {
+        for chunk in runtime.chunks().list.iter() {
+            for seg in chunk.segments() {
+                assert!(
+                    !seg.bracket_is_open(),
+                    "segment {} still holds an open bracket",
+                    seg.id
+                );
+                assert!(!seg.is_head_owned(), "segment {} is still owned", seg.id);
+            }
+        }
+    }
+
+    /// An abort after apply rewinds the span BEFORE the head goes back.
+    ///
+    /// It used to release the heads first, BEGIN still open, so the next
+    /// ordinary writer's acknowledged entries landed inside a bracket that
+    /// recovery discards (H1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_after_apply_rewinds_the_span_before_releasing_the_head() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_abort_rewinds";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let tid = test_hlc(1, 9101);
+        let cell = Id::allocated(0, 0, 9101);
+
+        apply_inserts(&manager, &schema, &tid, &[cell]).await;
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&tid, &store),
+            1,
+            "the apply must hold its head until the decision"
+        );
+        let seg = segment_holding(&runtime, &cell);
+        assert!(seg.bracket_is_open());
+        let begin_at = runtime.chunks().address_of(&cell)
+            - (crate::ram::entry::ENTRY_HEAD_SIZE + crate::ram::bracket::TXN_ID_SIZE);
+        assert_eq!(
+            entry_type_at(begin_at).0,
+            crate::ram::entry::EntryType::BEGIN
+        );
+        let cursor = seg.append_header.load(std::sync::atomic::Ordering::Acquire);
+
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        assert!(runtime.chunks().read_cell(&cell).is_err(), "rolled back");
+        assert_eq!(
+            entry_type_at(begin_at),
+            (crate::ram::entry::EntryType::PADDING, cursor - begin_at),
+            "the whole span, BEGIN included, must be one padding entry"
+        );
+        assert_no_open_bracket(&runtime);
+        assert!(seg.try_own(), "the head must be back in the pool");
+        seg.release_own();
+
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// An abort restores what every kind of write replaced: an updated cell
+    /// reads its old value, a removed cell is back, an inserted cell is gone
+    /// -- and the transaction's span is rewound, not left open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abort_restores_updates_removes_and_inserts() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_abort_restores";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let updated = Id::allocated(0, 0, 9201);
+        let removed = Id::allocated(0, 0, 9202);
+        let inserted = Id::allocated(0, 0, 9203);
+        let updated_version = seed_cell_version(&runtime, schema.vid.get(), updated, 5, 0);
+        let removed_version = seed_cell_version(&runtime, schema.vid.get(), removed, 6, 0);
+        let tid = test_hlc(1, 9201);
+        let prepare = prepare_ops_local(
+            &manager,
+            9201,
+            &tid,
+            vec![
+                PrepareOp {
+                    id: updated,
+                    expectation: CellExpectation::Present(updated_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: removed,
+                    expectation: CellExpectation::Present(removed_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: inserted,
+                    expectation: CellExpectation::Absent,
+                    intent: PrepareIntent::Write,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![
+                CommitOp::Update(counter_cell(schema.vid.get(), updated, 50, "new")),
+                CommitOp::Remove(removed),
+                CommitOp::Write(counter_cell(schema.vid.get(), inserted, 70, "new")),
+            ],
+        )
+        .await;
+        assert_eq!(commit, DMCommitResult::Success);
+        let store = runtime.chunks().address_range();
+        assert!(crate::ram::chunk::transaction_lease_count(&tid, &store) >= 1);
+
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        let chunks = runtime.chunks();
+        assert_eq!(
+            chunks.read_cell(&updated).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(5),
+            "the update must be undone"
+        );
+        assert_eq!(
+            chunks.read_cell(&removed).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(6),
+            "the remove must be undone"
+        );
+        assert!(
+            chunks.read_cell(&inserted).is_err(),
+            "the insert must be undone"
+        );
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        assert_no_open_bracket(&runtime);
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// The deadlock that made abort release its heads first, as a regression
+    /// test: the aborting transaction holds its heads through the rollback,
+    /// with every head the chunk can spare taken by transactions, and the
+    /// abort still completes at once. A lease never takes the last head that
+    /// is not a transaction's, so the rollback always has one to write to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abort_under_head_pressure_completes_without_waiting() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_abort_pressure";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let victim_cell = Id::allocated(0, 0, 9301);
+        let victim_version = seed_cell_version(&runtime, schema.vid.get(), victim_cell, 7, 0);
+        let victim = test_hlc(1, 9301);
+        let prepare = prepare_ops_local(
+            &manager,
+            9301,
+            &victim,
+            vec![PrepareOp {
+                id: victim_cell,
+                expectation: CellExpectation::Present(victim_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &victim,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    victim_cell,
+                    70,
+                    "new"
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // Others take every head the chunk can spare; the first one refused
+        // marks the pressure point.
+        let mut holders = Vec::new();
+        for k in 0..16u64 {
+            let tid = test_hlc(2, 9400 + k);
+            let cell = Id::allocated(0, 0, 9400 + k);
+            prepare_local_txn(&manager, &tid, vec![cell]);
+            let applied = commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Write(counter_cell(
+                    schema.vid.get(),
+                    cell,
+                    1,
+                    "holder",
+                ))],
+            )
+            .await;
+            if applied != DMCommitResult::Success {
+                assert_eq!(
+                    applied,
+                    DMCommitResult::WriteError(cell, WriteError::TransactionHeadUnavailable),
+                    "under head pressure a transaction must fail typed, not go unbracketed"
+                );
+                abort_and_end_local(&manager, &tid).await;
+                break;
+            }
+            holders.push(tid);
+        }
+        assert!(!holders.is_empty());
+
+        let started = std::time::Instant::now();
+        let abort = <DataManager as Service>::abort(&manager, victim.clone(), victim.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the abort waited {:?} for a head",
+            started.elapsed()
+        );
+        assert_eq!(
+            runtime
+                .chunks()
+                .read_cell(&victim_cell)
+                .unwrap()
+                .to_owned()
+                .data["score"]
+                .u64()
+                .copied(),
+            Some(7)
+        );
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&victim, &store),
+            0
+        );
+        for tid in &holders {
+            abort_and_end_local(&manager, tid).await;
+        }
+        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        assert_no_open_bracket(&runtime);
+        server.shutdown().await;
+    }
+
+    /// A panic between BEGIN and the decision aborts the transaction, rewinds
+    /// its span, and leaves the thread naming nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_apply_is_aborted_and_rewound() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_apply_panic";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let tid = test_hlc(1, 9102);
+        let first = Id::allocated(0, 0, 91021);
+        let second = Id::allocated(0, 0, 91022);
+
+        prepare_local_txn(&manager, &tid, vec![first, second]);
+        install_apply_panic_after_cell(tid.clone(), first);
+        let ops = vec![
+            CommitOp::Write(counter_cell(schema.vid.get(), first, 1, "panic")),
+            CommitOp::Write(counter_cell(schema.vid.get(), second, 2, "panic")),
+        ];
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Without an indexer the apply runs inside the call itself.
+            drop(<DataManager as Service>::commit(
+                &manager,
+                tid.clone(),
+                tid.clone(),
+                ops,
+            ));
+        }));
+        assert!(panicked.is_err(), "the hook must have fired");
+        assert!(
+            !crate::ram::chunk::is_in_transaction(),
+            "the unwind must not leave this thread naming the dead transaction"
+        );
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        assert!(runtime.chunks().read_cell(&first).is_err(), "rolled back");
+        assert!(runtime.chunks().read_cell(&second).is_err());
+        assert_eq!(
+            manager.txns.get(&tid).unwrap().lock().state,
+            TxnState::Aborted
+        );
+        assert_no_open_bracket(&runtime);
+
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// A slow owner and the lease sweeper.
+    ///
+    /// The sweep must wait while the owner still holds the transaction (an
+    /// apply in progress), then presume abort properly -- roll back, rewind,
+    /// release -- and the late decision that follows must NOT be told it
+    /// committed: its spans are gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_owner_after_lease_expiry_is_never_told_it_committed() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_slow_owner";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let tid = test_hlc(1, 9103);
+        let cell = Id::allocated(0, 0, 9103);
+
+        apply_inserts(&manager, &schema, &tid, &[cell]).await;
+        let txn_lock = manager.find_transaction(&tid).unwrap();
+        let owner = txn_lock.lock();
+        let sweep = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .sweep_idle_transactions(Duration::ZERO, Duration::ZERO)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!sweep.is_finished(), "the sweep must wait for the owner");
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&tid, &store),
+            1,
+            "and must not touch the owner's heads meanwhile"
+        );
+        drop(owner);
+        sweep.await.unwrap();
+
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        assert!(
+            runtime.chunks().read_cell(&cell).is_err(),
+            "presumed abort rolls back"
+        );
+        assert!(manager.find_transaction(&tid).is_none());
+        assert_no_open_bracket(&runtime);
+
+        // The owner wakes up with a commit decision. It must be refused.
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_ne!(
+            end,
+            EndResult::Success,
+            "a late decision must not be acknowledged"
+        );
+        assert!(runtime.chunks().read_cell(&cell).is_err());
+        server.shutdown().await;
+    }
+
+    /// The commit decision closes every bracket with a COMMIT before the
+    /// heads go back, and once it has started no abort can tear it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_decision_closes_the_bracket_and_cannot_be_aborted() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_commit_closes";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let store = runtime.chunks().address_range();
+        let tid = test_hlc(1, 9104);
+        let cell = Id::allocated(0, 0, 9104);
+
+        apply_inserts(&manager, &schema, &tid, &[cell]).await;
+        // Decided commit (as `end` marks it before writing any record): an
+        // abort from anywhere must now be refused, leases untouched.
+        manager
+            .find_transaction(&tid)
+            .unwrap()
+            .lock()
+            .decided_commit = true;
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(
+            abort,
+            AbortResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 1);
+
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
+        let addr = runtime.chunks().address_of(&cell);
+        let (_, size) = entry_type_at(addr);
+        assert_eq!(
+            entry_type_at(addr + size).0,
+            crate::ram::entry::EntryType::COMMIT,
+            "the bracket must be closed right behind the transaction's entry"
+        );
+        assert_eq!(
+            runtime.chunks().durable_txn_status(&tid),
+            crate::ram::chunk::DurableTxnStatus::Committed
+        );
+        assert!(runtime.chunks().read_cell(&cell).is_ok());
+        assert_no_open_bracket(&runtime);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4767,98 +5555,15 @@ impl Service for DataManager {
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
         };
+        // The leases are held through the rollback and released only after
+        // the spans are rewound; see `rollback_and_rewind`. They used to be
+        // released FIRST, which handed every head back with the
+        // transaction's BEGIN still open, so the next ordinary writer's
+        // acknowledged entries landed inside a bracket recovery discards.
         let mut txn = txn_lock.lock();
-        if txn.state == TxnState::Aborted {
-            return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
-        }
-        #[cfg(test)]
-        if Self::take_matching_abort_cannot_end(&tid, &txn.affected_cells) {
-            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
-        }
-
-        if txn.history.is_empty() {
-            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
-            txn.last_activity = get_time();
-            txn.state = TxnState::Aborted;
-            drop(txn);
-            drop(guards_to_drop);
-            return self.response_with(AbortResult::Success(None));
-        }
-
-        let Some(coordinator_id) = txn.coordinator_id else {
-            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
-        };
-        let expected_owner = TxnPriority::new(tid.clone(), coordinator_id);
-        let guarded_cell_ids = Self::guarded_txn_cell_ids(&txn);
-        let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
-        for cell_id in &guarded_cell_ids {
-            cell_mutexes.push(self.cell_meta_mutex(cell_id));
-        }
-        let mut cell_guards = Vec::with_capacity(cell_mutexes.len());
-        for cell_mutex in &cell_mutexes {
-            cell_guards.push(cell_mutex.lock());
-        }
-        if cell_guards
-            .iter()
-            .any(|meta| meta.owner.as_ref() != Some(&expected_owner))
-        {
-            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
-        }
-
-        // Keep segment references and metadata guards alive throughout rollback so the owner
-        // cannot be reclaimed between validation and the storage mutations.
-        let guards_to_drop = std::mem::take(&mut txn.segment_guards);
-
-        // Give the write heads back BEFORE rolling back.
-        //
-        // The lease keeps a transaction's entries contiguous until its
-        // decision, so that a COMMIT closes a bracket containing nothing but
-        // its own entries. This IS the decision and it is an abort: no COMMIT
-        // will ever be written, the bracket stays uncommitted, and recovery
-        // discards it whatever lands after it. There is nothing left to
-        // protect.
-        //
-        // Holding on, meanwhile, starves the rollback that must run right
-        // now: restoring old versions and writing tombstones are ordinary
-        // writes, and in a chunk whose heads this transaction owns they have
-        // nowhere to go. That is a participant deadlocking itself -- found
-        // with gdb on a transaction suite stuck for over an hour, one thread
-        // spinning for a head its own aborting transaction still held.
-        crate::ram::chunk::release_transaction_leases(&tid, &self.chunks().address_range());
-
-        let rollback_failures = {
-            debug!(
-                ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
-                txn.history.len(),
-                tid
-            );
-            let failures = self.rollback(&txn.history);
-            if failures.len() == 0 {
-                None
-            } else {
-                Some(failures)
-            }
-        };
-        txn.last_activity = get_time();
-        txn.state = TxnState::Aborted;
-
-        // NO physical rewind here any more.
-        //
-        // Padding over the transaction's span and resetting the cursor was
-        // only safe while the transaction still OWNED the segment, and the
-        // lease now ends above, before rollback, because holding it that long
-        // deadlocked the rollback. Rewinding after the release would pad over
-        // whatever another writer appended in between.
-        //
-        // Nothing is lost but the space: an aborted transaction writes no
-        // COMMIT, so recovery discards its bracket, and its entries are dead
-        // space the cleaner reclaims like any other.
-
-        drop(cell_guards);
+        let result = self.abort_locked(&tid, &mut txn);
         drop(txn);
-        drop(guards_to_drop);
-
-        self.response_with(AbortResult::Success(rollback_failures))
+        self.response_with(result)
     }
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
         let outcome = self.txn_outcome(&tid);
@@ -4993,17 +5698,14 @@ impl Service for DataManager {
             // durable, or the participant set to be resolvable; both are
             // Phase 6 and neither is fixed by moving this write.
             if txn_state == TxnState::Committed {
-                crate::ram::chunk::set_transaction_id(Some(tid.clone()));
-                let bracket_result = self.chunks().commit_transaction_brackets(&tid);
-                crate::ram::chunk::set_transaction_id(None);
-                if let Err(error) = bracket_result {
+                if let Err(reason) = self.close_committed_brackets(&tid) {
                     // Refusing is the honest answer: without a durable COMMIT
                     // the next restart discards this transaction, so telling
                     // the coordinator "ended" would be telling it something
                     // recovery will contradict.
                     error!(
-                        "transaction {:?} could not close its bracket at the decision: {:?}",
-                        tid, error
+                        "transaction {:?} could not close its bracket at the decision: {}",
+                        tid, reason
                     );
                     self.cleanup_signal.store(true, Relaxed);
                     return self
