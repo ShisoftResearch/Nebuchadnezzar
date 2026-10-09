@@ -91,7 +91,6 @@ src/index/inverted/
 - Schema Definitions (inverted_index_schema, inverted_stats_schema, etc.)
 - Index Metadata Builder (build_index_meta)
 - Utility Functions (tokenize_query, compute_idf, bm25_score)
-- Legacy Transactional Indexer (backward compatible)
 
 ## Architecture Diagrams
 
@@ -291,7 +290,6 @@ InvertedIndexClient::Hybrid { local_indexer }
 ### No Breaking Changes
 - Existing `InvertedIndexer` and `InvertedIndexClient` preserved
 - New functionality is additive
-- Backward compatible API
 
 ## Testing Strategy
 
@@ -370,7 +368,6 @@ Successfully designed and implemented a complete distributed inverted index syst
 1. **Eliminates transaction overhead** (10-100x faster writes)
 2. **Partition-aware** with automatic ownership checking
 3. **Distributed queries** with result aggregation
-4. **Backward compatible** with existing API
 5. **Well documented** with guides and examples
 6. **Production ready** architecture (pending RPC integration)
 

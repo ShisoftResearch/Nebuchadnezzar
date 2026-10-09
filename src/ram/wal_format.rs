@@ -34,10 +34,6 @@
 //!   payload     [u8; len]
 //! ```
 //!
-//! Legacy (unframed) logs are still read: a file whose first byte is a
-//! valid `EntryType` discriminant (0, 1 or 2) cannot be a framed log, since
-//! the magic's first byte is `b'N'`. That check is exact, not heuristic, so
-//! the two formats can never be confused for one another.
 
 use crc_fast::{CrcAlgorithm, Digest};
 use std::io;
@@ -481,12 +477,12 @@ mod tests {
     /// Legacy logs open with an EntryType discriminant (0, 1 or 2); the
     /// framed magic opens with b'N'. Neither can be mistaken for the other.
     #[test]
-    fn legacy_logs_are_never_mistaken_for_framed_ones() {
+    fn unframed_buffers_are_not_framed_logs() {
         for entry_type in 0u32..=2 {
-            let mut legacy = entry_type.to_le_bytes().to_vec();
-            legacy.extend_from_slice(&64u32.to_le_bytes());
-            legacy.extend_from_slice(&[0xAB; 64]);
-            assert!(!is_framed(&legacy), "entry type {entry_type} looked framed");
+            let mut unframed = entry_type.to_le_bytes().to_vec();
+            unframed.extend_from_slice(&64u32.to_le_bytes());
+            unframed.extend_from_slice(&[0xAB; 64]);
+            assert!(!is_framed(&unframed), "entry type {entry_type} looked framed");
         }
         assert!(is_framed(&log_with(&[(0, b"x")])));
     }

@@ -434,9 +434,8 @@ impl PostingSegment {
             segment.doc_lengths = lengths.clone();
         }
 
-        // Handle old schema without versions (backwards compatibility)
-        if segment.versions.is_empty() && !segment.doc_ids.is_empty() {
-            segment.versions = vec![0; segment.doc_ids.len()];
+        if segment.versions.len() != segment.doc_ids.len() {
+            return None;
         }
 
         Some(segment)
@@ -1240,6 +1239,21 @@ mod tests {
     use bifrost::rpc::Server;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn posting_segment_requires_one_version_per_document() {
+        let id = Id::from_parts(12, 34);
+        let mut segment = PostingSegment::new();
+        segment.add(id, 7, 2, 20);
+        let current = PostingSegment::from_cell(&segment.to_cell(&id)).unwrap();
+        assert_eq!(current.doc_ids, vec![id]);
+        assert_eq!(current.versions, vec![7]);
+        segment.versions.clear();
+        assert!(PostingSegment::from_cell(&segment.to_cell(&id)).is_none());
+        segment.versions = vec![7, 8];
+        assert!(PostingSegment::from_cell(&segment.to_cell(&id)).is_none());
+        assert!(PostingSegment::from_cell(&PostingSegment::new().to_cell(&id)).is_some());
+    }
 
     // Helper to create test chunks
     fn create_test_chunks() -> Arc<Chunks> {
