@@ -1168,7 +1168,8 @@ impl LocalSchemasCache {
         self.map.resident_bytes()
     }
     pub fn debug_only_new_schema(&self, schema: Schema) {
-        if !cfg!(debug_assertions) {
+        // Unit-test fixtures also install local schemas in the release profile.
+        if !cfg!(debug_assertions) && !cfg!(test) {
             panic!("for debug only");
         }
         let m = &self.map;
