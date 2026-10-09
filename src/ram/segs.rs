@@ -384,8 +384,55 @@ const JOURNAL_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
 /// acquisition a single fetch_or.
 const HEAD_OWNED: usize = 1 << (usize::BITS - 2);
 
+/// Third-from-top bit of `pending_journals`: the owning transaction has a
+/// BEGIN standing in this segment with neither a COMMIT nor a disowning
+/// padding behind it. Recovery reads every entry after an unclosed BEGIN as
+/// part of that transaction, so a head in this state that can still take an
+/// append must never be handed to another writer -- see
+/// [`Segment::try_release_own`], which is the one place that hand-over
+/// happens. Kept in the word the release already touches, so the check costs
+/// one load on a line that is about to be written anyway.
+const BRACKET_OPEN: usize = 1 << (usize::BITS - 3);
+
+/// Fourth-from-top bit: the owning transaction's bracket here was closed by
+/// its COMMIT. Lets the lease code refuse to disown (pad over) a bracket that
+/// is already decided committed, whatever the caller believes the
+/// transaction's state to be.
+const BRACKET_COMMITTED: usize = 1 << (usize::BITS - 4);
+
+/// Bracket state bits; cleared together when the owner lets the head go.
+const BRACKET_STATE_MASK: usize = BRACKET_OPEN | BRACKET_COMMITTED;
+
 /// Bits of `pending_journals` that are flags, not count.
-const JOURNAL_META_MASK: usize = JOURNAL_GATE_CLOSED | HEAD_OWNED;
+const JOURNAL_META_MASK: usize = JOURNAL_GATE_CLOSED | HEAD_OWNED | BRACKET_STATE_MASK;
+
+/// Head releases refused because the head still held an open transaction
+/// bracket and could take more appends. Non-zero is a bug in whichever exit
+/// path tried it: the head is kept out of the pool rather than handed over.
+pub static OPEN_BRACKET_RELEASES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A head was about to be handed to another writer with a transaction's
+/// BEGIN still open in it and room left behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenBracketRefused {
+    pub chunk_id: usize,
+    pub segment_id: u64,
+    pub seq_id: u64,
+}
+
+impl std::fmt::Display for OpenBracketRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused to release segment {} (chunk {}, seq {}): a transaction bracket is still \
+             open in it and it can take more appends, so the next writer's entries would be \
+             recovered as part of that transaction",
+            self.segment_id, self.chunk_id, self.seq_id
+        )
+    }
+}
+
+impl std::error::Error for OpenBracketRefused {}
 
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
@@ -867,19 +914,15 @@ impl Segment {
         self.segment_class
     }
 
-    /// Undo a transaction's writes physically: stamp padding over them and
-    /// put the cursor back.
+    /// Hand back the unused tail of the owner's own claim: stamp padding over
+    /// it and put the cursor back.
     ///
-    /// Safe only because of the lease. One writer owns a segment while a
-    /// transaction writes into it, so there is nothing after the
-    /// transaction's entries to disturb -- which is what lets an abort make
-    /// the writes VANISH instead of recording undo entries that a later
-    /// rollback has to replay.
-    ///
-    /// The padding matters as much as the cursor: the bytes are already in
-    /// the WAL, so recovery will rebuild an image containing them. Padding
-    /// makes that image walk straight over the span; rewinding the cursor
-    /// alone would leave entries a scan still reads.
+    /// ONLY for bytes that were claimed and never journaled -- the over-claim
+    /// a bracket part takes so the head it picks can hold its first entry.
+    /// Nothing about those bytes reached the WAL or the cell index, so moving
+    /// the cursor back over them is invisible. It is NOT how an abort undoes
+    /// journaled entries: see [`Segment::disown_span`] for why that must
+    /// leave the cursor where it is.
     pub fn rewind_to(&self, cursor: usize) -> bool {
         let current = self.append_header.load(Ordering::Acquire);
         if cursor < self.addr || cursor > current {
@@ -947,7 +990,158 @@ impl Segment {
         true
     }
 
+    /// Write a bare PADDING header covering `span` bytes at `addr`, as ONE
+    /// 8-byte store, so a concurrent walker reads either the old header or
+    /// the new one -- never the type of one and the length of the other.
+    fn store_padding_header(addr: usize, span: usize) {
+        debug_assert!(span >= ENTRY_HEAD_SIZE && addr % ENTRY_HEAD_SIZE == 0);
+        let mut header = [0u8; ENTRY_HEAD_SIZE];
+        header[..4].copy_from_slice(&entry::EntryType::PADDING.bits().to_le_bytes());
+        header[4..].copy_from_slice(&((span - ENTRY_HEAD_SIZE) as u32).to_le_bytes());
+        unsafe { (*(addr as *const AtomicU64)).store(u64::from_le_bytes(header), Release) };
+    }
+
+    /// Disown a transaction's span `[from, to)`: one PADDING entry over all of
+    /// it, BEGIN included, with that header JOURNALED.
+    ///
+    /// This is the physical half of an abort. Recovery rebuilds the segment
+    /// from the log, so a padding that existed only in memory would leave the
+    /// BEGIN standing in the rebuilt image, and every entry appended after it
+    /// -- acknowledged ordinary writes included -- would be recovered as part
+    /// of a transaction that never commits. With the header in the log the
+    /// rebuilt image walks straight over the span, exactly like the memory
+    /// does. Ordering is what makes it durable enough: the record sits in this
+    /// segment's WAL ahead of anything a later owner appends, so any sync that
+    /// persists a later entry persists the padding with it; and if nothing is
+    /// ever appended, losing the record only loses the abort to a bracket
+    /// that has no COMMIT, which recovery discards anyway.
+    ///
+    /// The cursor does NOT move back, although the original design had it do
+    /// so. Handing the span out again is unsafe three ways: a reader that
+    /// resolved a cell address in the span before the rollback could read
+    /// another writer's bytes; the per-segment dead bitmap is keyed by entry
+    /// address, so a rolled-back entry's dead bit would mark whatever live
+    /// cell is written at the same offset, and compaction would drop it; and
+    /// the WAL would hold new records over old ones, so a crash part-way
+    /// through refilling the span leaves the old transaction's bytes beyond
+    /// the new cursor, where a walk that happens to land on an old entry
+    /// boundary reads them as ordinary entries. The span costs space until
+    /// the cleaner collects the segment, and nothing else.
+    ///
+    /// Only the owner may call this, and only over journaled bytes. On
+    /// failure the original header is put back, so memory and log agree.
+    pub fn disown_span(&self, from: usize, to: usize) -> io::Result<()> {
+        let refuse = |what: &str| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot disown [{from:#x}, {to:#x}) in segment {} (chunk {}): {what}",
+                    self.id, self.chunk_id
+                ),
+            ))
+        };
+        let cursor = self.append_header.load(Acquire);
+        if from < self.addr || to > cursor || to > self.bound() || from >= to {
+            return refuse("the span is not inside the written part of the segment");
+        }
+        if from % ENTRY_HEAD_SIZE != 0 || to % ENTRY_HEAD_SIZE != 0 {
+            return refuse("the span is not 8-byte aligned");
+        }
+        if to - from < ENTRY_HEAD_SIZE {
+            return refuse("the span cannot hold an entry header");
+        }
+        if self.is_sealed() {
+            return refuse("the segment is sealed");
+        }
+        let saved = unsafe { (*(from as *const AtomicU64)).load(Acquire) };
+        Self::store_padding_header(from, to - from);
+        if !self.begin_pending_journal() {
+            unsafe { (*(from as *const AtomicU64)).store(saved, Release) };
+            return refuse("the segment is sealing");
+        }
+        let journaled = self.write_wal(from, ENTRY_HEAD_SIZE as u32, true);
+        self.end_pending_journal();
+        match journaled {
+            Ok(()) => {
+                self.set_dirty();
+                Ok(())
+            }
+            Err(error) => {
+                unsafe { (*(from as *const AtomicU64)).store(saved, Release) };
+                Err(error)
+            }
+        }
+    }
+
+    /// Retire this head: take every remaining byte at once, so nothing can
+    /// ever be appended again, and pad the tail in memory so walks step over
+    /// it. Returns how many bytes were retired.
+    ///
+    /// The exit for a head whose transaction bracket must be left exactly as
+    /// it is -- an abort whose rollback could not finish, a rewind that could
+    /// not be journaled, a lease reclaimed by a sweeper that cannot vouch for
+    /// the cell index. The bracket stays uncommitted, which recovery
+    /// discards; the only thing that matters is that no other writer's entry
+    /// can land behind its BEGIN, and a full head guarantees that. The next
+    /// writer to look at this slot finds it full and rotates it out, which
+    /// drains, archives and SEALS it through the ordinary path.
+    ///
+    /// Deliberately NOT journaled: it is the fallback for when the log is the
+    /// thing failing, and it does not need to be. The rebuilt image ends
+    /// where the last journaled entry ended -- which is where the cursor was
+    /// -- and a walk stops there cleanly.
+    pub fn retire_tail(&self) -> usize {
+        // A sealed segment already takes nothing, and its image is the
+        // archived one: it must not be touched, not even with padding.
+        if self.is_sealed() {
+            return 0;
+        }
+        loop {
+            let cursor = self.append_header.load(Acquire);
+            let remaining = self.bound().saturating_sub(cursor);
+            if remaining < ENTRY_HEAD_SIZE {
+                return 0;
+            }
+            if self
+                .append_header
+                .compare_exchange(cursor, self.bound(), AcqRel, Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            Self::store_padding_header(cursor, remaining);
+            // Space the cleaner should count as reclaimable: nothing will
+            // ever live there.
+            self.dead_space.fetch_add(remaining as u32, Relaxed);
+            self.note_dead_bytes_change();
+            self.set_dirty();
+            return remaining;
+        }
+    }
+
+    /// Whether another entry could still be appended here.
+    #[inline]
+    pub fn can_still_append(&self) -> bool {
+        !self.is_sealed()
+            && self
+                .bound()
+                .saturating_sub(self.append_header.load(Acquire))
+                >= ENTRY_HEAD_SIZE
+    }
+
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
+        self.try_acquire_reserving(size, 0)
+    }
+
+    /// `try_acquire`, granted only if `reserve` bytes would still be free
+    /// behind the claim.
+    ///
+    /// A transaction's bracket part claims its entries this way so that the
+    /// part can ALWAYS take its own COMMIT at the decision. A part filled to
+    /// the last byte cannot be closed, and an unclosed part is a committed
+    /// transaction that recovery discards -- or, once the cleaner has
+    /// compacted whichever part did hold a COMMIT, one it cannot even find.
+    pub fn try_acquire_reserving(&self, size: u32, reserve: usize) -> Option<usize> {
         // A sealed segment is out of append space by definition, whatever its
         // cursor says: it has a backup at its seq id, so an append here could
         // only become durable through a WAL that must never exist (see the
@@ -962,7 +1156,7 @@ impl Segment {
         loop {
             let curr_last = self.append_header.load(Ordering::Acquire);
             let exp_last = curr_last + size;
-            if exp_last > self.bound() {
+            if exp_last + reserve > self.bound() {
                 return None;
             } else {
                 if self
@@ -2392,13 +2586,90 @@ image, not an empty segment; archiving it would persist the damage.",
         self.pending_journals.fetch_or(HEAD_OWNED, Ordering::AcqRel) & HEAD_OWNED == 0
     }
 
-    /// Release head ownership. The RELEASE ORDERING here is the journal-in-
-    /// window invariant's other half: everything the owner wrote and
-    /// journaled happens-before the next owner's acquire.
+    /// Release head ownership, for callers that cannot act on a refusal.
+    ///
+    /// Goes through [`Segment::try_release_own`] like every release does; a
+    /// refusal is logged and the head stays owned -- out of the pool, never
+    /// handed to a writer that would append behind an open BEGIN. Reaching
+    /// that refusal from here is a bug in whoever left the bracket open.
     #[inline]
     pub fn release_own(&self) {
+        if let Err(refused) = self.try_release_own() {
+            error!("{refused}");
+        }
+    }
+
+    /// THE release point: every head goes back to the pool through here.
+    ///
+    /// The RELEASE ORDERING is the journal-in-window invariant's other half:
+    /// everything the owner wrote and journaled happens-before the next
+    /// owner's acquire.
+    ///
+    /// And the class-closing invariant for transaction brackets: a head with
+    /// an open bracket is never handed to another writer while it can still
+    /// take an append. Recovery reads everything behind an unclosed BEGIN as
+    /// part of that transaction, so whatever the next owner appended -- an
+    /// acknowledged ordinary write included -- would be dropped with it. The
+    /// bracket must be closed (COMMIT), disowned (padded over) or the head
+    /// retired (full) first; anything else is refused here, the head stays
+    /// owned, and the caller gets the typed error. A head that can take no
+    /// more appends is released whatever its bracket state, because nothing
+    /// can land behind the BEGIN any more.
+    ///
+    /// Releasing clears the bracket state with the ownership: it described
+    /// the owner's bracket, and the owner is leaving.
+    #[inline]
+    pub fn try_release_own(&self) -> Result<(), OpenBracketRefused> {
+        if self.pending_journals.load(Ordering::Acquire) & BRACKET_OPEN != 0
+            && self.can_still_append()
+        {
+            OPEN_BRACKET_RELEASES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(OpenBracketRefused {
+                chunk_id: self.chunk_id,
+                segment_id: self.id,
+                seq_id: self.seq_id,
+            });
+        }
         self.pending_journals
-            .fetch_and(!HEAD_OWNED, Ordering::Release);
+            .fetch_and(!(HEAD_OWNED | BRACKET_STATE_MASK), Ordering::Release);
+        Ok(())
+    }
+
+    /// The owner wrote a BEGIN here: from now until COMMIT, disown or
+    /// retirement, the head may not be handed over.
+    #[inline]
+    pub fn mark_bracket_open(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_COMMITTED, Ordering::AcqRel);
+        self.pending_journals
+            .fetch_or(BRACKET_OPEN, Ordering::AcqRel);
+    }
+
+    /// The bracket's COMMIT is journaled here.
+    #[inline]
+    pub fn mark_bracket_committed(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_OPEN, Ordering::AcqRel);
+        self.pending_journals
+            .fetch_or(BRACKET_COMMITTED, Ordering::AcqRel);
+    }
+
+    /// The bracket was padded over, BEGIN included: there is nothing left
+    /// open to close.
+    #[inline]
+    pub fn mark_bracket_disowned(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_OPEN, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn bracket_is_open(&self) -> bool {
+        self.pending_journals.load(Ordering::Acquire) & BRACKET_OPEN != 0
+    }
+
+    #[inline]
+    pub fn bracket_is_committed(&self) -> bool {
+        self.pending_journals.load(Ordering::Acquire) & BRACKET_COMMITTED != 0
     }
 
     /// Wait for in-flight journal writes to land, briefly.
