@@ -687,12 +687,9 @@ fn end_lease(
                     "a write into the span did not finish; its extent is unknown",
                 ))
             } else if lease.pre_cursor < end {
-                // Durable BEFORE the head can be reassigned: once another
-                // writer appends, a crash must find the padding, not the open
-                // BEGIN, or that writer's entries are read as this
-                // transaction's.
+                // Journal now. Keep the head owned until the syncer makes
+                // the padding durable, so no writer can append behind it.
                 seg.disown_span(lease.pre_cursor, end)
-                    .and_then(|()| seg.force_wal_sync())
             } else {
                 Ok(())
             };
@@ -700,6 +697,12 @@ fn end_lease(
                 Ok(()) => {
                     seg.mark_bracket_disowned();
                     TXN_SPANS_REWOUND.fetch_add(1, Ordering::Relaxed);
+                    // Transfer the lease reference to the syncer. Ownership
+                    // stays held until the padding is durable.
+                    if lease.pre_cursor < end && seg.defer_rewind_release() {
+                        crate::ram::segs::queue_wal_sync(seg);
+                        return;
+                    }
                 }
                 Err(error) => {
                     TXN_REWIND_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -764,11 +767,11 @@ fn end_transaction_leases(
 }
 
 /// Make an aborted transaction's writes vanish from the log, then give its
-/// heads back.
+/// heads back after the background sync makes the padding durable.
 ///
 /// Call it AFTER the transaction's effects were rolled back in the cell
 /// index, and BEFORE anything else may write into its heads -- which, since
-/// the transaction owns them until this returns, is automatic. Each span is
+/// the transaction transfers ownership to the syncer, is automatic. Each span is
 /// padded over and the padding journaled (see [`Segment::disown_span`]), so
 /// recovery walks straight past it and the next owner's entries are ordinary.
 ///
@@ -1653,42 +1656,34 @@ impl Chunk {
     /// Both sides then wait forever. That is not hypothetical: it wedged a
     /// server whose chunk held exactly one segment.
     ///
-    /// A chunk sized to one segment (common in tests, and the degenerate case
-    /// in production) has `reserve_boundary` saturate to zero, so the pool can
-    /// never grow either. There, a transaction simply cannot be given a head
-    /// of its own.
+    /// A chunk sized to one segment cannot hold both heads, so it refuses
+    /// a transaction before writing its BEGIN.
     fn can_spare_a_head_for_lease(&self, segment_class: SegmentClass) -> bool {
         let slots = self.head_slots(segment_class);
-        let mut usable_or_growable = 0usize;
+        let mut usable = 0usize;
+        let mut empty = 0usize;
         for slot in slots.iter() {
             let id = slot.load(Ordering::Acquire);
             if id == HEAD_SEG_ID_EMPTY {
-                // An empty slot only helps if the chunk has room to fill it.
-                if self.segs.len() * SEGMENT_SIZE < self.capacity.saturating_sub(SEGMENT_SIZE) {
-                    usable_or_growable += 1;
+                empty += 1;
+            } else if id != HEAD_SEG_ID_ALLOCATING {
+                if self
+                    .segs
+                    .get(&(id as usize))
+                    .map(|seg| {
+                        !seg.bracket_is_open()
+                            && !seg.rewind_release_pending()
+                            && seg.can_still_append()
+                    })
+                    .unwrap_or(false)
+                {
+                    usable += 1;
                 }
-                continue;
-            }
-            if id == HEAD_SEG_ID_ALLOCATING {
-                continue;
-            }
-            // A head a TRANSACTION owns is gone until its decision; one a plain
-            // writer owns is back in microseconds and is counted. Counting
-            // only unowned heads read every concurrent plain write as
-            // scarcity, which used to push transactions out of their bracket
-            // and now would make them wait for nothing.
-            if self
-                .segs
-                .get(&(id as usize))
-                .map(|seg| !seg.bracket_is_open())
-                .unwrap_or(false)
-            {
-                usable_or_growable += 1;
             }
         }
-        // Strictly more than one: the head being claimed right now is one of
-        // them, and something has to be left behind for everyone else.
-        usable_or_growable > 1
+        // Count actual grantable addresses, not one imaginary address for
+        // every empty slot. One ordinary head must remain beside the lease.
+        usable + empty.min(self.allocator.writer_headroom()) > 1
     }
 
     fn lease_head_for_current_txn(&self, head: &AArc<Segment>, addr: usize) -> bool {
@@ -2182,12 +2177,12 @@ impl Chunk {
     }
 
     /// Whether this chunk could EVER hold a head for a transaction while
-    /// leaving one for everyone else: it needs room for at least two live
-    /// heads plus the one being rotated out. A chunk smaller than that (one
+    /// leaving one for everyone else: it needs room for two live heads.
+    /// A chunk smaller than that (one
     /// segment is common in tests) refuses transactional writes at once
     /// instead of waiting for something that cannot happen.
     fn can_ever_spare_a_head(&self) -> bool {
-        self.capacity >= 3 * SEGMENT_SIZE
+        self.capacity >= 2 * SEGMENT_SIZE
     }
 
     /// Claim space for a transaction's BEGIN and write it, taking the lease.
@@ -2498,7 +2493,17 @@ impl Chunk {
             let any_live_head = || {
                 slots.iter().any(|slot| {
                     let id = slot.load(Ordering::Acquire);
-                    id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING
+                    id != HEAD_SEG_ID_EMPTY
+                        && id != HEAD_SEG_ID_ALLOCATING
+                        && self
+                            .segs
+                            .get(&(id as usize))
+                            .map(|seg| {
+                                !seg.bracket_is_open()
+                                    && !seg.rewind_release_pending()
+                                    && seg.can_still_append()
+                            })
+                            .unwrap_or(false)
                 })
             };
             if growing && near_wall && any_live_head() {
@@ -6236,6 +6241,53 @@ mod tests {
             plain.seg.id, first_seg,
             "the released head returns to the pool rather than being stranded"
         );
+    }
+
+    fn sequential_small_transactions_reuse_heads(abort: bool) {
+        let chunks = Chunks::new_dummy(1, 2 * SEGMENT_SIZE);
+        let chunk = &chunks.list[0];
+        let mut ids = std::collections::HashSet::new();
+        for n in 0..200 {
+            let txn = test_txn_id(10_000 + n);
+            let scope = TransactionScope::enter(txn.clone());
+            let entry = chunk
+                .try_acquire(64, false)
+                .expect("sequential transaction");
+            let segment_id = entry.seg.id;
+            if n > 1 {
+                assert!(
+                    ids.contains(&segment_id),
+                    "later transactions must reuse earlier heads"
+                );
+            }
+            ids.insert(segment_id);
+            drop(entry);
+            drop(scope);
+            if abort {
+                assert_eq!(
+                    rewind_transaction_writes(&txn, &chunks.address_range()),
+                    Ok(1)
+                );
+            } else {
+                chunks.commit_transaction_brackets(&txn).expect("commit");
+                assert_eq!(
+                    release_transaction_leases(&txn, &chunks.address_range()),
+                    Ok(1)
+                );
+            }
+        }
+        assert!(ids.len() < 200);
+        assert!(chunk.seg_count() <= 2);
+    }
+
+    #[test]
+    fn sequential_200_commits_reuse_heads_in_a_16_mb_chunk() {
+        sequential_small_transactions_reuse_heads(false);
+    }
+
+    #[test]
+    fn sequential_200_aborts_reuse_heads_in_a_16_mb_chunk() {
+        sequential_small_transactions_reuse_heads(true);
     }
 
     /// An aborted transaction's writes VANISH: the span becomes ONE padding

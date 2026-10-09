@@ -530,7 +530,6 @@ impl BracketLedger {
         self.commits.lock().insert(txn.clone(), manifest);
     }
 
-
     /// Apply every committed bracket and report the rest.
     ///
     /// Called once, after every segment has been scanned. Applying here rather
@@ -4531,11 +4530,15 @@ mod tests {
         }
 
         fn open(&self, recover: bool) -> Arc<Chunks> {
+            self.open_sized(recover, TEST_SEGMENT_SIZE * 8)
+        }
+
+        fn open_sized(&self, recover: bool, size: usize) -> Arc<Chunks> {
             let schemas = LocalSchemasCache::new_local("");
             schemas.debug_only_new_schema(self.schema.clone());
             Chunks::new_with_recovery(
                 1,
-                TEST_SEGMENT_SIZE * 8,
+                size,
                 Arc::new(ServerMeta { schemas }),
                 None,
                 Some(self.backup_dir.path().to_str().unwrap().to_string()),
@@ -4808,6 +4811,7 @@ mod tests {
             crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
             Ok(1)
         );
+        chunks.sync_all();
         let point1 = store.snapshot();
         // Reuse: make the rewound head the only live head in the pool, so the
         // next ordinary write lands in it whatever this thread's affinity.
@@ -4857,6 +4861,123 @@ mod tests {
                 reuse_expected,
                 "point {name}: the write that reused the head"
             );
+        }
+    }
+
+    #[test]
+    fn sequential_200_durable_aborts_reuse_heads_in_a_16_mb_chunk() {
+        let store = BracketCleanerStore::new(439, "durable_abort_reuse");
+        let chunks = store.open_sized(false, TEST_SEGMENT_SIZE * 2);
+        let mut segment_ids = std::collections::HashSet::new();
+        for n in 0..200u64 {
+            let id = Id::allocated(39, 0, n + 1);
+            let txn = crate::server::transactions::test_hlc(9000 + n, 9);
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+                chunks.write_cell(&mut store.cell(&id, 128)).unwrap();
+            }
+            let segment = segment_of(&chunks, &id);
+            if n > 1 {
+                assert!(segment_ids.contains(&segment.id), "reuse a previous head");
+            }
+            segment_ids.insert(segment.id);
+            chunks.remove_cell(&id).unwrap();
+            assert_eq!(
+                crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+                Ok(1)
+            );
+        }
+        chunks.sync_all();
+        assert!(segment_ids.len() <= 2);
+        assert!(chunks.list[0].seg_count() <= 2);
+        for n in 0..200u64 {
+            assert!(chunks.read_cell(&Id::allocated(39, 0, n + 1)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_crash_after_abort_returns_before_rewind_sync_discards_the_transaction() {
+        let store = BracketCleanerStore::new(438, "abort_before_sync");
+        let chunks = store.open(false);
+        let before = Id::allocated(38, 0, 1);
+        let aborted = Id::allocated(38, 0, 2);
+        let after = Id::allocated(38, 0, 3);
+        chunks.write_cell(&mut store.cell(&before, 128)).unwrap();
+        let txn = crate::server::transactions::test_hlc(8888, 9);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&aborted, 128)).unwrap();
+        }
+        let segment = segment_of(&chunks, &aborted);
+        chunks.sync_all();
+        // Model loss of the unsynced padding with the durable pre-abort WAL.
+        let lost_padding = store.snapshot();
+        let pause = crate::ram::segs::PauseRewindSync::new(&segment);
+        chunks.remove_cell(&aborted).unwrap();
+        assert_eq!(
+            crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+            Ok(1)
+        );
+        assert!(
+            segment.rewind_release_pending(),
+            "abort returned before sync"
+        );
+        assert!(segment.is_head_owned(), "the syncer retains the head");
+        assert!(!segment.try_own(), "no writer can append before durability");
+        let padding_survived = store.snapshot();
+        // A torn final WAL record models a partially persisted rewind.
+        let partial_padding = store.snapshot();
+        let mut truncated = false;
+        let mut directories = vec![partial_padding.wal.path().to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                let path = entry.path();
+                let old = lost_padding
+                    .wal
+                    .path()
+                    .join(path.strip_prefix(partial_padding.wal.path()).unwrap());
+                if old.exists() && entry.metadata().unwrap().len() > old.metadata().unwrap().len() {
+                    let old_len = old.metadata().unwrap().len();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(old_len + 1)
+                        .unwrap();
+                    truncated = true;
+                }
+            }
+        }
+        assert!(truncated, "the rewind appended a WAL record");
+        segment.force_wal_sync().unwrap();
+        assert!(!segment.rewind_release_pending());
+        assert!(!segment.is_head_owned());
+        drop(pause);
+        // Restrict the pool to the released head to prove actual reuse.
+        for slot in chunks.list[0].head_pool.iter() {
+            if slot.load(Ordering::Acquire) != segment.id {
+                slot.store(u64::MAX, Ordering::Release);
+            }
+        }
+        chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
+        assert_eq!(segment_of(&chunks, &after).id, segment.id);
+        chunks.sync_all();
+        let reused = store.snapshot();
+        for (snapshot, has_after) in [
+            (&lost_padding, false),
+            (&partial_padding, false),
+            (&padding_survived, false),
+            (&reused, true),
+        ] {
+            let recovered = store.recover_snapshot(snapshot);
+            assert!(recovered.read_cell(&before).is_ok());
+            assert!(recovered.read_cell(&aborted).is_err());
+            assert_eq!(recovered.read_cell(&after).is_ok(), has_after);
         }
     }
 

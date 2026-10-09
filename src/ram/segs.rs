@@ -54,6 +54,29 @@ pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
     parking_lot::Mutex::new(Vec::new());
 
+#[cfg(test)]
+static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(crate) struct PauseRewindSync(usize);
+
+#[cfg(test)]
+impl PauseRewindSync {
+    pub(crate) fn new(seg: &Segment) -> Self {
+        PAUSED_REWIND_SYNCS.lock().insert(seg.addr);
+        Self(seg.addr)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PauseRewindSync {
+    fn drop(&mut self) {
+        PAUSED_REWIND_SYNCS.lock().remove(&self.0);
+    }
+}
+
 /// Enqueue a segment for the syncer's next pass and lazily start the syncer.
 pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
     if seg
@@ -79,9 +102,17 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
                     // the sync re-enqueue for the next pass instead of being
                     // silently absorbed into a sync that may miss them.
                     seg.wal_sync_queued.store(false, Ordering::Release);
-                    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0 {
+                    #[cfg(test)]
+                    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) {
+                        queue_wal_sync(&seg);
+                        continue;
+                    }
+                    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0
+                        || seg.rewind_release_pending()
+                    {
                         if let Err(e) = seg.force_wal_sync() {
                             error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
+                            queue_wal_sync(&seg);
                         }
                     }
                 }
@@ -598,6 +629,8 @@ pub struct Segment {
     /// Set while this segment sits in the WAL syncer's dirty registry, so a
     /// segment is enqueued at most once per syncer pass.
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
+    /// The abort transferred its lease reference to the WAL syncer.
+    rewind_release: AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
     /// Entries that have taken space in this segment but have not yet written
@@ -900,6 +933,7 @@ impl Segment {
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
+            rewind_release: AtomicBool::new(false),
             // A segment born cold has no image in its mapping either: the
             // backup is all there is until something promotes it.
             block_residency: parking_lot::RwLock::new(BlockResidency {
@@ -2448,6 +2482,22 @@ image, not an empty segment; archiving it would persist the damage.",
         Ok(())
     }
 
+    /// Publish the deferred release under the same lock as fsync. A sync
+    /// that started before the padding was journaled cannot release it.
+    /// Without a WAL there is no durability wait, and the caller releases.
+    pub(crate) fn defer_rewind_release(&self) -> bool {
+        let state = self.file_state.lock();
+        if state.wal.is_none() {
+            return false;
+        }
+        self.rewind_release.store(true, Release);
+        true
+    }
+
+    pub(crate) fn rewind_release_pending(&self) -> bool {
+        self.rewind_release.load(Acquire)
+    }
+
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
@@ -2462,6 +2512,12 @@ image, not an empty segment; archiving it would persist the damage.",
             self.last_sync_time.store(current_time, Ordering::Relaxed);
 
             trace!("Forced WAL sync for segment {}", self.id);
+        }
+        if self.rewind_release.swap(false, AcqRel) {
+            // Still owned throughout the sync. No other writer can put
+            // bytes behind padding that has not reached stable storage.
+            self.try_release_own().map_err(io::Error::other)?;
+            self.decr_references();
         }
         Ok(())
     }
