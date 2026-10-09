@@ -1253,7 +1253,7 @@ impl NebRPCService {
         &self,
         cell: &OwnedCell,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
-        self.database_runtime.write_fence().enter(|| {
+        self.database_runtime.write_fence().enter_noted(cell.header.id.bits(), || {
             self.database_runtime
                 .schemas()
                 .uid_of_vid(&cell.header.schema)
@@ -1267,9 +1267,16 @@ impl NebRPCService {
         &self,
         id: &Id,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
-        self.database_runtime.write_fence().enter(|| {
-            let header = self.database_runtime.chunks().head_cell(id).ok()?;
-            self.database_runtime.schemas().uid_of_vid(&header.schema)
+        use crate::server::write_fence::KeyedFamily;
+        self.database_runtime.write_fence().enter_keyed(id.bits(), || {
+            match self.database_runtime.chunks().head_cell(id) {
+                Ok(header) => match self.database_runtime.schemas().uid_of_vid(&header.schema) {
+                    Some(uid) => KeyedFamily::Family(uid),
+                    None => KeyedFamily::Unknown,
+                },
+                Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
+                Err(_) => KeyedFamily::Unknown,
+            }
         })
     }
 
