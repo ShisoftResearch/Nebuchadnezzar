@@ -3332,6 +3332,9 @@ impl Chunk {
                             }
                         }
                     }
+                    if floors.is_empty() {
+                        floors.shrink_to_fit();
+                    }
                 }
                 self.retired_segment_files.fetch_sub(1, Ordering::AcqRel);
                 entry.segment.mem_drop(self);
