@@ -109,6 +109,39 @@ The fix, by exit:
   `decided_commit` before the first record, and no abort path may touch it
   after that.
 
+Follow-up rules (user, 2026-10-09) and how they landed:
+
+- **A live transaction owns its segments.** `lease_head_for_current_txn` marks
+  the head bracket-open while the claim still owns it, so there is no moment
+  between lease and BEGIN when the release point would accept it.
+  INVARIANT A (a lease never ends with its stream open) is enforced at
+  `Segment::try_release_own`; INVARIANT B (a thread's transaction context
+  never outlives its transaction) at `TransactionScope` exit and by the
+  ownership FENCE: ending a transaction's leases (abort, expiry) marks its
+  registry record `revoked` under the lock every placement takes, so a slow
+  owner's next write fails `TransactionRevoked`, and the rewind first drains
+  any write that owner had already claimed.
+- **The rewind is durable before reassignment**: the padding header is
+  fsynced before the head is released.
+- **No unbracketed fallback** (item 34): a transactional write that cannot get
+  a head of its own waits (bounded, `NEB_TXN_HEAD_WAIT_MS`, default 2 s) and
+  then fails `TransactionHeadUnavailable`. A chunk that can never spare a head
+  (capacity under three segments) refuses at once. "Spare" now counts heads a
+  plain writer holds for microseconds as available; only transaction-owned
+  heads are scarce.
+- **Recovery and open brackets**: recovery resumes NO segment as a write head
+  (`reset_write_heads_after_recovery` seals every recovered segment), so an
+  open BEGIN left by a crash can never have a later write appended behind it.
+  The bracket's cells are kept aside as in-doubt for cooperative termination
+  (Phase 6b) and dropped by compaction if never resolved committed.
+- **Why the logical rollback stays on the abort path**: the physical rewind
+  makes the LOG forget the span; it does not restore the cell index, the
+  secondary indexes, the dead-space/dead-bit accounting or the slot byte
+  counters. The rollback does all of those through the ordinary write path.
+  Its writes no longer endanger anything: the transaction keeps its heads
+  until the rewind is durable, and a lease can never take the last head that
+  is not a transaction's, so the rollback always has one to write to.
+
 STILL OPEN, deliberately: the undo log has NOT left the write path (abort is
 physical now, so it can — but that retirement needs its own validation);
 blob-class writes are outside the bracket (they are a separate segment class
