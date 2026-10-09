@@ -491,6 +491,48 @@ impl DataManager {
             }
         }
     }
+    /// Prepared transactions that carry at least one write. A fencer drains
+    /// these before it reports the fence engaged, because each can still commit.
+    pub fn prepared_writer_count(&self) -> usize {
+        let tids: Vec<TxnId> = self.txns_sorted.lock().iter().cloned().collect();
+        tids.iter()
+            .filter(|tid| {
+                self.find_transaction(tid).is_some_and(|txn| {
+                    let txn = txn.lock();
+                    txn.state == TxnState::Prepared
+                        && txn
+                            .certified
+                            .values()
+                            .any(|op| op.intent == PrepareIntent::Write)
+                })
+            })
+            .count()
+    }
+
+    /// Whether preparing `ops` would write a cell the engaged fence protects.
+    ///
+    /// A prepare names cells by id and carries no schema, so the family is read
+    /// off the stored cell. A write to a cell that does not exist yet (an
+    /// insert) has no stored header to read, and is treated as protected: an
+    /// insert is exactly what a dump must not miss, and refusing a derived
+    /// transactional insert for the length of a dump is the cheaper error.
+    fn prepare_writes_fenced_cell(&self, ops: &[PrepareOp]) -> bool {
+        let fence = self.database_runtime.write_fence();
+        ops.iter()
+            .filter(|op| op.intent == PrepareIntent::Write)
+            .any(|op| match op.expectation {
+                CellExpectation::Absent => true,
+                CellExpectation::Present(_) => {
+                    let family = self
+                        .chunks()
+                        .head_cell(&op.id)
+                        .ok()
+                        .and_then(|header| self.database_runtime.schemas().uid_of_vid(&header.schema));
+                    fence.would_refuse(family)
+                }
+            })
+    }
+
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         // Check if entry exists to avoid duplicate list insertions
         let is_new = self.cells.get(id).is_none();
@@ -2053,6 +2095,193 @@ mod tests {
             .payload;
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_database_refuses_to_prepare_writes_to_protected_cells() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_fenced_prepare";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("registered data site");
+        let present_id = Id::allocated(0, 0, 99101);
+        let version = seed_cell_version(&runtime, schema.vid.get(), present_id, 1, 0);
+        let absent_id = Id::allocated(0, 0, 99102);
+
+        let hold = runtime
+            .engage_write_fence([schema.uid].into_iter().collect(), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let write_present = PrepareOp {
+            id: present_id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+        let tid = test_hlc(1, 71);
+        assert_eq!(
+            prepare_ops_local(&manager, 71, &tid, vec![write_present.clone()]).await,
+            DMPrepareResult::DatabaseFenced
+        );
+        // An insert has no stored header to name its family, so it is refused too.
+        let tid = test_hlc(1, 72);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                72,
+                &tid,
+                vec![PrepareOp {
+                    id: absent_id,
+                    expectation: CellExpectation::Absent,
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::DatabaseFenced
+        );
+        // Reads are not writes.
+        let tid = test_hlc(1, 73);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                73,
+                &tid,
+                vec![PrepareOp {
+                    id: present_id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Read,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        abort_and_end_local(&manager, &tid).await;
+
+        drop(hold);
+        let tid = test_hlc(1, 74);
+        assert_eq!(
+            prepare_ops_local(&manager, 74, &tid, vec![write_present]).await,
+            DMPrepareResult::Success,
+            "the fence lifts when the hold drops"
+        );
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engaging_the_fence_waits_for_a_prepared_writer_to_commit() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_fence_drains_prepared";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("registered data site");
+        let cell_id = Id::allocated(0, 0, 99111);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 1, 0);
+        let tid = test_hlc(1, 81);
+
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                81,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(manager.prepared_writer_count(), 1);
+
+        let engaging = {
+            let runtime = runtime.clone();
+            let uid = schema.uid;
+            tokio::spawn(async move {
+                runtime
+                    .engage_write_fence([uid].into_iter().collect(), Duration::from_secs(10))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !engaging.is_finished(),
+            "the fence must not report engaged while a prepared writer can still commit"
+        );
+
+        // The prepared transaction is allowed to finish, fence or no fence.
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    cell_id,
+                    2,
+                    "committed-through-the-fence",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+
+        let hold = engaging.await.unwrap().expect("engages once the writer is done");
+        let stored = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*stored.data["score"].u64().unwrap(), 2);
+        drop(hold);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engaging_the_fence_times_out_on_a_prepared_writer_that_never_finishes() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_fence_drain_timeout";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("registered data site");
+        let cell_id = Id::allocated(0, 0, 99121);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell_id, 1, 0);
+        let tid = test_hlc(1, 91);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                91,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        let err = runtime
+            .engage_write_fence([schema.uid].into_iter().collect(), Duration::from_millis(100))
+            .await
+            .err()
+            .expect("must time out");
+        assert!(matches!(
+            err,
+            crate::server::write_fence::FenceError::DrainTimeout { .. }
+        ));
+        assert!(
+            !runtime.write_fence().is_engaged(),
+            "a timed-out engage leaves nothing fenced"
+        );
+        abort_and_end_local(&manager, &tid).await;
         server.shutdown().await;
     }
 
@@ -4364,6 +4593,16 @@ impl Service for DataManager {
                 Ok(prepared_ops) => prepared_ops,
                 Err(result) => return self.response_with(result).await,
             };
+            // The write fence. Counted for the whole prepare, so a fencer that
+            // is draining sees this transaction either not yet started (and
+            // then refuses it here) or already `Prepared` (and waits for it
+            // through `prepared_writer_count`). A prepare that is fenced out is
+            // refused before it takes any cell lock.
+            let fence = self.database_runtime.write_fence();
+            let _fence_guard = fence.enter(|| None).ok();
+            if fence.is_engaged() && self.prepare_writes_fenced_cell(&prepared_ops) {
+                return self.response_with(DMPrepareResult::DatabaseFenced).await;
+            }
             #[cfg(test)]
             if let Some(state) = Self::take_matching_prepare_delay(&tid, &prepared_ops) {
                 Self::await_prepare_delay(&state).await;
@@ -4471,6 +4710,11 @@ impl Service for DataManager {
         let phase_guard =
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantCommit);
         self.update_clock(clock);
+        // A commit is a write. It is admitted even while a fence is engaged
+        // (the transaction prepared before the fence, and aborting a prepared
+        // transaction here would leave its coordinator in doubt), but it is
+        // counted, so the fencer's drain waits for it.
+        let fence_guard = self.database_runtime.write_fence().enter(|| None).ok();
 
         let effective_ts = clock.max(tid);
 
@@ -4487,6 +4731,7 @@ impl Service for DataManager {
                 move || self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
             });
             return async move {
+                let _fence_guard = fence_guard;
                 #[cfg(feature = "occ_phase_profile")]
                 let _phase_guard = phase_guard;
                 let (payload, request_results) = scoped_commit.await;

@@ -618,6 +618,111 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
+    /// Headers (no bodies) for many cells, in the order of `ids`, each from the
+    /// server that owns it.
+    pub async fn head_all_cells(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Result<CellHeader, ReadError>>, RPCError> {
+        let mut by_server: HashMap<u64, Vec<(usize, Id)>> = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let server_id = self.locate_server_id(id)?;
+            by_server.entry(server_id).or_default().push((index, *id));
+        }
+        let mut out: Vec<Option<Result<CellHeader, ReadError>>> =
+            (0..ids.len()).map(|_| None).collect();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<Id>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let heads = client.head_all_cells(&batch).await?;
+                Ok::<_, RPCError>((indices, heads))
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(batch) = batches.next().await {
+            let (indices, heads) = batch?;
+            for (index, head) in indices.into_iter().zip(heads) {
+                out[index] = Some(head);
+            }
+        }
+        Ok(out.into_iter().map(|head| head.expect("every id was routed")).collect())
+    }
+
+    /// Fence writes to `families` on every member and wait for in-flight writes
+    /// to drain. The fence is leased: a holder that dies stops renewing and the
+    /// members lift it on their own. Hold the returned [`ClusterFence`] for as
+    /// long as the copy runs and call [`ClusterFence::release`] when done.
+    pub async fn engage_write_fence(
+        &self,
+        families: &[u32],
+        drain: std::time::Duration,
+        lease: std::time::Duration,
+    ) -> Result<ClusterFence, String> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .all_members(true)
+            .await
+            .map_err(|e| format!("cannot list members: {e:?}"))?;
+        let families = families.to_vec();
+        let lease_ms = lease.as_millis() as u64;
+        let mut holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)> = Vec::new();
+        for member in members {
+            let rpc = self
+                .client_by_server_id(member.id)
+                .await
+                .map_err(|e| format!("cannot reach member {}: {e:?}", member.id))?;
+            let engaged = rpc
+                .fence_engage(&families, drain.as_millis() as u64, lease_ms)
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|answer| answer);
+            match engaged {
+                Ok(token) => holds.push((rpc, token)),
+                Err(reason) => {
+                    for (rpc, token) in holds {
+                        let _ = rpc.fence_release(token).await;
+                    }
+                    return Err(format!("member {} refused the fence: {reason}", member.id));
+                }
+            }
+        }
+        Ok(ClusterFence::start(holds, lease_ms))
+    }
+
+    /// Cells the cell indexes of every member hold live, summed.
+    pub async fn live_cell_count(&self) -> Result<u64, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut total = 0;
+        for member in members {
+            total += self.client_by_server_id(member.id).await?.live_cell_count().await?;
+        }
+        Ok(total)
+    }
+
+    /// Begin a bounded-memory walk over every live cell id in the database,
+    /// server by server and chunk by chunk, straight off each chunk's primary
+    /// `cell_index`.
+    ///
+    /// The walk only yields ids the visited server OWNS. After a migration the
+    /// donor keeps a deferred copy of a cell until it is reclaimed, and
+    /// reporting both copies would visit one cell twice. Concurrent writes are
+    /// not frozen by this call: a caller that needs a stable set holds the
+    /// database's write fence for the walk.
+    pub async fn cell_id_scan(&self) -> Result<CellIdScan<'_>, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut servers: Vec<u64> = members.into_iter().map(|m| m.id).collect();
+        servers.sort_unstable();
+        Ok(CellIdScan {
+            client: self,
+            servers,
+            next_server: 0,
+            current: None,
+            not_owned: 0,
+        })
+    }
+
     pub async fn count(&self) -> Result<u64, RPCError> {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut member_futs: FuturesUnordered<_> = members
@@ -1230,4 +1335,136 @@ pub async fn client_by_server_name_for_database(
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
+}
+
+/// A walk over the live cell ids of a database. See [`AsyncClient::cell_id_scan`].
+pub struct CellIdScan<'a> {
+    client: &'a AsyncClient,
+    servers: Vec<u64>,
+    next_server: usize,
+    /// The server being walked and its open cursor.
+    current: Option<(u64, Arc<plain_server::AsyncServiceClient>, u64)>,
+    not_owned: u64,
+}
+
+impl CellIdScan<'_> {
+    /// Deferred donor copies skipped so far (ids a server holds but does not own).
+    pub fn not_owned_skipped(&self) -> u64 {
+        self.not_owned
+    }
+
+    /// The next page of at most `max` ids, or `None` when every server has been
+    /// walked. A page can be empty or short without the walk being over.
+    pub async fn next_page(&mut self, max: u32) -> Result<Option<Vec<Id>>, RPCError> {
+        loop {
+            if self.current.is_none() {
+                let Some(&server_id) = self.servers.get(self.next_server) else {
+                    return Ok(None);
+                };
+                self.next_server += 1;
+                let rpc = self.client.client_by_server_id(server_id).await?;
+                let cursor = rpc.cell_scan_open().await?;
+                self.current = Some((server_id, rpc, cursor));
+            }
+            let (server_id, rpc, cursor) = self.current.clone().expect("just set");
+            let page = rpc.cell_scan_next(cursor, max).await?.map_err(|reason| {
+                RPCError::IOError(io::Error::new(io::ErrorKind::Other, reason))
+            })?;
+            if page.done {
+                self.current = None;
+            }
+            let mut ids = Vec::with_capacity(page.ids.len());
+            for id in page.ids {
+                if self.client.locate_server_id(&id)? == server_id {
+                    ids.push(id);
+                } else {
+                    self.not_owned += 1;
+                }
+            }
+            if !ids.is_empty() || !page.done {
+                if ids.is_empty() {
+                    continue;
+                }
+                return Ok(Some(ids));
+            }
+        }
+    }
+}
+
+impl Drop for CellIdScan<'_> {
+    fn drop(&mut self) {
+        // A walk dropped part-way leaves its cursor to the server's idle expiry.
+        self.current = None;
+    }
+}
+
+/// Write fences engaged on every member. See [`AsyncClient::engage_write_fence`].
+pub struct ClusterFence {
+    holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)>,
+    stop: Arc<tokio::sync::Notify>,
+    renewal: Option<tokio::task::JoinHandle<()>>,
+    lost: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ClusterFence {
+    fn start(holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)>, lease_ms: u64) -> Self {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let renewal = {
+            let holds = holds.clone();
+            let stop = stop.clone();
+            let lost = lost.clone();
+            let every = std::time::Duration::from_millis((lease_ms / 3).max(1));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        _ = tokio::time::sleep(every) => {}
+                    }
+                    for (rpc, token) in &holds {
+                        match rpc.fence_renew(*token, lease_ms).await {
+                            Ok(true) => {}
+                            // A member that no longer holds the fence means the
+                            // copy is no longer protected on it.
+                            _ => lost.store(true, std::sync::atomic::Ordering::SeqCst),
+                        }
+                    }
+                }
+            })
+        };
+        ClusterFence {
+            holds,
+            stop,
+            renewal: Some(renewal),
+            lost,
+        }
+    }
+
+    /// Whether any member lost the fence (a missed renewal) since it was engaged.
+    /// A copy taken while this is true is not consistent.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn release(mut self) {
+        self.stop.notify_one();
+        if let Some(task) = self.renewal.take() {
+            let _ = task.await;
+        }
+        for (rpc, token) in &self.holds {
+            let _ = rpc.fence_release(*token).await;
+        }
+        self.holds.clear();
+    }
+}
+
+impl Drop for ClusterFence {
+    fn drop(&mut self) {
+        // Not released explicitly (a panic, a cancelled task): stop renewing and
+        // let the members' leases lapse.
+        self.stop.notify_one();
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
+    }
 }

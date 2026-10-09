@@ -105,6 +105,61 @@ service! {
     rpc post_schema_evolve(previous_id: u32, evolved_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
     rpc scrub_ranged_index(repair: bool) -> Result<ScrubReport, String>;
+    rpc cell_scan_open() -> u64;
+    rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
+    rpc cell_scan_close(cursor: u64) -> ();
+    rpc live_cell_count() -> u64;
+    rpc fence_engage(families: &Vec<u32>, drain_ms: u64, lease_ms: u64) -> Result<u64, String>;
+    rpc fence_renew(token: u64, lease_ms: u64) -> bool;
+    rpc fence_release(token: u64) -> ();
+}
+
+/// One page of a cell scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellScanPage {
+    /// Live cell ids of this server, ascending within the page. A page never
+    /// spans two chunks, so it can be shorter than the page size without the
+    /// scan being over.
+    pub ids: Vec<Id>,
+    /// The scan has visited every chunk. The cursor is closed by the server.
+    pub done: bool,
+}
+
+/// Server-side state of one open cell scan: where it is in the chunk list and
+/// the current chunk's ids. Holds one chunk's ids at most.
+struct CellScan {
+    next_chunk: usize,
+    ids: Vec<u64>,
+    position: usize,
+    last_used: std::time::Instant,
+}
+
+/// A scan abandoned by a vanished client is dropped after this long without a
+/// call, so a crashed dump cannot pin a chunk's worth of ids forever.
+const CELL_SCAN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A write fence held on behalf of a remote caller, kept alive by renewals.
+///
+/// The caller is another process, so the hold cannot be tied to a guard in its
+/// stack: a dump that dies would leave the database read-only forever. The
+/// lease makes the fence self-releasing -- it lapses unless the holder keeps
+/// renewing it.
+struct LeasedFence {
+    // Held for its Drop, which lifts the fence.
+    _hold: crate::server::write_fence::FenceHold,
+    expires: std::time::Instant,
+}
+
+#[derive(Default)]
+pub struct FenceLeases {
+    next_token: std::sync::atomic::AtomicU64,
+    holds: parking_lot::Mutex<std::collections::HashMap<u64, LeasedFence>>,
+}
+
+#[derive(Default)]
+pub struct CellScans {
+    next_id: std::sync::atomic::AtomicU64,
+    open: parking_lot::Mutex<std::collections::HashMap<u64, CellScan>>,
 }
 
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
@@ -131,6 +186,8 @@ fn available_bytes_for(path: &str) -> Option<u64> {
 pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
+    cell_scans: CellScans,
+    fence_leases: Arc<FenceLeases>,
 }
 
 #[cfg(test)]
@@ -242,6 +299,7 @@ impl Service for NebRPCService {
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;
@@ -263,6 +321,7 @@ impl Service for NebRPCService {
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
                 .await;
@@ -283,6 +342,7 @@ impl Service for NebRPCService {
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
             self.remove_cell_unchecked(key).await
         }
         .boxed()
@@ -290,6 +350,7 @@ impl Service for NebRPCService {
     fn upsert_cell(&self, cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             self.upsert_cell_unchecked(cell).await
         }
         .boxed()
@@ -706,6 +767,7 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
             let result = self
                 .with_indices_ensured(|| {
                     self.database_runtime
@@ -738,6 +800,7 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
             let first_value = value.clone();
             let result = self
                 .with_indices_ensured(|| {
@@ -887,6 +950,159 @@ impl Service for NebRPCService {
         .boxed()
     }
 
+    fn cell_scan_open(&self) -> BoxFuture<'_, u64> {
+        let scans = &self.cell_scans;
+        let mut open = scans.open.lock();
+        open.retain(|_, scan| scan.last_used.elapsed() < CELL_SCAN_IDLE);
+        let id = scans
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        open.insert(
+            id,
+            CellScan {
+                next_chunk: 0,
+                ids: Vec::new(),
+                position: 0,
+                last_used: std::time::Instant::now(),
+            },
+        );
+        future::ready(id).boxed()
+    }
+
+    fn cell_scan_next(
+        &self,
+        cursor: u64,
+        max: u32,
+    ) -> BoxFuture<'_, Result<CellScanPage, String>> {
+        let max = (max as usize).max(1);
+        let result = (|| {
+            let chunks = self.database_runtime.chunks();
+            let mut open = self.cell_scans.open.lock();
+            let scan = open
+                .get_mut(&cursor)
+                .ok_or_else(|| format!("cell scan {cursor} is not open (expired or closed)"))?;
+            scan.last_used = std::time::Instant::now();
+            // Skip exhausted chunks until one has ids. The previous chunk's ids
+            // are dropped before the next chunk's are built, so at most one
+            // chunk is ever resident.
+            while scan.position >= scan.ids.len() {
+                if scan.next_chunk >= chunks.chunk_count() {
+                    open.remove(&cursor);
+                    return Ok(CellScanPage {
+                        ids: Vec::new(),
+                        done: true,
+                    });
+                }
+                scan.ids = Vec::new();
+                scan.ids = chunks.live_cell_ids_of_chunk(scan.next_chunk);
+                scan.next_chunk += 1;
+                scan.position = 0;
+            }
+            let end = (scan.position + max).min(scan.ids.len());
+            let ids = scan.ids[scan.position..end]
+                .iter()
+                .map(|bits| Id::from_bits(*bits))
+                .collect();
+            scan.position = end;
+            let exhausted =
+                scan.position >= scan.ids.len() && scan.next_chunk >= chunks.chunk_count();
+            if exhausted {
+                open.remove(&cursor);
+            }
+            Ok(CellScanPage {
+                ids,
+                done: exhausted,
+            })
+        })();
+        future::ready(result).boxed()
+    }
+
+    fn live_cell_count(&self) -> BoxFuture<'_, u64> {
+        let chunks = self.database_runtime.chunks();
+        let count: usize = (0..chunks.chunk_count())
+            .map(|chunk| chunks.live_cell_ids_of_chunk(chunk).len())
+            .sum();
+        future::ready(count as u64).boxed()
+    }
+
+    fn fence_engage(
+        &self,
+        families: &Vec<u32>,
+        drain_ms: u64,
+        lease_ms: u64,
+    ) -> BoxFuture<'_, Result<u64, String>> {
+        let families: std::collections::HashSet<crate::ram::schema::SchemaUid> = families
+            .iter()
+            .map(|uid| crate::ram::schema::SchemaUid(*uid))
+            .collect();
+        async move {
+            let hold = self
+                .database_runtime
+                .engage_write_fence(families, std::time::Duration::from_millis(drain_ms))
+                .await
+                .map_err(|e| e.to_string())?;
+            let leases = &self.fence_leases;
+            let token = leases
+                .next_token
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let lease = std::time::Duration::from_millis(lease_ms.max(1));
+            leases.holds.lock().insert(
+                token,
+                LeasedFence {
+                    _hold: hold,
+                    expires: std::time::Instant::now() + lease,
+                },
+            );
+            // The reaper: lifts the fence if the holder stops renewing.
+            let leases = Arc::clone(&self.fence_leases);
+            tokio::spawn(async move {
+                loop {
+                    let wait = {
+                        let holds = leases.holds.lock();
+                        match holds.get(&token) {
+                            None => return,
+                            Some(held) => held.expires.saturating_duration_since(std::time::Instant::now()),
+                        }
+                    };
+                    if wait.is_zero() {
+                        if leases.holds.lock().remove(&token).is_some() {
+                            warn!("write fence lease {token} lapsed without a renewal; fence lifted");
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+            });
+            Ok(token)
+        }
+        .boxed()
+    }
+
+    fn fence_renew(&self, token: u64, lease_ms: u64) -> BoxFuture<'_, bool> {
+        let mut holds = self.fence_leases.holds.lock();
+        let renewed = match holds.get_mut(&token) {
+            Some(held) => {
+                held.expires = std::time::Instant::now()
+                    + std::time::Duration::from_millis(lease_ms.max(1));
+                true
+            }
+            None => false,
+        };
+        future::ready(renewed).boxed()
+    }
+
+    fn fence_release(&self, token: u64) -> BoxFuture<'_, ()> {
+        self.fence_leases.holds.lock().remove(&token);
+        future::ready(()).boxed()
+    }
+
+    fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
+        self.cell_scans.open.lock().remove(&cursor);
+        future::ready(()).boxed()
+    }
+
     fn post_schema_add<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
             let schema = self
@@ -967,6 +1183,8 @@ impl NebRPCService {
         Arc::new(NebRPCService {
             database_runtime,
             neb_client,
+            cell_scans: CellScans::default(),
+            fence_leases: Arc::new(FenceLeases::default()),
         })
     }
     async fn refresh_local_schema_cache_for_write(&self, schema_id: u32) -> Result<(), WriteError> {
@@ -1025,6 +1243,34 @@ impl NebRPCService {
             }
         }
         .boxed()
+    }
+
+    /// Admit a write of `cell` through the database's write fence.
+    ///
+    /// The cell names its own generation, which resolves to the family the
+    /// fence protects.
+    fn fence_for_cell_body(
+        &self,
+        cell: &OwnedCell,
+    ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
+        self.database_runtime.write_fence().enter(|| {
+            self.database_runtime
+                .schemas()
+                .uid_of_vid(&cell.header.schema)
+        })
+    }
+
+    /// Admit a write that names only a cell id (a remove, a field set). The
+    /// family is read off the stored cell's header, and only when a fence is
+    /// engaged: the normal path never pays for the lookup.
+    fn fence_for_cell_id(
+        &self,
+        id: &Id,
+    ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
+        self.database_runtime.write_fence().enter(|| {
+            let header = self.database_runtime.chunks().head_cell(id).ok()?;
+            self.database_runtime.schemas().uid_of_vid(&header.schema)
+        })
     }
 
     /// Refuse a write for a slot this member does not own.

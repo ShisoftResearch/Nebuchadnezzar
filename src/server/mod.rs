@@ -34,6 +34,7 @@ pub mod cell_rpc;
 pub mod database;
 pub mod status;
 mod storage_lock;
+pub mod write_fence;
 #[cfg(test)]
 mod tests;
 pub mod transactions;
@@ -1026,6 +1027,11 @@ pub struct DatabaseRuntime {
     /// Lazily-initialized compact-id allocator: first use claims an
     /// origin slot from the database's lease authority.
     id_allocator: tokio::sync::OnceCell<Arc<crate::ram::id_alloc::IdAllocator>>,
+    /// The database's id-allocation authority as seen from this server, kept so
+    /// floors can be reserved for origins other than our own.
+    id_alloc_sm: tokio::sync::OnceCell<Arc<crate::ram::id_alloc_sm::client::SMClient>>,
+    /// Holds writers off for a logical dump; see `write_fence`.
+    write_fence: Arc<write_fence::WriteFence>,
     /// This database's participant side, once its service is registered.
     ///
     /// WEAK on purpose: the data site holds the runtime, so a strong link
@@ -1070,6 +1076,8 @@ impl DatabaseRuntime {
             raft_client,
             neb_client,
             id_allocator: tokio::sync::OnceCell::new(),
+            id_alloc_sm: tokio::sync::OnceCell::new(),
+            write_fence: Arc::new(write_fence::WriteFence::new()),
             data_site: std::sync::OnceLock::new(),
         }
     }
@@ -1083,17 +1091,7 @@ impl DatabaseRuntime {
     ) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
         self.id_allocator
             .get_or_try_init(|| async {
-                let plane_client = self
-                    .raft_client
-                    .plane(database_meta_plane_id(&self.group_name, &self.database_name));
-                let sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(
-                    &self.group_name,
-                    &self.database_name,
-                );
-                let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
-                    sm_id,
-                    &plane_client,
-                ));
+                let sm = self.id_alloc_sm_client();
                 let holder = self.rpc.server_id;
                 let (origin, epoch) = sm
                     .claim_origin(&holder)
@@ -1110,7 +1108,7 @@ impl DatabaseRuntime {
                             format!("origin claim refused: {e}"),
                         )
                     })?;
-                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm));
+                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm.clone()));
                 // The recovery scan's max observed sequence for this origin is
                 // the belt-and-suspenders floor: even if the durable lease
                 // record was lost, no sequence that reached disk is reissued.
@@ -1125,6 +1123,100 @@ impl DatabaseRuntime {
                 Ok(Arc::new(allocator))
             })
             .await
+    }
+
+    fn id_alloc_sm_client(&self) -> Arc<crate::ram::id_alloc_sm::client::SMClient> {
+        if let Some(sm) = self.id_alloc_sm.get() {
+            return sm.clone();
+        }
+        let plane_client = self
+            .raft_client
+            .plane(database_meta_plane_id(&self.group_name, &self.database_name));
+        let sm_id =
+            crate::ram::id_alloc_sm::generate_scoped_sm_id(&self.group_name, &self.database_name);
+        let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
+            sm_id,
+            &plane_client,
+        ));
+        // Two racing first calls build equivalent clients; keep whichever won.
+        let _ = self.id_alloc_sm.set(sm.clone());
+        self.id_alloc_sm.get().cloned().unwrap_or(sm)
+    }
+
+    /// The highest sequence ever durably leased for `origin`, if any.
+    ///
+    /// A dump uses this to tell ids this authority issued (sequence at or below
+    /// the lease end) from ids that merely have the same bit layout, such as
+    /// the random-bit shim ids `Id::from_parts` makes.
+    pub async fn id_lease_end(&self, origin: u16) -> std::io::Result<Option<u64>> {
+        self.id_alloc_sm_client().last_lease_end(&origin).await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("last_lease_end query failed: {e:?}"),
+            )
+        })
+    }
+
+    /// Make sure no id of `origin` with a sequence at or below `floor` is
+    /// issued here or by any server that claims the slot later.
+    ///
+    /// For ids imported from another database. Our own origin also moves the
+    /// warm in-memory cursor; any other origin only the durable record, which a
+    /// later claimant's first lease starts above.
+    pub async fn reserve_id_floor(&self, origin: u16, floor: u64) -> std::io::Result<()> {
+        let allocator = self.id_allocator().await?;
+        if allocator.origin() == origin {
+            return allocator.raise_floor(floor).await;
+        }
+        self.id_alloc_sm_client()
+            .reserve_floor(&origin, &floor)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("reserve_floor consensus round failed: {e:?}"),
+                )
+            })?
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("reserve_floor refused: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub fn write_fence(&self) -> &Arc<write_fence::WriteFence> {
+        &self.write_fence
+    }
+
+    /// Fence the families in `protected` against writes, wait for the ones in
+    /// flight (including prepared-but-uncommitted transactions that write) to
+    /// finish, and return a hold that lifts the fence when dropped.
+    pub async fn engage_write_fence(
+        &self,
+        protected: std::collections::HashSet<crate::ram::schema::SchemaUid>,
+        drain_timeout: std::time::Duration,
+    ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
+        let started = std::time::Instant::now();
+        let hold = self.write_fence.engage(protected, drain_timeout).await?;
+        // A transaction that prepared before the flag was set may still commit
+        // afterwards, and a commit is a write. `prepare` is itself fenced, so
+        // the set of such transactions only shrinks from here.
+        if let Some(site) = self.data_site() {
+            loop {
+                let prepared_writers = site.prepared_writer_count();
+                if prepared_writers == 0 {
+                    break;
+                }
+                if started.elapsed() >= drain_timeout {
+                    drop(hold);
+                    return Err(write_fence::FenceError::DrainTimeout {
+                        in_flight_writes: prepared_writers as i64,
+                        waited: started.elapsed(),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        Ok(hold)
     }
 
     pub fn group_name(&self) -> &str {
@@ -2631,8 +2723,8 @@ impl NebServer {
                 take_snapshots: true,
                 append_logs: true,
                 trim_logs: true,
-                snapshot_log_threshold: 1000,
-                log_compaction_threshold: 2000,
+                snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
+                log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
             })
         } else {
             raft::Storage::MEMORY
@@ -3457,4 +3549,25 @@ fn apply_resolved_commit(
     );
     crate::ram::recovery::BRACKETS_APPLIED
         .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000
+/// applied entries, compact once the in-memory log passes 2000) are rarely
+/// reached by a short test lifetime, so the compaction paths stay unexercised;
+/// these variables let a test or a campaign lower them without a rebuild.
+fn raft_threshold_from_env(name: &str, default: u64) -> u64 {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            // Set but unusable: say so, or a typo silently runs the defaults.
+            warn!(
+                "{}={:?} is not a positive integer; using the default {}",
+                name, raw, default
+            );
+            default
+        }
+    }
 }

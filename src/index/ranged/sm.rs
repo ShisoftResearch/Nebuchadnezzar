@@ -229,16 +229,33 @@ impl StateMachineCmds for MasterTreeSM {
     }
 }
 
+/// Snapshot wire form of the placement map: ordered `(key, placement)` pairs.
+fn tree_snapshot_entries(
+    tree: &BTreeMap<EntryKey, TreePlacement>,
+) -> Vec<(&EntryKey, &TreePlacement)> {
+    tree.iter().collect()
+}
+
+/// Decode a placement snapshot (the pair-list form; stores written with the
+/// earlier map form are reimported, not read).
+fn decode_tree_snapshot(data: &[u8]) -> Option<BTreeMap<EntryKey, TreePlacement>> {
+    utils::serde::deserialize::<Vec<(EntryKey, TreePlacement)>>(data)
+        .map(|entries| entries.into_iter().collect())
+}
+
 impl StateMachineCtl for MasterTreeSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
         self.sm_id
     }
     fn snapshot(&self) -> Vec<u8> {
-        utils::serde::serialize(&self.tree)
+        // Persist ordered pairs. Recovery accepts only this form in every profile.
+        utils::serde::serialize(&tree_snapshot_entries(&self.tree))
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        let tree = decode_persisted_or_halt("ranged tree placement snapshot", &data);
+        let entries: Vec<(EntryKey, TreePlacement)> =
+            decode_persisted_or_halt("ranged tree placement snapshot", &data);
+        let tree = entries.into_iter().collect();
         self.tree = tree;
         // Load the trees these placements name. `try_initialize` does this at
         // startup, but it runs BEFORE registration, so on a runtime reload it
@@ -599,6 +616,47 @@ mod tests {
     use bifrost::rpc::Server;
     use std::fs;
     use tempfile::TempDir;
+
+    fn sample_tree() -> BTreeMap<EntryKey, TreePlacement> {
+        let mut tree = BTreeMap::new();
+        for lead in [0x00u8, 0x20, 0x30] {
+            let mut bytes = vec![lead];
+            bytes.extend(vec![0; 31]);
+            tree.insert(
+                EntryKey::from_slice(&bytes),
+                TreePlacement {
+                    id: Id::rand(),
+                    epoch: lead as u64 + 1,
+                },
+            );
+        }
+        tree
+    }
+
+    /// The placement snapshot must round-trip under BOTH codecs (serde_json in
+    /// debug, serde_cbor in release). `cargo test` in each profile covers both.
+    #[test]
+    fn placement_snapshot_round_trips_under_the_active_codec() {
+        let tree = sample_tree();
+        let bytes = utils::serde::serialize(&tree_snapshot_entries(&tree));
+        let restored = decode_tree_snapshot(&bytes).expect("snapshot decodes");
+        assert_eq!(restored.len(), tree.len());
+        for (key, placement) in &tree {
+            let got = restored.get(key).expect("key survives");
+            assert_eq!(got.id, placement.id);
+            assert_eq!(got.epoch, placement.epoch);
+        }
+    }
+
+    /// Root cause of the debug-build snapshot panic: a map keyed by
+    /// `EntryKey` (a sequence) is not representable in JSON.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn map_keyed_by_entry_key_is_not_json_representable() {
+        let tree = sample_tree();
+        assert!(serde_json::to_vec(&tree).is_err());
+        assert!(serde_json::to_vec(&tree_snapshot_entries(&tree)).is_ok());
+    }
 
     #[test]
     fn test_master_tree_persistence_and_recovery() {
