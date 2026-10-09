@@ -32,14 +32,14 @@ use std::sync::{Arc, RwLock};
 
 pub mod cell_rpc;
 pub mod database;
-#[cfg(test)]
-mod restart_delete_tests;
 pub mod status;
 mod storage_lock;
+pub mod write_fence;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod restart_delete_tests;
 pub mod transactions;
-pub mod write_fence;
 
 // Re-export status types for convenience
 pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
@@ -336,16 +336,17 @@ async fn ensure_type2_meta_plane(
             // round-robin can answer with THIS node's own unseeded view,
             // which reads as "no plane" and left joiners waiting for a
             // creator that had long since created it.
-            let (remote_has_plane, already_member) = match raft_service
-                .probe_plane_members(plane_id, &remote_seeds)
-                .await
-            {
-                Some(info) => {
-                    let members = info.member_addresses();
-                    (true, members.iter().any(|member| *member == self_addr))
-                }
-                None => (false, false),
-            };
+            let (remote_has_plane, already_member) =
+                match raft_service.probe_plane_members(plane_id, &remote_seeds).await {
+                    Some(info) => {
+                        let members = info.member_addresses();
+                        (
+                            true,
+                            members.iter().any(|member| *member == self_addr),
+                        )
+                    }
+                    None => (false, false),
+                };
             // Already in the plane's membership -- above all as its CURRENT
             // LEADER, which is exactly what the creator looks like when a
             // later ensure (a database's membership check, a retry) runs on
@@ -407,9 +408,7 @@ async fn ensure_type2_meta_plane(
                         let plane = raft_service
                             .ensure_plane(raft::PlaneSpec { plane_id })
                             .await
-                            .map_err(|e| {
-                                format!("joined {plane_label} but cannot handle it: {e}")
-                            })?;
+                            .map_err(|e| format!("joined {plane_label} but cannot handle it: {e}"))?;
                         match plane.member_addresses().await {
                             Ok(members) => {
                                 let members = canonical_member_addresses(members);
@@ -483,7 +482,9 @@ async fn ensure_type2_meta_plane(
         // from the pre-registration phase, promote it now. The promotion is
         // idempotent and refuses anything already seeded.
         if let Err(error) = raft_service.bootstrap_plane_if_unseeded(plane_id).await {
-            last_transient_error = Some(format!("failed to bootstrap {plane_label}: {error}"));
+            last_transient_error = Some(format!(
+                "failed to bootstrap {plane_label}: {error}"
+            ));
             if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
                 tokio::time::sleep(tokio::time::Duration::from_millis(
                     META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
@@ -676,9 +677,7 @@ async fn register_schema_state_machine_on_plane(
     // The compact-id lease authority lives on the same per-database plane.
     let alloc_sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(group_name, database_name);
     plane
-        .register_state_machine(Box::new(crate::ram::id_alloc_sm::IdAllocSM::new(
-            alloc_sm_id,
-        )))
+        .register_state_machine(Box::new(crate::ram::id_alloc_sm::IdAllocSM::new(alloc_sm_id)))
         .await
 }
 
@@ -1041,7 +1040,9 @@ pub struct DatabaseRuntime {
     /// database that was ever loaded would then keep its whole store
     /// resident -- the exact shape of the leak
     /// `ptr_hash_map_remove_does_not_release_the_value` documents.
-    data_site: std::sync::OnceLock<std::sync::Weak<transactions::data_site::DataManager>>,
+    data_site: std::sync::OnceLock<
+        std::sync::Weak<transactions::data_site::DataManager>,
+    >,
 }
 
 impl DatabaseRuntime {
@@ -1086,7 +1087,9 @@ impl DatabaseRuntime {
     /// slot (with a fresh fencing epoch) from the consensus lease
     /// authority and recovers the allocation floor from its durable
     /// lease record.
-    pub async fn id_allocator(&self) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
+    pub async fn id_allocator(
+        &self,
+    ) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
         self.id_allocator
             .get_or_try_init(|| async {
                 let sm = self.id_alloc_sm_client();
@@ -1111,9 +1114,13 @@ impl DatabaseRuntime {
                 // the belt-and-suspenders floor: even if the durable lease
                 // record was lost, no sequence that reached disk is reissued.
                 let scanned_floor = self.chunks().recovered_origin_floor(origin);
-                let allocator =
-                    crate::ram::id_alloc::IdAllocator::recover(store, origin, epoch, scanned_floor)
-                        .await?;
+                let allocator = crate::ram::id_alloc::IdAllocator::recover(
+                    store,
+                    origin,
+                    epoch,
+                    scanned_floor,
+                )
+                .await?;
                 Ok(Arc::new(allocator))
             })
             .await
@@ -1123,10 +1130,9 @@ impl DatabaseRuntime {
         if let Some(sm) = self.id_alloc_sm.get() {
             return sm.clone();
         }
-        let plane_client = self.raft_client.plane(database_meta_plane_id(
-            &self.group_name,
-            &self.database_name,
-        ));
+        let plane_client = self
+            .raft_client
+            .plane(database_meta_plane_id(&self.group_name, &self.database_name));
         let sm_id =
             crate::ram::id_alloc_sm::generate_scoped_sm_id(&self.group_name, &self.database_name);
         let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
@@ -1144,15 +1150,12 @@ impl DatabaseRuntime {
     /// the lease end) from ids that merely have the same bit layout, such as
     /// the random-bit shim ids `Id::from_parts` makes.
     pub async fn id_lease_end(&self, origin: u16) -> std::io::Result<Option<u64>> {
-        self.id_alloc_sm_client()
-            .last_lease_end(&origin)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("last_lease_end query failed: {e:?}"),
-                )
-            })
+        self.id_alloc_sm_client().last_lease_end(&origin).await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("last_lease_end query failed: {e:?}"),
+            )
+        })
     }
 
     /// Make sure no id of `origin` with a sequence at or below `floor` is
@@ -1176,10 +1179,7 @@ impl DatabaseRuntime {
                 )
             })?
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("reserve_floor refused: {e}"),
-                )
+                std::io::Error::new(std::io::ErrorKind::Other, format!("reserve_floor refused: {e}"))
             })?;
         Ok(())
     }
@@ -1207,10 +1207,7 @@ impl DatabaseRuntime {
         drain_timeout: std::time::Duration,
     ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
         let started = std::time::Instant::now();
-        let hold = self
-            .write_fence
-            .engage_with(protected, drain_timeout)
-            .await?;
+        let hold = self.write_fence.engage_with(protected, drain_timeout).await?;
         // A transaction that prepared before the flag was set may still commit
         // afterwards, and a commit is a write. `prepare` is itself fenced, so
         // the set of such transactions only shrinks from here.
@@ -1260,6 +1257,7 @@ impl DatabaseRuntime {
     pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
         self.indexer.as_ref()
     }
+
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
@@ -1475,7 +1473,9 @@ pub async fn init_conshash(
         }
         Err(e) => {
             error!("Cannot initialize consistent hash table: {:?}", e);
-            return Err(ServerError::CannotInitConsistentHashTable(format!("{e:?}")));
+            return Err(ServerError::CannotInitConsistentHashTable(format!(
+                "{e:?}"
+            )));
         }
     }
 }
@@ -1853,8 +1853,12 @@ impl NebServer {
                     .await;
                 }
                 Service::Transaction | Service::HashIndexer => {
-                    init_txn_data_site_service(rpc_server, database_runtime.clone(), hlc.clone())
-                        .await
+                    init_txn_data_site_service(
+                        rpc_server,
+                        database_runtime.clone(),
+                        hlc.clone(),
+                    )
+                    .await
                 }
                 Service::RangedIndexer => {
                     wait_for_scoped_cell_rpc_services(
@@ -2204,6 +2208,7 @@ impl NebServer {
         self.database_runtime.indexer()
     }
 
+
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.database_runtime.txn_manager()
     }
@@ -2291,6 +2296,7 @@ impl NebServer {
             use crate::index::builder::IndexBuilder;
             let _ = IndexBuilder::await_all_indices().await;
             info!("All pending index tasks completed");
+
 
             // "Completed" is not "succeeded". A task that could not place its
             // entries still completes, and the cell it belonged to was acked
@@ -2555,7 +2561,10 @@ impl NebServer {
             .tiered_config
             .clone()
             .or_else(crate::ram::tiered::TieredConfig::from_env);
-        check_tiered_eviction_can_archive(tiered_config.is_some(), opts.backup_storage.as_deref())?;
+        check_tiered_eviction_can_archive(
+            tiered_config.is_some(),
+            opts.backup_storage.as_deref(),
+        )?;
         let shared_memory_pool = tiered_config
             .as_ref()
             .map(crate::ram::tiered::SharedMemoryPool::new);
@@ -2596,9 +2605,13 @@ impl NebServer {
                 let registered = lightning::map::HashSet::with_capacity(16);
                 for name in discover_databases_for_startup_schema_registration(
                     opts.raft_storage.as_deref(),
-                    &[opts.backup_storage.as_deref(), opts.wal_storage.as_deref()],
+                    &[
+                        opts.backup_storage.as_deref(),
+                        opts.wal_storage.as_deref(),
+                    ],
                     database_name,
-                ) {
+                )
+                {
                     registered.insert(name);
                 }
                 registered
@@ -2721,14 +2734,8 @@ impl NebServer {
                 take_snapshots: true,
                 append_logs: true,
                 trim_logs: true,
-                snapshot_log_threshold: raft_threshold_from_env(
-                    "NEB_RAFT_SNAPSHOT_LOG_THRESHOLD",
-                    1000,
-                ),
-                log_compaction_threshold: raft_threshold_from_env(
-                    "NEB_RAFT_LOG_COMPACTION_THRESHOLD",
-                    2000,
-                ),
+                snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
+                log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
             })
         } else {
             raft::Storage::MEMORY
@@ -2748,7 +2755,10 @@ impl NebServer {
         debug!("Registering state machines before Raft start for WAL replay (recovery mode)");
         let startup_schema_databases = discover_databases_for_startup_schema_registration(
             opts.raft_storage.as_deref(),
-            &[opts.backup_storage.as_deref(), opts.wal_storage.as_deref()],
+            &[
+                opts.backup_storage.as_deref(),
+                opts.wal_storage.as_deref(),
+            ],
             database_name,
         );
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
@@ -2908,7 +2918,8 @@ impl NebServer {
     pub async fn refresh_slot_placement(&self) -> bool {
         match crate::slots::load_owner_vec(&self.group_name, &self.raft_client, SLOTS_SM_ID).await {
             Ok((owners, applied_index)) => {
-                self.consh.set_slot_overrides(owners.clone(), applied_index);
+                self.consh
+                    .set_slot_overrides(owners.clone(), applied_index);
                 // Each database client builds its own ring object, so refreshing
                 // only `self.consh` would leave the read and write paths of this
                 // very server disagreeing. Fan out this same result rather than
@@ -3015,7 +3026,9 @@ pub async fn init_txn_data_site_service(
     hlc: Arc<bifrost::hlc::HlcSource>,
 ) {
     let data_site = transactions::data_site::DataManager::new(database_runtime.clone(), hlc);
-    let _ = database_runtime.data_site.set(Arc::downgrade(&data_site));
+    let _ = database_runtime
+        .data_site
+        .set(Arc::downgrade(&data_site));
     rpc_server
         .register_service_with_id(
             transactions::data_site::generate_scoped_service_id(
@@ -3224,66 +3237,68 @@ where
     // readable. The raft command picks exactly one winner; losers drop
     // their orphan candidate cell.
     if matches!(sm_client.has_placements().await, Ok(false)) {
-        let genesis_id =
-            ranged::sm::MasterTreeSM::select_genesis_tree_id(cons_hash, rpc_server.server_id);
-        let _candidate = ranged::tree::tree::RangedTree::create(neb_client, &genesis_id).await;
-        match sm_client.try_init_genesis(&genesis_id).await {
-            Ok(true) => {
-                info!(
-                    "Won ranged-index genesis election with tree {:?} for {}/{}",
-                    genesis_id, group_name, database_name
-                );
-                let owner_client = match cons_hash.get_server_id_by(&genesis_id) {
-                    Some(server_id) => bifrost::rpc::DEFAULT_CLIENT_POOL
-                        .get_by_id(server_id, |sid| cons_hash.try_server_name(sid))
+    let genesis_id = ranged::sm::MasterTreeSM::select_genesis_tree_id(
+        cons_hash,
+        rpc_server.server_id,
+    );
+    let _candidate = ranged::tree::tree::RangedTree::create(neb_client, &genesis_id).await;
+    match sm_client.try_init_genesis(&genesis_id).await {
+        Ok(true) => {
+            info!(
+                "Won ranged-index genesis election with tree {:?} for {}/{}",
+                genesis_id, group_name, database_name
+            );
+            let owner_client = match cons_hash.get_server_id_by(&genesis_id) {
+                Some(server_id) => bifrost::rpc::DEFAULT_CLIENT_POOL
+                    .get_by_id(server_id, |sid| cons_hash.try_server_name(sid))
+                    .await
+                    .map(|rpc| {
+                        ranged::tree::service::AsyncServiceClient::new_with_service_id(
+                            ranged::tree::service::generate_scoped_service_id(
+                                group_name,
+                                database_name,
+                            ),
+                            &rpc,
+                        )
+                    })
+                    .ok(),
+                None => None,
+            };
+            match owner_client {
+                Some(client) => {
+                    // The root cell already exists, so this loads the tree we
+                    // just persisted into the owning service.
+                    if let Err(e) = client
+                        .crate_tree(
+                            genesis_id,
+                            ranged::tree::service::Boundary::new(
+                                ranged::trees::min_entry_key(),
+                                ranged::trees::max_entry_key(),
+                            ),
+                            ranged::tree::tree::INITIAL_TREE_EPOCH,
+                        )
                         .await
-                        .map(|rpc| {
-                            ranged::tree::service::AsyncServiceClient::new_with_service_id(
-                                ranged::tree::service::generate_scoped_service_id(
-                                    group_name,
-                                    database_name,
-                                ),
-                                &rpc,
-                            )
-                        })
-                        .ok(),
-                    None => None,
-                };
-                match owner_client {
-                    Some(client) => {
-                        // The root cell already exists, so this loads the tree we
-                        // just persisted into the owning service.
-                        if let Err(e) = client
-                            .crate_tree(
-                                genesis_id,
-                                ranged::tree::service::Boundary::new(
-                                    ranged::trees::min_entry_key(),
-                                    ranged::trees::max_entry_key(),
-                                ),
-                                ranged::tree::tree::INITIAL_TREE_EPOCH,
-                            )
-                            .await
-                        {
-                            error!("Failed to load genesis ranged tree: {:?}", e);
-                        }
+                    {
+                        error!("Failed to load genesis ranged tree: {:?}", e);
                     }
-                    None => error!(
-                        "Cannot locate owner for genesis ranged tree {:?}",
-                        genesis_id
-                    ),
                 }
-            }
-            Ok(false) => {
-                let _ = neb_client.remove_cell(genesis_id).await;
-            }
-            Err(e) => {
-                error!(
-                    "Ranged-index genesis election failed for {}/{}: {:?}",
-                    group_name, database_name, e
-                );
-                let _ = neb_client.remove_cell(genesis_id).await;
+                None => error!(
+                    "Cannot locate owner for genesis ranged tree {:?}",
+                    genesis_id
+                ),
             }
         }
+        Ok(false) => {
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+        Err(e) => {
+            error!(
+                "Ranged-index genesis election failed for {}/{}: {:?}",
+                group_name, database_name, e
+            );
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+    }
     }
     Ok(())
 }
@@ -3538,10 +3553,7 @@ fn apply_resolved_commit(
         if let Err(error) =
             crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell)
         {
-            error!(
-                "cannot install resolved transaction {:?}: {}",
-                bracket.txn, error
-            );
+            error!("cannot install resolved transaction {:?}: {}", bracket.txn, error);
             return;
         }
     }
@@ -3551,10 +3563,8 @@ fn apply_resolved_commit(
         bracket.txn,
         bracket.cells.len()
     );
-    crate::ram::recovery::BRACKETS_APPLIED.fetch_add(
-        bracket.cells.len() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    crate::ram::recovery::BRACKETS_APPLIED
+        .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000

@@ -316,6 +316,8 @@ impl SchemasSM {
             recovering,
         )
     }
+
+
 }
 
 impl SchemasSM {
@@ -734,10 +736,7 @@ mod tests {
         restored.load_from_list(decode_snapshot(&utils::serde::serialize(&map.get_all())));
         let uid = restored.uid_of_name("typed").unwrap();
         let vid = restored.handles.get(&uid).unwrap().current_vid;
-        assert_eq!(
-            restored.schema_map.get(&vid).unwrap().app_meta,
-            vec![7, 8, 9]
-        );
+        assert_eq!(restored.schema_map.get(&vid).unwrap().app_meta, vec![7, 8, 9]);
     }
 
     #[test]
@@ -757,10 +756,7 @@ mod tests {
             .unwrap();
         assert_eq!(previous, SchemaVid(1));
         assert_eq!(evolved.app_meta, vec![2, 2]);
-        assert_eq!(
-            map.schema_map.get(&SchemaVid(50)).unwrap().app_meta,
-            vec![2, 2]
-        );
+        assert_eq!(map.schema_map.get(&SchemaVid(50)).unwrap().app_meta, vec![2, 2]);
     }
 
     #[test]
