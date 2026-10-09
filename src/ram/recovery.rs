@@ -447,7 +447,9 @@ pub struct BracketLedger {
     /// this lets the settle step re-decide with the tombstone's identity
     /// (victim segment and version), and lets bracketed writes, which are
     /// applied later, respect it.
-    plain_deletes: Mutex<DeleteBook>,
+    plain_deletes: Mutex<Vec<(IdKey, DeleteMark)>>,
+    /// Equal-version ties, see `DeleteBook::ties`.
+    ties: Mutex<HashMap<IdKey, u32>>,
     /// Plain cells the scan discarded for carrying a LOWER version than what
     /// was already installed although they sit LATER in write order. That is
     /// either a stale copy, or a re-created id (versions restart at 1) whose
@@ -490,7 +492,8 @@ impl BracketLedger {
                 .collect(),
             pending: Mutex::new(HashMap::new()),
             commits: Mutex::new(HashMap::new()),
-            plain_deletes: Mutex::new(DeleteBook::default()),
+            plain_deletes: Mutex::new(Vec::new()),
+            ties: Mutex::new(HashMap::new()),
             late_losers: Mutex::new(Vec::new()),
         }
     }
@@ -500,17 +503,15 @@ impl BracketLedger {
     }
 
     fn note_plain_delete(&self, chunk_id: usize, hash: u64, mark: DeleteMark) {
-        self.plain_deletes.lock().add_mark((chunk_id, hash), mark);
+        // A flat list while the scan runs: one entry per tombstone in the
+        // store, so it must not pay for a hash table's growth spikes. It is
+        // indexed once the scan's per-chunk version maps are gone.
+        self.plain_deletes.lock().push(((chunk_id, hash), mark));
     }
 
     /// A second cell entry with the very same version as the one installed.
     fn note_tie(&self, chunk_id: usize, hash: u64) {
-        *self
-            .plain_deletes
-            .lock()
-            .ties
-            .entry((chunk_id, hash))
-            .or_insert(0) += 1;
+        *self.ties.lock().entry((chunk_id, hash)).or_insert(0) += 1;
     }
 
     fn note_pending(&self, txn: &crate::server::transactions::TxnId, cell: PendingBracketCell) {
@@ -592,7 +593,10 @@ impl BracketLedger {
         // order: a delete could run before the write it follows (the id came
         // back) and a re-create before the delete it follows (the id was
         // lost).
-        let mut plain_deletes = std::mem::take(&mut *self.plain_deletes.lock());
+        let mut plain_deletes = DeleteBook::from_scan(
+            std::mem::take(&mut *self.plain_deletes.lock()),
+            std::mem::take(&mut *self.ties.lock()),
+        );
         revalidate_plain_deletes(chunks, &plain_deletes);
         apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes));
         // A late loser comes back only if it is provably a re-create (see
@@ -706,25 +710,99 @@ type IdKey = (usize, u64);
 /// Everything recovery knows about deletes, per `(chunk, hash)`.
 #[derive(Default)]
 struct DeleteBook {
-    marks: HashMap<IdKey, Vec<DeleteMark>>,
+    /// Plain tombstones from the scan, sorted by id and then read-only: one
+    /// per tombstone in the store, so no per-entry allocation.
+    plain: Vec<(IdKey, DeleteMark)>,
+    /// Tombstones met later, inside committed brackets.
+    extra: HashMap<IdKey, DeleteMarks>,
     /// Extra cell entries that carried the same version as the one installed:
     /// an id with `n` entries at one version has `n - 1` ties.
     ties: HashMap<IdKey, u32>,
 }
 
-impl DeleteBook {
-    fn add_mark(&mut self, key: IdKey, mark: DeleteMark) {
-        let marks = self.marks.entry(key).or_default();
-        match marks
-            .iter_mut()
-            .find(|m| m.version == mark.version && m.target_seq == mark.target_seq)
-        {
+/// The tombstones of one id. Nearly every id has exactly one, and recovery
+/// holds one of these per tombstone in the store, so the first lives inline
+/// and `more` stays unallocated until an id is deleted more than once.
+#[derive(Clone)]
+struct DeleteMarks {
+    first: DeleteMark,
+    more: Vec<DeleteMark>,
+}
+
+impl DeleteMarks {
+    fn iter(&self) -> impl Iterator<Item = &DeleteMark> {
+        std::iter::once(&self.first).chain(self.more.iter())
+    }
+
+    fn add(&mut self, mark: DeleteMark) {
+        let same = |m: &DeleteMark| m.version == mark.version && m.target_seq == mark.target_seq;
+        let found = if same(&self.first) {
+            Some(&mut self.first)
+        } else {
+            self.more.iter_mut().find(|m| same(m))
+        };
+        match found {
             Some(existing) => {
                 existing.count += mark.count;
                 existing.addr = existing.addr.max(mark.addr);
             }
-            None => marks.push(mark),
+            None => self.more.push(mark),
         }
+    }
+}
+
+impl DeleteBook {
+    fn from_scan(mut plain: Vec<(IdKey, DeleteMark)>, ties: HashMap<IdKey, u32>) -> Self {
+        plain.sort_unstable_by_key(|(key, mark)| (*key, mark.version, mark.target_seq));
+        DeleteBook {
+            plain,
+            extra: HashMap::new(),
+            ties,
+        }
+    }
+
+    fn add_mark(&mut self, key: IdKey, mark: DeleteMark) {
+        match self.extra.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().add(mark),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(DeleteMarks {
+                    first: mark,
+                    more: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Every tombstone known for `key`, identical victims merged.
+    fn marks_for(&self, key: IdKey) -> Vec<DeleteMark> {
+        let start = self.plain.partition_point(|(k, _)| *k < key);
+        let run = self.plain[start..].iter().take_while(|(k, _)| *k == key);
+        let mut merged: Option<DeleteMarks> = None;
+        for (_, mark) in run {
+            match merged.as_mut() {
+                Some(marks) => marks.add(*mark),
+                None => {
+                    merged = Some(DeleteMarks {
+                        first: *mark,
+                        more: Vec::new(),
+                    })
+                }
+            }
+        }
+        if let Some(extra) = self.extra.get(&key) {
+            for mark in extra.iter() {
+                match merged.as_mut() {
+                    Some(marks) => marks.add(*mark),
+                    None => {
+                        merged = Some(DeleteMarks {
+                            first: *mark,
+                            more: Vec::new(),
+                        })
+                    }
+                }
+            }
+        }
+        merged.map(|m| m.iter().copied().collect()).unwrap_or_default()
     }
 }
 
@@ -758,32 +836,38 @@ impl DeleteMark {
     }
 }
 
-fn any_kills(
+fn any_kills<'a>(
     chunk: &Chunk,
-    marks: &[DeleteMark],
+    mut marks: impl Iterator<Item = &'a DeleteMark>,
     addr: usize,
     version: u64,
     rank: u32,
 ) -> bool {
-    marks.iter().any(|mark| mark.kills(chunk, addr, version, rank))
+    marks.any(|mark| mark.kills(chunk, addr, version, rank))
 }
 
 /// Re-decide, with every segment installed, each plain tombstone against what
 /// the scan left in the index. The scan decides a tombstone when it meets it,
 /// but the cell it killed may sit in a segment scanned LATER.
 fn revalidate_plain_deletes(chunks: &[Chunk], book: &DeleteBook) {
-    for ((chunk_id, hash), marks) in &book.marks {
-        let Some(chunk) = chunks.get(*chunk_id) else {
+    let mut at = 0;
+    while at < book.plain.len() {
+        let key = book.plain[at].0;
+        while at < book.plain.len() && book.plain[at].0 == key {
+            at += 1;
+        }
+        let (chunk_id, hash) = key;
+        let Some(chunk) = chunks.get(chunk_id) else {
             continue;
         };
-        if let Some(guard) = chunk.cell_index.lock(*hash as usize) {
+        if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let existing = *guard;
             if existing != 0 {
                 let version =
                     crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
                 // The index holds the LAST of the entries that tied.
-                let rank = book.ties.get(&(*chunk_id, *hash)).copied().unwrap_or(0);
-                if any_kills(chunk, marks, existing, version, rank) {
+                let rank = book.ties.get(&key).copied().unwrap_or(0);
+                if any_kills(chunk, book.marks_for(key).iter(), existing, version, rank) {
                     guard.remove();
                 }
             }
@@ -844,11 +928,8 @@ fn apply_bracketed_group(
         .as_deref()
         .and_then(|b| b.ties.get(&key).copied())
         .unwrap_or(0);
-    let mut marks: Vec<DeleteMark> = book
-        .as_deref()
-        .and_then(|b| b.marks.get(&key).cloned())
-        .unwrap_or_default();
-    let mut group_book = DeleteBook::default();
+    // Plain tombstones already known for this id, then this group's own.
+    let mut known = book.as_deref().map(|b| b.marks_for(key)).unwrap_or_default();
     for tombstone in group.iter().filter(|cell| cell.tombstone) {
         let mark = DeleteMark {
             addr: tombstone.addr,
@@ -856,19 +937,21 @@ fn apply_bracketed_group(
             target_seq: tombstone.target_seq,
             count: 1,
         };
-        group_book.add_mark(key, mark);
+        match known
+            .iter_mut()
+            .find(|m| m.version == mark.version && m.target_seq == mark.target_seq)
+        {
+            Some(existing) => {
+                existing.count += 1;
+                existing.addr = existing.addr.max(mark.addr);
+            }
+            None => known.push(mark),
+        }
         if let Some(b) = book.as_deref_mut() {
             b.add_mark(key, mark);
         }
     }
-    if let Some(group_marks) = group_book.marks.remove(&key) {
-        for mark in group_marks {
-            let mut single = DeleteBook::default();
-            single.marks.insert(key, std::mem::take(&mut marks));
-            single.add_mark(key, mark);
-            marks = single.marks.remove(&key).unwrap_or_default();
-        }
-    }
+    let marks = known;
 
     // The installed entry first: a delete in this group may be for it.
     if !marks.is_empty() {
@@ -877,7 +960,7 @@ fn apply_bracketed_group(
             if existing != 0 {
                 let version =
                     crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
-                if any_kills(chunk, &marks, existing, version, plain_ties) {
+                if any_kills(chunk, marks.iter(), existing, version, plain_ties) {
                     guard.remove();
                 }
             }
@@ -900,7 +983,7 @@ fn apply_bracketed_group(
                 .count() as u32;
             !any_kills(
                 chunk,
-                &marks,
+                marks.iter(),
                 cell.addr,
                 cell.version,
                 plain_ties + equals_before,
