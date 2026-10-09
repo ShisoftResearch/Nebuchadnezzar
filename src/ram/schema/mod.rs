@@ -1099,6 +1099,15 @@ pub struct LocalSchemasMap {
     name_map: LFHashMap<String, SchemaUid>,
     /// Family -> the generation new writes belong in.
     handles: LFHashMap<SchemaUid, SchemaVid>,
+    /// Serialises mutations. Reads stay lock-free; a writer holds this for
+    /// its whole read-modify-write so two of them (an evolution superseding a
+    /// record and a patch of that record, say) cannot interleave and leave a
+    /// record whose status disagrees with `handles`.
+    writer: parking_lot::Mutex<()>,
+    /// Advanced after every completed mutation. A reader that derives state
+    /// from records (Morpheus's graph kind, decoded from `app_meta`) keys its
+    /// derivation by this value: an unchanged epoch means no record changed.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 pub struct LocalSchemasCache {
@@ -1197,6 +1206,24 @@ impl LocalSchemasCache {
     }
     pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
         self.map.get(vid)
+    }
+    /// A value that changes whenever any record in this cache changes
+    /// (install, evolution, rename, delete, app_meta patch). Anything derived
+    /// from the records can be cached under it and is current exactly while
+    /// the epoch is unchanged.
+    pub fn epoch(&self) -> u64 {
+        self.map.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Replace the owner metadata of one installed generation, keeping
+    /// everything else about the record (status, name) as this node has it.
+    ///
+    /// For a writer that has just committed `set_app_meta` and wants its own
+    /// node to reflect it before the subscription event arrives. Unlike
+    /// re-installing a copy of the record, it cannot re-bind the family to a
+    /// generation that was superseded in the meantime. Returns whether the
+    /// generation was present.
+    pub fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
+        self.map.patch_app_meta(vid, app_meta)
     }
     /// Resident bytes of the schema maps behind this cache.
     pub fn resident_bytes(&self) -> usize {
@@ -1883,7 +1910,26 @@ impl LocalSchemasMap {
             schema_map: LFHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
             handles: LFHashMap::with_capacity(32),
+            writer: parking_lot::Mutex::new(()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn advance_epoch(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
+        let _writer = self.writer.lock();
+        let Some(existing) = self.schema_map.get(&vid) else {
+            return false;
+        };
+        let mut patched = (*existing).clone();
+        patched.app_meta = app_meta;
+        self.schema_map.insert(vid, Arc::new(patched));
+        self.advance_epoch();
+        true
     }
 
     /// The generation a name currently writes into.
@@ -1929,7 +1975,13 @@ impl LocalSchemasMap {
             .and_then(|uid| self.current_vid_of_uid(&uid))
     }
 
-    fn new_schema(&self, mut schema: Schema) {
+    fn new_schema(&self, schema: Schema) {
+        let _writer = self.writer.lock();
+        self.new_schema_locked(schema);
+        self.advance_epoch();
+    }
+
+    fn new_schema_locked(&self, mut schema: Schema) {
         let name = schema.name.clone();
         let vid = schema.vid;
         let uid = schema.uid;
@@ -2003,10 +2055,11 @@ impl LocalSchemasMap {
     /// believes is current, in that order: a moment with no current generation
     /// would make every write to the family fail to resolve.
     fn evolve_schema(&self, evolved: Schema) {
+        let _writer = self.writer.lock();
         let uid = evolved.uid;
         let new_vid = evolved.vid;
         let previous = self.handles.get(&uid);
-        self.new_schema(evolved);
+        self.new_schema_locked(evolved);
         if let Some(previous_vid) = previous {
             if previous_vid != new_vid {
                 if let Some(old) = self.schema_map.get(&previous_vid) {
@@ -2018,6 +2071,7 @@ impl LocalSchemasMap {
                 }
             }
         }
+        self.advance_epoch();
         info!(
             "Local schema family {} evolved to generation at {}",
             uid, new_vid
@@ -2025,6 +2079,7 @@ impl LocalSchemasMap {
     }
 
     fn rename_schema(&self, uid: SchemaUid, new_name: &str) {
+        let _writer = self.writer.lock();
         let Some(current_vid) = self.handles.get(&uid) else {
             debug!(
                 "Ignoring rename of unknown schema family {} to {}",
@@ -2048,6 +2103,7 @@ impl LocalSchemasMap {
         self.schema_map.insert(current_vid, Arc::new(renamed));
         self.name_map.remove(&old_name);
         self.name_map.insert(new_name.to_owned(), uid);
+        self.advance_epoch();
         info!(
             "Local schema family {} renamed {} -> {}",
             uid, old_name, new_name
@@ -2055,6 +2111,7 @@ impl LocalSchemasMap {
     }
 
     fn del_schema(&self, name: &str) {
+        let _writer = self.writer.lock();
         let Some(uid) = self.name_map.remove(&(name.to_owned())) else {
             return;
         };
@@ -2070,6 +2127,7 @@ impl LocalSchemasMap {
         for vid in &doomed {
             self.schema_map.remove(vid);
         }
+        self.advance_epoch();
         debug!(
             "Deleted local schema family {} ({}), {} generation(s)",
             uid,
@@ -2382,6 +2440,56 @@ mod tests {
     use dovahkiin::types::Type;
     use futures::{future::BoxFuture, FutureExt};
     use std::sync::{Arc, Mutex};
+
+    fn local_family(uid: u32) -> (LocalSchemasMap, Schema, Schema) {
+        let map = LocalSchemasMap::new();
+        let mut first = schema_of(base_fields());
+        first.assign_identity(uid);
+        first.name = format!("family_{uid}");
+        let mut second = first.clone();
+        second.vid = SchemaVid(uid + 1);
+        second.generation = 1;
+        map.new_schema(first.clone());
+        (map, first, second)
+    }
+
+    #[test]
+    fn every_local_record_change_advances_the_epoch() {
+        let (map, first, second) = local_family(40);
+        let mut seen = map.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let mut advanced = |map: &LocalSchemasMap, what: &str| {
+            let now = map.epoch.load(std::sync::atomic::Ordering::Acquire);
+            assert!(now > seen, "{what} must advance the epoch");
+            seen = now;
+        };
+        map.new_schema(first.clone());
+        advanced(&map, "a re-install");
+        map.evolve_schema(second.clone());
+        advanced(&map, "an evolution");
+        map.rename_schema(first.uid, "family_40_renamed");
+        advanced(&map, "a rename");
+        assert!(map.patch_app_meta(second.vid, vec![1]));
+        advanced(&map, "an app_meta patch");
+        map.del_schema("family_40_renamed");
+        advanced(&map, "a delete");
+    }
+
+    #[test]
+    fn patching_app_meta_never_rebinds_a_superseded_generation() {
+        // A writer read generation 40, committed set_app_meta, and meanwhile
+        // the family evolved to 41. Re-installing its copy of 40 (status
+        // Current) would make 40 current again on this node; the patch must
+        // only change the bytes.
+        let (map, first, second) = local_family(40);
+        map.evolve_schema(second.clone());
+        assert!(map.patch_app_meta(first.vid, vec![9, 9]));
+        assert_eq!(map.current_vid_of_uid(&first.uid), Some(second.vid));
+        let patched = map.get(&first.vid).unwrap();
+        assert_eq!(patched.app_meta, vec![9, 9]);
+        assert!(!patched.status.is_current(), "the patch keeps the superseded status");
+        assert!(map.get(&second.vid).unwrap().status.is_current());
+        assert!(!map.patch_app_meta(SchemaVid(999), vec![]), "an unknown generation is not patched");
+    }
 
     fn schema_of(fields: Vec<Field>) -> Schema {
         Schema::new_with_id(1, "s", None, Field::new_schema(fields), false, false)
