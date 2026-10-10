@@ -603,9 +603,10 @@ async fn ensure_type2_meta_plane(
     Err(last_transient_error.unwrap_or_else(|| "unknown transient bootstrap error".to_string()))
 }
 
-async fn initialize_database_catalog<F>(mut ensure: F) -> Result<(), sm_master::ExecError>
+async fn initialize_database_catalog<F, Fut>(mut ensure: F) -> Result<(), sm_master::ExecError>
 where
-    F: AsyncFnMut() -> Result<(), sm_master::ExecError>,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), sm_master::ExecError>> + Send,
 {
     // A recovered plane needs up to 30 s to elect a leader. A command's
     // 2 s discovery budget does not cover that startup phase.
@@ -1757,7 +1758,7 @@ impl NebServer {
             .await
             .unwrap(),
         );
-        initialize_database_catalog(async || neb_client.ensure_database().await)
+        initialize_database_catalog(|| neb_client.ensure_database())
             .await
             .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
 

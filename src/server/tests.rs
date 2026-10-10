@@ -3328,14 +3328,18 @@ async fn database_catalog_initialization_retries_election_retry_exhaustion() {
         .await
         .unwrap();
     let mut attempts = 0;
-    initialize_database_catalog(async || {
+    initialize_database_catalog(|| {
         attempts += 1;
         // Model the command's exhausted leader-discovery window. The next
         // attempt uses the real catalog command after the plane is ready.
-        if attempts == 1 {
-            Err(sm_master::ExecError::TooManyRetry)
-        } else {
-            client.ensure_database().await
+        let first_attempt = attempts == 1;
+        let client = &client;
+        async move {
+            if first_attempt {
+                Err(sm_master::ExecError::TooManyRetry)
+            } else {
+                client.ensure_database().await
+            }
         }
     })
     .await
@@ -3351,11 +3355,9 @@ async fn database_catalog_initialization_retries_election_retry_exhaustion() {
 #[tokio::test]
 async fn database_catalog_initialization_preserves_storage_errors() {
     let mut attempts = 0;
-    let result = initialize_database_catalog(async || {
+    let result = initialize_database_catalog(|| {
         attempts += 1;
-        Err(sm_master::ExecError::StorageFailure(
-            "persist failed".into(),
-        ))
+        async { Err(sm_master::ExecError::StorageFailure("persist failed".into())) }
     })
     .await;
     assert!(
