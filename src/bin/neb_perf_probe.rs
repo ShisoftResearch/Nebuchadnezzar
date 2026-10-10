@@ -211,6 +211,9 @@ async fn txn_lifecycle(base: &str, txns: u64, task_counts: &[u64]) {
     server.meta().schemas.register_internal_schema(schema());
     let manager = DataManager::new(server.current_database(), server.hlc.clone());
 
+    /// The cell every prepare-time abort collides with.
+    const CONFLICT_CELL: u64 = 49_999_999;
+
     // One transaction; `abort` picks the decision. Returns its latency.
     async fn one(
         manager: &Arc<DataManager>,
@@ -261,13 +264,51 @@ async fn txn_lifecycle(base: &str, txns: u64, task_counts: &[u64]) {
         started.elapsed()
     }
 
+    // A transaction that expected the conflict cell to be absent: prepare
+    // refuses it, nothing is applied, and the coordinator aborts it.
+    async fn one_conflict(
+        manager: &Arc<DataManager>,
+        hlc: &bifrost::hlc::HlcSource,
+    ) -> std::time::Duration {
+        let started = Instant::now();
+        let tid = hlc.now();
+        let op = PrepareOp {
+            id: id(CONFLICT_CELL),
+            expectation: CellExpectation::Absent,
+            intent: PrepareIntent::Write,
+        };
+        let prepared =
+            <DataManager as DataSite>::prepare(manager, 0, tid, tid, vec![op], vec![]).await;
+        assert!(
+            format!("{:?}", prepared.payload).contains("NotRealizable"),
+            "prepare must conflict: {:?}",
+            prepared.payload
+        );
+        <DataManager as DataSite>::abort(manager, tid, tid).await;
+        <DataManager as DataSite>::end(manager, tid, tid).await;
+        started.elapsed()
+    }
+
+    one(&manager, &server.hlc, CONFLICT_CELL, false).await;
     let mut next = 50_000_000u64;
-    for (name, abort) in [("txn_commit", false), ("txn_abort", true)] {
+    for (name, kind) in [
+        ("txn_commit", 0u8),
+        ("txn_abort", 1),
+        ("txn_prepare_abort", 2),
+    ] {
+        let run = move |manager: Arc<DataManager>,
+                        hlc: Arc<bifrost::hlc::HlcSource>,
+                        index: u64| async move {
+            match kind {
+                2 => one_conflict(&manager, &hlc).await,
+                _ => one(&manager, &hlc, index, kind == 1).await,
+            }
+        };
         // Sequential: latency.
         let mut latencies = Vec::with_capacity(txns as usize);
         let started = Instant::now();
         for i in 0..txns {
-            latencies.push(one(&manager, &server.hlc, next + i, abort).await);
+            latencies.push(run(manager.clone(), server.hlc.clone(), next + i).await);
         }
         next += txns;
         rate(&format!("{name}_seq"), txns, started);
@@ -288,7 +329,7 @@ async fn txn_lifecycle(base: &str, txns: u64, task_counts: &[u64]) {
                 let first = next + t * per_task;
                 handles.push(tokio::spawn(async move {
                     for i in 0..per_task {
-                        one(&manager, &hlc, first + i, abort).await;
+                        run(manager.clone(), hlc.clone(), first + i).await;
                     }
                 }));
             }

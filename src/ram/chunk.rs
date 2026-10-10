@@ -687,8 +687,10 @@ fn end_lease(
                     "a write into the span did not finish; its extent is unknown",
                 ))
             } else if lease.pre_cursor < end {
-                // Journal now. Keep the head owned until the syncer makes
-                // the padding durable, so no writer can append behind it.
+                // Journal now. The head goes back at once, below: the next
+                // owner's records follow the padding in this segment's WAL,
+                // and replay stops at the first bad record, so no state
+                // keeps a later record without the padding before it.
                 seg.disown_span(lease.pre_cursor, end)
             } else {
                 Ok(())
@@ -697,11 +699,9 @@ fn end_lease(
                 Ok(()) => {
                     seg.mark_bracket_disowned();
                     TXN_SPANS_REWOUND.fetch_add(1, Ordering::Relaxed);
-                    // Transfer the lease reference to the syncer. Ownership
-                    // stays held until the padding is durable.
-                    if lease.pre_cursor < end && seg.defer_rewind_release() {
+                    // The group-commit timer makes the padding durable.
+                    if lease.pre_cursor < end {
                         crate::ram::segs::queue_wal_sync(seg);
-                        return;
                     }
                 }
                 Err(error) => {
@@ -767,12 +767,12 @@ fn end_transaction_leases(
 }
 
 /// Make an aborted transaction's writes vanish from the log, then give its
-/// heads back after the background sync makes the padding durable.
+/// heads back. The group-commit timer syncs the padding later.
 ///
 /// Call it AFTER the transaction's effects were rolled back in the cell
-/// index, and BEFORE anything else may write into its heads -- which, since
-/// the transaction transfers ownership to the syncer, is automatic. Each span is
-/// padded over and the padding journaled (see [`Segment::disown_span`]), so
+/// index, and BEFORE anything else may write into its heads -- which is
+/// automatic, because the transaction owns them until it releases them. Each
+/// span is padded over and the padding journaled (see [`Segment::disown_span`]), so
 /// recovery walks straight past it and the next owner's entries are ordinary.
 ///
 /// Keyed on the transaction's STATE, never on whether a COMMIT record exists:
@@ -1741,11 +1741,7 @@ impl Chunk {
                 if self
                     .segs
                     .get(&(id as usize))
-                    .map(|seg| {
-                        !seg.bracket_is_open()
-                            && !seg.rewind_release_pending()
-                            && seg.can_still_append()
-                    })
+                    .map(|seg| !seg.bracket_is_open() && seg.can_still_append())
                     .unwrap_or(false)
                 {
                     usable += 1;
@@ -2569,11 +2565,7 @@ impl Chunk {
                         && self
                             .segs
                             .get(&(id as usize))
-                            .map(|seg| {
-                                !seg.bracket_is_open()
-                                    && !seg.rewind_release_pending()
-                                    && seg.can_still_append()
-                            })
+                            .map(|seg| !seg.bracket_is_open() && seg.can_still_append())
                             .unwrap_or(false)
                 })
             };
