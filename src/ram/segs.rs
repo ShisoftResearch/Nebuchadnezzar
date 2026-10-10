@@ -79,6 +79,8 @@ impl Drop for PauseRewindSync {
 
 /// Enqueue a segment for the syncer's next pass and lazily start the syncer.
 pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
+    #[cfg(feature = "abort_profile")]
+    let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::QueueSync);
     let enqueue = seg
         .wal_sync_queued
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -1055,7 +1057,11 @@ impl Segment {
             unsafe { (*(from as *const AtomicU64)).store(saved, Release) };
             return refuse("the segment is sealing");
         }
+        #[cfg(feature = "abort_profile")]
+        let padding_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Padding);
         let journaled = self.write_wal(from, ENTRY_HEAD_SIZE as u32, false);
+        #[cfg(feature = "abort_profile")]
+        drop(padding_timer);
         self.end_pending_journal();
         match journaled {
             Ok(()) => {
@@ -2434,6 +2440,10 @@ image, not an empty segment; archiving it would persist the damage.",
                 g
             }
         };
+        #[cfg(feature = "abort_profile")]
+        crate::ram::abort_profile::record(crate::ram::abort_profile::Phase::WalWait, acquire_start.elapsed().as_nanos() as u64);
+        #[cfg(feature = "abort_profile")]
+        let _held_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::WalHold);
         let held_start = std::time::Instant::now();
         let _hold_guard = WalHoldTimer(held_start);
         // Lazily create WAL file on first write if not already present
@@ -2523,6 +2533,8 @@ image, not an empty segment; archiving it would persist the damage.",
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
+        #[cfg(feature = "abort_profile")]
+        let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
         let mut state = self.file_state.lock();
         if let Some(ref mut file) = state.wal {
             file.sync_all()?;

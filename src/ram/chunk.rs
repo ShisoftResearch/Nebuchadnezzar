@@ -680,7 +680,11 @@ fn end_lease(
             // A stale owner may still be inside a write it claimed before
             // the revocation (claims are taken under the lock that revoked
             // it). Let that entry land first, so the padding covers it.
+            #[cfg(feature = "abort_profile")]
+            let drain_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
             let drained = seg.drain_pending_journals(std::time::Duration::from_secs(5));
+            #[cfg(feature = "abort_profile")]
+            drop(drain_timer);
             let end = seg.append_header.load(Ordering::Acquire);
             let outcome = if !drained {
                 Err(io::Error::other(

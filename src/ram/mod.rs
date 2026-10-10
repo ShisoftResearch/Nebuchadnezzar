@@ -26,3 +26,6 @@ pub mod tiered;
 
 #[cfg(test)]
 pub mod tests;
+
+#[cfg(feature = "abort_profile")]
+pub mod abort_profile;

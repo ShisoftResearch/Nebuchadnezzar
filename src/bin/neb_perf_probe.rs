@@ -5,6 +5,7 @@
 //!   neb_perf_probe recover  --base DIR
 //!   neb_perf_probe txn      --base DIR [--txns 20000] [--tasks 16,64] [--workers 4]
 //!   neb_perf_probe mix      --base DIR [--txns 20000] [--abort-every 10]
+//!   neb_perf_probe abortprof --base DIR [--txns 20000] [--tasks 1] [--decision abort|commit]
 //!   neb_perf_probe heads    --base DIR [--ops 200000] [--threads 1,16]
 //!
 //! `populate` starts a fresh durable server (WAL, backup and raft directories
@@ -365,6 +366,151 @@ fn heads(threads: u64, ops: u64) {
     rate(&format!("head_claim_t{threads}"), threads * ops, started);
 }
 
+/// Per-phase latency distribution and WAL cost of one transaction shape.
+///
+/// `txn` reports one number per run; a tail needs the distribution of each
+/// phase (prepare, apply, abort, end), so this run keeps every latency and
+/// prints quantiles. WAL records, bytes, forced syncs and lock waits are
+/// divided by the transaction count: they show what one abort costs the log.
+async fn abort_profile(base: &str, txns: u64, tasks: u64, abort: bool) {
+    use neb::server::transactions::data_site::{DataManager, Service as DataSite};
+    use neb::server::transactions::{CellExpectation, CommitOp, PrepareIntent, PrepareOp};
+
+    let addr = format!("127.0.0.1:{}", 47600 + std::process::id() % 100);
+    let server = NebServer::new_from_opts(&options(base, false), &addr, "perf_probe", async |_| {})
+        .await
+        .expect("server start");
+    server.meta().schemas.register_internal_schema(schema());
+    let manager = DataManager::new(server.current_database(), server.hlc.clone());
+    let before = (
+        neb::ram::segs::wal_counters(),
+        neb::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(tasks > 0 && txns >= tasks);
+    #[cfg(feature = "abort_profile")]
+    drop(neb::ram::abort_profile::take());
+    let per_task = txns / tasks;
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..tasks {
+        let manager = manager.clone();
+        let hlc = server.hlc.clone();
+        handles.push(tokio::spawn(async move {
+            let mut phases: [Vec<u64>; 5] = Default::default();
+            for i in 0..per_task {
+                let index = 80_000_000 + t * per_task + i;
+                let tid = hlc.now();
+                let op = PrepareOp {
+                    id: id(index),
+                    expectation: CellExpectation::Absent,
+                    intent: PrepareIntent::Write,
+                };
+                let t0 = Instant::now();
+                <DataManager as DataSite>::prepare(&manager, 0, tid, tid, vec![op], vec![]).await;
+                let t1 = Instant::now();
+                <DataManager as DataSite>::commit(
+                    &manager,
+                    tid,
+                    tid,
+                    vec![CommitOp::Write(cell(index, index))],
+                )
+                .await;
+                let t2 = Instant::now();
+                if abort {
+                    <DataManager as DataSite>::abort(&manager, tid, tid).await;
+                }
+                let t3 = Instant::now();
+                <DataManager as DataSite>::end(&manager, tid, tid).await;
+                let t4 = Instant::now();
+                let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+                phases[0].push(ns(t0, t1));
+                phases[1].push(ns(t1, t2));
+                phases[2].push(ns(t2, t3));
+                phases[3].push(ns(t3, t4));
+                phases[4].push(ns(t0, t4));
+            }
+            phases
+        }));
+    }
+    let mut all: [Vec<u64>; 5] = Default::default();
+    for handle in handles {
+        for (merged, part) in all.iter_mut().zip(handle.await.expect("task")) {
+            merged.extend(part);
+        }
+    }
+    let total = tasks * per_task;
+    rate(&format!("prof_t{tasks}"), total, started);
+    let after = (
+        neb::ram::segs::wal_counters(),
+        neb::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let delta = after.0.minus(&before.0);
+    let per = |v: u64| v as f64 / total as f64;
+    println!(
+        "METRIC prof_t{tasks}_wal_records_per_txn {:.2}",
+        per(delta.writes)
+    );
+    println!(
+        "METRIC prof_t{tasks}_wal_bytes_per_txn {:.1}",
+        per(after.1 - before.1)
+    );
+    println!(
+        "METRIC prof_t{tasks}_forced_syncs_per_txn {:.2}",
+        per(after.2 - before.2)
+    );
+    println!(
+        "METRIC prof_t{tasks}_lock_wait_ns_per_txn {:.0}",
+        per(delta.wait_nanos)
+    );
+    println!(
+        "METRIC prof_t{tasks}_lock_held_ns_per_txn {:.0}",
+        per(delta.held_nanos)
+    );
+    println!(
+        "METRIC prof_t{tasks}_lock_contended_per_txn {:.3}",
+        per(delta.contended)
+    );
+    for (name, values) in ["prepare", "apply", "abort", "end", "total"]
+        .iter()
+        .zip(all.iter_mut())
+    {
+        values.sort_unstable();
+        let q = |p: f64| {
+            values[((values.len() as f64 * p) as usize).min(values.len() - 1)] as f64 / 1000.0
+        };
+        println!(
+            "METRIC prof_t{tasks}_{name}_us p50={:.1} p90={:.1} p99={:.1} p999={:.1} max={:.1}",
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            q(0.999),
+            values[values.len() - 1] as f64 / 1000.0
+        );
+    }
+    #[cfg(feature = "abort_profile")]
+    for (phase, mut values) in neb::ram::abort_profile::take() {
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_unstable();
+        let q = |p: f64| {
+            values[((values.len() as f64 * p) as usize).min(values.len() - 1)] as f64 / 1000.0
+        };
+        println!(
+            "METRIC internal_{phase:?}_us n={} p50={:.3} p90={:.3} p99={:.3} p999={:.3} max={:.3}",
+            values.len(),
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            q(0.999),
+            q(1.0)
+        );
+    }
+    server.shutdown().await;
+}
+
 /// Space under an abort-heavy load: `txns` one-cell transactions, every
 /// `1/abort_every`-th aborted after apply. Reports the store's segments, used
 /// and dead bytes right after the load, and again after a full cleaner pass,
@@ -460,6 +606,16 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10);
             runtime.block_on(abort_mix(&base, txns, every))
+        }
+        Some("abortprof") => {
+            let txns: u64 = arg(&args, "--txns")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000);
+            let tasks: u64 = arg(&args, "--tasks")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let abort = arg(&args, "--decision").as_deref() != Some("commit");
+            runtime.block_on(abort_profile(&base, txns, tasks, abort))
         }
         Some("heads") => {
             let ops: u64 = arg(&args, "--ops")

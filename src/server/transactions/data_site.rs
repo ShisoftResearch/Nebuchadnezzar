@@ -780,11 +780,17 @@ impl DataManager {
             txn.history.len(),
             tid
         );
+        #[cfg(feature = "abort_profile")]
+        let rollback_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rollback);
         let failures = self.rollback(&txn.history);
+        #[cfg(feature = "abort_profile")]
+        drop(rollback_timer);
         let failures = (!failures.is_empty()).then_some(failures);
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
         let store = self.chunks().address_range();
+        #[cfg(feature = "abort_profile")]
+        let _rewind_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rewind);
         let ended = match failures {
             None => crate::ram::chunk::rewind_transaction_writes(tid, &store),
             Some(_) => crate::ram::chunk::retire_transaction_leases(tid, &store),
