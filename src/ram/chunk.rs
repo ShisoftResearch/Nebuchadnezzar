@@ -3581,6 +3581,18 @@ impl Chunk {
     where
         U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
+        self.update_cell_by_inner(hash, update, true)
+    }
+
+    fn update_cell_by_inner<U>(
+        &self,
+        hash: u64,
+        update: U,
+        retire_old: bool,
+    ) -> Result<OwnedCell, WriteError>
+    where
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
+    {
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
             let old_loc = cell_guard.get_ptr();
             match SharedCellData::from_chunk_raw(hash, *cell_guard, self) {
@@ -3624,9 +3636,11 @@ impl Chunk {
 
                         // Mark old entry as dead using size we captured earlier
                         // This avoids decoding old_loc after lock is released (race condition)
-                        if let Some(size) = old_entry_size {
-                            let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
-                            self.mark_dead_entry_with_size(old_loc, size, &seg);
+                        if retire_old {
+                            if let Some(size) = old_entry_size {
+                                let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
+                                self.mark_dead_entry_with_size(old_loc, size, &seg);
+                            }
                         }
 
                         self.refresh_statistics_for_schema(write_plan.schema.vid);
@@ -3705,6 +3719,18 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
+        self.remove_cell_by_inner(hash, predict, true)
+    }
+
+    fn remove_cell_by_inner<P>(
+        &self,
+        hash: u64,
+        predict: P,
+        retire_old: bool,
+    ) -> Result<(), WriteError>
+    where
+        P: Fn(&SharedCell) -> bool,
+    {
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3717,9 +3743,10 @@ impl Chunk {
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
+                    let removed_len =
+                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old)?;
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
-                    let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
                     self.slot_bytes.sub(hash, removed_len);
                     return Ok(());
                 }
@@ -3727,6 +3754,77 @@ impl Chunk {
             }
             Err(e) => Err(WriteError::ReadError(e)),
         }
+    }
+
+    /// Restore the index before the participant pads its leased spans.
+    /// The participant keeps the previous segment referenced until this returns.
+    fn restore_cell_location(
+        &self,
+        hash: u64,
+        previous: usize,
+        current_version: u64,
+    ) -> Result<(), WriteError> {
+        let mut guard = self.lock_or_insert_cell(hash);
+        let current = guard.get_ptr();
+        if (current_version == 0 && current != 0)
+            || (current_version != 0
+                && (current == 0
+                    || guard.cell_version().map_err(WriteError::ReadError)? != current_version))
+        {
+            if current == 0 {
+                guard.remove_cell();
+            }
+            return Err(WriteError::CellVersionMismatch);
+        }
+        let current_size = if current == 0 {
+            0
+        } else {
+            Entry::decode_from(current, |_, _| {}).0.content_length
+        };
+        let previous_size = if previous == 0 {
+            0
+        } else {
+            Entry::decode_from(previous, |_, _| {}).0.content_length
+        };
+        let mut schemas = [None, None];
+        if current != 0 {
+            schemas[0] = Some(
+                header_from_chunk_raw(current)
+                    .map_err(WriteError::ReadError)?
+                    .0
+                    .schema,
+            );
+            if self.index_builder.is_some() {
+                let (cell, schema) =
+                    SharedCell::from_chunk_raw(hash, guard, self).map_err(WriteError::ReadError)?;
+                self.remove_indices(&cell, &schema);
+                guard = cell.into_cell_guard();
+            }
+        }
+        if previous != 0 {
+            schemas[1] = Some(
+                header_from_chunk_raw(previous)
+                    .map_err(WriteError::ReadError)?
+                    .0
+                    .schema,
+            );
+            if let Some(indexer) = &self.index_builder {
+                let (cell, schema) = SharedCellData::from_chunk_raw(hash, previous, self)
+                    .map_err(WriteError::ReadError)?;
+                indexer.ensure_indices(&cell.to_owned(), &schema, None);
+            }
+        }
+        if previous == 0 {
+            guard.remove_cell();
+        } else {
+            guard.set_ptr(previous);
+        }
+        self.slot_bytes.sub(hash, current_size);
+        self.slot_bytes.add(hash, previous_size);
+        for schema in schemas.into_iter().flatten() {
+            self.refresh_statistics_for_schema(schema);
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -3983,6 +4081,7 @@ impl Chunk {
         &self,
         cell_header: &CellHeader,
         cell_seg: &AArc<Segment>,
+        record_deleted_version: bool,
     ) -> Result<(), WriteError> {
         // Bounded, and never retried when retrying cannot possibly work.
         //
@@ -4041,7 +4140,9 @@ impl Chunk {
             cell_header.version,
             cell_header.id,
         );
-        self.note_deleted_version(cell_header.id.bits(), cell_header.version);
+        if record_deleted_version {
+            self.note_deleted_version(cell_header.id.bits(), cell_header.version);
+        }
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
         Ok(())
@@ -4050,6 +4151,14 @@ impl Chunk {
     /// Returns the removed entry's content length, so the logical remove
     /// paths can settle the slot counter without a second decode.
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
+        self.put_tombstone_by_cell_loc_inner(cell_location, true)
+    }
+
+    fn put_tombstone_by_cell_loc_inner(
+        &self,
+        cell_location: usize,
+        retire_old: bool,
+    ) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -4065,8 +4174,10 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg)?;
-        self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+        self.put_tombstone(&header, &cell_seg, retire_old)?;
+        if retire_old {
+            self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+        }
         Ok(entry_size)
     }
 
@@ -5506,6 +5617,48 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
     }
+    pub(crate) fn apply_transaction_update<U>(
+        &self,
+        key: &Id,
+        update: U,
+    ) -> Result<OwnedCell, WriteError>
+    where
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
+    {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.update_cell_by_inner(hash, update, false)
+    }
+
+    pub(crate) fn apply_transaction_remove<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
+    where
+        P: Fn(&SharedCell) -> bool,
+    {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.remove_cell_by_inner(hash, predict, false)
+    }
+
+    pub(crate) fn restore_transaction_cell(
+        &self,
+        key: &Id,
+        previous: usize,
+        current_version: u64,
+    ) -> Result<(), WriteError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.restore_cell_location(hash, previous, current_version)
+    }
+
+    pub(crate) fn retire_transaction_version(&self, key: &Id, location: usize, deleted: bool) {
+        let (chunk, _) = self.locate_chunk_by_key(key);
+        let seg = chunk.locate_segment_ensured(location, key);
+        chunk.mark_dead_entry_with_seg(location, &seg);
+        if deleted {
+            let header = header_from_chunk_raw(location)
+                .expect("the transaction pins this version")
+                .0;
+            chunk.note_deleted_version(key.bits(), header.version);
+        }
+    }
+
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
@@ -7527,6 +7680,21 @@ mod tests {
             header: CellHeader::new(SchemaVid(schema_id), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
+    }
+
+    #[test]
+    fn transaction_restore_rejects_a_changed_index_without_a_placeholder() {
+        let (chunks, schema) = setup_test_chunks();
+        let id = Id::allocated(1, 0, 43);
+        let count = chunks.list[0].cell_count();
+        assert_eq!(chunks.restore_transaction_cell(&id, 0, 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(chunks.list[0].cell_count(), count);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let header = chunks.write_cell(&mut cell).unwrap();
+        let address = chunks.address_of(&id);
+        assert_eq!(chunks.restore_transaction_cell(&id, 0, header.version + 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(chunks.address_of(&id), address);
+        assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
     }
 
     #[test]
