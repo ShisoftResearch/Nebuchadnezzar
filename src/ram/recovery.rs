@@ -4933,7 +4933,7 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_after_abort_returns_before_rewind_sync_discards_the_transaction() {
+    fn an_abort_releases_the_head_before_its_padding_is_synced_and_a_crash_keeps_the_next_write() {
         let store = BracketCleanerStore::new(438, "abort_before_sync");
         let chunks = store.open(false);
         let before = Id::allocated(38, 0, 1);
@@ -4955,12 +4955,7 @@ mod tests {
             crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
             Ok(1)
         );
-        assert!(
-            segment.rewind_release_pending(),
-            "abort returned before sync"
-        );
-        assert!(segment.is_head_owned(), "the syncer retains the head");
-        assert!(!segment.try_own(), "no writer can append before durability");
+        assert!(!segment.is_head_owned(), "the head is back in the pool at once");
         let padding_survived = store.snapshot();
         // A torn final WAL record models a partially persisted rewind.
         let partial_padding = store.snapshot();
@@ -4991,10 +4986,8 @@ mod tests {
             }
         }
         assert!(truncated, "the rewind appended a WAL record");
-        segment.force_wal_sync().unwrap();
-        assert!(!segment.rewind_release_pending());
-        assert!(!segment.is_head_owned());
-        drop(pause);
+        // The syncer is held back: the next owner's acknowledged write must
+        // survive although the padding before it was never synced by the timer.
         // Restrict the pool to the released head to prove actual reuse.
         for slot in chunks.list[0].head_pool.iter() {
             if slot.load(Ordering::Acquire) != segment.id {
@@ -5004,6 +4997,7 @@ mod tests {
         chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
         assert_eq!(segment_of(&chunks, &after).id, segment.id);
         chunks.sync_all();
+        drop(pause);
         let reused = store.snapshot();
         for (snapshot, has_after) in [
             (&lost_padding, false),
@@ -5016,6 +5010,49 @@ mod tests {
             assert!(recovered.read_cell(&aborted).is_err());
             assert_eq!(recovered.read_cell(&after).is_ok(), has_after);
         }
+    }
+
+    /// After an abort the span is dead to the byte: the cells the rollback
+    /// removed, their headers, and the BEGIN. Nothing is counted twice, so
+    /// `living_space` neither stays too high (the cleaner never picks the
+    /// segment) nor underflows into the warn-and-zero branch (the cleaner
+    /// relocates it forever).
+    #[test]
+    fn living_space_is_exact_after_an_abort() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(440, "abort_living_space");
+        let chunks = store.open(false);
+        let aborted = [Id::allocated(40, 0, 1), Id::allocated(40, 0, 2)];
+        let txn = crate::server::transactions::test_hlc(7777, 9);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            for id in &aborted {
+                chunks.write_cell(&mut store.cell(id, 128)).unwrap();
+            }
+        }
+        let segment = segment_of(&chunks, &aborted[0]);
+        let begin_at = segment
+            .entry_iter()
+            .find(|meta| meta.entry_header.entry_type == crate::ram::entry::EntryType::BEGIN)
+            .expect("the transaction's BEGIN")
+            .entry_pos;
+        let cursor = segment.append_header.load(Ordering::Acquire);
+        let span = (cursor - begin_at) as u32;
+        let used = segment.used_spaces();
+        assert_eq!(segment.total_dead_space(), 0);
+        for id in &aborted {
+            chunks.remove_cell(id).unwrap();
+        }
+        assert_eq!(
+            crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
+            Ok(1)
+        );
+        assert!(segment.try_own(), "the head is back in the pool at once");
+        segment.release_own();
+        assert_eq!(segment.used_spaces(), used, "the cursor stays");
+        assert_eq!(segment.tombstones.load(Ordering::Relaxed), 0);
+        assert_eq!(segment.total_dead_space(), span, "the whole span, once");
+        assert_eq!(segment.living_space(), used - span);
     }
 
     /// H1 across a restart cannot happen: recovery resumes no segment as a
