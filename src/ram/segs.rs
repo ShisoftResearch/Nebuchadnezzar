@@ -124,8 +124,8 @@ fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
         WAL_DIRTY.lock().push(seg.clone());
         return;
     }
-    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0 {
-        if let Err(e) = seg.force_wal_sync() {
+    if seg.wal_pending_bytes() > 0 {
+        if let Err(e) = seg.sync_wal(false) {
             error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
             queue_wal_sync(&seg);
         }
@@ -636,8 +636,8 @@ pub struct Segment {
 
     // --- write-path atomics ---
     pub append_header: AtomicUsize,
-    pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
-    pub last_sync_time: AtomicI64,     // Timestamp of last fsync in milliseconds
+    wal_bytes_written: AtomicUsize, // Non-transactional bytes journaled
+    wal_bytes_synced: AtomicUsize,  // Journaled bytes covered by a successful sync
     /// Set while this segment sits in the WAL syncer's dirty registry, so a
     /// segment is enqueued at most once per syncer pass.
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
@@ -940,8 +940,8 @@ impl Segment {
             dirty_seq: AtomicU64::new(1),
             archived_seq: AtomicU64::new(0),
             sealed: AtomicBool::new(false),
-            last_sync_time: AtomicI64::new(0),
-            bytes_since_sync: AtomicUsize::new(0),
+            wal_bytes_synced: AtomicUsize::new(0),
+            wal_bytes_written: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
             // A segment born cold has no image in its mapping either: the
             // backup is all there is until something promotes it.
@@ -1058,7 +1058,8 @@ impl Segment {
             return refuse("the segment is sealing");
         }
         #[cfg(feature = "abort_profile")]
-        let padding_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Padding);
+        let padding_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Padding);
         let journaled = self.write_wal(from, ENTRY_HEAD_SIZE as u32, false);
         #[cfg(feature = "abort_profile")]
         drop(padding_timer);
@@ -2441,9 +2442,13 @@ image, not an empty segment; archiving it would persist the damage.",
             }
         };
         #[cfg(feature = "abort_profile")]
-        crate::ram::abort_profile::record(crate::ram::abort_profile::Phase::WalWait, acquire_start.elapsed().as_nanos() as u64);
+        crate::ram::abort_profile::record(
+            crate::ram::abort_profile::Phase::WalWait,
+            acquire_start.elapsed().as_nanos() as u64,
+        );
         #[cfg(feature = "abort_profile")]
-        let _held_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::WalHold);
+        let _held_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::WalHold);
         let held_start = std::time::Instant::now();
         let _hold_guard = WalHoldTimer(held_start);
         // Lazily create WAL file on first write if not already present
@@ -2504,16 +2509,13 @@ image, not an empty segment; archiving it would persist the damage.",
             // with every writer thread blocking inline on its own sync. Only
             // the byte threshold remains inline, as backpressure against one
             // segment accumulating unbounded unsynced bytes.
-            let bytes_written = self
-                .bytes_since_sync
-                .fetch_add(size as usize, Ordering::Relaxed)
-                + size as usize;
+            let written = self.wal_bytes_written.fetch_add(size as usize, Relaxed) + size as usize;
+            let bytes_written = written - self.wal_bytes_synced.load(Acquire);
 
             if bytes_written >= WAL_SYNC_BATCH_SIZE {
                 WAL_SYNCS.fetch_add(1, Relaxed);
                 file.sync_data()?;
-                self.bytes_since_sync.store(0, Ordering::Relaxed);
-                self.last_sync_time.store(get_time(), Ordering::Relaxed);
+                self.wal_bytes_synced.fetch_max(written, Release);
                 trace!(
                     "WAL synced inline for segment {} ({} bytes)",
                     self.id,
@@ -2533,20 +2535,43 @@ image, not an empty segment; archiving it would persist the damage.",
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
+        self.sync_wal(true)
+    }
+
+    fn wal_pending_bytes(&self) -> usize {
+        let synced = self.wal_bytes_synced.load(Acquire);
+        self.wal_bytes_written.load(Relaxed) - synced
+    }
+
+    fn sync_wal(&self, force: bool) -> io::Result<()> {
+        self.sync_wal_with(force, File::sync_all)
+    }
+
+    fn sync_wal_with<F>(&self, force: bool, sync: F) -> io::Result<()>
+    where
+        F: FnOnce(&File) -> io::Result<()>,
+    {
         #[cfg(feature = "abort_profile")]
         let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
-        let mut state = self.file_state.lock();
-        if let Some(ref mut file) = state.wal {
-            file.sync_all()?;
-            FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
-
-            // Reset counters after forced sync
-            let current_time = get_time();
-            self.bytes_since_sync.store(0, Ordering::Relaxed);
-            self.last_sync_time.store(current_time, Ordering::Relaxed);
-
-            trace!("Forced WAL sync for segment {}", self.id);
-        }
+        let (file, written) = {
+            let state = self.file_state.lock();
+            // A transaction can sync this segment while the timer waits for the lock.
+            if !force && self.wal_pending_bytes() == 0 {
+                return Ok(());
+            }
+            let Some(file) = &state.wal else {
+                return Ok(());
+            };
+            let file = file.try_clone()?;
+            let written = self.wal_bytes_written.load(Relaxed);
+            (file, written)
+        };
+        // The descriptor keeps this WAL inode alive if an archive unlinks its name.
+        // Appends remain ordered under file_state. This sync covers the records that
+        // preceded it; later appends keep their own dirty bytes or force their own sync.
+        sync(&file)?;
+        self.wal_bytes_synced.fetch_max(written, Release);
+        FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -3729,6 +3754,92 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_sync_leaves_later_appends_dirty_and_replays_them_after_the_next_sync() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.sync_wal_with(true, |file| {
+            assert!(
+                seg.file_state.try_lock().is_some(),
+                "fsync must not hold the append lock"
+            );
+            assert_eq!(seg.wal_pending_bytes(), 8);
+            file.sync_all()?;
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal(false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+        seg.sync_wal_with(false, |_| panic!("a clean timer pass must not fsync again"))
+            .unwrap();
+        let path = manager.wal_path(seg.chunk_id, seg.id, seg.seq_id).unwrap();
+        let data = std::fs::read(path).unwrap();
+        let replay = crate::ram::wal_format::scan_framed(&data, SEGMENT_SIZE).unwrap();
+        assert_eq!(replay.records, 2);
+        assert_eq!(replay.used_len, 16);
+        assert_eq!(replay.stop, crate::ram::wal_format::TailStop::Clean);
+    }
+
+    #[test]
+    fn a_late_sync_does_not_erase_bytes_appended_after_a_newer_sync() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        for offset in [0, 8, 16] {
+            Segment::store_padding_header(seg.addr + offset, 8);
+        }
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.sync_wal_with(true, |file| {
+            file.sync_all()?;
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            seg.sync_wal(false)?;
+            seg.write_wal(seg.addr + 16, 8, false)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal(false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_wal_sync_keeps_dirty_bytes_and_later_appends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let error = seg
+            .sync_wal_with(true, |_| {
+                seg.write_wal(seg.addr + 8, 8, false)?;
+                Err(io::Error::other("injected sync failure"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(seg.wal_pending_bytes(), 16);
+        seg.sync_wal(false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+    }
 
     /// ~250,000 Segment structs stay resident for a terabyte store, so both
     /// their inline size and what they eagerly drag onto the heap are
