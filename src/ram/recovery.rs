@@ -993,7 +993,11 @@ fn apply_bracketed_group(
             )
         })
         .map(|(_, cell)| *cell)
-        .last();
+        // The group is sorted by address, and addresses do not follow write
+        // order: concurrent transactions write into different segment heads.
+        // The highest version is the newest write; `max_by_key` keeps the
+        // later address when versions tie.
+        .max_by_key(|cell| cell.version);
     let Some(cell) = survivor else {
         return Ok(());
     };

@@ -659,3 +659,56 @@ async fn cold_after_updates_hashed_plain_then_txn_deletes() {
         IdClass::Hashed, Mode::DirectWritesTxnDeletes, "rd_cold_hpt", true,
     ).await;
 }
+
+/// Several acknowledged updates of one id, each in another transaction, must
+/// leave the LAST one after a restart. Concurrent transactions write into
+/// different segment heads, so the versions of one id sit at addresses that do
+/// not follow write order; recovery has to pick by version, not by address.
+async fn updated_in_many_transactions(class: IdClass, group: &str) {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    const IDS: u64 = 100;
+    const ROUNDS: u64 = 3;
+    const IN_FLIGHT: usize = 16;
+    let _ = env_logger::try_init();
+    let dir = scratch_dir();
+    let mut store = Store::start(dir.path(), group, Mode::Txn).await;
+    let mut model = HashMap::new();
+    for index in 0..IDS {
+        let id = class.id(index);
+        store.write(cell(&id, index, 8)).await;
+        model.insert(index, (id, Some(index)));
+    }
+    for round in 1..=ROUNDS {
+        let mut work = FuturesUnordered::new();
+        for index in 0..IDS {
+            if (index + round) % 3 == 0 {
+                continue;
+            }
+            let id = model[&index].0;
+            let value = round * 1_000_000 + index;
+            model.get_mut(&index).unwrap().1 = Some(value);
+            let store = &store;
+            work.push(async move {
+                store.update(cell(&id, value, ((index * 7 + round * 13) % 50) as usize)).await;
+            });
+            if work.len() >= IN_FLIGHT {
+                work.next().await;
+            }
+        }
+        while work.next().await.is_some() {}
+    }
+    check(&store.server, &model, "before the restart");
+    store = store.restart(dir.path(), group).await;
+    check(&store.server, &model, &format!("after a graceful restart ({class:?})"));
+    store.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_transaction_updates_survive_a_restart_hashed() {
+    updated_in_many_transactions(IdClass::Hashed, "rd_u_h").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_transaction_updates_survive_a_restart_allocated() {
+    updated_in_many_transactions(IdClass::Allocated, "rd_u_a").await;
+}
