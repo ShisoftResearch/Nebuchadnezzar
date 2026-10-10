@@ -2662,6 +2662,172 @@ mod tests {
         server.shutdown().await;
     }
 
+    async fn memory_rollback_index_tasks(nullable: bool) {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 16 * SEGMENT_SIZE,
+                db_size: 16 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![
+                    NebService::Cell,
+                    NebService::Transaction,
+                    NebService::RangedIndexer,
+                ],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            if nullable {
+                "memory_rollback_index_null"
+            } else {
+                "memory_rollback_index_order"
+            },
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let fields = if nullable {
+            use crate::ram::schema::{Field, IndexType};
+            use dovahkiin::types::Type;
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I64),
+                Field::new_unindexed("name", Type::String),
+                Field::new_indexed_nullable("score", Type::U64, vec![IndexType::Ranged]),
+            ])
+        } else {
+            default_fields()
+        };
+        let mut schema = Schema::new_with_id(992, "memory_rollback_index", None, fields, false, false);
+        schema.is_scannable = !nullable;
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema.clone());
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let id = Id::allocated(0, 0, 9281);
+        let (version, results) = IndexBuilder::with_request_index_scope(|| {
+            let mut cell = counter_cell(schema.vid.get(), id, 5, "seed");
+            if nullable {
+                if let OwnedValue::Map(data) = &mut cell.data {
+                    data.insert(&"score".to_string(), OwnedValue::Null);
+                }
+            }
+            runtime.chunks().write_cell(&mut cell).unwrap().version
+        })
+        .await;
+        assert!(results.iter().all(|result| matches!(result, Ok(Ok(())))));
+        let key = if nullable {
+            crate::index::EntryKey::from_props(
+                &id,
+                &OwnedValue::U64(5).feature(),
+                hash_str("score"),
+                schema.uid,
+            )
+        } else {
+            crate::index::EntryKey::for_scannable(&id, schema.uid)
+        };
+        let indexer = runtime.indexer().unwrap();
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !nullable
+        );
+        let tid = server.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                0,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    id,
+                    5,
+                    "new"
+                ))]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert!(indexer.clients.ranged_client.contains(&key).await.unwrap());
+        // Every task can run concurrently. Complete inserts before earlier removals.
+        let (aborted, tasks) = IndexBuilder::collect_test_index_tasks(|| {
+            <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+        });
+        assert_eq!(aborted.await.payload, AbortResult::Success(None));
+        for task in tasks.into_iter().rev() {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !nullable,
+            "rollback did not restore the index entry set"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().header.version,
+            version
+        );
+        if nullable {
+            // A previous schema can have no scannable key while the applied schema has one.
+            let applied_key =
+                crate::index::EntryKey::for_scannable(&id, crate::ram::schema::SchemaUid(993));
+            indexer
+                .clients
+                .ranged_client
+                .insert(&applied_key)
+                .await
+                .unwrap();
+            let cell = runtime.chunks().read_cell(&id).unwrap().to_owned();
+            let (_, tasks) = IndexBuilder::collect_test_index_tasks(|| {
+                indexer.restore_indices(&cell, &schema, Vec::new(), Some(applied_key.clone()));
+            });
+            for task in tasks.into_iter().rev() {
+                task.await.unwrap();
+            }
+            assert!(!indexer
+                .clients
+                .ranged_client
+                .contains(&applied_key)
+                .await
+                .unwrap());
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_keeps_an_unchanged_scannable_key_for_any_task_order() {
+        memory_rollback_index_tasks(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_removes_an_index_when_the_previous_value_is_null() {
+        memory_rollback_index_tasks(true).await;
+    }
+
     async fn memory_rollback_decision_survives_recovery(commit: bool) {
         let dir = tempfile::TempDir::new().unwrap();
         let opts = ServerOptions {

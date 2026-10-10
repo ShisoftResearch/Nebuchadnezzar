@@ -665,6 +665,49 @@ impl IndexBuilder {
         }
     }
 
+    pub(crate) fn restore_indices(
+        &self,
+        cell: &OwnedCell,
+        schema: &Schema,
+        applied_indices: Vec<IndexRes>,
+        applied_scannable_key: Option<EntryKey>,
+    ) {
+        let restored_indices = probe_cell_indices(cell, schema);
+        let restored_scannable_key = schema
+            .is_scannable
+            .then(|| EntryKey::for_scannable(&cell.id(), schema.uid));
+        // A shared key must remain present. Separate delete and insert tasks can race.
+        let remove_scannable_key = if applied_scannable_key == restored_scannable_key {
+            None
+        } else {
+            applied_scannable_key
+        };
+        if restored_indices.is_empty()
+            && applied_indices.is_empty()
+            && restored_scannable_key.is_none()
+            && remove_scannable_key.is_none()
+        {
+            return;
+        }
+        let indexers = self.clients.clone();
+        let cell_id = cell.id();
+        let schema_uid = schema.uid;
+        new_index_task(async move {
+            if let Some(key) = restored_scannable_key {
+                Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid).await?;
+            }
+            Self::ensure_indices_(restored_indices, Some(applied_indices), indexers.clone()).await?;
+            if let Some(key) = remove_scannable_key {
+                indexers
+                    .ranged_client
+                    .delete(&key)
+                    .await
+                    .map_err(IndexError::RPCError)?;
+            }
+            Ok(())
+        });
+    }
+
     async fn ensure_scannable_insert(
         indexers: Arc<IndexerClients>,
         key: EntryKey,
@@ -811,6 +854,22 @@ impl IndexBuilder {
                 .await
         }
         .boxed()
+    }
+
+    // Collect futures so a test can choose a valid completion order.
+    #[cfg(test)]
+    pub(crate) fn collect_test_index_tasks<R>(
+        op: impl FnOnce() -> R,
+    ) -> (R, Vec<BoxFuture<'static, Result<(), IndexError>>>) {
+        REQUEST_INDEX_TASKS.with(|scopes| {
+            scopes.borrow_mut().push(Vec::new());
+            let result = op();
+            let tasks = scopes
+                .borrow_mut()
+                .pop()
+                .expect("the test owns an index scope");
+            (result, tasks)
+        })
     }
 
     // Scope index tasks spawned by a single request so callers can wait only on

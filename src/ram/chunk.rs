@@ -3787,6 +3787,8 @@ impl Chunk {
             Entry::decode_from(previous, |_, _| {}).0.content_length
         };
         let mut schemas = [None, None];
+        let mut current_indices = Vec::new();
+        let mut current_scannable_key = None;
         if current != 0 {
             schemas[0] = Some(
                 header_from_chunk_raw(current)
@@ -3797,7 +3799,17 @@ impl Chunk {
             if self.index_builder.is_some() {
                 let (cell, schema) =
                     SharedCell::from_chunk_raw(hash, guard, self).map_err(WriteError::ReadError)?;
-                self.remove_indices(&cell, &schema);
+                if previous == 0 {
+                    self.remove_indices(&cell, &schema);
+                } else {
+                    current_indices = probe_cell_indices(&cell, &schema);
+                    if schema.is_scannable {
+                        current_scannable_key = Some(crate::index::EntryKey::for_scannable(
+                            &cell.id(),
+                            schema.uid,
+                        ));
+                    }
+                }
                 guard = cell.into_cell_guard();
             }
         }
@@ -3811,7 +3823,12 @@ impl Chunk {
             if let Some(indexer) = &self.index_builder {
                 let (cell, schema) = SharedCellData::from_chunk_raw(hash, previous, self)
                     .map_err(WriteError::ReadError)?;
-                indexer.ensure_indices(&cell.to_owned(), &schema, None);
+                indexer.restore_indices(
+                    &cell.to_owned(),
+                    &schema,
+                    current_indices,
+                    current_scannable_key,
+                );
             }
         }
         if previous == 0 {
