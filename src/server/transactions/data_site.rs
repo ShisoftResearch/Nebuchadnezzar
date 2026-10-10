@@ -664,6 +664,29 @@ impl DataManager {
         );
         None
     }
+    fn capture_transaction_version(
+        &self,
+        id: &Id,
+        expected_version: u64,
+    ) -> Result<(usize, SegmentReferenceGuard), WriteError> {
+        let chunk = self
+            .chunks()
+            .locate_chunk_by_partition(id.locality() as u64);
+        // A cleaner selected before the pin can unpublish the source despite its reference.
+        // Complete that round first. Later rounds see the pin and exclude the source.
+        let _gc = chunk.gc_lock.lock();
+        let cell = self.chunks().read_cell(id).map_err(WriteError::ReadError)?;
+        if cell.header.version != expected_version {
+            return Err(WriteError::CellVersionMismatch);
+        }
+        let addr = cell.cell_guard().get_ptr();
+        let (segment_id, _) = chunk.get_cell_segment_info(addr);
+        let guard = self
+            .acquire_segment_guard(chunk.id, segment_id)
+            .ok_or(WriteError::ReadError(ReadError::CellDoesNotExisted))?;
+        Ok((addr, guard))
+    }
+
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
         for (id, history) in history.iter() {
@@ -1655,33 +1678,14 @@ impl DataManager {
                                 continue;
                             }
 
-                            let (cell_addr, guard) = {
-                                let shared_cell = match self.chunks().read_cell(cell_id) {
-                                    Ok(cell) => cell,
-                                    Err(read_error) => {
-                                        write_error =
-                                            Some((*cell_id, WriteError::ReadError(read_error)));
-                                        break;
-                                    }
-                                };
-                                if shared_cell.header.version != expected_version {
-                                    write_error = Some((*cell_id, WriteError::CellVersionMismatch));
+                            let (cell_addr, guard) = match self
+                                .capture_transaction_version(cell_id, expected_version)
+                            {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    write_error = Some((*cell_id, error));
                                     break;
                                 }
-                                let addr = shared_cell.cell_guard().get_ptr();
-                                let chunk = self
-                                    .chunks()
-                                    .locate_chunk_by_partition(cell_id.locality() as u64);
-                                let (segment_id, _) = chunk.get_cell_segment_info(addr);
-                                let Some(guard) = self.acquire_segment_guard(chunk.id, segment_id)
-                                else {
-                                    write_error = Some((
-                                        *cell_id,
-                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                    ));
-                                    break;
-                                };
-                                (addr, guard)
                             };
                             match self.chunks().apply_transaction_remove(cell_id, |cell| {
                                 cell.header.version == expected_version
@@ -1717,33 +1721,14 @@ impl DataManager {
                                 continue;
                             }
 
-                            let (cell_addr, guard) = {
-                                let shared_cell = match self.chunks().read_cell(&cell_id) {
-                                    Ok(cell) => cell,
-                                    Err(read_error) => {
-                                        write_error =
-                                            Some((cell_id, WriteError::ReadError(read_error)));
-                                        break;
-                                    }
-                                };
-                                if shared_cell.header.version != expected_version {
-                                    write_error = Some((cell_id, WriteError::CellVersionMismatch));
+                            let (cell_addr, guard) = match self
+                                .capture_transaction_version(&cell_id, expected_version)
+                            {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    write_error = Some((cell_id, error));
                                     break;
                                 }
-                                let addr = shared_cell.cell_guard().get_ptr();
-                                let chunk = self
-                                    .chunks()
-                                    .locate_chunk_by_partition(cell_id.locality() as u64);
-                                let (segment_id, _) = chunk.get_cell_segment_info(addr);
-                                let Some(guard) = self.acquire_segment_guard(chunk.id, segment_id)
-                                else {
-                                    write_error = Some((
-                                        cell_id,
-                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                    ));
-                                    break;
-                                };
-                                (addr, guard)
                             };
                             match self.chunks().apply_transaction_update(
                                 &cell_id,
@@ -2605,6 +2590,75 @@ mod tests {
         assert_eq!(commit_ops_local(&manager, &older, vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 15, "older"))]).await, DMCommitResult::Success);
         assert_eq!(<DataManager as Service>::end(&manager, older, older).await.payload, EndResult::Success);
         assert_eq!(runtime.chunks().read_cell(&id).unwrap().data["score"].u64().copied(), Some(15));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_waits_for_a_cleaner_before_pinning_the_source() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_lease_test_server(&address, "memory_rollback_cleaner_capture").await;
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        for remove in [false, true] {
+            let id = Id::allocated(0, 0, 9271 + u64::from(remove));
+            let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+            let previous = runtime.chunks().address_of(&id);
+            let tid = server.hlc.now();
+            assert_eq!(
+                prepare_ops_local(
+                    &manager,
+                    0,
+                    &tid,
+                    vec![PrepareOp {
+                        id,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    }]
+                )
+                .await,
+                DMPrepareResult::Success
+            );
+            let chunk = runtime
+                .chunks()
+                .locate_chunk_by_partition(id.locality() as u64);
+            // A cleaner already holds this lock and can unpublish its selected source.
+            let gc = chunk.gc_lock.lock();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer_manager = manager.clone();
+            let writer_tid = tid.clone();
+            let handle = tokio::runtime::Handle::current();
+            let schema_id = schema.vid.get();
+            let writer = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let op = if remove {
+                    CommitOp::Remove(id)
+                } else {
+                    CommitOp::Update(counter_cell(schema_id, id, 50, "new"))
+                };
+                let result = handle.block_on(commit_ops_local(&writer_manager, &writer_tid, vec![op]));
+                done_tx.send(result).unwrap();
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+            drop(gc);
+            writer.join().unwrap();
+            assert!(
+                matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "apply captured a source that an in-flight cleaner can unpublish"
+            );
+            assert_eq!(done_rx.recv().unwrap(), DMCommitResult::Success);
+            abort_and_end_local(&manager, &tid).await;
+            assert_eq!(runtime.chunks().address_of(&id), previous);
+            assert_eq!(
+                runtime.chunks().read_cell(&id).unwrap().header.version,
+                version
+            );
+        }
         server.shutdown().await;
     }
 
