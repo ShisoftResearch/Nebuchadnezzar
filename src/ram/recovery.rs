@@ -993,7 +993,11 @@ fn apply_bracketed_group(
             )
         })
         .map(|(_, cell)| *cell)
-        .last();
+        // The group is sorted by address, and addresses do not follow write
+        // order: concurrent transactions write into different segment heads.
+        // The highest version is the newest write; `max_by_key` keeps the
+        // later address when versions tie.
+        .max_by_key(|cell| cell.version);
     let Some(cell) = survivor else {
         return Ok(());
     };
@@ -5048,6 +5052,51 @@ mod tests {
         let chunks = store.open(true);
         assert!(chunks.read_cell(&in_flight).is_err());
         assert!(chunks.read_cell(&after).is_ok(), "the write after the restart survives");
+    }
+
+    /// A delete whose bracket never got its COMMIT is dropped at the restart.
+    /// The cell it named stays alive, and it must stay alive: a cleaner pass
+    /// in the recovered store must not turn the dropped tombstone into a
+    /// plain one that the next restart applies.
+    #[test]
+    fn a_dropped_open_delete_stays_dropped_after_compaction_and_a_second_restart() {
+        let _ = env_logger::try_init();
+        let store = BracketCleanerStore::new(438, "dropped_open_delete");
+        let txn = crate::server::transactions::test_hlc(8888, 9);
+        let victim = Id::allocated(39, 0, 1);
+        {
+            let chunks = store.open(false);
+            chunks.write_cell(&mut store.cell(&victim, 128)).unwrap();
+            chunks.sync_all();
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.remove_cell(&victim).unwrap();
+            chunks.sync_all();
+            // Crash: no decision ever arrives.
+        }
+        {
+            let chunks = store.open(true);
+            assert!(chunks.read_cell(&victim).is_ok(), "the undecided delete is dropped");
+            let chunk = &chunks.list[0];
+            let _ = ordinary_rotated_segment(&store, &chunks, 200);
+            // Compact everything that is not a write head.
+            let candidates: Vec<_> = chunk
+                .segments()
+                .into_iter()
+                .filter(|seg| !chunk.is_active_head(seg.id) && seg.is_sealed())
+                .collect();
+            eprintln!("dropped_open_delete: {} candidate(s)", candidates.len());
+            assert!(candidates.len() >= 2, "test setup: nothing to combine");
+            let (_, collected) =
+                crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+            eprintln!("dropped_open_delete: collected {collected}");
+            assert!(chunks.read_cell(&victim).is_ok());
+            chunks.sync_all();
+        }
+        let chunks = store.open(true);
+        assert!(
+            chunks.read_cell(&victim).is_ok(),
+            "a delete that was dropped at one restart took effect at the next"
+        );
     }
 
     /// Item 34: a transaction must never write outside its bracket. Before

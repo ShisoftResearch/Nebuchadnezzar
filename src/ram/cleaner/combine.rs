@@ -310,6 +310,21 @@ impl CombinedCleaner {
         needed
     }
 
+    /// A tombstone whose id is live in the index at a version the tombstone
+    /// would kill never took effect: its delete was dropped (a bracket that
+    /// never got its COMMIT) or undone. Carrying it forward would write it
+    /// outside that bracket, and the next recovery would apply it as an
+    /// ordinary delete. A real delete clears the index entry, and a re-create
+    /// continues above the deleted version, so neither is held back by this.
+    fn tombstone_is_contradicted(chunk: &Chunk, tombstone: &crate::ram::tombstone::Tombstone) -> bool {
+        match chunk.lock_cell_for_read(tombstone.id.bits()) {
+            Ok(mut guard) => guard
+                .cell_version()
+                .map_or(false, |version| version <= tombstone.version),
+            Err(_) => false,
+        }
+    }
+
     fn collect_and_deduplicate_entries(
         chunk: &Chunk,
         segments: &[SegmentCandidate],
@@ -333,7 +348,9 @@ impl CombinedCleaner {
             .collect();
         let needed = Self::needed_tombstones(chunk, &entries, segment_ids_to_combine);
         for entry in entries.into_iter().filter(|entry| match &entry.content {
-            EntryContent::Tombstone(t) => needed.contains(&t.id.bits()),
+            EntryContent::Tombstone(t) => {
+                needed.contains(&t.id.bits()) && !Self::tombstone_is_contradicted(chunk, t)
+            }
             _ => true,
         }) {
             let entry_size = entry.meta.entry_size;
