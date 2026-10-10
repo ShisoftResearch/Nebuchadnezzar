@@ -729,6 +729,26 @@ impl DataManager {
                 tid, error
             );
         }
+        // Give back the segment references the transaction holds -- its read
+        // pins and its write guards -- NOW, and do not wait for the record to
+        // be freed. `txns` is a lock-free map: `remove` hands back a clone and
+        // the map frees the original later, at its own reclamation point, so
+        // the record (and every reference inside it) can outlive the
+        // transaction by an unbounded time. A segment holding a reference is
+        // never a combine candidate, so each such leak keeps a segment of
+        // dead data out of the cleaner's reach for good, until the chunk is
+        // full.
+        if let Some(txn_lock) = self.txns.get(tid) {
+            let (guards, pins) = {
+                let mut txn = txn_lock.lock();
+                (
+                    std::mem::take(&mut txn.segment_guards),
+                    std::mem::take(&mut txn.pinned_reads),
+                )
+            };
+            drop(guards);
+            drop(pins);
+        }
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }

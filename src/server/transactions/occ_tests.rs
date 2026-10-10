@@ -1671,3 +1671,55 @@ async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     abort_txn(&txn, tid).await;
     server.shutdown().await;
 }
+
+/// Every segment reference the transactions below took must be given back
+/// when they end: a read pin that outlives its transaction keeps the
+/// segment it points into out of the cleaner's reach for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn ended_transactions_give_back_their_read_pins() {
+    let _ = env_logger::try_init();
+    let address = &crate::utils::test_port::unique_localhost_addr();
+    let group = "txn_occ_pins_given_back";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    const CELLS: u64 = 20;
+    for i in 0..CELLS {
+        let mut seed = counter_cell(schema.vid.get(), Id::from_parts(0, 91000 + i), 1, "pin_seed");
+        runtime.chunks().write_cell(&mut seed).unwrap();
+    }
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    for round in 0..200u64 {
+        let id = Id::from_parts(0, 91000 + round % CELLS);
+        let tid = txn.begin().await.unwrap().unwrap();
+        accepted_head(txn.head(tid.clone(), id).await.unwrap().unwrap());
+        let update = counter_cell(schema.vid.get(), id, round + 2, "pin_update");
+        assert_eq!(
+            txn.update(tid.clone(), update).await.unwrap().unwrap(),
+            TxnExecResult::Accepted(())
+        );
+        assert_eq!(
+            txn.prepare(tid.clone()).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(
+            txn.commit(tid.clone()).await.unwrap().unwrap(),
+            EndResult::Success
+        );
+    }
+    let held = || -> usize {
+        runtime
+            .chunks()
+            .list
+            .iter()
+            .flat_map(|chunk| chunk.segments())
+            .map(|segment| segment.references_count())
+            .sum()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while held() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(held(), 0, "ended transactions still hold segment references");
+    server.shutdown().await;
+}
