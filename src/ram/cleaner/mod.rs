@@ -12,6 +12,12 @@ pub mod combine;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GC_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(&Chunk)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Foreground-to-cleaner wake signal. Allocation-pressure paths request a
 /// cleaning pass instead of running one synchronously: an inline combine on
 /// the mutation path stalls the writer for a whole collection cycle, so
@@ -221,6 +227,18 @@ impl Cleaner {
         };
         return cleaner;
     }
+    #[cfg(test)]
+    pub(crate) fn clean_with_test_probe(
+        chunk: &Chunk,
+        probe: impl FnOnce(&Chunk) + 'static,
+    ) -> bool {
+        TEST_GC_PROBE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(probe));
+        });
+        Self::clean(chunk, true, true)
+    }
+
     /// Returns true if any cleaning work reclaimed space or reduced segments.
     pub fn clean(chunk: &Chunk, full: bool, wait: bool) -> bool {
         trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
@@ -236,6 +254,13 @@ impl Cleaner {
             );
             return false;
         }
+        #[cfg(test)]
+        TEST_GC_PROBE.with(|slot| {
+            let probe = slot.borrow_mut().take();
+            if let Some(probe) = probe {
+                probe(chunk);
+            }
+        });
         let num_segs = chunk.segs.len();
         trace!(
             "Cleaning chunk {}, full {}, segs {}, head seg {}",

@@ -556,6 +556,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let tid = txn.begin().await.unwrap().unwrap();
     let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&first), 1);
+    let first_address = runtime.chunks().address_of(&cell_id);
 
     let pending = counter_cell(
         schema.vid.get(),
@@ -588,7 +589,10 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
     let rolled_back = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&rolled_back), 1);
-    assert!(rolled_back.header.version > first.header.version);
+    assert_eq!(rolled_back.header.version, first.header.version);
+    assert_eq!(rolled_back.header.timestamp, first.header.timestamp);
+    assert_eq!(rolled_back.data, first.data);
+    assert_eq!(runtime.chunks().address_of(&cell_id), first_address);
 
     let retry_tid = txn.begin().await.unwrap().unwrap();
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), cell_id).await.unwrap().unwrap());

@@ -1,5 +1,4 @@
 use super::*;
-use crate::ram::cell::OwnedCellRef;
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
@@ -312,15 +311,17 @@ struct Transaction {
 
 #[derive(Debug)]
 struct CellHistory {
-    cell: Option<OwnedCellRef>,
+    previous_location: usize,
     current_version: u64,
+    previous_write: TxnId,
 }
 
 impl CellHistory {
-    pub fn new(cell: Option<OwnedCellRef>, current_ver: u64) -> CellHistory {
-        CellHistory {
-            cell,
-            current_version: current_ver,
+    fn new(previous_location: usize, current_version: u64, previous_write: TxnId) -> Self {
+        Self {
+            previous_location,
+            current_version,
+            previous_write,
         }
     }
 }
@@ -663,33 +664,37 @@ impl DataManager {
         );
         None
     }
+    fn capture_transaction_version(
+        &self,
+        id: &Id,
+        expected_version: u64,
+    ) -> Result<(usize, SegmentReferenceGuard), WriteError> {
+        let chunk = self
+            .chunks()
+            .locate_chunk_by_partition(id.locality() as u64);
+        // A cleaner selected before the pin can unpublish the source despite its reference.
+        // Complete that round first. Later rounds see the pin and exclude the source.
+        let _gc = chunk.gc_lock.lock();
+        let cell = self.chunks().read_cell(id).map_err(WriteError::ReadError)?;
+        if cell.header.version != expected_version {
+            return Err(WriteError::CellVersionMismatch);
+        }
+        let addr = cell.cell_guard().get_ptr();
+        let (segment_id, _) = chunk.get_cell_segment_info(addr);
+        let guard = self
+            .acquire_segment_guard(chunk.id, segment_id)
+            .ok_or(WriteError::ReadError(ReadError::CellDoesNotExisted))?;
+        Ok((addr, guard))
+    }
+
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
         for (id, history) in history.iter() {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
-            let cell = &history.cell;
-            let current_ver = history.current_version;
-            let error = if cell.is_none() {
-                // the cell was created, need to remove
-                self.chunks()
-                    .remove_cell_by(id, |cell| cell.header.version == current_ver)
-                    .err()
-            } else if current_ver > 0 {
-                // the cell was updated, need to update back
-                self.chunks()
-                    .update_cell_by(id, |cell_to_update| {
-                        if cell_to_update.header.version == current_ver {
-                            cell.as_ref().map(|r| r.clone_referred())
-                        } else {
-                            None
-                        }
-                    })
-                    .err()
-            } else {
-                // the cell was removed, need to put back
-                let mut cell = cell.as_ref().unwrap().clone_referred();
-                self.chunks().write_cell(&mut cell).err()
-            };
+            let error = self
+                .chunks()
+                .restore_transaction_cell(id, history.previous_location, history.current_version)
+                .err();
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
             }
@@ -753,38 +758,38 @@ impl DataManager {
         self.txns_sorted.lock().remove(tid);
     }
 
-    /// Undo an applied transaction: restore the cell index from its history,
-    /// then rewind its spans, then let its heads go. The caller holds the
-    /// transaction lock and the cells' meta locks.
-    ///
-    /// In THAT order, and the order is the fix. The heads stay leased through
-    /// the rollback, so nothing can be appended behind the transaction's open
-    /// BEGIN while it runs; the rollback's own writes are ordinary and go to
-    /// other heads, which a lease can never all take
-    /// (`can_spare_a_head_for_lease`). Only once the index names nothing in
-    /// the spans are they padded over, journaled, and only then are the heads
-    /// released -- with no bracket left open in them.
-    ///
-    /// A rollback that failed for any cell may leave the index naming that
-    /// cell's entry inside the span, and padding over an indexed entry would
-    /// leave the index pointing into space the cleaner then frees. So the
-    /// spans are left as uncommitted brackets in RETIRED heads instead:
-    /// recovery discards them, and no writer appends behind them.
+    /// Restore the cell index, pad the spans, then release the leased heads.
+    /// The caller holds the transaction and metadata locks, plus segment references.
+    /// A failed restore leaves the heads retired, so recovery discards their brackets.
     fn rollback_and_rewind(
         &self,
         tid: &TxnId,
         txn: &mut Transaction,
+        guarded_cell_ids: &[Id],
+        cell_guards: &mut [parking_lot::MutexGuard<'_, CellMeta>],
     ) -> Option<Vec<RollbackFailure>> {
         debug!(
             ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
             txn.history.len(),
             tid
         );
+        #[cfg(feature = "abort_profile")]
+        let rollback_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rollback);
         let failures = self.rollback(&txn.history);
+        for (id, history) in &txn.history {
+            if failures.iter().all(|failure| failure.id != *id) {
+                let position = guarded_cell_ids.binary_search(id).expect("an applied cell has a metadata guard");
+                cell_guards[position].write = history.previous_write.clone();
+            }
+        }
+        #[cfg(feature = "abort_profile")]
+        drop(rollback_timer);
         let failures = (!failures.is_empty()).then_some(failures);
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
         let store = self.chunks().address_range();
+        #[cfg(feature = "abort_profile")]
+        let _rewind_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rewind);
         let ended = match failures {
             None => crate::ram::chunk::rewind_transaction_writes(tid, &store),
             Some(_) => crate::ram::chunk::retire_transaction_leases(tid, &store),
@@ -858,7 +863,7 @@ impl DataManager {
         // Keep segment references and metadata guards alive throughout rollback so the owner
         // cannot be reclaimed between validation and the storage mutations.
         let guards_to_drop = std::mem::take(&mut txn.segment_guards);
-        let rollback_failures = self.rollback_and_rewind(tid, txn);
+        let rollback_failures = self.rollback_and_rewind(tid, txn, &guarded_cell_ids, &mut cell_guards);
         drop(cell_guards);
         drop(guards_to_drop);
         AbortResult::Success(rollback_failures)
@@ -962,6 +967,16 @@ impl DataManager {
         self.chunks()
             .commit_transaction_brackets(tid)
             .map_err(|error| format!("{error:?}"))?;
+        for (id, history) in &txn.history {
+            if history.previous_location != 0 {
+                self.chunks().retire_transaction_version(
+                    id,
+                    history.previous_location,
+                    history.current_version == 0,
+                );
+            }
+        }
+        txn.history.clear();
         if let Err(error) = crate::ram::chunk::release_transaction_leases(tid, &store) {
             // Every bracket carries its COMMIT, so this is unreachable; if it
             // is reached, the final wipe retires the head rather than hand it
@@ -1631,7 +1646,7 @@ impl DataManager {
                             match self.chunks().write_cell(&mut cell) {
                                 Ok(header) => {
                                     txn.history
-                                        .insert(cell_id, CellHistory::new(None, header.version));
+                                        .insert(cell_id, CellHistory::new(0, header.version, write_ts));
                                     meta.write = effective_ts.clone();
                                     #[cfg(test)]
                                     if take_apply_panic_hook(tid, &cell_id) {
@@ -1663,47 +1678,20 @@ impl DataManager {
                                 continue;
                             }
 
-                            let (cell_addr, old_cell_ref) = {
-                                let shared_cell = match self.chunks().read_cell(cell_id) {
-                                    Ok(cell) => cell,
-                                    Err(read_error) => {
-                                        write_error =
-                                            Some((*cell_id, WriteError::ReadError(read_error)));
-                                        break;
-                                    }
-                                };
-                                if shared_cell.header.version != expected_version {
-                                    write_error = Some((*cell_id, WriteError::CellVersionMismatch));
-                                    break;
-                                }
-                                let addr = shared_cell.cell_guard().get_ptr();
-                                let cell_ref = shared_cell.to_owned().into_ref();
-                                (addr, cell_ref)
-                            };
-                            let chunk = self
-                                .chunks()
-                                .locate_chunk_by_partition(cell_id.locality() as u64);
-                            let chunk_idx = chunk.id;
-                            let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                            let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                            let cell_offset = (cell_addr - segment_base_addr) as u64;
-                            let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                                Some(guard) => guard,
-                                None => {
-                                    write_error = Some((
-                                        *cell_id,
-                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                    ));
+                            let (cell_addr, guard) = match self
+                                .capture_transaction_version(cell_id, expected_version)
+                            {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    write_error = Some((*cell_id, error));
                                     break;
                                 }
                             };
-
-                            match self.chunks().remove_cell_by(cell_id, |cell| {
+                            match self.chunks().apply_transaction_remove(cell_id, |cell| {
                                 cell.header.version == expected_version
                             }) {
                                 Ok(()) => {
-                                    txn.history
-                                        .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
+                                    txn.history.insert(*cell_id, CellHistory::new(cell_addr, 0, write_ts));
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
                                 }
@@ -1733,54 +1721,30 @@ impl DataManager {
                                 continue;
                             }
 
-                            let cell_addr = {
-                                let shared_cell = match self.chunks().read_cell(&cell_id) {
-                                    Ok(cell) => cell,
-                                    Err(read_error) => {
-                                        write_error =
-                                            Some((cell_id, WriteError::ReadError(read_error)));
-                                        break;
+                            let (cell_addr, guard) = match self
+                                .capture_transaction_version(&cell_id, expected_version)
+                            {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    write_error = Some((cell_id, error));
+                                    break;
+                                }
+                            };
+                            match self.chunks().apply_transaction_update(
+                                &cell_id,
+                                |cell_to_update| {
+                                    if cell_to_update.header.version == expected_version {
+                                        cell.header.version = expected_version;
+                                        Some(cell)
+                                    } else {
+                                        None
                                     }
-                                };
-                                if shared_cell.header.version != expected_version {
-                                    write_error = Some((cell_id, WriteError::CellVersionMismatch));
-                                    break;
-                                }
-                                shared_cell.cell_guard().get_ptr()
-                            };
-                            let chunk = self
-                                .chunks()
-                                .locate_chunk_by_partition(cell_id.locality() as u64);
-                            let chunk_idx = chunk.id;
-                            let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                            let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                            let cell_offset = (cell_addr - segment_base_addr) as u64;
-                            let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                                Some(guard) => guard,
-                                None => {
-                                    write_error = Some((
-                                        cell_id,
-                                        WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                    ));
-                                    break;
-                                }
-                            };
-
-                            let mut old_cell_ref = None;
-                            match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                                if cell_to_update.header.version == expected_version {
-                                    old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
-                                    cell.header.version = expected_version;
-                                    Some(cell)
-                                } else {
-                                    None
-                                }
-                            }) {
+                                },
+                            ) {
                                 Ok(updated_cell) => {
-                                    debug_assert!(old_cell_ref.is_some());
                                     txn.history.insert(
                                         cell_id,
-                                        CellHistory::new(old_cell_ref, updated_cell.header.version),
+                                        CellHistory::new(cell_addr, updated_cell.header.version, write_ts),
                                     );
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
@@ -1805,7 +1769,7 @@ impl DataManager {
                      the panic continues",
                     tid
                 );
-                let _ = self.rollback_and_rewind(tid, &mut txn);
+                let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
                 drop(crate::ram::chunk::take_transactional_segments());
                 std::panic::resume_unwind(panic);
             }
@@ -1887,7 +1851,7 @@ impl DataManager {
                  so it is not treated as committed.",
                 tid, error
             );
-            let _ = self.rollback_and_rewind(tid, &mut txn);
+            let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
             return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
         }
 
@@ -2604,6 +2568,492 @@ mod tests {
             .payload;
         assert_eq!(end, EndResult::Success);
         server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_restores_the_write_timestamp_for_an_older_transaction() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_lease_test_server(&address, "memory_rollback_timestamp").await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let id = Id::allocated(0, 0, 9261);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let older = server.hlc.now();
+        manager.get_or_create_transaction(&older);
+        let newer = server.hlc.now();
+        let op = PrepareOp { id, expectation: CellExpectation::Present(version), intent: PrepareIntent::Write };
+        assert_eq!(prepare_ops_local(&manager, 0, &newer, vec![op.clone()]).await, DMPrepareResult::Success);
+        assert_eq!(commit_ops_local(&manager, &newer, vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "aborted"))]).await, DMCommitResult::Success);
+        abort_and_end_local(&manager, &newer).await;
+        assert_eq!(prepare_ops_local(&manager, 0, &older, vec![op]).await, DMPrepareResult::Success);
+        assert_eq!(commit_ops_local(&manager, &older, vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 15, "older"))]).await, DMCommitResult::Success);
+        assert_eq!(<DataManager as Service>::end(&manager, older, older).await.payload, EndResult::Success);
+        assert_eq!(runtime.chunks().read_cell(&id).unwrap().data["score"].u64().copied(), Some(15));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_waits_for_a_cleaner_before_pinning_the_source() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_lease_test_server(&address, "memory_rollback_cleaner_capture").await;
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        for remove in [false, true] {
+            let id = Id::allocated(0, 0, 9271 + u64::from(remove));
+            let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+            let previous = runtime.chunks().address_of(&id);
+            let tid = server.hlc.now();
+            assert_eq!(
+                prepare_ops_local(
+                    &manager,
+                    0,
+                    &tid,
+                    vec![PrepareOp {
+                        id,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    }]
+                )
+                .await,
+                DMPrepareResult::Success
+            );
+            let chunk = runtime
+                .chunks()
+                .locate_chunk_by_partition(id.locality() as u64);
+            // A cleaner already holds this lock and can unpublish its selected source.
+            let gc = chunk.gc_lock.lock();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer_manager = manager.clone();
+            let writer_tid = tid.clone();
+            let handle = tokio::runtime::Handle::current();
+            let schema_id = schema.vid.get();
+            let writer = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let op = if remove {
+                    CommitOp::Remove(id)
+                } else {
+                    CommitOp::Update(counter_cell(schema_id, id, 50, "new"))
+                };
+                let result = handle.block_on(commit_ops_local(&writer_manager, &writer_tid, vec![op]));
+                done_tx.send(result).unwrap();
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+            drop(gc);
+            writer.join().unwrap();
+            assert!(
+                matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "apply captured a source that an in-flight cleaner can unpublish"
+            );
+            assert_eq!(done_rx.recv().unwrap(), DMCommitResult::Success);
+            abort_and_end_local(&manager, &tid).await;
+            assert_eq!(runtime.chunks().address_of(&id), previous);
+            assert_eq!(
+                runtime.chunks().read_cell(&id).unwrap().header.version,
+                version
+            );
+        }
+        server.shutdown().await;
+    }
+
+    mod review_tests {
+        include!("review_tests.rs");
+    }
+
+    async fn memory_rollback_index_tasks(nullable: bool, remove: bool) {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 16 * SEGMENT_SIZE,
+                db_size: 16 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![
+                    NebService::Cell,
+                    NebService::Transaction,
+                    NebService::RangedIndexer,
+                ],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            if nullable {
+                "memory_rollback_index_null"
+            } else {
+                "memory_rollback_index_order"
+            },
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let fields = if nullable {
+            use crate::ram::schema::{Field, IndexType};
+            use dovahkiin::types::Type;
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I64),
+                Field::new_unindexed("name", Type::String),
+                Field::new_indexed_nullable("score", Type::U64, vec![IndexType::Ranged]),
+            ])
+        } else {
+            default_fields()
+        };
+        let mut schema = Schema::new_with_id(992, "memory_rollback_index", None, fields, false, false);
+        schema.is_scannable = !nullable;
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema.clone());
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let id = Id::allocated(0, 0, 9281);
+        let (version, results) = IndexBuilder::with_request_index_scope(|| {
+            let mut cell = counter_cell(schema.vid.get(), id, 5, "seed");
+            if nullable {
+                if let OwnedValue::Map(data) = &mut cell.data {
+                    data.insert(&"score".to_string(), OwnedValue::Null);
+                }
+            }
+            runtime.chunks().write_cell(&mut cell).unwrap().version
+        })
+        .await;
+        assert!(results.iter().all(|result| matches!(result, Ok(Ok(())))));
+        let key = if nullable {
+            crate::index::EntryKey::from_props(
+                &id,
+                &OwnedValue::U64(5).feature(),
+                hash_str("score"),
+                schema.uid,
+            )
+        } else {
+            crate::index::EntryKey::for_scannable(&id, schema.uid)
+        };
+        let indexer = runtime.indexer().unwrap();
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !nullable
+        );
+        let tid = server.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                0,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![if remove {
+                    CommitOp::Remove(id)
+                } else {
+                    CommitOp::Update(counter_cell(schema.vid.get(), id, 5, "new"))
+                }]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !remove
+        );
+        // Every task can run concurrently. Complete inserts before earlier removals.
+        let (aborted, tasks) = IndexBuilder::collect_test_index_tasks(|| {
+            <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+        });
+        assert_eq!(aborted.await.payload, AbortResult::Success(None));
+        for task in tasks.into_iter().rev() {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !nullable,
+            "rollback did not restore the index entry set"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().header.version,
+            version
+        );
+        if nullable {
+            // A previous schema can have no scannable key while the applied schema has one.
+            let applied_key =
+                crate::index::EntryKey::for_scannable(&id, crate::ram::schema::SchemaUid(993));
+            indexer
+                .clients
+                .ranged_client
+                .insert(&applied_key)
+                .await
+                .unwrap();
+            let cell = runtime.chunks().read_cell(&id).unwrap().to_owned();
+            let (_, tasks) = IndexBuilder::collect_test_index_tasks(|| {
+                indexer.restore_indices(&cell, &schema, Vec::new(), Some(applied_key.clone()));
+            });
+            for task in tasks.into_iter().rev() {
+                task.await.unwrap();
+            }
+            assert!(!indexer
+                .clients
+                .ranged_client
+                .contains(&applied_key)
+                .await
+                .unwrap());
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_keeps_an_unchanged_scannable_key_for_any_task_order() {
+        memory_rollback_index_tasks(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_removes_an_index_when_the_previous_value_is_null() {
+        memory_rollback_index_tasks(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_delete_restores_scannable_key_for_any_task_order() {
+        memory_rollback_index_tasks(false, true).await;
+    }
+
+    async fn memory_rollback_decision_survives_recovery(commit: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let opts = ServerOptions {
+            chunk_size: 16 * SEGMENT_SIZE,
+            db_size: 16 * SEGMENT_SIZE,
+            tiered_config: None,
+            backup_storage: Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            wal_storage: Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            raft_storage: Some(dir.path().join("raft").to_string_lossy().into_owned()),
+            index_enabled: false,
+            services: vec![NebService::Cell, NebService::Transaction],
+            enable_recovery: true,
+            disable_storage_locks: true,
+        };
+        let group = if commit {
+            "memory_rollback_commit"
+        } else {
+            "memory_rollback_abort"
+        };
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+            .await
+            .unwrap();
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let schema =
+            Schema::new_with_id(991, "memory_rollback", None, default_fields(), false, false);
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema.clone());
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let updated = Id::allocated(0, 0, 9251);
+        let removed = Id::allocated(0, 0, 9252);
+        let inserted = Id::allocated(0, 0, 9253);
+        let updated_version = seed_cell_version(&runtime, schema.vid.get(), updated, 5, 0);
+        let removed_version = seed_cell_version(&runtime, schema.vid.get(), removed, 6, 0);
+        let previous = [
+            runtime.chunks().address_of(&updated),
+            runtime.chunks().address_of(&removed),
+        ];
+        let source = segment_holding(&runtime, &updated);
+        let dead_before = source.dead_space.load(Relaxed);
+        let chunk = &runtime.chunks().list[0];
+        // Remove the source from the head pool so the cleaner's reference gate is exercised.
+        for slot in chunk.head_pool.iter() {
+            let _ = slot.compare_exchange(
+                source.id,
+                u64::MAX,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        let tid = server.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                0,
+                &tid,
+                vec![
+                    PrepareOp {
+                        id: updated,
+                        expectation: CellExpectation::Present(updated_version),
+                        intent: PrepareIntent::Write
+                    },
+                    PrepareOp {
+                        id: removed,
+                        expectation: CellExpectation::Present(removed_version),
+                        intent: PrepareIntent::Write
+                    },
+                    PrepareOp {
+                        id: inserted,
+                        expectation: CellExpectation::Absent,
+                        intent: PrepareIntent::Write
+                    },
+                ]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Update(counter_cell(schema.vid.get(), updated, 50, "new")),
+                    CommitOp::Remove(removed),
+                    CommitOp::Write(counter_cell(schema.vid.get(), inserted, 70, "new")),
+                ]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(source.dead_space.load(Relaxed), dead_before);
+        for location in previous {
+            assert!(!source.is_dead_at(location));
+        }
+        assert!(source.references_count() >= 2);
+        assert!(chunk
+            .segs_for_combine_cleaner_full()
+            .iter()
+            .all(|(seg, _)| seg.id != source.id));
+        crate::ram::cleaner::Cleaner::clean(chunk, true, true);
+        assert!(chunk.segs.get(&(source.id as usize)).is_some());
+        for (id, location, version) in [
+            (updated, previous[0], updated_version),
+            (removed, previous[1], removed_version),
+        ] {
+            assert_eq!(
+                runtime
+                    .chunks()
+                    .read_cell_at(&id, location)
+                    .unwrap()
+                    .header
+                    .version,
+                version
+            );
+        }
+        let spans: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .map(|seg| {
+                (
+                    seg.clone(),
+                    seg.append_header.load(std::sync::atomic::Ordering::Acquire),
+                )
+            })
+            .collect();
+        if !commit {
+            assert_eq!(
+                <DataManager as Service>::abort(&manager, tid, tid)
+                    .await
+                    .payload,
+                AbortResult::Success(None)
+            );
+            assert_eq!(runtime.chunks().address_of(&updated), previous[0]);
+            assert_eq!(runtime.chunks().address_of(&removed), previous[1]);
+            assert_eq!(
+                runtime.chunks().head_cell(&updated).unwrap().version,
+                updated_version
+            );
+            assert_eq!(
+                runtime.chunks().head_cell(&removed).unwrap().version,
+                removed_version
+            );
+            assert!(runtime.chunks().read_cell(&inserted).is_err());
+            assert_eq!(source.dead_space.load(Relaxed), dead_before);
+            for location in previous {
+                assert!(!source.is_dead_at(location));
+            }
+            assert_eq!(chunk.deleted_versions.len(), 0);
+            // Rollback allocates no entry in any head; only the padding header changes.
+            assert_eq!(chunk.seg_count(), spans.len());
+            for (seg, cursor) in &spans {
+                assert_eq!(
+                    seg.append_header.load(std::sync::atomic::Ordering::Acquire),
+                    *cursor
+                );
+            }
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid, tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        if commit {
+            for location in previous {
+                assert!(source.is_dead_at(location));
+            }
+            assert!(source.dead_space.load(Relaxed) > dead_before);
+            assert_eq!(chunk.deleted_versions.len(), 1);
+        }
+        // Both outcomes release the transaction's protection of the source.
+        assert_eq!(source.references_count(), 0);
+        runtime.chunks().sync_all();
+        server.shutdown().await;
+        let recovered = NebServer::new_from_opts(
+            &opts,
+            &crate::utils::test_port::unique_localhost_addr(),
+            group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        recovered.meta().schemas.register_internal_schema(schema);
+        let value = recovered.chunks().read_cell(&updated).unwrap().to_owned();
+        assert_eq!(
+            value.data["score"].u64().copied(),
+            Some(if commit { 50 } else { 5 })
+        );
+        if !commit {
+            assert_eq!(value.header.version, updated_version);
+        }
+        assert_eq!(recovered.chunks().read_cell(&removed).is_ok(), !commit);
+        assert_eq!(recovered.chunks().read_cell(&inserted).is_ok(), commit);
+        if !commit {
+            assert_eq!(
+                recovered.chunks().read_cell(&removed).unwrap().data["score"]
+                    .u64()
+                    .copied(),
+                Some(6)
+            );
+        }
+        recovered.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_abort_preserves_versions_and_recovery() {
+        memory_rollback_decision_survives_recovery(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_commit_retires_versions_after_the_decision() {
+        memory_rollback_decision_survives_recovery(true).await;
     }
 
     /// The deadlock that made abort release its heads first, as a regression
@@ -5754,17 +6204,8 @@ impl Service for DataManager {
         async move {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard = phase_guard;
-            // Release all segment references before wiping out transaction
-            let guards_to_drop = {
-                if let Some(txn_lock) = self.find_transaction(&tid) {
-                    let mut txn = txn_lock.lock();
-                    std::mem::take(&mut txn.segment_guards)
-                } else {
-                    Vec::new()
-                }
-            };
-            drop(guards_to_drop); // Drop guards, releasing all segment references
-
+            // The transaction keeps its old versions referenced through the decision.
+            // A failed close keeps those references for a later retry.
             // The bracket closes HERE, with the decision.
             //
             // This is where a transaction is actually committed or aborted;

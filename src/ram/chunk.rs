@@ -680,7 +680,11 @@ fn end_lease(
             // A stale owner may still be inside a write it claimed before
             // the revocation (claims are taken under the lock that revoked
             // it). Let that entry land first, so the padding covers it.
+            #[cfg(feature = "abort_profile")]
+            let drain_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
             let drained = seg.drain_pending_journals(std::time::Duration::from_secs(5));
+            #[cfg(feature = "abort_profile")]
+            drop(drain_timer);
             let end = seg.append_header.load(Ordering::Acquire);
             let outcome = if !drained {
                 Err(io::Error::other(
@@ -3058,6 +3062,11 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    #[cfg(test)]
+    pub(crate) fn deleted_version_for_test(&self, hash: u64) -> u64 {
+        self.deleted_versions.version(hash)
+    }
+
     pub(crate) fn note_deleted_version(&self, hash: u64, version: u64) {
         self.deleted_versions.note(hash, version);
     }
@@ -3577,6 +3586,18 @@ impl Chunk {
     where
         U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
+        self.update_cell_by_inner(hash, update, true)
+    }
+
+    fn update_cell_by_inner<U>(
+        &self,
+        hash: u64,
+        update: U,
+        retire_old: bool,
+    ) -> Result<OwnedCell, WriteError>
+    where
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
+    {
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
             let old_loc = cell_guard.get_ptr();
             match SharedCellData::from_chunk_raw(hash, *cell_guard, self) {
@@ -3620,9 +3641,11 @@ impl Chunk {
 
                         // Mark old entry as dead using size we captured earlier
                         // This avoids decoding old_loc after lock is released (race condition)
-                        if let Some(size) = old_entry_size {
-                            let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
-                            self.mark_dead_entry_with_size(old_loc, size, &seg);
+                        if retire_old {
+                            if let Some(size) = old_entry_size {
+                                let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
+                                self.mark_dead_entry_with_size(old_loc, size, &seg);
+                            }
                         }
 
                         self.refresh_statistics_for_schema(write_plan.schema.vid);
@@ -3701,6 +3724,18 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
+        self.remove_cell_by_inner(hash, predict, true)
+    }
+
+    fn remove_cell_by_inner<P>(
+        &self,
+        hash: u64,
+        predict: P,
+        retire_old: bool,
+    ) -> Result<(), WriteError>
+    where
+        P: Fn(&SharedCell) -> bool,
+    {
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3713,9 +3748,12 @@ impl Chunk {
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
+                    // The cleaner can probe this cell. Do not wait for its GC lock
+                    // while the cell-index guard is held, even at the allocator wall.
+                    let removed_len =
+                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old, false)?;
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
-                    let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
                     self.slot_bytes.sub(hash, removed_len);
                     return Ok(());
                 }
@@ -3723,6 +3761,94 @@ impl Chunk {
             }
             Err(e) => Err(WriteError::ReadError(e)),
         }
+    }
+
+    /// Restore the index before the participant pads its leased spans.
+    /// The participant keeps the previous segment referenced until this returns.
+    fn restore_cell_location(
+        &self,
+        hash: u64,
+        previous: usize,
+        current_version: u64,
+    ) -> Result<(), WriteError> {
+        let mut guard = self.lock_or_insert_cell(hash);
+        let current = guard.get_ptr();
+        if (current_version == 0 && current != 0)
+            || (current_version != 0
+                && (current == 0
+                    || guard.cell_version().map_err(WriteError::ReadError)? != current_version))
+        {
+            if current == 0 {
+                guard.remove_cell();
+            }
+            return Err(WriteError::CellVersionMismatch);
+        }
+        let current_size = if current == 0 {
+            0
+        } else {
+            Entry::decode_from(current, |_, _| {}).0.content_length
+        };
+        let previous_size = if previous == 0 {
+            0
+        } else {
+            Entry::decode_from(previous, |_, _| {}).0.content_length
+        };
+        let mut schemas = [None, None];
+        let mut current_indices = Vec::new();
+        let mut current_scannable_key = None;
+        if current != 0 {
+            schemas[0] = Some(
+                header_from_chunk_raw(current)
+                    .map_err(WriteError::ReadError)?
+                    .0
+                    .schema,
+            );
+            if self.index_builder.is_some() {
+                let (cell, schema) =
+                    SharedCell::from_chunk_raw(hash, guard, self).map_err(WriteError::ReadError)?;
+                if previous == 0 {
+                    self.remove_indices(&cell, &schema);
+                } else {
+                    current_indices = probe_cell_indices(&cell, &schema);
+                    if schema.is_scannable {
+                        current_scannable_key = Some(crate::index::EntryKey::for_scannable(
+                            &cell.id(),
+                            schema.uid,
+                        ));
+                    }
+                }
+                guard = cell.into_cell_guard();
+            }
+        }
+        if previous != 0 {
+            schemas[1] = Some(
+                header_from_chunk_raw(previous)
+                    .map_err(WriteError::ReadError)?
+                    .0
+                    .schema,
+            );
+            if let Some(indexer) = &self.index_builder {
+                let (cell, schema) = SharedCellData::from_chunk_raw(hash, previous, self)
+                    .map_err(WriteError::ReadError)?;
+                indexer.restore_indices(
+                    &cell.to_owned(),
+                    &schema,
+                    current_indices,
+                    current_scannable_key,
+                );
+            }
+        }
+        if previous == 0 {
+            guard.remove_cell();
+        } else {
+            guard.set_ptr(previous);
+        }
+        self.slot_bytes.sub(hash, current_size);
+        self.slot_bytes.add(hash, previous_size);
+        for schema in schemas.into_iter().flatten() {
+            self.refresh_statistics_for_schema(schema);
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -3979,6 +4105,8 @@ impl Chunk {
         &self,
         cell_header: &CellHeader,
         cell_seg: &AArc<Segment>,
+        record_deleted_version: bool,
+        full_gc: bool,
     ) -> Result<(), WriteError> {
         // Bounded, and never retried when retrying cannot possibly work.
         //
@@ -4000,7 +4128,7 @@ impl Chunk {
         let mut acquired = None;
         let mut last_error = WriteError::CannotAllocateSpace;
         for attempt in 0..TOMBSTONE_ACQUIRE_ATTEMPTS {
-            match self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
+            match self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, full_gc) {
                 Ok(pending_entry) => {
                     acquired = Some(pending_entry);
                     break;
@@ -4037,7 +4165,9 @@ impl Chunk {
             cell_header.version,
             cell_header.id,
         );
-        self.note_deleted_version(cell_header.id.bits(), cell_header.version);
+        if record_deleted_version {
+            self.note_deleted_version(cell_header.id.bits(), cell_header.version);
+        }
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
         Ok(())
@@ -4046,6 +4176,15 @@ impl Chunk {
     /// Returns the removed entry's content length, so the logical remove
     /// paths can settle the slot counter without a second decode.
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
+        self.put_tombstone_by_cell_loc_inner(cell_location, true, true)
+    }
+
+    fn put_tombstone_by_cell_loc_inner(
+        &self,
+        cell_location: usize,
+        retire_old: bool,
+        full_gc: bool,
+    ) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -4061,8 +4200,10 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg)?;
-        self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+        self.put_tombstone(&header, &cell_seg, retire_old, full_gc)?;
+        if retire_old {
+            self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+        }
         Ok(entry_size)
     }
 
@@ -5502,6 +5643,48 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
     }
+    pub(crate) fn apply_transaction_update<U>(
+        &self,
+        key: &Id,
+        update: U,
+    ) -> Result<OwnedCell, WriteError>
+    where
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
+    {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.update_cell_by_inner(hash, update, false)
+    }
+
+    pub(crate) fn apply_transaction_remove<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
+    where
+        P: Fn(&SharedCell) -> bool,
+    {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.remove_cell_by_inner(hash, predict, false)
+    }
+
+    pub(crate) fn restore_transaction_cell(
+        &self,
+        key: &Id,
+        previous: usize,
+        current_version: u64,
+    ) -> Result<(), WriteError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.restore_cell_location(hash, previous, current_version)
+    }
+
+    pub(crate) fn retire_transaction_version(&self, key: &Id, location: usize, deleted: bool) {
+        let (chunk, _) = self.locate_chunk_by_key(key);
+        let seg = chunk.locate_segment_ensured(location, key);
+        chunk.mark_dead_entry_with_seg(location, &seg);
+        if deleted {
+            let header = header_from_chunk_raw(location)
+                .expect("the transaction pins this version")
+                .0;
+            chunk.note_deleted_version(key.bits(), header.version);
+        }
+    }
+
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
@@ -7212,6 +7395,130 @@ mod tests {
         );
     }
 
+    fn delete_at_the_wall_does_not_wait_for_gc(transactional: bool) {
+        let (_, schema) = setup_test_chunks();
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let before = chunks.write_cell(&mut cell).unwrap();
+        // Apply normally captures this source before a cleaner can start.
+        let _source_pin = transactional.then(|| {
+            crate::ram::segs::SegmentReferenceGuard::new(
+                chunk.locate_segment(chunks.address_of(&id)).unwrap(),
+            )
+            .unwrap()
+        });
+        let txn = test_txn_id(99123);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let writer_txn = txn.clone();
+        let writer = std::thread::spawn(move || {
+            let scope = transactional.then(|| TransactionScope::enter(writer_txn));
+            if transactional {
+                let mut inserted =
+                    payload_cell(cell.header.schema.get(), &Id::allocated(0, 0, 99124), 64);
+                writer_chunks.write_cell(&mut inserted).unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            let predict = |_: &SharedCell| {
+                guard_tx.send(()).unwrap();
+                true
+            };
+            let result = if transactional {
+                writer_chunks.apply_transaction_remove(&id, predict)
+            } else {
+                writer_chunks.remove_cell_by(&id, predict)
+            };
+            drop(scope);
+            done_tx.send(result).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        while chunk.allocator.writer_headroom() > 1 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let seg_id = seg.id;
+            chunk.put_segment(seg);
+            if let Some(slot) = chunk
+                .head_pool
+                .iter()
+                .find(|slot| slot.load(Ordering::Acquire) == HEAD_SEG_ID_EMPTY)
+            {
+                slot.store(seg_id, Ordering::Release);
+            }
+        }
+        assert_eq!(chunk.allocator.writer_headroom(), 1);
+        for seg in chunk.segments() {
+            if seg.bracket_is_open() {
+                seg.retire_tail();
+            } else {
+                // Leave a live ordinary head that is too small for a tombstone or BEGIN.
+                let cursor = seg.append_header.load(Ordering::Acquire);
+                let end = seg.bound() - 8;
+                crate::ram::entry::stamp_checked_padding(cursor, (end - cursor) as u32);
+                seg.append_header.store(end, Ordering::Release);
+            }
+        }
+        let (gc_ready_tx, gc_ready_rx) = std::sync::mpsc::channel();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let cleaner_chunks = chunks.clone();
+        let cleaner = std::thread::spawn(move || {
+            Cleaner::clean_with_test_probe(&cleaner_chunks.list[0], move |chunk| {
+                // Pause a real round after it takes gc_lock, before it probes X.
+                gc_ready_tx.send(()).unwrap();
+                guard_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                probe_tx.send(chunk.head_cell(id.bits())).unwrap();
+            });
+        });
+        gc_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        go_tx.send(()).unwrap();
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            result.is_ok(),
+            "delete waited for GC under the cell-index lock"
+        );
+        writer.join().unwrap();
+        cleaner.join().unwrap();
+        let probed = probe_rx.recv().unwrap();
+        match result.expect("delete waited for GC under the cell-index lock") {
+            Ok(()) => assert!(probed.is_err()),
+            Err(WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable) => {
+                assert_eq!(probed.unwrap().version, before.version);
+            }
+            other => panic!("unexpected delete result: {:?}", other),
+        }
+        if transactional {
+            retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        }
+    }
+
+    #[test]
+    fn transactional_delete_at_the_wall_does_not_wait_for_gc_under_the_cell_lock() {
+        delete_at_the_wall_does_not_wait_for_gc(true);
+    }
+
+    #[test]
+    fn conditional_delete_at_the_wall_does_not_wait_for_gc_under_the_cell_lock() {
+        delete_at_the_wall_does_not_wait_for_gc(false);
+    }
+
     /// A chunk whose allocator is empty must refuse the write, not wedge.
     ///
     /// `try_acquire_in_class` publishes `HEAD_SEG_ID_ALLOCATING` into the head
@@ -7523,6 +7830,21 @@ mod tests {
             header: CellHeader::new(SchemaVid(schema_id), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
+    }
+
+    #[test]
+    fn transaction_restore_rejects_a_changed_index_without_a_placeholder() {
+        let (chunks, schema) = setup_test_chunks();
+        let id = Id::allocated(1, 0, 43);
+        let count = chunks.list[0].cell_count();
+        assert_eq!(chunks.restore_transaction_cell(&id, 0, 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(chunks.list[0].cell_count(), count);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let header = chunks.write_cell(&mut cell).unwrap();
+        let address = chunks.address_of(&id);
+        assert_eq!(chunks.restore_transaction_cell(&id, 0, header.version + 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(chunks.address_of(&id), address);
+        assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
     }
 
     #[test]
