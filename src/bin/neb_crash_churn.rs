@@ -1004,11 +1004,12 @@ async fn child_async(
     // the startup path is a price, and a price nobody measures is one that
     // grows.
     println!(
-        "RECONCILE ms={} scanned={} noidx={} repaired={} abandoned_pages={}",
+        "RECONCILE ms={} scanned={} noidx={} repaired={} pruned={} abandoned_pages={}",
         neb::index::scrub::LAST_RECONCILE_MS.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_SCANNED.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_NOIDX.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
             .load(std::sync::atomic::Ordering::Relaxed),
     );
@@ -1032,13 +1033,16 @@ async fn child_async(
         let began = std::time::Instant::now();
         match client.scrub_ranged_index(false).await {
             Ok(report) => println!(
-                "SCRUB missing={} unreachable={} present={} derived={} cells={} took_ms={}",
+                "SCRUB missing={} unreachable={} present={} derived={} cells={} took_ms={} index_keys={} stale={} prune_incomplete={}",
                 report.entries_missing,
                 report.entries_unreachable,
                 report.entries_present,
                 report.entries_derived,
                 report.cells_scanned,
-                began.elapsed().as_millis()
+                began.elapsed().as_millis(),
+                report.index_keys_scanned,
+                report.entries_stale,
+                report.prune_incomplete
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
