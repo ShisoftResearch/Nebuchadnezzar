@@ -7412,6 +7412,13 @@ mod tests {
         let id = Id::allocated(0, 0, 99123);
         let mut cell = payload_cell(schema.vid.get(), &id, 64);
         let before = chunks.write_cell(&mut cell).unwrap();
+        // Apply normally captures this source before a cleaner can start.
+        let _source_pin = transactional.then(|| {
+            crate::ram::segs::SegmentReferenceGuard::new(
+                chunk.locate_segment(chunks.address_of(&id)).unwrap(),
+            )
+            .unwrap()
+        });
         let txn = test_txn_id(99123);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel();
@@ -7465,19 +7472,31 @@ mod tests {
                 seg.append_header.store(end, Ordering::Release);
             }
         }
-        let gc = chunk.gc_lock.lock();
-        go_tx.send(()).unwrap();
-        guard_rx
+        let (gc_ready_tx, gc_ready_rx) = std::sync::mpsc::channel();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let cleaner_chunks = chunks.clone();
+        let cleaner = std::thread::spawn(move || {
+            Cleaner::clean_with_test_probe(&cleaner_chunks.list[0], move |chunk| {
+                // Pause a real round after it takes gc_lock, before it probes X.
+                gc_ready_tx.send(()).unwrap();
+                guard_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                probe_tx.send(chunk.head_cell(id.bits())).unwrap();
+            });
+        });
+        gc_ready_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        // The cleaner owns gc_lock and probes the same cell-index entry.
-        let cleaner_chunks = chunks.clone();
-        let probe = std::thread::spawn(move || cleaner_chunks.head_cell(&id));
+        go_tx.send(()).unwrap();
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        assert!(result.is_ok(), "delete waited for GC under the cell-index lock");
-        drop(gc);
+        assert!(
+            result.is_ok(),
+            "delete waited for GC under the cell-index lock"
+        );
         writer.join().unwrap();
-        let probed = probe.join().unwrap();
+        cleaner.join().unwrap();
+        let probed = probe_rx.recv().unwrap();
         match result.expect("delete waited for GC under the cell-index lock") {
             Ok(()) => assert!(probed.is_err()),
             Err(WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable) => {
