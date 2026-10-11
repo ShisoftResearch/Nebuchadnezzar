@@ -2662,7 +2662,11 @@ mod tests {
         server.shutdown().await;
     }
 
-    async fn memory_rollback_index_tasks(nullable: bool) {
+    mod review_tests {
+        include!("review_tests.rs");
+    }
+
+    async fn memory_rollback_index_tasks(nullable: bool, remove: bool) {
         let address = crate::utils::test_port::unique_localhost_addr();
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -2757,17 +2761,19 @@ mod tests {
             commit_ops_local(
                 &manager,
                 &tid,
-                vec![CommitOp::Update(counter_cell(
-                    schema.vid.get(),
-                    id,
-                    5,
-                    "new"
-                ))]
+                vec![if remove {
+                    CommitOp::Remove(id)
+                } else {
+                    CommitOp::Update(counter_cell(schema.vid.get(), id, 5, "new"))
+                }]
             )
             .await,
             DMCommitResult::Success
         );
-        assert!(indexer.clients.ranged_client.contains(&key).await.unwrap());
+        assert_eq!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            !remove
+        );
         // Every task can run concurrently. Complete inserts before earlier removals.
         let (aborted, tasks) = IndexBuilder::collect_test_index_tasks(|| {
             <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
@@ -2820,12 +2826,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn memory_rollback_keeps_an_unchanged_scannable_key_for_any_task_order() {
-        memory_rollback_index_tasks(false).await;
+        memory_rollback_index_tasks(false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn memory_rollback_removes_an_index_when_the_previous_value_is_null() {
-        memory_rollback_index_tasks(true).await;
+        memory_rollback_index_tasks(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_rollback_delete_restores_scannable_key_for_any_task_order() {
+        memory_rollback_index_tasks(false, true).await;
     }
 
     async fn memory_rollback_decision_survives_recovery(commit: bool) {

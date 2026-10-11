@@ -3062,6 +3062,11 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    #[cfg(test)]
+    pub(crate) fn deleted_version_for_test(&self, hash: u64) -> u64 {
+        self.deleted_versions.version(hash)
+    }
+
     pub(crate) fn note_deleted_version(&self, hash: u64, version: u64) {
         self.deleted_versions.note(hash, version);
     }
@@ -7469,7 +7474,7 @@ mod tests {
         let cleaner_chunks = chunks.clone();
         let probe = std::thread::spawn(move || cleaner_chunks.head_cell(&id));
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        // Release before asserting so the unfixed implementation can unwind the test.
+        assert!(result.is_ok(), "delete waited for GC under the cell-index lock");
         drop(gc);
         writer.join().unwrap();
         let probed = probe.join().unwrap();

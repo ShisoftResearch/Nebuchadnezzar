@@ -3756,6 +3756,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wal_sync_racing_a_head_close_credits_only_covered_bytes() {
+        use std::io::Read;
+        let dir = tempfile::TempDir::new().unwrap();
+        let chunks = crate::ram::chunk::Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(crate::server::ServerMeta {
+                schemas: crate::ram::schema::LocalSchemasCache::new_local(""),
+            }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let allocated = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        let id = allocated.id;
+        chunk.put_segment(allocated);
+        let seg = chunk.segs.get(&(id as usize)).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.append_header.store(seg.addr + 16, Release);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let path = chunk
+            .file_manager
+            .wal_path(seg.chunk_id, seg.id, seg.seq_id)
+            .unwrap();
+        let mut reader = File::open(path).unwrap();
+        seg.sync_wal_with(true, |file| {
+            assert_eq!(seg.wal_pending_bytes(), 8);
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            assert_eq!(seg.wal_pending_bytes(), 16);
+            // Close and archive while the first sync still owns its cloned descriptor.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| chunk.finish_rotated_head(id))
+                    .join()
+                    .unwrap();
+            });
+            assert!(seg.file_state.lock().wal.is_none());
+            assert_eq!(seg.wal_pending_bytes(), 0, "close must cover both records");
+            file.sync_all()?;
+
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            let replay = crate::ram::wal_format::scan_framed(&data, SEGMENT_SIZE).unwrap();
+            assert_eq!(replay.records, 2);
+            assert_eq!(replay.used_len, 16);
+            assert_eq!(replay.stop, crate::ram::wal_format::TailStop::Clean);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seg.wal_bytes_written.load(Relaxed), 16);
+        assert_eq!(
+            seg.wal_bytes_synced.load(Acquire),
+            16,
+            "late sync must not lower the close's credit"
+        );
+        assert_eq!(seg.wal_pending_bytes(), 0);
+    }
+
+    #[test]
     fn wal_sync_leaves_later_appends_dirty_and_replays_them_after_the_next_sync() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(SegmentFileManager::new(
