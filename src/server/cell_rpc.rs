@@ -1,5 +1,5 @@
 use std::sync::atomic::{self, AtomicU64};
-use crate::index::scrub::{scrub_ranged_index, ScrubMode, ScrubReport};
+use crate::index::scrub::{ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
 use crate::ram::types::Id;
@@ -104,7 +104,7 @@ service! {
     rpc post_schema_add(schema_id: u32) -> Result<(), String>;
     rpc post_schema_evolve(previous_id: u32, evolved_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
-    rpc scrub_ranged_index(repair: bool) -> Result<ScrubReport, String>;
+    rpc scrub_index(repair: bool) -> Result<ScrubReport, String>;
     rpc cell_scan_open() -> u64;
     rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
     rpc cell_scan_close(cursor: u64) -> ();
@@ -915,18 +915,19 @@ impl Service for NebRPCService {
         return future::ready(cells).boxed();
     }
 
-    /// Re-derive this node's ranged index entries and report (or fill) the
-    /// holes. The maintenance command for a range that reads as errors, or
-    /// as empty, while its cells are demonstrably still there.
+    /// Re-derive this node's index entries and report (or fill) the holes, in
+    /// both directions and for both secondary indexes. The maintenance command
+    /// for a range that reads as errors, or as empty, while its cells are
+    /// demonstrably still there.
     ///
-    /// Server-side because the walk needs the chunks: no client API
-    /// enumerates cells, and entries have to be derived from cell contents
-    /// through the write path's own function.
+    /// Server-side because the walk needs the chunks: no client API enumerates
+    /// cells, and entries have to be derived from cell contents through the write
+    /// path's own function.
     ///
-    /// Refused when this node has no index builder. A store without one has
-    /// no ranged index to scrub, and answering "clean" for it would be a lie
-    /// in exactly the situation the caller is checking for.
-    fn scrub_ranged_index(&self, repair: bool) -> BoxFuture<'_, Result<ScrubReport, String>> {
+    /// Refused when this node has no index builder. A store without one has no
+    /// index to scrub, and answering "clean" for it would be a lie in exactly the
+    /// situation the caller is checking for.
+    fn scrub_index(&self, repair: bool) -> BoxFuture<'_, Result<ScrubReport, String>> {
         async move {
             let Some(indexer) = self.database_runtime.indexer.as_ref() else {
                 return Err(String::from(
@@ -938,8 +939,15 @@ impl Service for NebRPCService {
             } else {
                 ScrubMode::Verify
             };
-            let report =
-                scrub_ranged_index(self.database_runtime.chunks(), &indexer.clients, mode).await;
+            // Fully qualified: inside this impl the bare name finds the RPC
+            // handler being defined, and an async fn cannot recurse through its
+            // own future.
+            let report = crate::index::scrub::scrub_all_indexes(
+                self.database_runtime.chunks(),
+                &indexer.clients,
+                mode,
+            )
+            .await;
             if report.is_clean() {
                 info!("Index scrub ({:?}) clean: {}", mode, report);
             } else {

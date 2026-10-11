@@ -1,6 +1,11 @@
 //! Index scrub: re-derive every live cell's index entries and compare them
 //! against the index that is supposed to hold them.
 //!
+//! Two index types are walked, and both in both directions. The ranged walk
+//! reconciles keys inside B-tree pages; the hash walk reconciles ids inside
+//! bucket cells (`scrub_hash_index`). They share the rules below and share one
+//! entry point, `scrub_all_indexes`, because one question is being asked.
+//!
 //! # Why this exists
 //!
 //! Cell data and the ranged index fail independently. A cell lives in a
@@ -16,6 +21,12 @@
 //! that range errors, retries re-read the same broken pages, and nothing in
 //! the system ever rebuilds them. The data is entirely intact and entirely
 //! unreachable. This module is the way out.
+//!
+//! The hash index fails the same way, for a smaller reason. Its entries are
+//! ordinary cells, so it has no write-back and no checkpoint, and the only
+//! window that can split it from its cells is inside one write request: the
+//! data record is written, then the request awaits its own index task, and a
+//! stop between those two leaves a durable cell whose bucket was never told.
 //!
 //! # The two rules that make it safe
 //!
@@ -34,11 +45,21 @@
 //! makes a single-node scrub sound in both directions: a cell HERE implies
 //! entries HERE, and an entry HERE naming a cell HERE is either justified
 //! by that cell or it is not.
+//!
+//! The hash walks obey the same two rules. `IndexRes::hash_buckets` is the
+//! writer's own list of which buckets a cell belongs to, and
+//! `judge_local_hash_entry` reads the cell a bucket lists and asks it the same
+//! question the ranged prune asks. The hash prune carries one extra duty: a
+//! bucket segment must say which bucket it is part of, because a bucket id is a
+//! one-way hash and a spilled segment's id names nothing. That is the `OWNER`
+//! field of `HASH_INDEX_SCHEMA`.
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::index::builder::probe_cell_indices;
+use crate::index::hash::{bucket_segment, BucketSegment, HASH_INDEX_SCHEMA_ID, MAX_CHAIN_HOPS};
 use crate::index::ranged::client::NextTree;
 use crate::index::ranged::tree::btree::Ordering;
 use crate::index::ranged::trees::min_entry_key;
@@ -47,13 +68,15 @@ use crate::index::IndexerClients;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::EntryContent;
+use crate::ram::schema::IndexType;
 use crate::ram::types::Id;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScrubMode {
     /// Read-only. Reports what is missing and changes nothing.
     Verify,
-    /// Inserts every derived entry the index does not hold. Never deletes.
+    /// Inserts every derived entry the index does not hold, and deletes every
+    /// held entry no cell implies.
     Repair,
 }
 
@@ -119,6 +142,51 @@ pub struct ScrubReport {
     /// The prune walk stopped before it covered the index. Its counts are a
     /// partial account, so they must never be read as "clean".
     pub prune_incomplete: u64,
+    /// Hash bucket entries derived from the cells walked: one (bucket, cell) pair
+    /// per indexed value per cell. Kept apart from `entries_derived` because a
+    /// hash entry and a ranged key are different objects with different repair
+    /// costs, and a report that merged them could not say which index is broken.
+    pub hash_entries_derived: u64,
+    /// Derived (bucket, cell) pairs the bucket already held.
+    pub hash_entries_present: u64,
+    /// Derived (bucket, cell) pairs the bucket did NOT hold. This is the MISSING
+    /// direction, and it is the one that costs a query a row: a hash lookup
+    /// answers with the ids its bucket lists and nothing else.
+    pub hash_entries_missing: u64,
+    /// Missing pairs a repair pass inserted. In `Verify` this is 0.
+    pub hash_entries_repaired: u64,
+    /// Inserts the bucket refused.
+    pub hash_repairs_failed: u64,
+    /// Buckets whose contents the pass could not establish -- a chain link that
+    /// names a missing or unreadable cell. The held set is then not the whole
+    /// story, so the pass forms no opinion and inserts nothing, rather than
+    /// writing a duplicate into the bucket on every restart.
+    pub hash_buckets_unreachable: u64,
+    /// (bucket, id) pairs read out of this member's bucket cells. This is a walk
+    /// of the INDEX side, so it counts entries whether or not a cell implies them.
+    pub hash_index_ids_scanned: u64,
+    /// Held ids no local cell implies: the id names a cell that is gone, or a cell
+    /// whose value has moved on. This is the STALE direction. A query hides it --
+    /// `HashIndexer::query` re-reads every candidate and filters the ones that no
+    /// longer match -- so it costs garbage and wasted reads rather than a wrong
+    /// answer. It is still what a store accumulates forever if nothing prunes it.
+    pub hash_entries_stale: u64,
+    /// Stale pairs a repair pass removed. In `Verify` this is 0.
+    pub hash_entries_pruned: u64,
+    /// Removes the bucket refused.
+    pub hash_prune_failed: u64,
+    /// Held ids this member could not judge because the cell they name sits on
+    /// another member. Same rule as `entries_not_local`: no opinion, no delete.
+    pub hash_entries_not_local: u64,
+    /// Cells the hash walks could not read. Kept apart from `cells_unreadable`
+    /// because the two walks read the same cells, and a summed count would be a
+    /// multiple of the number of damaged cells rather than the number itself.
+    pub hash_cells_unreadable: u64,
+    /// Cells whose schema is not in this member's catalog, seen by the hash walks.
+    pub hash_cells_schema_missing: u64,
+    /// The bucket walk stopped before it covered every segment. Its counts are a
+    /// partial account.
+    pub hash_prune_incomplete: u64,
 }
 
 impl ScrubReport {
@@ -135,6 +203,12 @@ impl ScrubReport {
             && self.entries_stale == 0
             && self.prune_failed == 0
             && self.prune_incomplete == 0
+            && self.hash_entries_missing == 0
+            && self.hash_buckets_unreachable == 0
+            && self.hash_repairs_failed == 0
+            && self.hash_entries_stale == 0
+            && self.hash_prune_failed == 0
+            && self.hash_prune_incomplete == 0
     }
 
     /// Fold another node's report into this one. Public because a
@@ -159,6 +233,20 @@ impl ScrubReport {
         self.prune_failed += other.prune_failed;
         self.entries_not_local += other.entries_not_local;
         self.prune_incomplete += other.prune_incomplete;
+        self.hash_entries_derived += other.hash_entries_derived;
+        self.hash_entries_present += other.hash_entries_present;
+        self.hash_entries_missing += other.hash_entries_missing;
+        self.hash_entries_repaired += other.hash_entries_repaired;
+        self.hash_repairs_failed += other.hash_repairs_failed;
+        self.hash_buckets_unreachable += other.hash_buckets_unreachable;
+        self.hash_index_ids_scanned += other.hash_index_ids_scanned;
+        self.hash_entries_stale += other.hash_entries_stale;
+        self.hash_entries_pruned += other.hash_entries_pruned;
+        self.hash_prune_failed += other.hash_prune_failed;
+        self.hash_entries_not_local += other.hash_entries_not_local;
+        self.hash_cells_unreadable += other.hash_cells_unreadable;
+        self.hash_cells_schema_missing += other.hash_cells_schema_missing;
+        self.hash_prune_incomplete += other.hash_prune_incomplete;
     }
 }
 
@@ -169,7 +257,10 @@ impl std::fmt::Display for ScrubReport {
             "cells={} (no-indices={}, unreadable={}, schema-missing={}) entries={} \
              present={} missing={} repaired={} not-stuck={} unreachable={} \
              repair-failed={} index-keys={} stale={} pruned={} prune-failed={} \
-             not-local={} prune-incomplete={}",
+             not-local={} prune-incomplete={} | hash: derived={} present={} missing={} \
+             repaired={} repair-failed={} bucket-unreachable={} index-ids={} stale={} \
+             pruned={} prune-failed={} not-local={} unreadable={} schema-missing={} \
+             prune-incomplete={}",
             self.cells_scanned,
             self.cells_no_indices,
             self.cells_unreadable,
@@ -187,6 +278,20 @@ impl std::fmt::Display for ScrubReport {
             self.prune_failed,
             self.entries_not_local,
             self.prune_incomplete,
+            self.hash_entries_derived,
+            self.hash_entries_present,
+            self.hash_entries_missing,
+            self.hash_entries_repaired,
+            self.hash_repairs_failed,
+            self.hash_buckets_unreachable,
+            self.hash_index_ids_scanned,
+            self.hash_entries_stale,
+            self.hash_entries_pruned,
+            self.hash_prune_failed,
+            self.hash_entries_not_local,
+            self.hash_cells_unreadable,
+            self.hash_cells_schema_missing,
+            self.hash_prune_incomplete,
         )
     }
 }
@@ -219,6 +324,15 @@ pub static LAST_RECONCILE_REPAIRED: std::sync::atomic::AtomicU64 =
 /// prune that did not run or did not finish.
 pub static LAST_RECONCILE_PRUNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Hash bucket entries the last reconciliation inserted and removed. The hash
+/// index has no write-back and no checkpoint, so a store that never lost a
+/// write inside a request comes back with both at zero; a store with
+/// `HASH_REPAIRED=0 HASH_PRUNED=0` while a bucket lists ids its cells do not
+/// imply has a hash pass that did not run.
+pub static LAST_RECONCILE_HASH_REPAIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_HASH_PRUNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// **Why it BLOCKS rather than running in the background.** The index is a
 /// cache of the cells, and a cache that has not caught up answers queries
@@ -242,6 +356,13 @@ pub static LAST_RECONCILE_PRUNED: std::sync::atomic::AtomicU64 =
 /// heals itself and everything else does not: a cell written once keeps a lost
 /// entry for the life of the store, and a cell whose value moved keeps the old
 /// entry beside the new one forever.
+///
+/// Both index types are covered. The ranged window is "since that page's last
+/// flush", up to 60 s of writes. The hash window is one request: the data cell's
+/// record is written, then the request awaits its index task, and a stop between
+/// those two leaves a durable cell whose bucket was never told about it --
+/// missing for an insert, stale for a delete, and both for an update. See
+/// `scrub_hash_index`.
 pub async fn reconcile_index_before_serving(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
@@ -259,7 +380,7 @@ pub async fn reconcile_index_before_serving(
     let label = format!("{}/{}", group, database);
     info!("Reconciling {}'s index against its cells", label);
     let began = std::time::Instant::now();
-    let report = scrub_ranged_index(chunks, indexers, mode).await;
+    let report = scrub_all_indexes(chunks, indexers, mode).await;
     let elapsed = began.elapsed();
     use std::sync::atomic::Ordering as AtomicOrdering;
     LAST_RECONCILE_MS.store(elapsed.as_millis() as u64, AtomicOrdering::Relaxed);
@@ -267,6 +388,8 @@ pub async fn reconcile_index_before_serving(
     LAST_RECONCILE_NOIDX.store(report.cells_no_indices, AtomicOrdering::Relaxed);
     LAST_RECONCILE_REPAIRED.store(report.entries_repaired, AtomicOrdering::Relaxed);
     LAST_RECONCILE_PRUNED.store(report.entries_pruned, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_HASH_REPAIRED.store(report.hash_entries_repaired, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_HASH_PRUNED.store(report.hash_entries_pruned, AtomicOrdering::Relaxed);
     if report.is_clean() {
         info!(
             "Index reconciliation for {} found nothing to repair in {:?}: {}",
@@ -274,9 +397,15 @@ pub async fn reconcile_index_before_serving(
         );
     } else {
         warn!(
-            "Index reconciliation for {} repaired {} missing and pruned {} stale entries in \
-             {:?}: {}",
-            label, report.entries_repaired, report.entries_pruned, elapsed, report
+            "Index reconciliation for {} repaired {} missing and pruned {} stale ranged entries, \
+             and repaired {} missing and pruned {} stale hash entries, in {:?}: {}",
+            label,
+            report.entries_repaired,
+            report.entries_pruned,
+            report.hash_entries_repaired,
+            report.hash_entries_pruned,
+            elapsed,
+            report
         );
     }
     if report.index_keys_scanned > 0 && report.entries_not_local == report.index_keys_scanned {
@@ -313,6 +442,33 @@ fn mode_from_env() -> Option<ScrubMode> {
             None
         }
     }
+}
+
+/// Walk BOTH secondary indexes and reconcile them with the cells.
+///
+/// One entry point because one question is being asked: does this store's index
+/// answer what its cells imply. An operator who has to run two commands to find
+/// out runs one of them.
+///
+/// The two walks stay separate, and so do their counters, because the objects
+/// they walk are different. A ranged key lives inside a B-tree page, and a page
+/// is a cell whose contents the store cannot enumerate one by one -- that is why
+/// the ranged prune needed a `scan_keys` RPC. A hash entry is an id inside a
+/// bucket cell, and a bucket cell is a cell in this member's own chunks, so the
+/// hash prune reads it with no RPC at all.
+///
+/// Named apart from the `scrub_index` RPC that calls it, and not after it: inside
+/// the service impl the bare name `scrub_index` finds the handler being defined,
+/// and an `async fn` that recurses through its own boxed future is a compile
+/// error the compiler reports as a lifetime bound, not as recursion.
+pub async fn scrub_all_indexes(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+) -> ScrubReport {
+    let mut total = scrub_ranged_index(chunks, indexers, mode).await;
+    total.merge(&scrub_hash_index(chunks, indexers, mode).await);
+    total
 }
 
 /// Walk the ranged index and the live cells, and reconcile the two.
@@ -436,12 +592,15 @@ const PRUNE_PLACEMENT_RETRIES: usize = 32;
 /// taken the process's timers down with it.
 const PRUNE_MAX_BLOCKS: usize = 1 << 20;
 
-/// Whether this member is the one that holds the cell an entry names.
+/// Whether this member is the one that holds the cell, or the bucket, that an id
+/// names.
 ///
 /// A ranged tree covers a key range for the WHOLE cluster, so an entry sitting
 /// here can name a cell that lives anywhere. Only the member holding the cell
-/// can say what that cell implies, so everyone else abstains.
-fn owns_cell(indexers: &IndexerClients, id: &Id) -> bool {
+/// can say what that cell implies, so everyone else abstains. The same question
+/// is asked of a hash bucket cell, which sits on whichever member owns its slot
+/// and can hold ids that live on others.
+fn owns_slot(indexers: &IndexerClients, id: &Id) -> bool {
     indexers
         .conshash
         .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
@@ -460,7 +619,7 @@ fn entry_contradicted(
     report: &mut ScrubReport,
 ) -> bool {
     let id = key.id();
-    if !owns_cell(indexers, &id) {
+    if !owns_slot(indexers, &id) {
         report.entries_not_local += 1;
         return false;
     }
@@ -468,52 +627,89 @@ fn entry_contradicted(
     judge_local_entry(chunk, id, key, report)
 }
 
+/// What this member's own chunks say about one id.
+///
+/// `Absent` is kept apart from the two "no verdict" states on purpose: a cell
+/// that is gone IS a verdict for an index entry, and it is the one the prune
+/// exists to act on, while a cell that could not be read must never be.
+enum LocalCell<'a> {
+    /// The cell is here and readable, with the schema it was written under.
+    Found(
+        crate::ram::cell::SharedCell<'a>,
+        crate::ram::schema::SchemaRef,
+    ),
+    /// The cell index has nothing for this id, or a zero address: the cell is
+    /// gone.
+    Absent,
+    /// A read this chunk could not produce.
+    Unreadable,
+    /// The cell's schema is not in this member's catalog.
+    SchemaMissing,
+}
+
+/// Read a cell out of this member's own chunks.
+///
+/// The header is decoded and the catalog consulted BEFORE the cell is read, for
+/// the reason `derive_into` states: `read_cell` treats a schema it cannot find
+/// as "this shall never happen" and panics in a debug build, and these walks see
+/// whatever the store contains -- including cells whose schema this restart has
+/// not registered yet. A store restarted with a schema it has to re-import
+/// therefore abstains here instead of crashing at startup.
+///
+/// Synchronous, and it must stay that way: the read guard it returns pins a
+/// segment, and no RPC may be awaited with one alive.
+fn read_local_cell(chunk: &crate::ram::chunk::Chunk, id: Id) -> LocalCell<'_> {
+    let guard = match crate::ram::chunk::CellGuard::for_read(id.bits(), chunk) {
+        Ok(guard) => guard,
+        Err(ReadError::CellDoesNotExisted) | Err(ReadError::CellIdIsUnitId) => {
+            return LocalCell::Absent
+        }
+        Err(_) => return LocalCell::Unreadable,
+    };
+    let location = guard.get_ptr();
+    if location == 0 {
+        return LocalCell::Absent;
+    }
+    let Ok((header, _)) = crate::ram::cell::header_from_chunk_raw(location) else {
+        return LocalCell::Unreadable;
+    };
+    let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
+        return LocalCell::SchemaMissing;
+    };
+    let Ok((cell, _)) = crate::ram::cell::SharedCell::from_chunk_raw(id.bits(), guard, chunk)
+    else {
+        return LocalCell::Unreadable;
+    };
+    LocalCell::Found(cell, schema)
+}
+
 /// The verdict for one entry, taken from the chunk that would hold its cell.
 ///
-/// The header is read before the cell, and the catalog is consulted before the
-/// header is followed, for the reason `derive_into` states: `read_cell` treats a
-/// schema it cannot find as "this shall never happen" and panics in a debug
-/// build, and this walk sees whatever the store contains -- including cells
-/// whose schema this restart never registered. A store restarted with a schema
-/// it has to re-import therefore abstains here instead of crashing at startup.
+/// The read follows the guard/header/catalog order `read_local_cell` states.
 fn judge_local_entry(
     chunk: &crate::ram::chunk::Chunk,
     id: Id,
     key: &EntryKey,
     report: &mut ScrubReport,
 ) -> bool {
-    let guard = match crate::ram::chunk::CellGuard::for_read(id.bits(), chunk) {
-        Ok(guard) => guard,
+    let (cell, schema) = match read_local_cell(chunk, id) {
+        LocalCell::Found(cell, schema) => (cell, schema),
         // The cell index has nothing for this id: the cell is gone, so its
         // delete was durable and the index's own record of that delete was not.
         // This is the common stale case.
-        Err(ReadError::CellDoesNotExisted) | Err(ReadError::CellIdIsUnitId) => {
+        LocalCell::Absent => {
             report.entries_stale += 1;
             return true;
         }
-        // A guard this chunk could not produce says nothing about the entry.
-        Err(_) => {
+        // A cell this chunk could not read says nothing about the entry.
+        LocalCell::Unreadable => {
             report.cells_unreadable += 1;
             return false;
         }
-    };
-    let location = guard.get_ptr();
-    if location == 0 {
-        report.entries_stale += 1;
-        return true;
-    }
-    let Ok((header, _)) = crate::ram::cell::header_from_chunk_raw(location) else {
-        report.cells_unreadable += 1;
-        return false;
-    };
-    let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
-        report.cells_schema_missing += 1;
-        return false;
-    };
-    let Ok((cell, _)) = crate::ram::cell::SharedCell::from_chunk_raw(id.bits(), guard, chunk)
-    else {
-        report.cells_unreadable += 1;
-        return false;
+        LocalCell::SchemaMissing => {
+            report.cells_schema_missing += 1;
+            return false;
+        }
     };
     // Re-derive through the write path's own probe, the same function the
     // insert half uses, so the two directions cannot disagree about what a cell
@@ -682,9 +878,523 @@ async fn next_prune_cursor(indexers: &Arc<IndexerClients>, at: &EntryKey) -> Opt
     None
 }
 
+// ---- the hash index: its entries are cells, and they drift the same way -----
+
+/// Segments one bucket chain may span before the walk stops calling it a chain.
+///
+/// The query path uses the same bound (`hash::MAX_CHAIN_HOPS`); the point of
+/// restating it here is that this pass can REPORT on it. A chain with a cycle in
+/// it would otherwise spin at startup, and every unbounded loop on this index
+/// path has eventually hung a worker and taken the process's timers with it.
+const HASH_MAX_CHAIN_SEGMENTS: usize = MAX_CHAIN_HOPS;
+
+/// Whether a schema declares a field the hash index is built on.
+///
+/// The hash walk asks this before it reads a cell. Without it, a store that
+/// indexes only RANGED fields would pay a second full read of every indexed cell
+/// for an index it has never built.
+fn schema_has_hash_index(schema: &crate::ram::schema::Schema) -> bool {
+    schema.index_fields.values().any(|indices| {
+        indices
+            .iter()
+            .any(|index| matches!(index, IndexType::Hashed | IndexType::Null))
+    })
+}
+
+/// The verdict for one hash entry, taken from the chunk that would hold its cell.
+///
+/// `bucket` is the chain HEAD the entry sits under, which the segment cell names
+/// in its `OWNER` field. Asking the cell whether it implies the HEAD is the same
+/// question the ranged prune asks of a key, and it is answered by the same
+/// `probe_cell_indices` call the writer uses.
+fn judge_local_hash_entry(
+    chunk: &crate::ram::chunk::Chunk,
+    id: Id,
+    bucket: &Id,
+    report: &mut ScrubReport,
+) -> bool {
+    let (cell, schema) = match read_local_cell(chunk, id) {
+        LocalCell::Found(cell, schema) => (cell, schema),
+        // The cell index has nothing for this id: the cell's delete reached the
+        // WAL and the bucket's own record of that delete did not. This is the
+        // common stale case.
+        LocalCell::Absent => {
+            report.hash_entries_stale += 1;
+            return true;
+        }
+        LocalCell::Unreadable => {
+            report.hash_cells_unreadable += 1;
+            return false;
+        }
+        LocalCell::SchemaMissing => {
+            report.hash_cells_schema_missing += 1;
+            return false;
+        }
+    };
+    // Membership, not equality: an array-valued indexed field implies several
+    // buckets and this entry may be any of them.
+    let implied = probe_cell_indices(&cell, &*schema)
+        .iter()
+        .any(|res| res.hash_buckets().any(|derived| derived == bucket));
+    if implied {
+        false
+    } else {
+        // The cell is here and no longer holds the value this bucket lists.
+        report.hash_entries_stale += 1;
+        true
+    }
+}
+
+/// What a bucket chain told the pass.
+enum BucketContents {
+    /// Every segment was read. These are the ids the bucket holds. An absent head
+    /// is an empty bucket, so the set is simply empty and the answer is complete.
+    Whole(HashSet<Id>),
+    /// A segment could not be read, a link named a cell that is not there, or the
+    /// walk hit its hop bound. The held set is then not the whole story, so the
+    /// pass forms no opinion and inserts nothing: write-side dedup checks only the
+    /// head segment, so an id the unreadable part already holds would be written a
+    /// second time on every restart.
+    Partial,
+}
+
+/// Read one bucket segment, from this member's chunks when it owns the slot and
+/// over RPC when it does not.
+///
+/// The local half is what keeps this pass cheap. A bucket cell is an ordinary
+/// cell, so on the member that owns its slot the reconcile reads it the same way
+/// it reads a data cell -- no round trip. A healthy single-member store therefore
+/// reconciles its hash index with NO RPCs at all, because both sides of every
+/// entry sit in its own chunks.
+async fn read_bucket_segment(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    segment: Id,
+) -> Result<Option<BucketSegment>, ()> {
+    if owns_slot(indexers, &segment) {
+        let chunk = chunks.locate_chunk_by_partition(segment.locality() as u64);
+        return match read_local_cell(chunk, segment) {
+            LocalCell::Found(cell, _) => Ok(Some(bucket_segment(&cell))),
+            LocalCell::Absent => Ok(None),
+            // A schema this member has not registered, or a read that failed:
+            // either way there is no opinion to give.
+            _ => Err(()),
+        };
+    }
+    match indexers.hashed_client.client.read_cell(segment).await {
+        Ok(Ok(cell)) => Ok(Some(bucket_segment(&cell))),
+        Ok(Err(ReadError::CellDoesNotExisted)) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// Walk one bucket chain and collect the ids it holds.
+///
+/// The walk must be WHOLE. A bucket that spilled keeps most of its ids behind the
+/// head, so a head-only membership check would call every one of them missing and
+/// re-insert the whole population at every restart.
+async fn bucket_contents(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    head: Id,
+) -> BucketContents {
+    let mut held = HashSet::new();
+    let mut cursor = Some(head);
+    let mut segments = 0usize;
+    while let Some(segment) = cursor {
+        match read_bucket_segment(chunks, indexers, segment).await {
+            Ok(Some(contents)) => {
+                held.extend(contents.ids.iter().copied());
+                cursor = contents.next;
+            }
+            // An absent HEAD is an empty bucket. A missing link past the first
+            // segment is a broken chain, and says so rather than answering with a
+            // short set that reads like a complete one.
+            Ok(None) if segments == 0 => return BucketContents::Whole(held),
+            Ok(None) => {
+                error!(
+                    "hash bucket {:?} links to a missing segment {:?}; the ids past it are \
+                     unreachable, so this pass forms no opinion about that bucket",
+                    head, segment
+                );
+                return BucketContents::Partial;
+            }
+            Err(_) => return BucketContents::Partial,
+        }
+        segments += 1;
+        if segments > HASH_MAX_CHAIN_SEGMENTS {
+            return BucketContents::Partial;
+        }
+    }
+    BucketContents::Whole(held)
+}
+
+/// Remove the stale pairs of one batch, with a bounded number of outstanding
+/// deletes.
+///
+/// Returns `(pruned, failed)`.
+async fn prune_hash_batch(indexers: &Arc<IndexerClients>, stale: &[(Id, Id)]) -> (u64, u64) {
+    let mut pruned = 0u64;
+    let mut failed = 0u64;
+    let mut in_flight = FuturesUnordered::new();
+    let mut pending = stale.iter();
+    for (bucket, member) in pending.by_ref().take(concurrency()) {
+        in_flight.push(remove_hash_entry(indexers, *member, *bucket));
+    }
+    while let Some(ok) = in_flight.next().await {
+        if ok {
+            pruned += 1;
+        } else {
+            failed += 1;
+        }
+        if let Some((bucket, member)) = pending.next() {
+            in_flight.push(remove_hash_entry(indexers, *member, *bucket));
+        }
+    }
+    (pruned, failed)
+}
+
+/// Take one id out of one bucket, through the writer's own removal.
+///
+/// `bucket` is the chain head. `remove_index` walks the chain and compares-and-
+/// sets the segment that holds the id, so a concurrent spill is not raced by a
+/// second copy of that rule written here -- which is the whole reason this calls
+/// the indexer rather than rewriting the segment the walk already had in hand.
+async fn remove_hash_entry(indexers: &Arc<IndexerClients>, member: Id, bucket: Id) -> bool {
+    match indexers
+        .hashed_client
+        .indexer
+        .remove_index(&member, &bucket)
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(
+                "hash reconcile could not remove {:?} from bucket {:?}: {:?}",
+                member, bucket, error
+            );
+            false
+        }
+    }
+}
+
+/// Insert the ids one batch of cells implies, one chain walk per bucket.
+///
+/// The pairs are grouped by bucket before they are asked about, so a bucket that
+/// this segment holds many members of costs ONE walk rather than one per member.
+/// That is the difference between a bounded pass and a quadratic one on a
+/// low-cardinality indexed field, which is the shape that funnels millions of
+/// cells into a handful of buckets.
+async fn fill_hash_batch(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mut owed: Vec<(Id, Id)>,
+    mode: ScrubMode,
+) -> ScrubReport {
+    let mut report = ScrubReport::default();
+    owed.sort_unstable();
+    let mut groups: Vec<(Id, std::ops::Range<usize>)> = Vec::new();
+    for (index, (bucket, _)) in owed.iter().enumerate() {
+        match groups.last_mut() {
+            Some((last, range)) if *last == *bucket => range.end = index + 1,
+            _ => groups.push((*bucket, index..index + 1)),
+        }
+    }
+    let mut in_flight = FuturesUnordered::new();
+    let mut pending = groups.iter();
+    for group in pending.by_ref().take(concurrency()) {
+        in_flight.push(fill_one_bucket(
+            chunks,
+            indexers,
+            group.0,
+            &owed[group.1.start..group.1.end],
+            mode,
+        ));
+    }
+    while let Some(fill) = in_flight.next().await {
+        report.hash_entries_present += fill.present;
+        report.hash_entries_missing += fill.missing;
+        report.hash_entries_repaired += fill.repaired;
+        report.hash_repairs_failed += fill.repairs_failed;
+        report.hash_buckets_unreachable += fill.unreachable;
+        if let Some(group) = pending.next() {
+            in_flight.push(fill_one_bucket(
+                chunks,
+                indexers,
+                group.0,
+                &owed[group.1.start..group.1.end],
+                mode,
+            ));
+        }
+    }
+    report
+}
+
+/// What asking one bucket about the ids its cells imply cost.
+#[derive(Default)]
+struct BucketFill {
+    present: u64,
+    missing: u64,
+    repaired: u64,
+    repairs_failed: u64,
+    unreachable: u64,
+}
+
+/// Compare one bucket with the ids this member's cells imply, and in `Repair`
+/// mode insert the difference.
+///
+/// `members` are the (bucket, cell) pairs sorted for one bucket; the bucket is
+/// passed apart from them because the pairs carry it in every element and only
+/// the first is ever read.
+async fn fill_one_bucket(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    bucket: Id,
+    members: &[(Id, Id)],
+    mode: ScrubMode,
+) -> BucketFill {
+    let mut out = BucketFill::default();
+    let BucketContents::Whole(held) = bucket_contents(chunks, indexers, bucket).await else {
+        out.unreachable = 1;
+        warn!(
+            "hash reconcile could not read the whole bucket {:?} and inserted nothing; the ids \
+             its cells imply may still be missing",
+            bucket
+        );
+        return out;
+    };
+    let missing: Vec<Id> = members
+        .iter()
+        .filter_map(|(_, cell)| {
+            if held.contains(cell) {
+                out.present += 1;
+                None
+            } else {
+                Some(*cell)
+            }
+        })
+        .collect();
+    out.missing = missing.len() as u64;
+    for cell in &missing {
+        report_hash_missing(cell, &bucket);
+    }
+    if !mode.repairs() || missing.is_empty() {
+        return out;
+    }
+    // One `add_index` per missing id, run together. Concurrent inserts into the
+    // SAME bucket fold into one read-modify-CAS through the indexer's per-bucket
+    // latch, so repairing a bucket that holds a whole population costs one write
+    // rather than one per id -- and a bucket is rewritten whole on every append,
+    // which is the cost that would otherwise be quadratic here.
+    let results = futures::future::join_all(missing.iter().map(|cell| async move {
+        // `insert` takes the bucket first and the cell second, which is the
+        // opposite of `HashIndexer::add_index`: swapped, it writes a bucket cell
+        // named after a data id and the store refuses it for a confusing reason.
+        indexers.hashed_client.insert(&bucket, cell).await
+    }))
+    .await;
+    for result in results {
+        match result {
+            Ok(_) => out.repaired += 1,
+            Err(error) => {
+                out.repairs_failed += 1;
+                warn!(
+                    "hash reconcile could not insert into bucket {:?}: {:?}",
+                    bucket, error
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Walk the hash index and the live cells, and reconcile the two.
+///
+/// Both directions, in this order:
+///
+/// 1. The prune half reads this member's bucket cells and reports -- and in
+///    `Repair` mode removes -- the ids no local cell implies.
+/// 2. The fill half derives every live cell's buckets and reports -- and in
+///    `Repair` mode inserts -- the ids a bucket lacks.
+///
+/// Prune first, so a fill that follows re-adds anything a prune took by mistake.
+/// That ordering is not decoration here: a prune can only be wrong about whether
+/// an entry belongs, and a fill is driven by the cells alone, so a wrong prune is
+/// invisible to everything except the fill in the same pass.
+///
+/// Like the ranged walk, this is batched by segment, and for the same reason: the
+/// derivation half holds cell read guards and the reconciliation half awaits RPCs,
+/// and a guard held across an await pins a segment for the length of a round trip.
+///
+/// **What a stop costs this index.** A hash entry is a cell write, so unlike a
+/// ranged entry it has no write-back and no checkpoint of its own. The only window
+/// in which it can disagree with its cell is INSIDE one request: the data cell's
+/// record is written, then the request awaits its own index task
+/// (`cell_rpc::with_indices_ensured`), and a stop between those two leaves a
+/// durable cell whose bucket was never told. An insert then reads MISSING, a
+/// delete reads STALE, and an update reads both at once. The window is one request
+/// rather than 60 seconds, which is why the durability campaign counted thousands
+/// of stale ranged entries against 86 missing hash ones.
+///
+/// **Why the stale direction is worth walking at all, when a query already filters
+/// it.** `HashIndexer::query` re-reads every candidate id and keeps only the ones
+/// whose value still matches, so a stale hash entry never changes an answer. It
+/// still costs one cell read per stale id on every query for that value, it keeps
+/// buckets larger than their populations, and nothing else ever removes it: the
+/// write path drops an entry only when the cell that owns it is written again.
+pub async fn scrub_hash_index(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+) -> ScrubReport {
+    HASH_STALE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
+    HASH_MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut total = ScrubReport::default();
+    for chunk in &chunks.list {
+        for segment in chunk.segments() {
+            // --- derive (synchronous; every read guard released before the await)
+            // (bucket, cell) pairs the live cells imply, and (bucket, cell) pairs
+            // a bucket holds with no cell behind it.
+            let mut owed: Vec<(Id, Id)> = Vec::new();
+            let mut stale: Vec<(Id, Id)> = Vec::new();
+            let mut derived = ScrubReport::default();
+            for entry in chunk.live_entries(&segment) {
+                let EntryContent::Cell(header) = entry.content else {
+                    continue;
+                };
+                let id = header.id();
+                if header.schema == *HASH_INDEX_SCHEMA_ID {
+                    // The index side. A bucket cell names the head of its own
+                    // chain, so every entry in it can be judged without walking
+                    // anything -- the ranged walk needs a `scan_keys` RPC for the
+                    // same job, because its keys live inside page images.
+                    let cell = match read_local_cell(chunk, id) {
+                        LocalCell::Found(cell, _) => cell,
+                        // `Absent` cannot happen: `live_entries` just said this
+                        // cell is here. An unreadable cell, or one whose schema
+                        // this restart never registered, holds no verdict either
+                        // way, and no opinion is never a delete.
+                        LocalCell::Absent => continue,
+                        LocalCell::Unreadable => {
+                            derived.hash_cells_unreadable += 1;
+                            continue;
+                        }
+                        LocalCell::SchemaMissing => {
+                            derived.hash_cells_schema_missing += 1;
+                            continue;
+                        }
+                    };
+                    let contents = bucket_segment(&cell);
+                    let head = contents.owner.unwrap_or(id);
+                    for member in contents.ids {
+                        derived.hash_index_ids_scanned += 1;
+                        if !owns_slot(indexers, &member) {
+                            derived.hash_entries_not_local += 1;
+                            continue;
+                        }
+                        let holder = chunks.locate_chunk_by_partition(member.locality() as u64);
+                        if judge_local_hash_entry(holder, member, &head, &mut derived) {
+                            stale.push((head, member));
+                        }
+                    }
+                    continue;
+                }
+                // The cell side. The catalog and the schema's index declarations
+                // are both consulted before the cell is read, so a store with no
+                // hash index reads nothing here, and a store whose schema this
+                // restart has not registered abstains instead of panicking.
+                let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
+                    derived.hash_cells_schema_missing += 1;
+                    continue;
+                };
+                if !schema_has_hash_index(&schema) {
+                    continue;
+                }
+                let (cell, written_under) = match read_local_cell(chunk, id) {
+                    LocalCell::Found(cell, schema) => (cell, schema),
+                    LocalCell::Absent => continue,
+                    LocalCell::Unreadable => {
+                        derived.hash_cells_unreadable += 1;
+                        continue;
+                    }
+                    LocalCell::SchemaMissing => {
+                        derived.hash_cells_schema_missing += 1;
+                        continue;
+                    }
+                };
+                for res in probe_cell_indices(&cell, &*written_under) {
+                    for bucket in res.hash_buckets() {
+                        owed.push((*bucket, id));
+                    }
+                }
+            }
+            derived.hash_entries_derived += owed.len() as u64;
+            total.merge(&derived);
+
+            // --- reconcile (asynchronous; nothing borrowed from the chunk)
+            // Prune first. `remove_index` is the writer's own removal: it walks
+            // the chain from the head and compares-and-sets the segment that holds
+            // the id, so a concurrent spill is not raced by a second copy of that
+            // rule written here.
+            for (bucket, member) in &stale {
+                report_hash_stale(*member, *bucket);
+            }
+            if mode.repairs() {
+                let (pruned, failed) = prune_hash_batch(indexers, &stale).await;
+                total.hash_entries_pruned += pruned;
+                total.hash_prune_failed += failed;
+            }
+
+            let filled = fill_hash_batch(chunks, indexers, owed, mode).await;
+            total.merge(&filled);
+        }
+    }
+    total
+}
+
+/// Examples of stale hash entries logged this pass. Same cap and same reason as
+/// the ranged ones.
+static HASH_STALE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn report_hash_stale(cell: Id, bucket: Id) {
+    const EXAMPLES: usize = 12;
+    let n = HASH_STALE_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < EXAMPLES {
+        warn!(
+            "Hash prune: bucket {:?} lists cell {:?}, which does not imply it{}",
+            bucket,
+            cell,
+            if n + 1 == EXAMPLES {
+                " (further stale hash entries will not be logged; see the report counts)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// Examples of missing hash entries logged this pass.
+static HASH_MISSING_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn report_hash_missing(cell: &Id, bucket: &Id) {
+    const EXAMPLES: usize = 12;
+    let n = HASH_MISSING_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < EXAMPLES {
+        warn!(
+            "Hash scrub: bucket {:?} does not list cell {:?}{}",
+            bucket,
+            cell,
+            if n + 1 == EXAMPLES {
+                " (further missing hash entries will not be logged; see the report counts)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
 /// Examples of stale entries logged this pass. Same reset discipline, and the
 /// same reason: once a stale set proves STABLE across restarts, the ids in it
-/// are the whole investigation.
 static STALE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn report_stale(key: &EntryKey) {
@@ -1188,17 +1898,19 @@ mod tests {
         write_products(&client, 20).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
-        let over_rpc = client.scrub_ranged_index(false).await.unwrap();
+        let over_rpc = client.scrub_index(false).await.unwrap();
         println!("scrub over rpc: {}", over_rpc);
         assert!(over_rpc.is_clean(), "rpc scrub not clean: {}", over_rpc);
         assert!(over_rpc.entries_derived >= 20);
 
         // The fan-out must agree with what the node itself sees; a
-        // silently-empty report would pass every assertion above.
+        // silently-empty report would pass every assertion above. Compared in
+        // full, because the report is the whole product of the command.
         let indexers = &server.indexer().unwrap().clients;
-        let in_process = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        let in_process = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
         assert_eq!(
-            over_rpc.entries_derived, in_process.entries_derived,
+            format!("{over_rpc}"),
+            format!("{in_process}"),
             "rpc scrub disagreed with the in-process walk"
         );
     }
@@ -1553,5 +2265,535 @@ mod tests {
             after.entries_derived, baseline.entries_derived,
             "the prune took live entries with it"
         );
+    }
+    // ---- the hash index: buckets, and what a stop leaves behind --------------
+
+    const SKU_FIELD: &str = "sku";
+    const HASH_SCHEMA_ID: u32 = 4214;
+    /// Half of these cells get a new sku and half are deleted, so the stop leaves
+    /// both directions present: a bucket that lacks a live cell's id, and buckets
+    /// that still list ids whose cells moved on or went away.
+    const HASH_CRASH_CELLS: u64 = 240;
+
+    fn hash_products_schema() -> Schema {
+        Schema::new_with_id(
+            HASH_SCHEMA_ID,
+            "hash_scrub_products",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                SKU_FIELD,
+                Type::U64,
+                vec![IndexType::Hashed],
+            )]),
+            false,
+            false,
+        )
+    }
+
+    fn hash_product_id(i: u64) -> Id {
+        Id::from_parts(3, 700_000 + i)
+    }
+
+    fn hash_product_cell(i: u64, sku: u64) -> OwnedCell {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[SKU_FIELD] = OwnedValue::U64(sku);
+        OwnedCell::new_with_id(SchemaVid(HASH_SCHEMA_ID), &hash_product_id(i), value)
+    }
+
+    fn sku_field_id() -> u64 {
+        bifrost_hasher::hash_str(SKU_FIELD)
+    }
+
+    /// The bucket a sku belongs to, derived the way the writer derives it.
+    fn sku_bucket(sku: u64) -> Id {
+        crate::index::hash::get_hash_id_from_value(
+            SchemaUid(HASH_SCHEMA_ID),
+            sku_field_id(),
+            &OwnedValue::U64(sku),
+        )
+    }
+
+    /// The ids one bucket holds. A missing bucket is an empty one.
+    async fn bucket_ids(client: &AsyncClient, bucket: Id) -> Vec<Id> {
+        match client.read_cell(bucket).await {
+            Ok(Ok(cell)) => crate::index::hash::bucket_segment(&cell).ids,
+            Ok(Err(ReadError::CellDoesNotExisted)) => Vec::new(),
+            other => panic!("reading bucket {:?} failed: {:?}", bucket, other),
+        }
+    }
+
+    async fn server_with_hash_schema(
+        addr: &str,
+        group: &str,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &addr.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
+        let client = Arc::new(client);
+        client
+            .new_schema_with_id(hash_products_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        (server, client)
+    }
+
+    async fn write_hash_products(client: &Arc<AsyncClient>, count: u64) {
+        for i in 0..count {
+            client
+                .write_cell(hash_product_cell(i, i))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// A store with no hash index at all must cost the hash walk nothing it can
+    /// be charged for: no derived pairs, no scanned ids, no abstains. Without
+    /// this, "the hash pass is cheap" is a claim about the stores that happen to
+    /// be indexed, and a ranged-only database would be paying for an index it
+    /// never built.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_with_no_hash_index_derives_no_hash_entries() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_walk_on_ranged_store",
+            &dir,
+        )
+        .await;
+        write_products(&client, 30).await;
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let indexers = &server.indexer().unwrap().clients;
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        println!("hash walk over a ranged-only store: {}", report);
+        assert_eq!(
+            report.hash_entries_derived, 0,
+            "a ranged field derived a bucket"
+        );
+        assert_eq!(
+            report.hash_index_ids_scanned, 0,
+            "no bucket cell was expected"
+        );
+        assert_eq!(report.hash_entries_missing, 0);
+        assert_eq!(report.hash_entries_stale, 0);
+        assert_eq!(report.hash_entries_repaired, 0);
+        assert_eq!(report.hash_entries_pruned, 0);
+        assert!(report.is_clean(), "{}", report);
+    }
+
+    /// The MISSING direction, and the one that costs a query a row: take ids out
+    /// of their buckets and leave the cells alone. That is the shape a stop leaves
+    /// after an insert whose data record reached the WAL and whose bucket record
+    /// did not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_hash_entry_is_found_and_repaired() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_scrub_repair",
+        )
+        .await;
+        write_hash_products(&client, 40).await;
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let indexers = &server.indexer().unwrap().clients;
+        let baseline = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("healthy hash index: {}", baseline);
+        assert_eq!(baseline.hash_entries_derived, 40, "one bucket per sku");
+        assert_eq!(baseline.hash_index_ids_scanned, 40, "one id per bucket");
+        assert!(baseline.is_clean(), "precondition: {}", baseline);
+
+        let holes = [3u64, 17, 29];
+        for sku in holes {
+            indexers
+                .hashed_client
+                .indexer
+                .remove_index(&hash_product_id(sku), &sku_bucket(sku))
+                .await
+                .unwrap();
+            assert!(
+                bucket_ids(&client, sku_bucket(sku)).await.is_empty(),
+                "punching the hole for sku {sku} did not empty its bucket"
+            );
+        }
+
+        let found = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("after punching holes: {}", found);
+        assert_eq!(
+            found.hash_entries_missing, 3,
+            "the hash scrub did not find the holes: {}",
+            found
+        );
+        assert_eq!(found.hash_entries_repaired, 0, "verify mode must not write");
+        assert_eq!(found.hash_entries_stale, 0, "a live cell was called stale");
+        assert!(
+            !found.is_clean(),
+            "missing hash entries were reported clean"
+        );
+
+        let repaired = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        println!("after the hash repair: {}", repaired);
+        assert_eq!(repaired.hash_entries_repaired, 3, "{}", repaired);
+
+        for sku in holes {
+            assert!(
+                bucket_ids(&client, sku_bucket(sku))
+                    .await
+                    .contains(&hash_product_id(sku)),
+                "sku {sku} is still missing from its bucket after the repair"
+            );
+        }
+
+        let after = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("re-verify: {}", after);
+        assert!(after.is_clean(), "hash index still holed: {}", after);
+        assert_eq!(after.hash_entries_derived, baseline.hash_entries_derived);
+        assert_eq!(
+            after.hash_index_ids_scanned,
+            baseline.hash_index_ids_scanned
+        );
+    }
+
+    /// The STALE direction: an id a bucket lists that no cell implies. Two shapes,
+    /// because a stop produces both -- an id whose cell is gone (a delete whose
+    /// bucket write did not land) and an id whose cell holds a different value (an
+    /// update whose bucket write did not land).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hash_entry_no_cell_implies_is_reported_and_pruned() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_scrub_prune",
+        )
+        .await;
+        write_hash_products(&client, 30).await;
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let indexers = &server.indexer().unwrap().clients;
+        let baseline = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        assert!(baseline.is_clean(), "precondition: {}", baseline);
+
+        // A never-seen id, and a live id filed under a value it does not hold.
+        let ghost = Id::from_parts(3, 999_999);
+        let ghost_bucket = sku_bucket(777_777);
+        indexers
+            .hashed_client
+            .insert(&ghost_bucket, &ghost)
+            .await
+            .unwrap();
+        let moved_bucket = sku_bucket(555_555);
+        indexers
+            .hashed_client
+            .insert(&moved_bucket, &hash_product_id(5))
+            .await
+            .unwrap();
+
+        let found = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("with two stale hash entries: {}", found);
+        assert_eq!(
+            found.hash_entries_stale, 2,
+            "the hash scrub did not see the stale entries: {}",
+            found
+        );
+        assert_eq!(found.hash_entries_pruned, 0, "verify mode must not write");
+        assert_eq!(
+            found.hash_entries_missing, 0,
+            "a live entry was called missing"
+        );
+        assert!(!found.is_clean(), "stale hash entries were reported clean");
+
+        let repaired = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        println!("after the hash prune: {}", repaired);
+        assert_eq!(repaired.hash_entries_stale, 2, "{}", repaired);
+        assert_eq!(repaired.hash_entries_pruned, 2, "{}", repaired);
+        assert!(
+            !bucket_ids(&client, ghost_bucket).await.contains(&ghost),
+            "the stale hash entry for an absent id survived the repair"
+        );
+        assert!(
+            !bucket_ids(&client, moved_bucket)
+                .await
+                .contains(&hash_product_id(5)),
+            "the stale hash entry for a value the cell does not hold survived the repair"
+        );
+
+        let after = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("hash re-verify: {}", after);
+        assert!(after.is_clean(), "hash index still stale: {}", after);
+        assert_eq!(
+            after.hash_entries_derived, baseline.hash_entries_derived,
+            "the hash prune took live entries with it"
+        );
+        // The live entry for cell 5 must still be there: pruning one bucket must
+        // not touch the same cell's entry in another.
+        assert!(
+            bucket_ids(&client, sku_bucket(5))
+                .await
+                .contains(&hash_product_id(5)),
+            "pruning a wrong-value bucket also emptied the cell's real bucket"
+        );
+    }
+
+    /// A stop, and what recovery owes the hash index in BOTH directions.
+    ///
+    /// Three servers on one directory. The first writes the cells and their
+    /// buckets. The second runs with `index_enabled: false`, so its writes change
+    /// the cells and tell no bucket -- which is the durable form of "the stop
+    /// landed after the data record and before the bucket record", reached
+    /// deterministically instead of by racing a kill inside one request. The third
+    /// starts with the index on and recovery on, so its startup runs the
+    /// reconcile. Dropping a server without `shutdown()` is the SIGKILL: `impl
+    /// Drop for NebServer` (`server/mod.rs:1381`) stops the threads and does no
+    /// drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_leaves_the_recovered_hash_index_agreeing_with_its_cells() {
+        let _ = env_logger::try_init();
+        let dir = crash_scratch();
+        let group = "hash_index_crash_reconcile";
+        let updated = HASH_CRASH_CELLS / 2;
+        let new_sku = |i: u64| 10_000 + i;
+
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        for i in 0..HASH_CRASH_CELLS {
+            client
+                .write_cell(hash_product_cell(i, i))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        for i in 0..HASH_CRASH_CELLS {
+            assert!(
+                bucket_ids(&client, sku_bucket(i))
+                    .await
+                    .contains(&hash_product_id(i)),
+                "before the stop: sku {i} is not in its own bucket"
+            );
+        }
+        drop(client);
+        drop(server);
+
+        // The window, made durable: cells change, buckets do not hear about it.
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            false,
+        )
+        .await;
+        for i in 0..updated {
+            client
+                .update_cell(hash_product_cell(i, new_sku(i)))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for i in updated..HASH_CRASH_CELLS {
+            client
+                .remove_cell(hash_product_id(i))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // The divergence is real BEFORE the reconcile, so the assertions after it
+        // cannot be satisfied by a store that was never wrong.
+        for i in 0..updated {
+            assert!(
+                !bucket_ids(&client, sku_bucket(new_sku(i)))
+                    .await
+                    .contains(&hash_product_id(i)),
+                "precondition: the new sku {} is already in its bucket",
+                new_sku(i)
+            );
+            assert!(
+                bucket_ids(&client, sku_bucket(i))
+                    .await
+                    .contains(&hash_product_id(i)),
+                "precondition: the old sku {} already dropped its entry",
+                i
+            );
+        }
+        for i in updated..HASH_CRASH_CELLS {
+            assert!(
+                bucket_ids(&client, sku_bucket(i))
+                    .await
+                    .contains(&hash_product_id(i)),
+                "precondition: the deleted cell's bucket {} is already clean",
+                i
+            );
+        }
+        // Why the durability campaign reported no STALE hash entries: a query
+        // re-reads every candidate id and filters the ones that no longer match,
+        // so a stale entry never changes an ANSWER. "0 stale" there is not
+        // evidence of absence; it is the check not being able to see it.
+        let indexer = crate::index::hash::HashIndexer::new(&client);
+        let dead = hash_product_id(updated);
+        let dead_bucket = sku_bucket(updated);
+        let answered = indexer
+            .query(dead_bucket, sku_field_id(), &OwnedValue::U64(updated))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bucket_ids(&client, dead_bucket).await.contains(&dead),
+            "precondition: the dead id is not listed by its bucket"
+        );
+        assert!(
+            !answered.contains(&dead),
+            "the query was expected to filter the dead id, which is why a stale hash \
+             entry is invisible to a query-level check"
+        );
+        drop(client);
+        drop(server);
+
+        // Recovery, with the reconcile on the startup path.
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        let indexers = &server.indexer().unwrap().clients;
+
+        let mut missing = Vec::new();
+        let mut stale = Vec::new();
+        for i in 0..HASH_CRASH_CELLS {
+            let id = hash_product_id(i);
+            let live = i < updated;
+            let sku = if live { new_sku(i) } else { i };
+            assert_eq!(
+                matches!(client.read_cell(id).await, Ok(Ok(_))),
+                live,
+                "cell {:?} did not come back as expected after the crash",
+                id
+            );
+            if live && !bucket_ids(&client, sku_bucket(sku)).await.contains(&id) {
+                missing.push((id, sku));
+            }
+            // A bucket whose cell is gone, or whose cell holds another value, is
+            // stale in both halves of the split.
+            if bucket_ids(&client, sku_bucket(i)).await.contains(&id) {
+                stale.push((id, i));
+            }
+        }
+        println!(
+            "after the crash: {} missing and {} stale hash entries survived; the recovery \
+             reconcile repaired {} and pruned {} hash entries",
+            missing.len(),
+            stale.len(),
+            LAST_RECONCILE_HASH_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+            LAST_RECONCILE_HASH_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(
+            missing.is_empty(),
+            "{} hash entries are MISSING for live cells after recovery: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(4)]
+        );
+        assert!(
+            stale.is_empty(),
+            "{} STALE hash entries survived recovery: a bucket still lists an id whose cell is \
+             gone or holds another value: {:?}",
+            stale.len(),
+            &stale[..stale.len().min(4)]
+        );
+
+        // The whole-store form of the same statement, as an operator sees it.
+        let hash_report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("post-recovery hash scrub: {}", hash_report);
+        assert!(
+            hash_report.is_clean(),
+            "recovered hash index is not clean: {}",
+            hash_report
+        );
+        assert_eq!(hash_report.hash_entries_derived, updated);
+        assert_eq!(hash_report.hash_entries_missing, 0);
+        assert_eq!(hash_report.hash_entries_stale, 0);
+
+        let all = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("post-recovery full scrub: {}", all);
+        assert!(all.is_clean(), "recovered index is not clean: {}", all);
+    }
+
+    /// Registering the schema is the first start's job; a restart finds it in the
+    /// recovered catalog and answers `NameExists`, which is not an error.
+    ///
+    /// `index_enabled` is the switch this test drives the crash window with: with
+    /// it off, `Chunk::ensure_indices` and `Chunk::remove_indices` have no builder
+    /// to hand their work to, so the cells change and the buckets stay where they
+    /// were.
+    async fn start_hash_crash_server(
+        dir: &std::path::Path,
+        group: &str,
+        addr: &str,
+        enable_recovery: bool,
+        index_enabled: bool,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        for d in ["backup", "wal", "raft"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let services = if index_enabled {
+            vec![Service::Cell, Service::Query, Service::RangedIndexer]
+        } else {
+            vec![Service::Cell]
+        };
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(dir.join("backup").to_string_lossy().to_string()),
+                wal_storage: Some(dir.join("wal").to_string_lossy().to_string()),
+                raft_storage: Some(dir.join("raft").to_string_lossy().to_string()),
+                index_enabled,
+                services,
+                enable_recovery,
+                disable_storage_locks: true,
+            },
+            &addr.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
+        let client = Arc::new(client);
+        let _ = client
+            .new_schema_with_id(hash_products_schema())
+            .await
+            .expect("schema registration rpc");
+        (server, client)
     }
 }
