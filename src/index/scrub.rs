@@ -559,7 +559,7 @@ async fn prune_ranged_index(
             report.prune_incomplete += 1;
             warn!(
                 "index prune gave up after {} blocks ({} keys walked, {} stale) at {:?}; the \
-                 counts below are a partial account",
+                 report this pass returns is a partial account",
                 blocks,
                 report.index_keys_scanned,
                 report.entries_stale,
@@ -635,8 +635,8 @@ async fn prune_ranged_index(
                     report.prune_incomplete += 1;
                     warn!(
                         "index prune stopped after {} rounds that did not move past {:?}; the \
-                         placement map and the trees disagree, and the counts above are a \
-                         partial account",
+                         placement map and the trees disagree, and the report this pass returns \
+                         is a partial account",
                         stalled,
                         cursor.id()
                     );
