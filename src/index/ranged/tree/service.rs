@@ -56,6 +56,27 @@ pub struct ServBlock {
     pub last_key: Option<EntryKey>,
 }
 
+/// One block of a tree's LOGICAL keys, in key order.
+///
+/// `ServBlock` carries ids because that is what a query returns: a ranged scan
+/// answers "which cells hold this value", and the value is the part the caller
+/// already knows. The reconcile's prune direction asks the opposite question --
+/// "which entries does this tree hold that no cell implies" -- and an id cannot
+/// name an entry. An entry IS its full `[schema][field][feature][id]`, and the
+/// feature is exactly what an id does not carry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyBlock {
+    /// The keys, ascending, from the requested key on. A key the tree holds is
+    /// listed once, and a tombstoned key is not listed at all: the walk sees
+    /// what a reader sees.
+    pub keys: Vec<EntryKey>,
+    /// Where to continue in THIS tree, or `None` when this tree holds nothing
+    /// later. An empty block with no resume point still means "ask for the next
+    /// tree": a seek that landed at or past this tree's upper bound collects
+    /// nothing here and says so the same way.
+    pub next: Option<EntryKey>,
+}
+
 pub struct DistTree {
     id: Id,
     tree: RangedTree,
@@ -142,6 +163,7 @@ service! {
     rpc contains(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
+    rpc scan_keys(id: Id, resume: EntryKey, limit: u32, epoch: u64) -> OpResult<KeyBlock>;
     rpc stat(id: Id) -> OpResult<TreeStat>;
     rpc audit(id: Id) -> OpResult<TreeAudit>;
     rpc flush_all();
@@ -939,6 +961,76 @@ impl Service for TreeService {
                 }
             }
             OpResult::Successful(result_block)
+        })
+    }
+
+    /// One block of this tree's keys, for the reconcile's prune walk.
+    ///
+    /// Read-only: it takes no write latch and marks no page dirty, so a pass
+    /// that only looks changes nothing. Like every other tree operation it
+    /// hydrates a tree that is not loaded yet -- the reconcile needs the trees
+    /// in memory anyway. The walk is the filtered one, so a key the tree has
+    /// logically deleted is not reported: reporting it would have the caller
+    /// delete an entry that is already gone and count that as a repair.
+    fn scan_keys(
+        &self,
+        id: Id,
+        resume: EntryKey,
+        limit: u32,
+        epoch: u64,
+    ) -> BoxFuture<'_, OpResult<KeyBlock>> {
+        self.apply_in_ranged_tree(id, resume, epoch, false, move |entry, tree, prop| {
+            // A client asks; it does not decide how much one round trip
+            // carries. Without the cap, `limit = usize::MAX` would make this
+            // handler allocate the whole tree's key list in one block.
+            const MAX_BLOCK: usize = 8192;
+            let limit = (limit as usize).clamp(1, MAX_BLOCK);
+            let boundary = &prop.boundary;
+            let start = if entry < &boundary.lower {
+                boundary.lower.clone()
+            } else {
+                entry.clone()
+            };
+            let mut cursor = tree.seek(&start, Ordering::Forward);
+            let mut pending = cursor.current().cloned();
+            let mut keys: Vec<EntryKey> = Vec::with_capacity(limit.min(1024));
+            // Rounds, not keys: the dedup and the boundary arms advance the
+            // walk without collecting, and every unbounded loop on this path
+            // has cost somebody a hung worker at least once.
+            let max_rounds = limit.saturating_mul(8).saturating_add(4096);
+            let mut rounds = 0usize;
+            while let Some(key) = pending.take() {
+                rounds += 1;
+                if rounds > max_rounds {
+                    warn!(
+                        "scan_keys on tree {:?} stopped after {} rounds without filling a {}-key \
+                         block (collected {}, at {:?}); the caller resumes at that key",
+                        id,
+                        rounds,
+                        limit,
+                        keys.len(),
+                        key.id()
+                    );
+                    pending = Some(key);
+                    break;
+                }
+                if &key >= &boundary.upper {
+                    // Physically present, logically this tree's neighbour's.
+                    break;
+                }
+                if keys.last() == Some(&key) {
+                    pending = cursor.next();
+                    continue;
+                }
+                if keys.len() >= limit {
+                    pending = Some(key);
+                    break;
+                }
+                keys.push(key);
+                pending = cursor.next();
+            }
+            let next = pending.filter(|key| key < &boundary.upper);
+            OpResult::Successful(KeyBlock { keys, next })
         })
     }
 

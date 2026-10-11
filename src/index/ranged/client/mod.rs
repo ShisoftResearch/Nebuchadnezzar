@@ -235,6 +235,24 @@ impl RangedIndexerClient {
         .await
     }
 
+    /// One block of index keys from `start` on, out of the tree that covers it.
+    ///
+    /// The prune half of the reconcile walks the INDEX rather than the cells,
+    /// and it needs whole keys: `seek` answers with deduped ids, which is what
+    /// a query wants and is not enough to name an entry for removal. Read-only
+    /// like `contains` -- the walk must not hydrate or write-latch a tree just
+    /// by looking at it.
+    pub async fn scan_keys(&self, start: &EntryKey, limit: u32) -> Result<KeyBlock, RPCError> {
+        self.run_on_destinated_tree(
+            start,
+            |key, client, tree_id, epoch| {
+                async move { client.scan_keys(tree_id, key, limit, epoch).await }.boxed()
+            },
+            |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
+        )
+        .await
+    }
+
     /// Raw per-tree audit of every tree in the index: physical key copies,
     /// duplicates, and tombstoned-but-present keys. The duplicates count is
     /// the observable form of the single-copy-per-key invariant, which no
