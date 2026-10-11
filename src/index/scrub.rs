@@ -465,29 +465,61 @@ fn entry_contradicted(
         return false;
     }
     let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
-    let cell = match chunk.read_cell(id.bits()) {
-        Ok(cell) => cell,
-        // The cell is gone: its delete was durable and the index's own record
-        // of that delete was not. This is the common stale case.
+    judge_local_entry(chunk, id, key, report)
+}
+
+/// The verdict for one entry, taken from the chunk that would hold its cell.
+///
+/// The header is read before the cell, and the catalog is consulted before the
+/// header is followed, for the reason `derive_into` states: `read_cell` treats a
+/// schema it cannot find as "this shall never happen" and panics in a debug
+/// build, and this walk sees whatever the store contains -- including cells
+/// whose schema this restart never registered. A store restarted with a schema
+/// it has to re-import therefore abstains here instead of crashing at startup.
+fn judge_local_entry(
+    chunk: &crate::ram::chunk::Chunk,
+    id: Id,
+    key: &EntryKey,
+    report: &mut ScrubReport,
+) -> bool {
+    let guard = match crate::ram::chunk::CellGuard::for_read(id.bits(), chunk) {
+        Ok(guard) => guard,
+        // The cell index has nothing for this id: the cell is gone, so its
+        // delete was durable and the index's own record of that delete was not.
+        // This is the common stale case.
         Err(ReadError::CellDoesNotExisted) | Err(ReadError::CellIdIsUnitId) => {
             report.entries_stale += 1;
             return true;
         }
-        // A read that failed for another reason says nothing about the entry.
+        // A guard this chunk could not produce says nothing about the entry.
         Err(_) => {
             report.cells_unreadable += 1;
             return false;
         }
     };
-    let Some(schema) = chunk.meta.schemas.get(&cell.header.schema) else {
+    let location = guard.get_ptr();
+    if location == 0 {
+        report.entries_stale += 1;
+        return true;
+    }
+    let Ok((header, _)) = crate::ram::cell::header_from_chunk_raw(location) else {
+        report.cells_unreadable += 1;
+        return false;
+    };
+    let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
         report.cells_schema_missing += 1;
         return false;
     };
+    let Ok((cell, _)) = crate::ram::cell::SharedCell::from_chunk_raw(id.bits(), guard, chunk)
+    else {
+        report.cells_unreadable += 1;
+        return false;
+    };
     // Re-derive through the write path's own probe, the same function the
-    // insert half uses, so the two directions cannot disagree about what a
-    // cell means. An array-valued indexed field implies several keys and the
-    // entry may be any of them, so membership is the question -- not "does
-    // the first derived key match".
+    // insert half uses, so the two directions cannot disagree about what a cell
+    // means. An array-valued indexed field implies several keys and the entry
+    // may be any of them, so membership is the question -- not "does the first
+    // derived key match".
     let implied = probe_cell_indices(&cell, &*schema)
         .iter()
         .any(|res| res.ranged_keys().any(|derived| derived == key))
