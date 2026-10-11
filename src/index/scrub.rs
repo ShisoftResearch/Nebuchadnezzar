@@ -572,7 +572,8 @@ async fn prune_ranged_index(
 /// the donor copy while a cached placement still names that donor. Until the
 /// prune can hold a cluster placement guard, restrict it to a confirmed
 /// singleton. Include offline members; an offline owner still holds data.
-async fn singleton_prune_authority(indexers: &Arc<IndexerClients>) -> bool {
+/// Read-only verification can use a settled cluster snapshot without deleting.
+async fn prune_placement_authority(indexers: &Arc<IndexerClients>, mode: ScrubMode) -> bool {
     let client = &indexers.neb_client;
     let Ok(Some((members, _))) = indexers
         .conshash
@@ -582,7 +583,10 @@ async fn singleton_prune_authority(indexers: &Arc<IndexerClients>) -> bool {
     else {
         return false;
     };
-    if members.len() != 1 || members[0].id != indexers.server_id {
+    if members.len() != indexers.conshash.server_count()
+        || !members.iter().any(|member| member.id == indexers.server_id)
+        || (mode.repairs() && members.len() != 1)
+    {
         return false;
     }
     let Ok((Some(table), applied_index)) = crate::slots::load_table(
@@ -596,17 +600,25 @@ async fn singleton_prune_authority(indexers: &Arc<IndexerClients>) -> bool {
     };
     use bifrost::conshash::slots::SlotState;
     if table.len() != crate::slots::SLOT_COUNT
-        || !table.values().all(
-            |state| matches!(state, SlotState::Stable { owner } if *owner == indexers.server_id),
-        )
+        || !table.values().all(|state| {
+            matches!(state, SlotState::Stable { owner }
+            if members.iter().any(|member| member.id == *owner))
+        })
     {
         return false;
     }
+    let mut owners = vec![0; crate::slots::SLOT_COUNT];
+    for (slot, state) in table {
+        let Some(owner) = owners.get_mut(slot as usize) else {
+            return false;
+        };
+        *owner = state.serving_owner();
+    }
     // Replace a startup fallback with this ordered, complete slot snapshot.
-    indexers.conshash.set_slot_overrides(
-        Some(vec![indexers.server_id; crate::slots::SLOT_COUNT]),
-        applied_index,
-    ) && indexers.conshash.server_count() == 1
+    indexers
+        .conshash
+        .set_slot_overrides(Some(owners), applied_index)
+        && indexers.conshash.server_count() == members.len()
 }
 
 async fn prune_ranged_index_with_cap(
@@ -616,17 +628,18 @@ async fn prune_ranged_index_with_cap(
     max_blocks: usize,
 ) -> ScrubReport {
     let mut report = ScrubReport::default();
-    if !singleton_prune_authority(indexers).await {
+    if !prune_placement_authority(indexers, mode).await {
         report.prune_incomplete += 1;
-        warn!("Index prune skipped: placement does not prove a stable singleton; cell insertion continues");
+        warn!("Index prune skipped: placement is unsettled or destructive pruning needs a singleton; cell insertion continues");
         return report;
     }
+    let members_at_start = indexers.conshash.server_count();
     let mut cursor = min_entry_key();
     let mut blocks = 0usize;
     let mut stalled = 0usize;
     loop {
         blocks += 1;
-        if blocks > max_blocks || indexers.conshash.server_count() != 1 {
+        if blocks > max_blocks || indexers.conshash.server_count() != members_at_start {
             report.prune_incomplete += 1;
             warn!(
                 "index prune gave up after {} blocks ({} keys walked, {} stale) at {:?}; the \
@@ -2035,6 +2048,12 @@ mod tests {
             &mut report
         ));
         assert_eq!(report.entries_not_local, 1);
+        let healthy = client.scrub_ranged_index(false).await.unwrap();
+        assert!(
+            healthy.is_clean(),
+            "stable cluster verification: {}",
+            healthy
+        );
         // During transfer the donor remains the owner. Deliberately install
         // a wrong local cache, reproducing the reviewer's dangerous miss.
         placement
@@ -2042,6 +2061,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let migrating = client.scrub_ranged_index(false).await.unwrap();
+        assert!(
+            migrating.prune_incomplete > 0,
+            "migration was reported complete: {}",
+            migrating
+        );
+        assert!(!migrating.is_clean());
         indexers.conshash.note_slot_owner(
             3,
             servers[0].server_id,
