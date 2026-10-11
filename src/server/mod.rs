@@ -1942,12 +1942,14 @@ impl NebServer {
 
             // The cells are authoritative and the index is a cache of them,
             // so bring the cache up to date BEFORE anything can read it. A
-            // crash leaves ranged entries missing for cells written since the
-            // tree's last flush, and the write path re-asserts an entry only
-            // when its cell is written again -- so hot data heals and nothing
-            // else does. Bounded by the durability mark, so this costs the
-            // crash window and not the store; see
-            // `reconcile_index_before_serving`.
+            // crash leaves the index holding whatever reached disk, which cuts
+            // both ways: entries missing for cells written since the tree's
+            // last flush, and stale entries for cells whose delete or value
+            // change never reached the tree. The write path re-asserts an entry
+            // only when its cell is written again, and never removes one it did
+            // not just write, so neither half heals on its own. Bounded by the
+            // durability mark, so this costs the crash window and not the
+            // store; see `reconcile_index_before_serving`.
             if let Some(indexer) = database_runtime.indexer.as_ref() {
                 crate::index::scrub::reconcile_index_before_serving(
                     &database_runtime.chunks,

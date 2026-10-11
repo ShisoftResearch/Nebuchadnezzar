@@ -24,25 +24,27 @@
 //! copy of the derivation rules would drift, and every drift would surface
 //! as a permanent disagreement that looks exactly like corruption.
 //!
-//! **It never deletes.** Repair inserts and nothing else. An entry that
-//! looks unaccounted-for may belong to a cell written after this pass read
-//! that segment, or to a cell on another node this pass cannot see -- a
-//! ranged tree covers a key range across the WHOLE cluster, while this walk
-//! sees one node's chunks. Deleting on a partial view is how a diagnostic
-//! becomes an outage. The asymmetry is what makes a single-node scrub sound:
-//! a cell HERE whose entry is missing is a genuine hole no matter what other
-//! nodes hold, so missing entries are always safe to report and to insert.
-//!
-//! Consequently this pass can say "the index is missing these entries" but
-//! never "the index holds entries it should not"; the latter needs a
-//! cluster-wide pass and is not attempted here.
+//! **It deletes only what it can prove.** The cell walk never deletes: an
+//! entry that looks unaccounted-for may belong to a cell written after this
+//! pass read that segment, or to a cell on another node this pass cannot
+//! see. The prune walk does delete, and it earns that by asking a question
+//! with one local answer -- it holds the entry, it reads the cell the entry
+//! names, and it re-derives that cell's keys here. An entry naming a cell
+//! this member does not own gets no verdict at all. The asymmetry is what
+//! makes a single-node scrub sound in both directions: a cell HERE implies
+//! entries HERE, and an entry HERE naming a cell HERE is either justified
+//! by that cell or it is not.
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 
 use crate::index::builder::probe_cell_indices;
+use crate::index::ranged::client::NextTree;
+use crate::index::ranged::tree::btree::Ordering;
+use crate::index::ranged::trees::min_entry_key;
 use crate::index::EntryKey;
 use crate::index::IndexerClients;
+use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::EntryContent;
 use crate::ram::types::Id;
@@ -99,6 +101,24 @@ pub struct ScrubReport {
     /// Repairs the index refused. Distinct from `unreachable`: the tree
     /// answered and the insert still failed.
     pub repairs_failed: u64,
+    /// Index keys the prune walk read. This is a walk of the INDEX, so it
+    /// counts entries whether or not any cell of this node implies them.
+    pub index_keys_scanned: u64,
+    /// Index keys no local cell implies: the entry names a cell that is gone,
+    /// or a cell whose value has moved on. This is the STALE direction, and it
+    /// is the one the store had no way to reach before the prune walk existed.
+    pub entries_stale: u64,
+    /// Stale keys a repair pass deleted. In `Verify` this is 0.
+    pub entries_pruned: u64,
+    /// Deletes the index refused.
+    pub prune_failed: u64,
+    /// Entries the prune walk could not form an opinion about, because the cell
+    /// they name sits on another member. A ranged tree covers a key range for
+    /// the whole cluster; a node's chunks do not.
+    pub entries_not_local: u64,
+    /// The prune walk stopped before it covered the index. Its counts are a
+    /// partial account, so they must never be read as "clean".
+    pub prune_incomplete: u64,
 }
 
 impl ScrubReport {
@@ -112,6 +132,9 @@ impl ScrubReport {
             && self.entries_unreachable == 0
             && self.cells_unreadable == 0
             && self.repairs_failed == 0
+            && self.entries_stale == 0
+            && self.prune_failed == 0
+            && self.prune_incomplete == 0
     }
 
     /// Fold another node's report into this one. Public because a
@@ -130,6 +153,12 @@ impl ScrubReport {
         self.entries_unreachable += other.entries_unreachable;
         self.repairs_failed += other.repairs_failed;
         self.repairs_not_stuck += other.repairs_not_stuck;
+        self.index_keys_scanned += other.index_keys_scanned;
+        self.entries_stale += other.entries_stale;
+        self.entries_pruned += other.entries_pruned;
+        self.prune_failed += other.prune_failed;
+        self.entries_not_local += other.entries_not_local;
+        self.prune_incomplete += other.prune_incomplete;
     }
 }
 
@@ -139,7 +168,8 @@ impl std::fmt::Display for ScrubReport {
             f,
             "cells={} (no-indices={}, unreadable={}, schema-missing={}) entries={} \
              present={} missing={} repaired={} not-stuck={} unreachable={} \
-             repair-failed={}",
+             repair-failed={} index-keys={} stale={} pruned={} prune-failed={} \
+             not-local={} prune-incomplete={}",
             self.cells_scanned,
             self.cells_no_indices,
             self.cells_unreadable,
@@ -151,6 +181,12 @@ impl std::fmt::Display for ScrubReport {
             self.repairs_not_stuck,
             self.entries_unreachable,
             self.repairs_failed,
+            self.index_keys_scanned,
+            self.entries_stale,
+            self.entries_pruned,
+            self.prune_failed,
+            self.entries_not_local,
+            self.prune_incomplete,
         )
     }
 }
@@ -176,6 +212,13 @@ pub static LAST_RECONCILE_NOIDX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static LAST_RECONCILE_REPAIRED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Stale entries the last reconciliation removed. Alongside `REPAIRED`, this
+/// is the number that says the prune direction ran at all: a store that comes
+/// back with `REPAIRED=0 PRUNED=0` after a kill has an index that was already
+/// current, and a store with `PRUNED=0` while scans disagree with cells has a
+/// prune that did not run or did not finish.
+pub static LAST_RECONCILE_PRUNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// **Why it BLOCKS rather than running in the background.** The index is a
 /// cache of the cells, and a cache that has not caught up answers queries
@@ -190,11 +233,15 @@ pub static LAST_RECONCILE_REPAIRED: std::sync::atomic::AtomicU64 =
 /// affordable anyway -- 1.0-5.9 s for 0.7-4M cells -- so the bound bought
 /// seconds at the risk of silently missing entries.
 ///
-/// **Why it is worth running at all.** A crash leaves ranged entries missing
-/// for cells written since the tree's last flush, and the write path only
-/// re-asserts an entry when its cell is written AGAIN. Hot data heals itself
-/// and everything else does not: a cell written once keeps its lost entry for
-/// the life of the store.
+/// **Why it is worth running at all.** A crash leaves the index holding the
+/// changes that reached disk and losing the ones that had not, and that cuts
+/// both ways: entries MISSING for cells written since the tree's last flush,
+/// and entries STALE for cells whose delete, or whose value change, never
+/// reached the tree. The write path re-asserts an entry only when its cell is
+/// written AGAIN, and it never removes one it did not just write, so hot data
+/// heals itself and everything else does not: a cell written once keeps a lost
+/// entry for the life of the store, and a cell whose value moved keeps the old
+/// entry beside the new one forever.
 pub async fn reconcile_index_before_serving(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
@@ -219,15 +266,17 @@ pub async fn reconcile_index_before_serving(
     LAST_RECONCILE_SCANNED.store(report.cells_scanned, AtomicOrdering::Relaxed);
     LAST_RECONCILE_NOIDX.store(report.cells_no_indices, AtomicOrdering::Relaxed);
     LAST_RECONCILE_REPAIRED.store(report.entries_repaired, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_PRUNED.store(report.entries_pruned, AtomicOrdering::Relaxed);
     if report.is_clean() {
         info!(
-            "Index reconciliation for {} found nothing missing in {:?}: {}",
+            "Index reconciliation for {} found nothing to repair in {:?}: {}",
             label, elapsed, report
         );
     } else {
         warn!(
-            "Index reconciliation for {} took {:?}: {}",
-            label, elapsed, report
+            "Index reconciliation for {} repaired {} missing and pruned {} stale entries in \
+             {:?}: {}",
+            label, report.entries_repaired, report.entries_pruned, elapsed, report
         );
     }
 }
@@ -253,13 +302,20 @@ fn mode_from_env() -> Option<ScrubMode> {
     }
 }
 
-/// Walk every live cell in `chunks` and reconcile its ranged index entries.
+/// Walk the ranged index and the live cells, and reconcile the two.
 ///
-/// Batched by segment: the derivation half holds cell read guards and the
-/// reconciliation half awaits RPCs, and those two must not overlap -- a
-/// guard held across an await pins a segment for the length of a network
-/// round trip, which is how a scrub of a large store would block the
-/// cleaner for its entire duration.
+/// Both directions, in this order:
+///
+/// 1. [`prune_ranged_index`] walks the INDEX and removes what no cell implies.
+/// 2. The cell walk derives every live cell's keys and inserts what the index
+///    lacks.
+///
+/// Prune first, so the insert pass reads the index in its final shape and can
+/// re-add anything the prune removed on a race. The cell walk is batched by
+/// segment: the derivation half holds cell read guards and the reconciliation
+/// half awaits RPCs, and those two must not overlap -- a guard held across an
+/// await pins a segment for the length of a network round trip, which is how a
+/// scrub of a large store would block the cleaner for its entire duration.
 pub async fn scrub_ranged_index(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
@@ -267,7 +323,8 @@ pub async fn scrub_ranged_index(
 ) -> ScrubReport {
     UNREACHABLE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
-    let mut total = ScrubReport::default();
+    STALE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut total = prune_ranged_index(chunks, indexers, mode).await;
     for chunk in &chunks.list {
         for segment in chunk.segments() {
             // --- derive (synchronous; all guards released before the await)
@@ -343,6 +400,261 @@ fn derive_into(
     };
     for res in probe_cell_indices(&cell, &*schema) {
         out.extend(res.ranged_keys().cloned());
+    }
+}
+
+// ---- the prune direction: what the index holds that no cell implies -------
+
+/// Keys per `scan_keys` round trip while pruning.
+///
+/// Smaller than a query block on purpose: the walk judges every key it gets
+/// against a cell read, so one RPC per 1024 keys already leaves the reads as
+/// the cost, and a huge block just holds memory and delays the first delete.
+const PRUNE_BLOCK_KEYS: u32 = 1024;
+
+/// How many times the walk will ask for the next tree placement after an
+/// answer that only means "not yet". Placement settles during startup, and a
+/// reconcile that runs before it settles must retry rather than declare the
+/// index pruned on the strength of a routing miss.
+const PRUNE_PLACEMENT_RETRIES: usize = 32;
+
+/// Blocks one prune pass may walk. Not a tuning knob -- a spin guard: every
+/// unbounded loop on this index path has eventually hung a worker at 100% and
+/// taken the process's timers down with it.
+const PRUNE_MAX_BLOCKS: usize = 1 << 20;
+
+/// Whether this member is the one that holds the cell an entry names.
+///
+/// A ranged tree covers a key range for the WHOLE cluster, so an entry sitting
+/// here can name a cell that lives anywhere. Only the member holding the cell
+/// can say what that cell implies, so everyone else abstains.
+fn owns_cell(indexers: &IndexerClients, id: &Id) -> bool {
+    indexers
+        .conshash
+        .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+        .is_some_and(|owner| owner == indexers.server_id)
+}
+
+/// Ask the local store whether it contradicts one index entry, and count the
+/// answer.
+///
+/// Synchronous, and it must stay that way: the cell read guard it holds pins a
+/// segment, and no delete RPC may be awaited with it live.
+fn entry_contradicted(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    key: &EntryKey,
+    report: &mut ScrubReport,
+) -> bool {
+    let id = key.id();
+    if !owns_cell(indexers, &id) {
+        report.entries_not_local += 1;
+        return false;
+    }
+    let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
+    let cell = match chunk.read_cell(id.bits()) {
+        Ok(cell) => cell,
+        // The cell is gone: its delete was durable and the index's own record
+        // of that delete was not. This is the common stale case.
+        Err(ReadError::CellDoesNotExisted) | Err(ReadError::CellIdIsUnitId) => {
+            report.entries_stale += 1;
+            return true;
+        }
+        // A read that failed for another reason says nothing about the entry.
+        Err(_) => {
+            report.cells_unreadable += 1;
+            return false;
+        }
+    };
+    let Some(schema) = chunk.meta.schemas.get(&cell.header.schema) else {
+        report.cells_schema_missing += 1;
+        return false;
+    };
+    // Re-derive through the write path's own probe, the same function the
+    // insert half uses, so the two directions cannot disagree about what a
+    // cell means. An array-valued indexed field implies several keys and the
+    // entry may be any of them, so membership is the question -- not "does
+    // the first derived key match".
+    let implied = probe_cell_indices(&cell, &*schema)
+        .iter()
+        .any(|res| res.ranged_keys().any(|derived| derived == key))
+        || (schema.is_scannable && *key == EntryKey::for_scannable(&id, schema.uid));
+    if implied {
+        false
+    } else {
+        // The cell is here and no longer holds the value this entry lists.
+        report.entries_stale += 1;
+        true
+    }
+}
+
+/// Walk every ranged tree and report -- and in `Repair` mode remove -- the
+/// entries no local cell implies.
+///
+/// This is the direction the cell walk cannot see. A crash loses the index
+/// changes that had not reached disk, and it loses them in BOTH directions:
+/// an insert that never landed leaves a MISSING entry, which the cell walk
+/// repairs, and a delete that never landed leaves a STALE one, which the cell
+/// walk never notices because it only ever asks "does the index hold what this
+/// cell needs". A store left with stale entries answers a range scan with rows
+/// whose cells say something else, or with rows that have no cell at all, and
+/// it keeps doing so across every later restart.
+async fn prune_ranged_index(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+) -> ScrubReport {
+    let mut report = ScrubReport::default();
+    let mut cursor = min_entry_key();
+    let mut blocks = 0usize;
+    let mut stalled = 0usize;
+    loop {
+        blocks += 1;
+        if blocks > PRUNE_MAX_BLOCKS {
+            report.prune_incomplete += 1;
+            warn!(
+                "index prune gave up after {} blocks ({} keys walked, {} stale) at {:?}; the \
+                 counts below are a partial account",
+                blocks,
+                report.index_keys_scanned,
+                report.entries_stale,
+                cursor.id()
+            );
+            break;
+        }
+        let block = match indexers
+            .ranged_client
+            .scan_keys(&cursor, PRUNE_BLOCK_KEYS)
+            .await
+        {
+            Ok(block) => block,
+            Err(error) => {
+                // The tree covering this key could not be reached or loaded.
+                // Same accounting as an unreachable entry in the cell walk: no
+                // opinion, and the pass is not clean.
+                report.prune_incomplete += 1;
+                report_unreachable(&cursor, &error);
+                break;
+            }
+        };
+        report.index_keys_scanned += block.keys.len() as u64;
+        // Judge the whole block before the first delete, so no read guard is
+        // alive across an RPC.
+        let stale: Vec<EntryKey> = block
+            .keys
+            .iter()
+            .filter(|key| entry_contradicted(chunks, indexers, key, &mut report))
+            .cloned()
+            .collect();
+        for key in &stale {
+            report_stale(key);
+        }
+        if mode.repairs() {
+            for key in &stale {
+                match indexers.ranged_client.delete(key).await {
+                    Ok(_) => {
+                        report.entries_pruned += 1;
+                    }
+                    Err(error) => {
+                        report.prune_failed += 1;
+                        warn!(
+                            "index prune could not delete the stale entry for {:?}: {error:?}",
+                            key.id()
+                        );
+                    }
+                }
+            }
+        }
+        // Where to continue: the next key in this tree, or the lower bound of
+        // the next tree, or nowhere.
+        let advance = match block.next {
+            Some(next) => Some(next),
+            None => next_prune_cursor(indexers, &cursor).await,
+        };
+        match advance {
+            // Nothing follows: the whole index is walked.
+            None => break,
+            Some(next) if next > cursor => {
+                cursor = next;
+                stalled = 0;
+            }
+            Some(next) => {
+                // The walk did not move on. A split may have re-homed this key
+                // range, in which case the tree now covering `cursor` really
+                // does hold more keys and walking it again is right. If nothing
+                // moves, this loop would never end -- so count it and stop
+                // after a few goes rather than after a million blocks.
+                cursor = next;
+                stalled += 1;
+                if stalled > 64 {
+                    report.prune_incomplete += 1;
+                    warn!(
+                        "index prune stopped after {} rounds that did not move past {:?}; the \
+                         placement map and the trees disagree, and the counts above are a \
+                         partial account",
+                        stalled,
+                        cursor.id()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    report
+}
+
+/// The lower bound of the next tree after `at`, or `None` when the state
+/// machine says nothing follows -- or when it kept refusing to answer.
+async fn next_prune_cursor(indexers: &Arc<IndexerClients>, at: &EntryKey) -> Option<EntryKey> {
+    for attempt in 0..PRUNE_PLACEMENT_RETRIES {
+        match indexers
+            .ranged_client
+            .next_tree(at, Ordering::Forward)
+            .await
+        {
+            Ok(NextTree::Found(lower, _)) => return Some(lower),
+            Ok(NextTree::End) => return None,
+            Ok(NextTree::Unresolved(reason)) => {
+                if attempt == PRUNE_PLACEMENT_RETRIES - 1 {
+                    warn!(
+                        "index prune could not resolve the placement after {:?}: {}",
+                        at.id(),
+                        reason
+                    );
+                }
+            }
+            Err(error) => {
+                if attempt == PRUNE_PLACEMENT_RETRIES - 1 {
+                    warn!(
+                        "index prune could not ask what follows the tree holding {:?}: {error:?}",
+                        at.id()
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// Examples of stale entries logged this pass. Same reset discipline, and the
+/// same reason: once a stale set proves STABLE across restarts, the ids in it
+/// are the whole investigation.
+static STALE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn report_stale(key: &EntryKey) {
+    const EXAMPLES: usize = 12;
+    let n = STALE_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < EXAMPLES {
+        warn!(
+            "Index prune: entry {:?} is not implied by its cell{}",
+            key,
+            if n + 1 == EXAMPLES {
+                " (further stale entries will not be logged; see the report counts)"
+            } else {
+                ""
+            }
+        );
     }
 }
 
@@ -556,9 +868,10 @@ mod tests {
     use crate::client::AsyncClient;
     use crate::index::ranged::tree::btree::page_schema;
     use crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA;
+    use crate::index::FEATURE_SIZE;
     use crate::ram::cell::OwnedCell;
     use crate::ram::schema::SchemaVid;
-    use crate::ram::schema::{Field, IndexType, Schema};
+    use crate::ram::schema::{Field, IndexType, Schema, SchemaUid};
     use crate::ram::types::{Map, OwnedMap, OwnedValue, Type};
     use crate::server::{NebServer, ServerOptions, Service};
     use tempfile::TempDir;
@@ -874,5 +1187,319 @@ mod tests {
         let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         assert!(after.is_clean(), "{}", after);
         assert_eq!(after.entries_derived, first.entries_derived);
+    }
+
+    // ---- a crash, and what recovery owes the index -------------------------
+
+    const CRASH_SCHEMA_ID: u32 = 4212;
+    /// Half of these cells get a new price and half are deleted, so the count
+    /// must be even and big enough to outgrow one B-tree leaf.
+    const CRASH_CELLS: u64 = 240;
+
+    /// Scratch on the big disk, never `/tmp`: a crash restart leaves WAL,
+    /// backup and raft files behind.
+    fn crash_scratch() -> TempDir {
+        let base = std::path::PathBuf::from("/mnt/ext/morpheus-fixes/indexfix/scratch");
+        std::fs::create_dir_all(&base).expect("scratch base");
+        tempfile::Builder::new()
+            .prefix("neb-index-crash-")
+            .tempdir_in(base)
+            .expect("scratch dir")
+    }
+
+    fn crash_schema() -> Schema {
+        Schema::new_with_id(
+            CRASH_SCHEMA_ID,
+            "crash_products",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                PRICE_FIELD,
+                Type::U64,
+                vec![IndexType::Ranged],
+            )]),
+            false,
+            true,
+        )
+    }
+
+    fn crash_cell(id: &Id, price: u64) -> OwnedCell {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[PRICE_FIELD] = OwnedValue::U64(price);
+        OwnedCell::new_with_id(SchemaVid(CRASH_SCHEMA_ID), id, value)
+    }
+
+    /// Every ranged key one cell implies: its indexed-field entries and, for a
+    /// scannable schema, its enumeration entry. Derived through the write
+    /// path's own probe, which is what the reconcile uses too.
+    fn implied_keys(cell: &OwnedCell, schema: &Schema) -> Vec<EntryKey> {
+        let mut keys: Vec<EntryKey> = probe_cell_indices(cell, schema)
+            .iter()
+            .flat_map(|res| res.ranged_keys().cloned())
+            .collect();
+        if schema.is_scannable {
+            keys.push(EntryKey::for_scannable(&cell.id(), schema.uid));
+        }
+        keys
+    }
+
+    async fn start_crash_server(
+        dir: &std::path::Path,
+        group: &str,
+        addr: &str,
+        enable_recovery: bool,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        for d in ["backup", "wal", "raft"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(dir.join("backup").to_string_lossy().to_string()),
+                wal_storage: Some(dir.join("wal").to_string_lossy().to_string()),
+                raft_storage: Some(dir.join("raft").to_string_lossy().to_string()),
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery,
+                disable_storage_locks: true,
+            },
+            &addr.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
+        let client = Arc::new(client);
+        // The first start registers it; a restart finds it already in the
+        // recovered catalog and answers `NameExists`, which is not an error.
+        let _ = client
+            .new_schema_with_id(crash_schema())
+            .await
+            .expect("schema registration rpc");
+        (server, client)
+    }
+
+    /// The crash window, made deterministic rather than raced.
+    ///
+    /// `flush_all_trees` is the checkpoint the balancer runs every 60 s, and it
+    /// ends by resetting this server's write-back hub
+    /// (`ranged/tree/service.rs:1217`), so every index change after it stays in
+    /// memory. Dropping the server without `shutdown` is the SIGKILL: `impl
+    /// Drop for NebServer` (`server/mod.rs:1381`) stops the threads and does no
+    /// index drain, no WAL sync and no archive. The restarted store therefore
+    /// holds cells at their new state and a ranged tree at its old one -- the
+    /// shape the durability campaign reports as thousands of STALE entries that
+    /// fail every later check (`crash-verify2/REPORT.md`, "Index check").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_leaves_the_recovered_index_agreeing_with_its_cells() {
+        let _ = env_logger::try_init();
+        let dir = crash_scratch();
+        let group = "index_crash_reconcile";
+        let (server, client) = start_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+        )
+        .await;
+        let schema = crash_schema();
+        let ids: Vec<Id> = (0..CRASH_CELLS)
+            .map(|i| Id::from_parts(3, 500_000 + i))
+            .collect();
+
+        for (i, id) in ids.iter().enumerate() {
+            client
+                .write_cell(crash_cell(id, i as u64))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        // Checkpoint the index: durable from here, and the write-back hub is
+        // stopped, so what follows cannot reach disk.
+        crate::index::ranged::tree::service::local_tree_service(group, group)
+            .expect("the indexed database publishes its tree service")
+            .flush_all_trees()
+            .await;
+
+        let updated = CRASH_CELLS / 2;
+        let new_price = |i: u64| 10_000 + i;
+        for i in 0..updated {
+            client
+                .update_cell(crash_cell(&ids[i as usize], new_price(i)))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for i in updated..CRASH_CELLS {
+            client.remove_cell(ids[i as usize]).await.unwrap().unwrap();
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        // The live store agrees with itself before the kill: the in-memory tree
+        // already dropped the old keys. Without this, the assertions after the
+        // restart could be satisfied by an index that never held them.
+        let ranged = &server.indexer().unwrap().clients.ranged_client;
+        for i in 0..updated {
+            let old = implied_keys(&crash_cell(&ids[i as usize], i), &schema);
+            for key in old
+                .iter()
+                .filter(|k| **k != EntryKey::for_scannable(&ids[i as usize], schema.uid))
+            {
+                assert!(
+                    !ranged.contains(key).await.unwrap(),
+                    "pre-crash: the replaced key for cell {:?} is still in the index",
+                    ids[i as usize]
+                );
+            }
+        }
+
+        // The kill.
+        drop(client);
+        drop(server);
+
+        let (server, client) = start_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+        )
+        .await;
+        let ranged = &server.indexer().unwrap().clients.ranged_client;
+
+        let mut stale = Vec::new();
+        let mut missing = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let i = i as u64;
+            let live = i < updated;
+            let price = if live { new_price(i) } else { i };
+            assert_eq!(
+                matches!(client.read_cell(*id).await.unwrap(), Ok(_)),
+                live,
+                "cell {:?} did not come back as expected after the crash",
+                id
+            );
+            for key in implied_keys(&crash_cell(id, price), &schema) {
+                let present = ranged.contains(&key).await.unwrap();
+                match (live, present) {
+                    (true, false) => missing.push((id, key)),
+                    (false, true) => stale.push((id, key)),
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "after the crash: {} stale entries, {} missing entries of {} expected",
+            stale.len(),
+            missing.len(),
+            CRASH_CELLS * 2 - updated
+        );
+        assert!(
+            missing.is_empty(),
+            "{} index entries are MISSING for live cells after recovery: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(4)]
+        );
+        assert!(
+            stale.is_empty(),
+            "{} STALE index entries survived recovery: the index still lists a value or an id \
+             its cells no longer imply: {:?}",
+            stale.len(),
+            &stale[..stale.len().min(4)]
+        );
+
+        // The whole-store form of the same statement, as an operator sees it.
+        let indexers = &server.indexer().unwrap().clients;
+        let report = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("post-recovery scrub: {}", report);
+        assert!(
+            report.is_clean(),
+            "recovered index is not clean: {}",
+            report
+        );
+    }
+
+    /// The prune half of the reconcile, without a crash: an entry the cells do
+    /// not imply must be reported in `Verify` and removed in `Repair`, and a
+    /// repair must not invent one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_entry_no_cell_implies_is_reported_and_pruned() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_prune",
+            &dir,
+        )
+        .await;
+        write_products(&client, 30).await;
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let indexers = &server.indexer().unwrap().clients;
+        let baseline = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        assert!(baseline.is_clean(), "precondition: {}", baseline);
+
+        // Two entries no cell implies: one for a live cell under a value it does
+        // not hold, and one for an id the store has never seen.
+        let ghost = EntryKey::from_props(
+            &Id::from_parts(3, 999_999),
+            &[7u8; FEATURE_SIZE],
+            1,
+            SchemaUid(SCHEMA_ID),
+        );
+        indexers.ranged_client.insert(&ghost).await.unwrap();
+        let wrong_value = EntryKey::from_props(
+            &Id::from_parts(3, 7),
+            &[9u8; FEATURE_SIZE],
+            1,
+            SchemaUid(SCHEMA_ID),
+        );
+        indexers.ranged_client.insert(&wrong_value).await.unwrap();
+
+        let found = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("with two stale entries: {}", found);
+        assert_eq!(
+            found.entries_stale, 2,
+            "the scrub did not see the stale entries: {}",
+            found
+        );
+        assert_eq!(
+            found.entries_pruned, 0,
+            "verify mode must not write: {}",
+            found
+        );
+        assert!(
+            !found.is_clean(),
+            "stale entries were reported clean: {}",
+            found
+        );
+
+        let repaired = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        println!("after the prune: {}", repaired);
+        assert_eq!(repaired.entries_stale, 2, "{}", repaired);
+        assert_eq!(repaired.entries_pruned, 2, "{}", repaired);
+        assert!(
+            !indexers.ranged_client.contains(&ghost).await.unwrap(),
+            "the stale entry for the absent id survived the repair"
+        );
+        assert!(
+            !indexers.ranged_client.contains(&wrong_value).await.unwrap(),
+            "the stale entry for the wrong value survived the repair"
+        );
+
+        let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!("re-verify: {}", after);
+        assert!(
+            after.is_clean(),
+            "index still stale after the prune: {}",
+            after
+        );
+        assert_eq!(
+            after.entries_derived, baseline.entries_derived,
+            "the prune took live entries with it"
+        );
     }
 }
