@@ -2092,10 +2092,25 @@ mod tests {
         assert_eq!(report.entries_pruned, 0, "{}", report);
         assert_eq!(report.prune_incomplete, 1, "{}", report);
         assert!(servers[1].chunks().read_cell(&id).is_ok());
+        // A stable owner is not proof that carry-over has finished. Model
+        // a late cell still on the donor after the ownership commit.
         placement
-            .abort_slot_migration(&slot_group, &3)
+            .complete_slot_migration(&slot_group, &3)
             .await
             .unwrap()
+            .unwrap();
+        let after_commit =
+            prune_ranged_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
+        assert!(
+            indexers.ranged_client.contains(&key).await.unwrap(),
+            "a stable handover pruned a cell awaiting carry-over"
+        );
+        assert_eq!(after_commit.entries_pruned, 0);
+        assert_eq!(after_commit.prune_incomplete, 1);
+        assert!(servers[1].chunks().read_cell(&id).is_ok());
+        placement
+            .set_slot_owner(&slot_group, &3, &owner)
+            .await
             .unwrap();
         for server in servers {
             server.shutdown().await;
