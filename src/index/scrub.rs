@@ -1546,6 +1546,15 @@ mod tests {
                     _ => {}
                 }
             }
+            if live {
+                for key in implied_keys(&crash_cell(id, i), &schema) {
+                    if key != EntryKey::for_scannable(id, schema.uid)
+                        && ranged.contains(&key).await.unwrap()
+                    {
+                        stale.push((id, key));
+                    }
+                }
+            }
         }
         println!(
             "after the crash: {} stale entries, {} missing entries of {} expected; the recovery \
@@ -1640,7 +1649,7 @@ mod tests {
         let wrong_value = EntryKey::from_props(
             &Id::from_parts(3, 7),
             &[9u8; FEATURE_SIZE],
-            1,
+            crate::ram::types::key_hash(PRICE_FIELD),
             SchemaUid(SCHEMA_ID),
         );
         indexers.ranged_client.insert(&wrong_value).await.unwrap();
