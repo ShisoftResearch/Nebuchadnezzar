@@ -279,6 +279,19 @@ pub async fn reconcile_index_before_serving(
             label, report.entries_repaired, report.entries_pruned, elapsed, report
         );
     }
+    if report.index_keys_scanned > 0 && report.entries_not_local == report.index_keys_scanned {
+        // Every entry the walk saw named a cell this member does not own, so
+        // the prune judged nothing at all. On a single-node store that is not a
+        // placement fact but a placement FAILURE: the ring or the slot table
+        // was empty when this ran, and the stale entries this pass exists to
+        // remove are still there, reported as clean.
+        warn!(
+            "Index reconciliation for {} could not judge a single one of its {} index entries: \
+             every one names a slot this member does not own. Check the placement ring before \
+             believing a clean report.",
+            label, report.index_keys_scanned
+        );
+    }
 }
 
 fn mode_from_env() -> Option<ScrubMode> {
@@ -1343,16 +1356,20 @@ mod tests {
         // already dropped the old keys. Without this, the assertions after the
         // restart could be satisfied by an index that never held them.
         let ranged = &server.indexer().unwrap().clients.ranged_client;
-        for i in 0..updated {
-            let old = implied_keys(&crash_cell(&ids[i as usize], i), &schema);
-            for key in old
-                .iter()
-                .filter(|k| **k != EntryKey::for_scannable(&ids[i as usize], schema.uid))
-            {
+        for i in 0..CRASH_CELLS {
+            let id = ids[i as usize];
+            for key in implied_keys(&crash_cell(&id, i), &schema) {
+                let gone = !ranged.contains(&key).await.unwrap();
+                if i < updated && key == EntryKey::for_scannable(&id, schema.uid) {
+                    // The enumeration entry of an UPDATED cell is unchanged: it
+                    // names the id, not the value, and it must stay.
+                    assert!(!gone, "pre-crash: the scannable entry of {:?} vanished", id);
+                    continue;
+                }
                 assert!(
-                    !ranged.contains(key).await.unwrap(),
-                    "pre-crash: the replaced key for cell {:?} is still in the index",
-                    ids[i as usize]
+                    gone,
+                    "pre-crash: the key {:?} of cell {:?} is still in the live index",
+                    key, id
                 );
             }
         }
@@ -1392,10 +1409,13 @@ mod tests {
             }
         }
         println!(
-            "after the crash: {} stale entries, {} missing entries of {} expected",
+            "after the crash: {} stale entries, {} missing entries of {} expected; the recovery \
+             reconcile pruned {} and repaired {}",
             stale.len(),
             missing.len(),
-            CRASH_CELLS * 2 - updated
+            CRASH_CELLS * 2 - updated,
+            LAST_RECONCILE_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
+            LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed)
         );
         assert!(
             missing.is_empty(),
