@@ -945,17 +945,15 @@ fn judge_local_hash_entry(
     }
 }
 
-/// What a bucket chain told the pass.
-enum BucketContents {
-    /// Every segment was read. These are the ids the bucket holds. An absent head
-    /// is an empty bucket, so the set is simply empty and the answer is complete.
-    Whole(HashSet<Id>),
-    /// A segment could not be read, a link named a cell that is not there, or the
-    /// walk hit its hop bound. The held set is then not the whole story, so the
-    /// pass forms no opinion and inserts nothing: write-side dedup checks only the
-    /// head segment, so an id the unreadable part already holds would be written a
-    /// second time on every restart.
-    Partial,
+/// What one read of one bucket segment produced.
+enum SegmentRead {
+    /// The segment is there, and decoded.
+    Found(BucketSegment),
+    /// No cell with this id. For a chain that is the end of the walk.
+    Absent,
+    /// The read failed, or the cell's schema is not in this member's catalog.
+    /// Neither says anything about what the bucket holds.
+    NoVerdict,
 }
 
 /// Read one bucket segment, from this member's chunks when it owns the slot and
@@ -970,63 +968,89 @@ async fn read_bucket_segment(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     segment: Id,
-) -> Result<Option<BucketSegment>, ()> {
+) -> SegmentRead {
     if owns_slot(indexers, &segment) {
         let chunk = chunks.locate_chunk_by_partition(segment.locality() as u64);
         return match read_local_cell(chunk, segment) {
-            LocalCell::Found(cell, _) => Ok(Some(bucket_segment(&cell))),
-            LocalCell::Absent => Ok(None),
+            LocalCell::Found(cell, _) => SegmentRead::Found(bucket_segment(&cell)),
+            LocalCell::Absent => SegmentRead::Absent,
             // A schema this member has not registered, or a read that failed:
             // either way there is no opinion to give.
-            _ => Err(()),
+            _ => SegmentRead::NoVerdict,
         };
     }
     match indexers.hashed_client.client.read_cell(segment).await {
-        Ok(Ok(cell)) => Ok(Some(bucket_segment(&cell))),
-        Ok(Err(ReadError::CellDoesNotExisted)) => Ok(None),
-        _ => Err(()),
+        Ok(Ok(cell)) => SegmentRead::Found(bucket_segment(&cell)),
+        Ok(Err(ReadError::CellDoesNotExisted)) => SegmentRead::Absent,
+        _ => SegmentRead::NoVerdict,
     }
 }
 
-/// Walk one bucket chain and collect the ids it holds.
+/// Which of `wanted` the bucket at `head` does NOT hold.
 ///
-/// The walk must be WHOLE. A bucket that spilled keeps most of its ids behind the
-/// head, so a head-only membership check would call every one of them missing and
-/// re-insert the whole population at every restart.
-async fn bucket_contents(
+/// The walk must be WHOLE over the part that matters. A bucket that spilled keeps
+/// most of its ids behind the head, so a head-only membership check would call
+/// every one of them missing and re-insert the whole population at every restart.
+///
+/// It is asked about the ids this batch implies, not about the bucket's whole
+/// population, and it stops as soon as they are all accounted for. A
+/// low-cardinality indexed value can hold millions of ids; materialising one
+/// bucket per outstanding round trip would put a dozen of those populations in
+/// the heap at once, which is the wrong shape for a pass that runs at startup on
+/// a store that may already be sick.
+///
+/// `Err` means the chain could not be read whole. The caller then forms no
+/// opinion and inserts nothing, because write-side dedup checks only the head
+/// segment and an id the unreadable part already holds would be written a second
+/// time at every restart.
+async fn bucket_missing(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     head: Id,
-) -> BucketContents {
-    let mut held = HashSet::new();
+    wanted: &[Id],
+) -> Result<Vec<Id>, ()> {
+    // `still_wanted` shrinks as the walk finds ids, so the walk can stop before
+    // the end of a long chain, and so the memory is bounded by what this batch
+    // asked about rather than by how big the bucket has grown.
+    let mut still_wanted: HashSet<Id> = wanted.iter().copied().collect();
     let mut cursor = Some(head);
     let mut segments = 0usize;
-    while let Some(segment) = cursor {
+    while !still_wanted.is_empty() {
+        let Some(segment) = cursor else { break };
         match read_bucket_segment(chunks, indexers, segment).await {
-            Ok(Some(contents)) => {
-                held.extend(contents.ids.iter().copied());
+            SegmentRead::Found(contents) => {
+                for id in &contents.ids {
+                    still_wanted.remove(id);
+                }
                 cursor = contents.next;
             }
-            // An absent HEAD is an empty bucket. A missing link past the first
-            // segment is a broken chain, and says so rather than answering with a
-            // short set that reads like a complete one.
-            Ok(None) if segments == 0 => return BucketContents::Whole(held),
-            Ok(None) => {
+            // An absent HEAD is an empty bucket, which is a complete answer:
+            // every wanted id is missing. A missing link PAST the first segment
+            // is a broken chain, and says so rather than answering with a short
+            // walk that reads like a complete one.
+            SegmentRead::Absent if segments == 0 => break,
+            SegmentRead::Absent => {
                 error!(
                     "hash bucket {:?} links to a missing segment {:?}; the ids past it are \
                      unreachable, so this pass forms no opinion about that bucket",
                     head, segment
                 );
-                return BucketContents::Partial;
+                return Err(());
             }
-            Err(_) => return BucketContents::Partial,
+            SegmentRead::NoVerdict => return Err(()),
         }
         segments += 1;
         if segments > HASH_MAX_CHAIN_SEGMENTS {
-            return BucketContents::Partial;
+            return Err(());
         }
     }
-    BucketContents::Whole(held)
+    // In the order the batch listed them, so a report and its examples do not
+    // shuffle between runs.
+    Ok(wanted
+        .iter()
+        .copied()
+        .filter(|id| still_wanted.contains(id))
+        .collect())
 }
 
 /// Remove the stale pairs of one batch, with a bounded number of outstanding
@@ -1093,23 +1117,17 @@ async fn fill_hash_batch(
 ) -> ScrubReport {
     let mut report = ScrubReport::default();
     owed.sort_unstable();
-    let mut groups: Vec<(Id, std::ops::Range<usize>)> = Vec::new();
-    for (index, (bucket, _)) in owed.iter().enumerate() {
+    let mut groups: Vec<(Id, Vec<Id>)> = Vec::new();
+    for (bucket, cell) in &owed {
         match groups.last_mut() {
-            Some((last, range)) if *last == *bucket => range.end = index + 1,
-            _ => groups.push((*bucket, index..index + 1)),
+            Some((last, cells)) if *last == *bucket => cells.push(*cell),
+            _ => groups.push((*bucket, vec![*cell])),
         }
     }
     let mut in_flight = FuturesUnordered::new();
     let mut pending = groups.iter();
-    for group in pending.by_ref().take(concurrency()) {
-        in_flight.push(fill_one_bucket(
-            chunks,
-            indexers,
-            group.0,
-            &owed[group.1.start..group.1.end],
-            mode,
-        ));
+    for (bucket, cells) in pending.by_ref().take(concurrency()) {
+        in_flight.push(fill_one_bucket(chunks, indexers, *bucket, cells, mode));
     }
     while let Some(fill) = in_flight.next().await {
         report.hash_entries_present += fill.present;
@@ -1117,14 +1135,8 @@ async fn fill_hash_batch(
         report.hash_entries_repaired += fill.repaired;
         report.hash_repairs_failed += fill.repairs_failed;
         report.hash_buckets_unreachable += fill.unreachable;
-        if let Some(group) = pending.next() {
-            in_flight.push(fill_one_bucket(
-                chunks,
-                indexers,
-                group.0,
-                &owed[group.1.start..group.1.end],
-                mode,
-            ));
+        if let Some((bucket, cells)) = pending.next() {
+            in_flight.push(fill_one_bucket(chunks, indexers, *bucket, cells, mode));
         }
     }
     report
@@ -1143,18 +1155,17 @@ struct BucketFill {
 /// Compare one bucket with the ids this member's cells imply, and in `Repair`
 /// mode insert the difference.
 ///
-/// `members` are the (bucket, cell) pairs sorted for one bucket; the bucket is
-/// passed apart from them because the pairs carry it in every element and only
-/// the first is ever read.
+/// `members` are the cell ids that imply `bucket`, gathered into one group by
+/// `fill_hash_batch` so the chain is walked once for the whole group.
 async fn fill_one_bucket(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     bucket: Id,
-    members: &[(Id, Id)],
+    members: &[Id],
     mode: ScrubMode,
 ) -> BucketFill {
     let mut out = BucketFill::default();
-    let BucketContents::Whole(held) = bucket_contents(chunks, indexers, bucket).await else {
+    let Ok(missing) = bucket_missing(chunks, indexers, bucket, members).await else {
         out.unreachable = 1;
         warn!(
             "hash reconcile could not read the whole bucket {:?} and inserted nothing; the ids \
@@ -1163,18 +1174,8 @@ async fn fill_one_bucket(
         );
         return out;
     };
-    let missing: Vec<Id> = members
-        .iter()
-        .filter_map(|(_, cell)| {
-            if held.contains(cell) {
-                out.present += 1;
-                None
-            } else {
-                Some(*cell)
-            }
-        })
-        .collect();
     out.missing = missing.len() as u64;
+    out.present = members.len() as u64 - out.missing;
     for cell in &missing {
         report_hash_missing(cell, &bucket);
     }
