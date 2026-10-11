@@ -3743,8 +3743,10 @@ impl Chunk {
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
+                    // The cleaner can probe this cell. Do not wait for its GC lock
+                    // while the cell-index guard is held, even at the allocator wall.
                     let removed_len =
-                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old)?;
+                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old, false)?;
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
                     self.slot_bytes.sub(hash, removed_len);
@@ -4099,6 +4101,7 @@ impl Chunk {
         cell_header: &CellHeader,
         cell_seg: &AArc<Segment>,
         record_deleted_version: bool,
+        full_gc: bool,
     ) -> Result<(), WriteError> {
         // Bounded, and never retried when retrying cannot possibly work.
         //
@@ -4120,7 +4123,7 @@ impl Chunk {
         let mut acquired = None;
         let mut last_error = WriteError::CannotAllocateSpace;
         for attempt in 0..TOMBSTONE_ACQUIRE_ATTEMPTS {
-            match self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
+            match self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, full_gc) {
                 Ok(pending_entry) => {
                     acquired = Some(pending_entry);
                     break;
@@ -4168,13 +4171,14 @@ impl Chunk {
     /// Returns the removed entry's content length, so the logical remove
     /// paths can settle the slot counter without a second decode.
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
-        self.put_tombstone_by_cell_loc_inner(cell_location, true)
+        self.put_tombstone_by_cell_loc_inner(cell_location, true, true)
     }
 
     fn put_tombstone_by_cell_loc_inner(
         &self,
         cell_location: usize,
         retire_old: bool,
+        full_gc: bool,
     ) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
@@ -4191,7 +4195,7 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg, retire_old)?;
+        self.put_tombstone(&header, &cell_seg, retire_old, full_gc)?;
         if retire_old {
             self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
         }
@@ -7384,6 +7388,111 @@ mod tests {
             chunks.read_cell(&id).unwrap().header.version,
             updated.header.version
         );
+    }
+
+    fn delete_at_the_wall_does_not_wait_for_gc(transactional: bool) {
+        let (_, schema) = setup_test_chunks();
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let before = chunks.write_cell(&mut cell).unwrap();
+        let txn = test_txn_id(99123);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let writer_txn = txn.clone();
+        let writer = std::thread::spawn(move || {
+            let scope = transactional.then(|| TransactionScope::enter(writer_txn));
+            if transactional {
+                let mut inserted =
+                    payload_cell(cell.header.schema.get(), &Id::allocated(0, 0, 99124), 64);
+                writer_chunks.write_cell(&mut inserted).unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            let predict = |_: &SharedCell| {
+                guard_tx.send(()).unwrap();
+                true
+            };
+            let result = if transactional {
+                writer_chunks.apply_transaction_remove(&id, predict)
+            } else {
+                writer_chunks.remove_cell_by(&id, predict)
+            };
+            drop(scope);
+            done_tx.send(result).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        while chunk.allocator.writer_headroom() > 1 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let seg_id = seg.id;
+            chunk.put_segment(seg);
+            if let Some(slot) = chunk
+                .head_pool
+                .iter()
+                .find(|slot| slot.load(Ordering::Acquire) == HEAD_SEG_ID_EMPTY)
+            {
+                slot.store(seg_id, Ordering::Release);
+            }
+        }
+        assert_eq!(chunk.allocator.writer_headroom(), 1);
+        for seg in chunk.segments() {
+            if seg.bracket_is_open() {
+                seg.retire_tail();
+            } else {
+                // Leave a live ordinary head that is too small for a tombstone or BEGIN.
+                let cursor = seg.append_header.load(Ordering::Acquire);
+                let end = seg.bound() - 8;
+                crate::ram::entry::stamp_checked_padding(cursor, (end - cursor) as u32);
+                seg.append_header.store(end, Ordering::Release);
+            }
+        }
+        let gc = chunk.gc_lock.lock();
+        go_tx.send(()).unwrap();
+        guard_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The cleaner owns gc_lock and probes the same cell-index entry.
+        let cleaner_chunks = chunks.clone();
+        let probe = std::thread::spawn(move || cleaner_chunks.head_cell(&id));
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Release before asserting so the unfixed implementation can unwind the test.
+        drop(gc);
+        writer.join().unwrap();
+        let probed = probe.join().unwrap();
+        match result.expect("delete waited for GC under the cell-index lock") {
+            Ok(()) => assert!(probed.is_err()),
+            Err(WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable) => {
+                assert_eq!(probed.unwrap().version, before.version);
+            }
+            other => panic!("unexpected delete result: {:?}", other),
+        }
+        if transactional {
+            retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        }
+    }
+
+    #[test]
+    fn transactional_delete_at_the_wall_does_not_wait_for_gc_under_the_cell_lock() {
+        delete_at_the_wall_does_not_wait_for_gc(true);
+    }
+
+    #[test]
+    fn conditional_delete_at_the_wall_does_not_wait_for_gc_under_the_cell_lock() {
+        delete_at_the_wall_does_not_wait_for_gc(false);
     }
 
     /// A chunk whose allocator is empty must refuse the write, not wedge.
