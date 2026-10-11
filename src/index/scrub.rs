@@ -24,7 +24,9 @@
 //! copy of the derivation rules would drift, and every drift would surface
 //! as a permanent disagreement that looks exactly like corruption.
 //!
-//! **It deletes only what it can prove.** The cell walk never deletes: an
+//! **It deletes only what it can prove.** Destructive pruning requires a
+//! complete, stable singleton placement. Cluster pruning is deferred until
+//! it can hold placement stable through deletion. The cell walk never deletes: an
 //! entry that looks unaccounted-for may belong to a cell written after this
 //! pass read that segment, or to a cell on another node this pass cannot
 //! see. The prune walk does delete, and it earns that by asking a question
@@ -131,6 +133,7 @@ impl ScrubReport {
         self.entries_missing == 0
             && self.entries_unreachable == 0
             && self.cells_unreadable == 0
+            && self.cells_schema_missing == 0
             && self.repairs_failed == 0
             && self.entries_stale == 0
             && self.prune_failed == 0
@@ -338,6 +341,16 @@ pub async fn scrub_ranged_index(
     MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     STALE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = prune_ranged_index(chunks, indexers, mode).await;
+    total.merge(&reconcile_cell_entries(chunks, indexers, mode).await);
+    total
+}
+
+async fn reconcile_cell_entries(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+) -> ScrubReport {
+    let mut total = ScrubReport::default();
     for chunk in &chunks.list {
         for segment in chunk.segments() {
             // --- derive (synchronous; all guards released before the await)
@@ -361,7 +374,7 @@ pub async fn scrub_ranged_index(
                         derived_report.cells_schema_missing += 1;
                         continue;
                     }
-                    Some(schema) if schema.index_fields.is_empty() => {
+                    Some(schema) if schema.index_fields.is_empty() && !schema.is_scannable => {
                         // Derives nothing, so reading it can only confirm
                         // that. This is not a rare case: the b-tree's own
                         // pages are cells in these very chunks, and a flush
@@ -413,6 +426,9 @@ fn derive_into(
     };
     for res in probe_cell_indices(&cell, &*schema) {
         out.extend(res.ranged_keys().cloned());
+    }
+    if schema.is_scannable {
+        out.push(EntryKey::for_scannable(&id, schema.uid));
     }
 }
 
@@ -549,13 +565,68 @@ async fn prune_ranged_index(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    prune_ranged_index_with_cap(chunks, indexers, mode, PRUNE_MAX_BLOCKS).await
+}
+
+/// A local miss is not proof of deletion in a cluster. Migration can remove
+/// the donor copy while a cached placement still names that donor. Until the
+/// prune can hold a cluster placement guard, restrict it to a confirmed
+/// singleton. Include offline members; an offline owner still holds data.
+async fn singleton_prune_authority(indexers: &Arc<IndexerClients>) -> bool {
+    let client = &indexers.neb_client;
+    let Ok(Some((members, _))) = indexers
+        .conshash
+        .membership()
+        .group_members(&client.group_name, false)
+        .await
+    else {
+        return false;
+    };
+    if members.len() != 1 || members[0].id != indexers.server_id {
+        return false;
+    }
+    let Ok((Some(table), applied_index)) = crate::slots::load_table(
+        client.group_name(),
+        &client.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    else {
+        return false;
+    };
+    use bifrost::conshash::slots::SlotState;
+    if table.len() != crate::slots::SLOT_COUNT
+        || !table.values().all(
+            |state| matches!(state, SlotState::Stable { owner } if *owner == indexers.server_id),
+        )
+    {
+        return false;
+    }
+    // Replace a startup fallback with this ordered, complete slot snapshot.
+    indexers.conshash.set_slot_overrides(
+        Some(vec![indexers.server_id; crate::slots::SLOT_COUNT]),
+        applied_index,
+    ) && indexers.conshash.server_count() == 1
+}
+
+async fn prune_ranged_index_with_cap(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    max_blocks: usize,
+) -> ScrubReport {
     let mut report = ScrubReport::default();
+    if !singleton_prune_authority(indexers).await {
+        report.prune_incomplete += 1;
+        warn!("Index prune skipped: placement does not prove a stable singleton; cell insertion continues");
+        return report;
+    }
     let mut cursor = min_entry_key();
     let mut blocks = 0usize;
     let mut stalled = 0usize;
     loop {
         blocks += 1;
-        if blocks > PRUNE_MAX_BLOCKS {
+        if blocks > max_blocks || indexers.conshash.server_count() != 1 {
             report.prune_incomplete += 1;
             warn!(
                 "index prune gave up after {} blocks ({} keys walked, {} stale) at {:?}; the \
@@ -596,6 +667,10 @@ async fn prune_ranged_index(
         }
         if mode.repairs() {
             for key in &stale {
+                if indexers.conshash.server_count() != 1 || !owns_cell(indexers, &key.id()) {
+                    report.prune_incomplete += 1;
+                    return report;
+                }
                 match indexers.ranged_client.delete(key).await {
                     Ok(_) => {
                         report.entries_pruned += 1;
@@ -614,7 +689,13 @@ async fn prune_ranged_index(
         // the next tree, or nowhere.
         let advance = match block.next {
             Some(next) => Some(next),
-            None => next_prune_cursor(indexers, &cursor).await,
+            None => match next_prune_cursor(indexers, &cursor).await {
+                Ok(next) => next,
+                Err(()) => {
+                    report.prune_incomplete += 1;
+                    break;
+                }
+            },
         };
         match advance {
             // Nothing follows: the whole index is walked.
@@ -648,17 +729,30 @@ async fn prune_ranged_index(
     report
 }
 
-/// The lower bound of the next tree after `at`, or `None` when the state
-/// machine says nothing follows -- or when it kept refusing to answer.
-async fn next_prune_cursor(indexers: &Arc<IndexerClients>, at: &EntryKey) -> Option<EntryKey> {
+/// The lower bound of the next tree after `at`, or `Ok(None)` when the state
+/// machine says nothing follows. Failed placement resolution is incomplete.
+async fn next_prune_cursor(
+    indexers: &Arc<IndexerClients>,
+    at: &EntryKey,
+) -> Result<Option<EntryKey>, ()> {
+    resolve_prune_cursor(
+        || indexers.ranged_client.next_tree(at, Ordering::Forward),
+        at,
+    )
+    .await
+}
+
+async fn resolve_prune_cursor<F, Fut>(mut fetch: F, at: &EntryKey) -> Result<Option<EntryKey>, ()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<NextTree, bifrost::raft::state_machine::master::ExecError>,
+    >,
+{
     for attempt in 0..PRUNE_PLACEMENT_RETRIES {
-        match indexers
-            .ranged_client
-            .next_tree(at, Ordering::Forward)
-            .await
-        {
-            Ok(NextTree::Found(lower, _)) => return Some(lower),
-            Ok(NextTree::End) => return None,
+        match fetch().await {
+            Ok(NextTree::Found(lower, _)) => return Ok(Some(lower)),
+            Ok(NextTree::End) => return Ok(None),
             Ok(NextTree::Unresolved(reason)) => {
                 if attempt == PRUNE_PLACEMENT_RETRIES - 1 {
                     warn!(
@@ -679,7 +773,7 @@ async fn next_prune_cursor(indexers: &Arc<IndexerClients>, at: &EntryKey) -> Opt
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    None
+    Err(())
 }
 
 /// Examples of stale entries logged this pass. Same reset discipline, and the
@@ -1472,6 +1566,33 @@ mod tests {
             "recovered index is not clean: {}",
             report
         );
+
+        drop(client);
+        drop(server);
+        let (server, _client) = start_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            LAST_RECONCILE_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a second recovery must not prune live entries"
+        );
+        assert_eq!(
+            LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a second recovery must not insert duplicate entries"
+        );
+        let report = scrub_ranged_index(
+            server.chunks(),
+            &server.indexer().unwrap().clients,
+            ScrubMode::Verify,
+        )
+        .await;
+        assert!(report.is_clean(), "second recovery: {}", report);
     }
 
     /// The prune half of the reconcile, without a crash: an entry the cells do
@@ -1553,5 +1674,396 @@ mod tests {
             after.entries_derived, baseline.entries_derived,
             "the prune took live entries with it"
         );
+    }
+    fn wrong_key(id: Id, schema: u32) -> EntryKey {
+        EntryKey::from_props(&id, &[9u8; FEATURE_SIZE], 1, SchemaUid(schema))
+    }
+
+    async fn forget_product_schema(server: &Arc<NebServer>, client: &Arc<AsyncClient>) -> Schema {
+        let schema = (*server.chunks().list[0]
+            .meta
+            .schemas
+            .get(&SchemaVid(SCHEMA_ID))
+            .unwrap())
+        .clone();
+        client
+            .del_schema(schema.name.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.chunks().list[0]
+                .meta
+                .schemas
+                .get(&SchemaVid(SCHEMA_ID))
+                .is_some()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("schema deletion callback");
+        schema
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_cell_is_not_a_reason_to_prune() {
+        use lightning::map::Map as _;
+        let dir = crash_scratch();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_unreadable",
+            &dir,
+        )
+        .await;
+        write_products(&client, 2).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let key = wrong_key(Id::from_parts(3, 0), SCHEMA_ID);
+        indexers.ranged_client.insert(&key).await.unwrap();
+        let chunk = server.chunks().locate_chunk_by_partition(3);
+        let bits = key.id().bits() as usize;
+        let original = chunk.cell_index.get(&bits).unwrap();
+        let other = chunk
+            .cell_index
+            .get(&(Id::from_parts(3, 1).bits() as usize))
+            .unwrap();
+        // A real stale-pointer read error, with intact bytes in both cells.
+        chunk.cell_index.insert(bits, other);
+        let report = prune_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        chunk.cell_index.insert(bits, original);
+        assert!(
+            indexers.ranged_client.contains(&key).await.unwrap(),
+            "unreadable cell was pruned"
+        );
+        assert!(report.cells_unreadable > 0, "{}", report);
+        assert_eq!(report.entries_pruned, 0, "{}", report);
+        assert!(!report.is_clean(), "{}", report);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_schema_preserves_all_its_entries() {
+        let dir = crash_scratch();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_missing_schema",
+            &dir,
+        )
+        .await;
+        write_products(&client, 1).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let key = wrong_key(Id::from_parts(3, 0), SCHEMA_ID);
+        indexers.ranged_client.insert(&key).await.unwrap();
+        let _schema = forget_product_schema(&server, &client).await;
+        let report = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert!(indexers.ranged_client.contains(&key).await.unwrap());
+        assert!(report.cells_schema_missing > 0, "{}", report);
+        assert_eq!(report.entries_pruned, 0, "{}", report);
+        assert!(
+            !report.is_clean(),
+            "missing schema was called clean: {}",
+            report
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_schema_imported_after_start_allows_a_later_repair() {
+        let dir = crash_scratch();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_late_schema",
+            &dir,
+        )
+        .await;
+        write_products(&client, 1).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let key = wrong_key(Id::from_parts(3, 0), SCHEMA_ID);
+        indexers.ranged_client.insert(&key).await.unwrap();
+        let schema = forget_product_schema(&server, &client).await;
+        reconcile_index_before_serving(
+            server.chunks(),
+            indexers,
+            "scrub_late_schema",
+            "scrub_late_schema",
+        )
+        .await;
+        assert!(indexers.ranged_client.contains(&key).await.unwrap());
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.chunks().list[0]
+                .meta
+                .schemas
+                .get(&SchemaVid(SCHEMA_ID))
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late schema callback");
+        let report = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(report.entries_pruned, 1, "{}", report);
+        assert!(!indexers.ranged_client.contains(&key).await.unwrap());
+        assert!(
+            scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify)
+                .await
+                .is_clean()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_prune_crosses_scan_batches_without_skipping_keys() {
+        let dir = crash_scratch();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_batches",
+            &dir,
+        )
+        .await;
+        write_products(&client, 12).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let before = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        let ghosts: Vec<_> = (0..2200)
+            .map(|i| wrong_key(Id::from_parts(3, 1_000_000 + i), SCHEMA_ID))
+            .collect();
+        for key in &ghosts {
+            indexers.ranged_client.insert(key).await.unwrap();
+        }
+        let report = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(
+            report.index_keys_scanned,
+            before.index_keys_scanned + 2200,
+            "{}",
+            report
+        );
+        assert_eq!(report.entries_pruned, 2200, "{}", report);
+        assert_eq!(report.prune_incomplete, 0, "{}", report);
+        for key in ghosts {
+            assert!(!indexers.ranged_client.contains(&key).await.unwrap());
+        }
+        assert!(
+            scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify)
+                .await
+                .is_clean()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_block_cap_reports_a_partial_prune() {
+        let dir = crash_scratch();
+        let (server, _client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_cap",
+            &dir,
+        )
+        .await;
+        let indexers = &server.indexer().unwrap().clients;
+        for i in 0..1025 {
+            indexers
+                .ranged_client
+                .insert(&wrong_key(Id::from_parts(3, 1_000_000 + i), SCHEMA_ID))
+                .await
+                .unwrap();
+        }
+        let report =
+            prune_ranged_index_with_cap(server.chunks(), indexers, ScrubMode::Repair, 1).await;
+        assert_eq!(report.index_keys_scanned, 1024, "{}", report);
+        assert_eq!(report.entries_pruned, 1024, "{}", report);
+        assert_eq!(report.prune_incomplete, 1, "{}", report);
+        assert!(!report.is_clean());
+        let rest = prune_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(rest.entries_pruned, 1, "{}", rest);
+        assert_eq!(rest.prune_incomplete, 0, "{}", rest);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_insert_pass_restores_field_and_scannable_entries_after_a_prune_race() {
+        use lightning::map::Map as _;
+        let dir = crash_scratch();
+        let (server, client) = server_with_indexed_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_restore_scannable",
+            &dir,
+        )
+        .await;
+        let schema = Schema::new_with_id(
+            4219,
+            "enumeration_only",
+            None,
+            Field::new_schema(vec![Field::new_unindexed(PRICE_FIELD, Type::U64)]),
+            false,
+            true,
+        );
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let id = Id::from_parts(3, 99);
+        let mut data = OwnedValue::Map(OwnedMap::new());
+        data[PRICE_FIELD] = OwnedValue::U64(5);
+        client
+            .write_cell(OwnedCell::new_with_id(SchemaVid(4219), &id, data))
+            .await
+            .unwrap()
+            .unwrap();
+        write_products(&client, 1).await;
+        let key = EntryKey::for_scannable(&id, schema.uid);
+        let product = Id::from_parts(3, 0);
+        let product_schema = (*server.chunks().list[0]
+            .meta
+            .schemas
+            .get(&SchemaVid(SCHEMA_ID))
+            .unwrap())
+        .clone();
+        let mut product_data = OwnedValue::Map(OwnedMap::new());
+        product_data[PRICE_FIELD] = OwnedValue::U64(0);
+        let product_keys = implied_keys(
+            &OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &product, product_data),
+            &product_schema,
+        );
+        let indexers = &server.indexer().unwrap().clients;
+        assert!(indexers.ranged_client.contains(&key).await.unwrap());
+        let chunk = server.chunks().locate_chunk_by_partition(3);
+        // Stage the visibility race deterministically. The live bytes remain
+        // intact. Restore the cell index before the insertion half sees them.
+        let location = chunk.cell_index.remove(&(id.bits() as usize)).unwrap();
+        let product_location = chunk.cell_index.remove(&(product.bits() as usize)).unwrap();
+        let pruned = prune_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        chunk.cell_index.insert(id.bits() as usize, location);
+        chunk
+            .cell_index
+            .insert(product.bits() as usize, product_location);
+        assert_eq!(pruned.entries_pruned, 3, "{}", pruned);
+        assert!(!indexers.ranged_client.contains(&key).await.unwrap());
+        let inserted = reconcile_cell_entries(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(inserted.entries_repaired, 3, "{}", inserted);
+        assert!(
+            indexers.ranged_client.contains(&key).await.unwrap(),
+            "insertion did not restore enumeration"
+        );
+        for key in product_keys {
+            assert!(
+                indexers.ranged_client.contains(&key).await.unwrap(),
+                "insertion did not restore {:?}",
+                key
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_placement_retries_are_not_the_end_of_the_index() {
+        let at = min_entry_key();
+        let result = resolve_prune_cursor(
+            || async { Ok(NextTree::Unresolved("not ready".into())) },
+            &at,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolved placement was called the end"
+        );
+        assert_eq!(
+            resolve_prune_cursor(|| async { Ok(NextTree::End) }, &at)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cluster_prune_preserves_foreign_cells_and_migrating_slots() {
+        std::env::set_var("NEB_DISABLE_JOIN_FILL", "1");
+        let addresses: Vec<_> = (0..2)
+            .map(|_| crate::utils::test_port::unique_localhost_addr())
+            .collect();
+        let group = "scrub_cluster_guard".to_string();
+        let opts = ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell, Service::RangedIndexer],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+        let mut servers = Vec::new();
+        for address in &addresses {
+            servers.push(
+                NebServer::new_cluster_from_opts(&opts, address, &addresses, &group, async |_| {})
+                    .await
+                    .unwrap(),
+            );
+        }
+        std::env::remove_var("NEB_DISABLE_JOIN_FILL");
+        let client = Arc::new(servers[0].data_client(&addresses).await.unwrap());
+        client
+            .new_schema_with_id(crash_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        let id = Id::from_parts(3, 77);
+        let owner = servers[1].server_id;
+        let placement = crate::migration::placement_client(&client);
+        let slot_group = crate::slots::slot_group_id(&group);
+        placement
+            .set_slot_owner(&slot_group, &3, &owner)
+            .await
+            .unwrap();
+        assert!(servers[0].refresh_slot_placement().await);
+        assert!(servers[1].refresh_slot_placement().await);
+        client.reload_slot_owners().await;
+        client
+            .write_cell(crash_cell(&id, 77))
+            .await
+            .unwrap()
+            .unwrap();
+        let key = implied_keys(&crash_cell(&id, 77), &crash_schema()).remove(0);
+        let indexers = &servers[0].indexer().unwrap().clients;
+        assert!(indexers.ranged_client.contains(&key).await.unwrap());
+        let mut report = ScrubReport::default();
+        assert!(!entry_contradicted(
+            servers[0].chunks(),
+            indexers,
+            &key,
+            &mut report
+        ));
+        assert_eq!(report.entries_not_local, 1);
+        // During transfer the donor remains the owner. Deliberately install
+        // a wrong local cache, reproducing the reviewer's dangerous miss.
+        placement
+            .begin_slot_migration(&slot_group, &3, &owner, &servers[0].server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        indexers.conshash.note_slot_owner(
+            3,
+            servers[0].server_id,
+            crate::slots::SLOT_COUNT,
+            u64::MAX,
+        );
+        assert!(servers[0].chunks().read_cell(&id).is_err());
+        let report = prune_ranged_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
+        assert!(
+            indexers.ranged_client.contains(&key).await.unwrap(),
+            "a remote live entry was deleted"
+        );
+        assert_eq!(report.entries_pruned, 0, "{}", report);
+        assert_eq!(report.prune_incomplete, 1, "{}", report);
+        assert!(servers[1].chunks().read_cell(&id).is_ok());
+        placement
+            .abort_slot_migration(&slot_group, &3)
+            .await
+            .unwrap()
+            .unwrap();
+        for server in servers {
+            server.shutdown().await;
+        }
     }
 }
