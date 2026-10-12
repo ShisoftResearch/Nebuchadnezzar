@@ -1,4 +1,4 @@
-use crate::ram::cell::{ReadError, WriteError, MAX_CELL_SIZE};
+use crate::ram::cell::{Cell, ReadError, WriteError, MAX_CELL_SIZE};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket-size accounting for the hashed index.
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::Feature;
+use crate::index::full_text::ToOwnedValue;
 
 const MAX_CAS_RETRIES: u32 = 1000;
 
@@ -23,16 +24,26 @@ const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 /// Link to the rest of a bucket that has outgrown one cell.
 const HASH_NEXT_FIELD: &'static str = "NEXT";
+/// The head of the chain this segment belongs to.
+///
+/// A bucket id is a one-way hash of (schema, field, value feature), and a
+/// spilled segment's id is a one-way hash of (head, version), so nothing in a
+/// segment's own id says which bucket it is part of. The recovery reconcile
+/// must ask "does the cell this entry names still imply THIS bucket", and it
+/// can only ask that of the bucket, not of a segment. `OWNER` is what makes an
+/// entry self-describing, the way a ranged key already is.
+const HASH_OWNER_FIELD: &'static str = "OWNER";
 
 /// Runaway guard when walking a bucket chain. A well-formed chain is
 /// `bucket_len / BUCKET_CAPACITY` cells; anything beyond this is a cycle or
 /// corruption, and walking it forever would hang a query.
-const MAX_CHAIN_HOPS: usize = 1_000_000;
+pub(crate) const MAX_CHAIN_HOPS: usize = 1_000_000;
 
 lazy_static! {
     pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
     pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
+    pub static ref HASH_OWNER_FIELD_ID: u64 = hash_str(HASH_OWNER_FIELD);
     /// Ids one bucket cell holds before the bucket spills into a chain.
     ///
     /// A cell is capped at `MAX_CELL_SIZE`, so before chaining a bucket could
@@ -243,8 +254,7 @@ impl HashIndexer {
     }
 
     /// Next cell in the bucket chain, if this one has spilled. Null, NA and a
-    /// missing field all mean "end of chain" -- the last covers cells written
-    /// before the link field existed.
+    /// missing field all mean "end of chain".
     fn cell_next(cell: &OwnedCell) -> Option<Id> {
         match &cell[*HASH_NEXT_FIELD_ID] {
             OwnedValue::Id(id) => Some(*id),
@@ -252,7 +262,9 @@ impl HashIndexer {
         }
     }
 
-    fn bucket_cell(index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
+    /// `owner` is the head of the chain this cell belongs to; a head is its own
+    /// owner.
+    fn bucket_cell(owner: &Id, index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
         let mut map = OwnedMap::new();
         map.insert_key_id(
             *HASH_INDEX_FIELD_ID,
@@ -265,6 +277,7 @@ impl HashIndexer {
                 None => OwnedValue::Null,
             },
         );
+        map.insert_key_id(*HASH_OWNER_FIELD_ID, OwnedValue::Id(*owner));
         OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map))
     }
 
@@ -331,7 +344,7 @@ impl HashIndexer {
             // rejected create and falls through to the merge below, which the
             // measurement says is the rare path.
             if retry == 0 {
-                let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                 match self.neb_client.write_cell(cell).await {
                     Ok(Ok(_)) => return Ok(()),
                     // Bucket already there: fall through and merge into it.
@@ -446,7 +459,7 @@ impl HashIndexer {
                     // frozen cells by the same version they both read, so the
                     // contents are identical by construction.
                     let frozen_id = spilled_cell_id(index_id, version);
-                    let frozen = Self::bucket_cell(&frozen_id, head, next);
+                    let frozen = Self::bucket_cell(index_id, &frozen_id, head, next);
                     match self.neb_client.write_cell(frozen).await {
                         Ok(Ok(_)) | Ok(Err(WriteError::CellAlreadyExisted)) => {}
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -460,7 +473,7 @@ impl HashIndexer {
                         }
                     }
 
-                    let new_head = Self::bucket_cell(index_id, fresh, Some(frozen_id));
+                    let new_head = Self::bucket_cell(index_id, index_id, fresh, Some(frozen_id));
                     match self
                         .neb_client
                         .compare_version_and_update_cell(*index_id, version, new_head)
@@ -489,7 +502,7 @@ impl HashIndexer {
                     }
                 }
                 Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                    let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                     match self.neb_client.write_cell(cell).await {
                         Ok(Ok(_)) => return Ok(()),
                         Ok(Err(WriteError::CellAlreadyExisted)) => continue,
@@ -708,13 +721,59 @@ pub fn hash_index_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-            // Nullable: a bucket that never outgrew one cell has no link, and
-            // so does a bucket written before chaining existed.
+            // Nullable: a bucket that never outgrew one cell has no link.
             Field::new_unindexed_nullable(HASH_NEXT_FIELD, Type::Id),
+            // Nullable: a cell that names no owner is a head of its own chain.
+            Field::new_unindexed_nullable(HASH_OWNER_FIELD, Type::Id),
         ]),
         false,
         false,
     )
+}
+
+/// What one bucket segment holds.
+///
+/// The recovery reconcile reads bucket cells in both cell forms -- `OwnedCell`
+/// when the segment sits on another member and `SharedCell` when it sits in
+/// this member's own chunks -- so the decode is written once, against the
+/// `Cell` trait, rather than twice.
+pub(crate) struct BucketSegment {
+    /// The head of the chain this segment belongs to. `None` means the cell
+    /// names no owner, which is what makes it a head.
+    pub(crate) owner: Option<Id>,
+    /// The member ids this segment holds.
+    pub(crate) ids: Vec<Id>,
+    /// The older segment of the chain, if this one spilled.
+    pub(crate) next: Option<Id>,
+}
+
+fn bucket_field<C>(cell: &C, field_id: u64) -> OwnedValue
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    cell.data().get_in_by_ids(&vec![field_id]).to_owned_value()
+}
+
+/// Read a bucket cell out of any cell form.
+pub(crate) fn bucket_segment<C>(cell: &C) -> BucketSegment
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    let ids = match bucket_field(cell, *HASH_INDEX_FIELD_ID) {
+        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids,
+        _ => Vec::new(),
+    };
+    let owner = match bucket_field(cell, *HASH_OWNER_FIELD_ID) {
+        OwnedValue::Id(id) => Some(id),
+        _ => None,
+    };
+    let next = match bucket_field(cell, *HASH_NEXT_FIELD_ID) {
+        OwnedValue::Id(id) => Some(id),
+        _ => None,
+    };
+    BucketSegment { owner, ids, next }
 }
 
 pub struct HashedIndexClient {

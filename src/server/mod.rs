@@ -2337,7 +2337,7 @@ impl NebServer {
                     "Shutting down with {} index task(s) that never landed. The cells are \
                      durable; their index entries are not, and nothing rebuilds them on its own. \
                      Start with NEB_SCRUB_ON_RECOVERY=repair, or run \
-                     client.scrub_ranged_index(true) once this server is back.",
+                     client.scrub_index(true) once this server is back.",
                     owed
                 );
             }

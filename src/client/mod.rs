@@ -738,19 +738,20 @@ impl AsyncClient {
         }
         Ok(sum)
     }
-    /// Re-derive every node's ranged index entries and report (or fill) the
-    /// holes. The maintenance command for an index that has lost entries
-    /// their cells can still supply.
+    /// Re-derive every node's index entries and report (or fill) the holes, for
+    /// both secondary indexes. The maintenance command for an index that has lost
+    /// entries their cells can still supply.
     ///
     /// Fans out to EVERY member and sums, because a ranged tree covers a key
     /// range across the whole cluster while each node can only walk its own
-    /// chunks. A single node's pass is sound but partial: it can prove an
-    /// entry is missing, never that the index is complete. Only the union
-    /// rebuilds a tree in full.
+    /// chunks, and because a bucket cell sits on whichever member owns its slot
+    /// while the ids it lists can live anywhere. A single node's pass is sound but
+    /// partial: it can prove an entry is missing, never that the index is complete.
+    /// Only the union rebuilds an index in full.
     ///
-    /// `repair` inserts what is missing and never deletes, so it is safe to
-    /// run on a healthy store -- on which it is a no-op.
-    pub async fn scrub_ranged_index(
+    /// `repair` inserts what is missing and prunes what no cell implies, so it is
+    /// safe to run on a healthy store -- on which it is a no-op.
+    pub async fn scrub_index(
         &self,
         repair: bool,
     ) -> Result<crate::index::scrub::ScrubReport, String> {
@@ -759,7 +760,7 @@ impl AsyncClient {
             .into_iter()
             .map(|m| async move {
                 let client = self.client_by_server_id(m.id).await?;
-                Ok::<_, RPCError>(client.scrub_ranged_index(repair).await?)
+                Ok::<_, RPCError>(client.scrub_index(repair).await?)
             })
             .collect();
         let mut total = crate::index::scrub::ScrubReport::default();
