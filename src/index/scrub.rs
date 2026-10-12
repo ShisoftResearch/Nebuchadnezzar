@@ -1183,13 +1183,13 @@ async fn bucket_missing_with_cap(
 /// deletes.
 ///
 /// Returns `(pruned, failed)`.
-async fn prune_hash_batch(indexers: &Arc<IndexerClients>, stale: &[(Id, Id)]) -> (u64, u64) {
+async fn prune_hash_batch(indexers: &Arc<IndexerClients>, stale: &[(Id, Id, Id)]) -> (u64, u64) {
     let mut pruned = 0u64;
     let mut failed = 0u64;
     let mut in_flight = FuturesUnordered::new();
     let mut pending = stale.iter();
-    for (bucket, member) in pending.by_ref().take(concurrency()) {
-        in_flight.push(remove_hash_entry(indexers, *member, *bucket));
+    for (segment, bucket, member) in pending.by_ref().take(concurrency()) {
+        in_flight.push(remove_hash_entry(indexers, *member, *bucket, *segment));
     }
     while let Some(ok) = in_flight.next().await {
         if ok {
@@ -1197,8 +1197,8 @@ async fn prune_hash_batch(indexers: &Arc<IndexerClients>, stale: &[(Id, Id)]) ->
         } else {
             failed += 1;
         }
-        if let Some((bucket, member)) = pending.next() {
-            in_flight.push(remove_hash_entry(indexers, *member, *bucket));
+        if let Some((segment, bucket, member)) = pending.next() {
+            in_flight.push(remove_hash_entry(indexers, *member, *bucket, *segment));
         }
     }
     (pruned, failed)
@@ -1212,14 +1212,15 @@ async fn remove_hash_entry(
     indexers: &Arc<IndexerClients>,
     member: Id,
     bucket: Id,
- ) -> bool {
+    segment: Id,
+) -> bool {
     if indexers.conshash.server_count() != 1 || !owns_slot(indexers, &member) {
         return false;
     }
     match indexers
         .hashed_client
         .indexer
-        .remove_index(&member, &bucket)
+        .remove_segment_member(&member, &segment, &bucket)
         .await
     {
         Ok(_) => true,
@@ -1390,7 +1391,7 @@ pub async fn scrub_hash_index(
             // (bucket, cell) pairs the live cells imply, and (bucket, cell) pairs
             // a bucket holds with no cell behind it.
             let mut owed: Vec<(Id, Id)> = Vec::new();
-            let mut stale: Vec<(Id, Id)> = Vec::new();
+            let mut stale: Vec<(Id, Id, Id)> = Vec::new();
             let mut derived = ScrubReport::default();
             for entry in chunk.live_entries(&segment) {
                 let EntryContent::Cell(header) = entry.content else {
@@ -1434,7 +1435,7 @@ pub async fn scrub_hash_index(
                         }
                         let holder = chunks.locate_chunk_by_partition(member.locality() as u64);
                         if judge_local_hash_entry(holder, member, &head, &mut derived) {
-                            stale.push((head, member));
+                            stale.push((id, head, member));
                         }
                     }
                     continue;
@@ -1474,7 +1475,7 @@ pub async fn scrub_hash_index(
             // --- reconcile (asynchronous; nothing borrowed from the chunk)
             // Prune the inspected segment first, including orphan spills.
             // The indexer checks its owner before each CAS.
-            for (bucket, member) in &stale {
+            for (_, bucket, member) in &stale {
                 report_hash_stale(*member, *bucket);
             }
             if mode.repairs() {
@@ -2837,7 +2838,7 @@ mod tests {
         assert_eq!(stable.hash_prune_incomplete, 1, "{stable}");
         assert!(bucket_ids(&client, hash_head).await.contains(&ghost));
         assert!(
-            !remove_hash_entry(indexers, ghost, hash_head).await,
+            !remove_hash_entry(indexers, ghost, hash_head, hash_head).await,
             "a delete bypassed the singleton recheck"
         );
         // During transfer the donor remains the owner. Deliberately install
@@ -3854,7 +3855,47 @@ mod tests {
             assert_eq!(bucket_ids(&client, bucket).await, vec![id]);
         }
     }
-
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_orphan_spill_is_pruned_in_place() {
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_orphan_spill",
+        )
+        .await;
+        write_hash_products(&client, 1).await;
+        let head = sku_bucket(0);
+        let orphan = Id::from_parts(12, 789_789);
+        let ghost = hash_product_id(9999);
+        let mut map = OwnedMap::new();
+        map.insert_key_id(
+            *crate::index::hash::HASH_INDEX_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::Id(vec![ghost, ghost])),
+        );
+        map.insert_key_id(
+            *crate::index::hash::HASH_OWNER_FIELD_ID,
+            OwnedValue::Id(head),
+        );
+        map.insert_key_id(*crate::index::hash::HASH_NEXT_FIELD_ID, OwnedValue::Null);
+        client
+            .write_cell(OwnedCell::new_with_id(
+                *HASH_INDEX_SCHEMA_ID,
+                &orphan,
+                OwnedValue::Map(map),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let indexers = &server.indexer().unwrap().clients;
+        let repaired = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(repaired.hash_entries_pruned, 2, "{repaired}");
+        assert!(
+            bucket_ids(&client, orphan).await.is_empty(),
+            "orphan entries survived a claimed prune"
+        );
+        assert_eq!(bucket_ids(&client, head).await, vec![hash_product_id(0)]);
+        let second = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(second.hash_entries_pruned, 0, "{second}");
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn hash_chain_across_members_repairs_missing_but_defers_pruning() {
         std::env::set_var("NEB_HASH_BUCKET_CAPACITY", "2");

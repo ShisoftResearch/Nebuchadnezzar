@@ -644,6 +644,58 @@ impl HashIndexer {
         Err(WriteError::CellVersionMismatch)
     }
 
+    /// Remove a member from the exact segment that the prune inspected.
+    /// Orphan spills are not reachable from the head after a lost head CAS.
+    pub(crate) async fn remove_segment_member(
+        &self,
+        member: &Id,
+        segment: &Id,
+        owner: &Id,
+    ) -> Result<(), WriteError> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let cell = match self.neb_client.read_cell(*segment).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(ReadError::CellDoesNotExisted)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(Err(e)) => return Err(WriteError::ReadError(e)),
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            let mut contents = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+            if contents.owner != *owner {
+                return Err(WriteError::ReadError(ReadError::ExecError(
+                    "hash segment owner changed".into(),
+                )));
+            }
+            let previous = contents.ids.len();
+            contents.ids.retain(|id| id != member);
+            if contents.ids.len() == previous {
+                return Ok(());
+            }
+            match self
+                .neb_client
+                .compare_version_and_set_field(
+                    *segment,
+                    cell.header.version,
+                    *HASH_INDEX_FIELD_ID,
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(contents.ids)),
+                )
+                .await
+            {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_write_error(&e) => tokio::task::yield_now().await,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        Err(WriteError::CellVersionMismatch)
+    }
+
     /// Cells whose `field_id` equals `value`, walking the bucket chain.
     ///
     /// Streams: one segment is held at a time, its members are verified and
