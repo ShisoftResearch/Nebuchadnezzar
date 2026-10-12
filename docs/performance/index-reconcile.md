@@ -65,3 +65,11 @@
 **Observed:** All 34 scrub tests pass. All 24 compiled mutants are rejected, with 26 assertion failures and 0 timeouts. A 10-cycle campaign includes 5 SIGKILL recoveries and checks up to 1,114,124 hash memberships. Every recovery scrub reports 0 missing, 0 stale, and 0 incomplete entries.
 
 **Observed:** Full logs, scripts, source hashes, sample statistics, and suite audits are in `/mnt/ext/morpheus-fixes/indexperf/`.
+
+## Develop reference
+
+**Observed:** A fresh Genoa reference at `80f80410` has median startup times of 10.16 s after clean shutdown and 10.54 s after SIGKILL. Each median contains 8 successful recoveries, arranged as 4 A/A pairs. Clean A/A differences range from +0.20 % to +1.77 %. SIGKILL A/A differences range from -1.39 % to +0.67 %.
+
+**Observed:** The reference also has 7 failed attempts: 6 clean and 1 SIGKILL. Each fails the unchanged recovered-cell count assertion. Their stores and logs remain available. The reference harness checks exact raw hash membership because this revision has no hash scrub API.
+
+**Observed:** Candidate medians are 76.18 % and 72.82 % above these successful reference medians. These are separate series on different Genoa slots, not paired verdicts. The historical develop result was 10.17 s. The primary paired gate remains the comparison against `83e3cb71`.
