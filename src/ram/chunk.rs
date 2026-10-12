@@ -6285,6 +6285,32 @@ mod tests {
         crate::server::transactions::test_hlc(n, n)
     }
 
+    #[test]
+    fn missing_and_zero_address_reads_return_typed_errors() {
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunk = &chunks.list[0];
+        let hash = Id::allocated(1, 0, 55).bits();
+        for zero_address in [false, true] {
+            if zero_address {
+                drop(chunk.cell_index.lock_or_insert(hash as usize, 0));
+            }
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                chunk.read_cell(hash),
+                Err(ReadError::CellDoesNotExisted)
+            ));
+            assert!(matches!(
+                chunk.head_cell(hash),
+                Err(ReadError::CellDoesNotExisted)
+            ));
+            assert!(matches!(
+                chunk.read_selected(hash, &[], false),
+                Err(ReadError::CellDoesNotExisted)
+            ));
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
     /// Every chunk's lease key must fall inside its own store's address
     /// window -- the assumption the whole store-scoped lease API rests on.
     ///
