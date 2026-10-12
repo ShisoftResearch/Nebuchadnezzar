@@ -10,6 +10,7 @@
 //! usage: neb_hash_reconcile_cost <dir> <cells> [batch] [lanes]
 //!        NEB_HRC_SCHEMA=ranged   to build the same store with no hash index
 //!        NEB_HRC_REGIONS=16      to make the second hash field spill
+//!        NEB_HRC_STOP=kill       to stop the loader with SIGKILL after WAL sync
 //! ```
 //!
 //! Phase 1 loads the store and shuts it down cleanly, so phase 2 starts from a
@@ -272,7 +273,18 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
             healthy.is_clean(),
             "the store this harness builds is not clean before the restart: {healthy}"
         );
+        if std::env::var("NEB_HRC_STOP").as_deref() == Ok("kill") {
+            // Preserve the fixture's cell count without flushing ranged trees.
+            server.chunks().sync_all();
+            println!("KILL_READY cells={cells}");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            unsafe { libc::raise(libc::SIGKILL) };
+            unreachable!("SIGKILL returned");
+        }
+        let shutdown = Instant::now();
         server.shutdown().await;
+        println!("SHUTDOWN secs={:.6}", shutdown.elapsed().as_secs_f64());
         drop(client);
         drop(server);
 
@@ -338,7 +350,9 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
         hashed.is_clean(),
         "the restarted store's hash index: {hashed}"
     );
+    let shutdown = Instant::now();
     server.shutdown().await;
+    println!("SHUTDOWN secs={:.6}", shutdown.elapsed().as_secs_f64());
 }
 
 fn main() -> std::process::ExitCode {
