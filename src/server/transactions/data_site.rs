@@ -951,22 +951,19 @@ impl DataManager {
     /// the applied-and-undecided state, is refused here and the coordinator
     /// is not told it committed. `decided_commit` is set before the first
     /// record is written, which from then on keeps every abort path away.
-    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), String> {
+    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), EndResult> {
         let Some(txn_lock) = self.find_transaction(tid) else {
-            return Err("the transaction was ended here before its decision arrived".into());
+            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
         };
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Committed {
-            return Err(format!(
-                "the transaction is {:?} here, not applied-and-undecided",
-                txn.state
-            ));
+            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
         }
         txn.decided_commit = true;
         let store = self.chunks().address_range();
         self.chunks()
             .commit_transaction_brackets(tid)
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(EndResult::StoreFull)?;
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -6232,13 +6229,11 @@ impl Service for DataManager {
                     // the coordinator "ended" would be telling it something
                     // recovery will contradict.
                     error!(
-                        "transaction {:?} could not close its bracket at the decision: {}",
+                        "transaction {:?} could not close its bracket at the decision: {:?}",
                         tid, reason
                     );
                     self.cleanup_signal.store(true, Relaxed);
-                    return self
-                        .response_with(EndResult::CheckFailed(CheckError::CannotEnd))
-                        .await;
+                    return self.response_with(reason).await;
                 }
             }
 

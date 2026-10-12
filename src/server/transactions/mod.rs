@@ -183,6 +183,7 @@ pub struct LockReleaseFailure {
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum EndResult {
+    StoreFull(WriteError),
     CheckFailed(CheckError),
     SomeLocksNotReleased {
         released: usize,
