@@ -915,6 +915,9 @@ mod startup_discovery_tests {
 
 #[derive(Debug)]
 pub enum ServerError {
+    HashIndexFormatMismatch {
+        found: Vec<u8>,
+    },
     CannotJoinCluster,
     CannotJoinClusterRejected(String),
     CannotJoinClusterGroup(sm_master::ExecError),
@@ -942,6 +945,9 @@ pub enum ServerError {
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServerError::HashIndexFormatMismatch { found } => {
+                write!(f, "hash index format mismatch: {found:?}")
+            }
             ServerError::CannotJoinCluster => write!(f, "cannot join cluster"),
             ServerError::CannotJoinClusterRejected(error) => {
                 write!(f, "cannot join cluster: {error}")
@@ -1746,6 +1752,20 @@ impl NebServer {
                 last_schema_cache_error.unwrap_or_else(|| "unknown error".to_string())
             )));
         };
+        let expected_hash_schema = crate::index::hash::hash_index_schema();
+        if let Some(vid) = schemas.name_to_id(&expected_hash_schema.name) {
+            let schema = schemas
+                .get(&vid)
+                .ok_or_else(|| ServerError::HashIndexFormatMismatch { found: vec![] })?;
+            if schema.vid != expected_hash_schema.vid
+                || schema.app_meta != crate::index::hash::HASH_FORMAT_VERSION
+                || schema.fields != expected_hash_schema.fields
+            {
+                return Err(ServerError::HashIndexFormatMismatch {
+                    found: schema.app_meta.clone(),
+                });
+            }
+        }
         let meta_rc = Arc::new(ServerMeta { schemas });
         let neb_client = Arc::new(
             client::AsyncClient::new_for_database(
@@ -1804,6 +1824,9 @@ impl NebServer {
             effective_opts.enable_recovery,
             effective_opts.raft_storage.clone(),
         );
+
+        crate::index::hash::validate_recovered_buckets(&chunks)
+            .map_err(ServerError::CannotRecoverPersistedState)?;
 
         if let Some(ref index_builder) = index_builder {
             index_builder.initialize_inverted_indexer(&chunks);
@@ -1947,9 +1970,8 @@ impl NebServer {
             // last flush, and stale entries for cells whose delete or value
             // change never reached the tree. The write path re-asserts an entry
             // only when its cell is written again, and never removes one it did
-            // not just write, so neither half heals on its own. Bounded by the
-            // durability mark, so this costs the crash window and not the
-            // store; see `reconcile_index_before_serving`.
+            // not just write, so neither half heals on its own. The pass scans
+            // the whole store; see `reconcile_index_before_serving`.
             if let Some(indexer) = database_runtime.indexer.as_ref() {
                 crate::index::scrub::reconcile_index_before_serving(
                     &database_runtime.chunks,

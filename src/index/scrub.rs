@@ -876,7 +876,7 @@ async fn prune_ranged_index_with_cap(
         }
         if mode.repairs() {
             for key in &stale {
-                if indexers.conshash.server_count() != 1 || !owns_cell(indexers, &key.id()) {
+                if indexers.conshash.server_count() != 1 || !owns_slot(indexers, &key.id()) {
                     report.prune_incomplete += 1;
                     return report;
                 }
@@ -1079,7 +1079,10 @@ async fn read_bucket_segment(
     if owns_slot(indexers, &segment) {
         let chunk = chunks.locate_chunk_by_partition(segment.locality() as u64);
         return match read_local_cell(chunk, segment) {
-            LocalCell::Found(cell, _) => SegmentRead::Found(bucket_segment(&cell)),
+            LocalCell::Found(cell, _) => match bucket_segment(&cell) {
+                Ok(contents) => SegmentRead::Found(contents),
+                Err(_) => SegmentRead::NoVerdict,
+            },
             LocalCell::Absent => SegmentRead::Absent,
             // A schema this member has not registered, or a read that failed:
             // either way there is no opinion to give.
@@ -1087,7 +1090,10 @@ async fn read_bucket_segment(
         };
     }
     match indexers.hashed_client.client.read_cell(segment).await {
-        Ok(Ok(cell)) => SegmentRead::Found(bucket_segment(&cell)),
+        Ok(Ok(cell)) => match bucket_segment(&cell) {
+            Ok(contents) => SegmentRead::Found(contents),
+            Err(_) => SegmentRead::NoVerdict,
+        },
         Ok(Err(ReadError::CellDoesNotExisted)) => SegmentRead::Absent,
         _ => SegmentRead::NoVerdict,
     }
@@ -1392,8 +1398,11 @@ pub async fn scrub_hash_index(
                             continue;
                         }
                     };
-                    let contents = bucket_segment(&cell);
-                    let head = contents.owner.unwrap_or(id);
+                    let Ok(contents) = bucket_segment(&cell) else {
+                        derived.hash_cells_unreadable += 1;
+                        continue;
+                    };
+                    let head = contents.owner;
                     for member in contents.ids {
                         derived.hash_index_ids_scanned += 1;
                         if !owns_slot(indexers, &member) {
@@ -1735,7 +1744,7 @@ mod tests {
     use crate::ram::cell::OwnedCell;
     use crate::ram::schema::SchemaVid;
     use crate::ram::schema::{Field, IndexType, Schema, SchemaUid};
-    use crate::ram::types::{Map, OwnedMap, OwnedValue, Type};
+    use crate::ram::types::{Map, OwnedMap, OwnedPrimArray, OwnedValue, Type};
     use crate::server::{NebServer, ServerOptions, Service};
     use tempfile::TempDir;
 
@@ -2770,7 +2779,7 @@ mod tests {
             &mut report
         ));
         assert_eq!(report.entries_not_local, 1);
-        let healthy = client.scrub_ranged_index(false).await.unwrap();
+        let healthy = client.scrub_index(false).await.unwrap();
         assert!(
             healthy.is_clean(),
             "stable cluster verification: {}",
@@ -2783,7 +2792,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let migrating = client.scrub_ranged_index(false).await.unwrap();
+        let migrating = client.scrub_index(false).await.unwrap();
         assert!(
             migrating.prune_incomplete > 0,
             "migration was reported complete: {}",
@@ -2879,7 +2888,7 @@ mod tests {
     /// The ids one bucket holds. A missing bucket is an empty one.
     async fn bucket_ids(client: &AsyncClient, bucket: Id) -> Vec<Id> {
         match client.read_cell(bucket).await {
-            Ok(Ok(cell)) => crate::index::hash::bucket_segment(&cell).ids,
+            Ok(Ok(cell)) => crate::index::hash::bucket_segment(&cell).unwrap().ids,
             Ok(Err(ReadError::CellDoesNotExisted)) => Vec::new(),
             other => panic!("reading bucket {:?} failed: {:?}", bucket, other),
         }
@@ -3359,4 +3368,228 @@ mod tests {
             .expect("schema registration rpc");
         (server, client)
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_old_catalog_format_stops_start_with_a_typed_error() {
+        let dir = crash_scratch();
+        let group = "hash_format_rejection".to_string();
+        let opts = ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+            wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+            raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: true,
+            disable_storage_locks: true,
+        };
+        let addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
+            .await
+            .unwrap();
+        let client = server.data_client(&vec![addr]).await.unwrap();
+        let mut old = crate::index::hash::hash_index_schema();
+        old.app_meta.clear();
+        old.fields = Field::new_schema(vec![
+            Field::new_unindexed_array("CELL_ID", Type::Id),
+            Field::new_unindexed_nullable("NEXT", Type::Id),
+        ]);
+        // Build the exact pre-task-2 schema with the same schema id and name.
+        let old = Schema::new_with_id(
+            crate::index::hash::HASH_INDEX_SCHEMA_V1_ID.get(),
+            &old.name,
+            None,
+            old.fields,
+            false,
+            false,
+        );
+        client.new_schema_with_id(old).await.unwrap().unwrap();
+        server.shutdown().await;
+        drop(client);
+        drop(server);
+        for index_enabled in [false, true] {
+            let mut opts = opts.clone();
+            opts.index_enabled = index_enabled;
+            let result = NebServer::new_from_opts(
+                &opts,
+                &crate::utils::test_port::unique_localhost_addr(),
+                &group,
+                async |_| {},
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::server::ServerError::HashIndexFormatMismatch { .. })
+                ),
+                "old hash schema did not stop startup with a typed format error"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_wrong_version_marker_stops_start_even_with_the_current_layout() {
+        let dir = crash_scratch();
+        let group = "hash_marker_rejection";
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        client
+            .set_schema_app_meta(
+                &crate::index::hash::hash_index_schema().name,
+                b"NEB_HASH_BUCKET:99".to_vec(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        server.shutdown().await;
+        drop(client);
+        drop(server);
+        let opts = ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+            wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+            raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+            index_enabled: true,
+            services: vec![Service::Cell, Service::RangedIndexer],
+            enable_recovery: true,
+            disable_storage_locks: true,
+        };
+        let result = NebServer::new_from_opts(
+            &opts,
+            &crate::utils::test_port::unique_localhost_addr(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::server::ServerError::HashIndexFormatMismatch { .. })
+            ),
+            "a wrong marker started with the current layout"
+        );
+    }
+
+    #[test]
+    fn hash_malformed_bucket_fields_are_errors() {
+        let id = hash_product_id(0);
+        let mut map = OwnedMap::new();
+        map.insert_key_id(
+            *crate::index::hash::HASH_INDEX_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::Id(vec![id])),
+        );
+        map.insert_key_id(*crate::index::hash::HASH_OWNER_FIELD_ID, OwnedValue::Id(id));
+        map.insert_key_id(*crate::index::hash::HASH_NEXT_FIELD_ID, OwnedValue::Null);
+        let mut cell = OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &id, OwnedValue::Map(map));
+        assert!(bucket_segment(&cell).is_ok());
+        for field in [
+            *crate::index::hash::HASH_INDEX_FIELD_ID,
+            *crate::index::hash::HASH_OWNER_FIELD_ID,
+            *crate::index::hash::HASH_NEXT_FIELD_ID,
+        ] {
+            let original = cell[field].clone();
+            cell[field] = OwnedValue::U64(99);
+            assert!(
+                bucket_segment(&cell).is_err(),
+                "malformed field {field} decoded"
+            );
+            cell[field] = original;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_old_bucket_without_its_catalog_still_stops_start() {
+        let dir = crash_scratch();
+        let group = "hash_missing_internal_catalog".to_string();
+        let opts = ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+            wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+            raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: true,
+            disable_storage_locks: true,
+        };
+        let addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
+            .await
+            .unwrap();
+        let client = server.data_client(&vec![addr]).await.unwrap();
+        let old = Schema::new_with_id(
+            crate::index::hash::HASH_INDEX_SCHEMA_V1_ID.get(),
+            "HASH_INDEX_SCHEMA",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed_array("CELL_ID", Type::Id),
+                Field::new_unindexed_nullable("NEXT", Type::Id),
+            ]),
+            false,
+            false,
+        );
+        client
+            .new_schema_with_id(old.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(hash_products_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .write_cell(hash_product_cell(0, 0))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut map = OwnedMap::new();
+        map.insert(
+            "CELL_ID",
+            OwnedValue::PrimArray(OwnedPrimArray::Id(vec![hash_product_id(0)])),
+        );
+        map.insert("NEXT", OwnedValue::Null);
+        client
+            .write_cell(OwnedCell::new_with_id(
+                old.vid,
+                &sku_bucket(0),
+                OwnedValue::Map(map),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        client.del_schema(old.name).await.unwrap().unwrap();
+        server.shutdown().await;
+        drop(client);
+        drop(server);
+        let mut opts = opts;
+        opts.index_enabled = true;
+        opts.services = vec![Service::Cell, Service::RangedIndexer];
+        let result = NebServer::new_from_opts(
+            &opts,
+            &crate::utils::test_port::unique_localhost_addr(),
+            &group,
+            async |_| {},
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::server::ServerError::CannotRecoverPersistedState(_))
+            ),
+            "an old bucket was decoded under a newly registered schema; error={:?}",
+            result.as_ref().err()
+        );
+    }
+
 }

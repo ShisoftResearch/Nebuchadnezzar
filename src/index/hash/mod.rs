@@ -20,6 +20,10 @@ use crate::index::full_text::ToOwnedValue;
 
 const MAX_CAS_RETRIES: u32 = 1000;
 
+const HASH_BUCKET_FORMAT_VERSION: u32 = 2;
+
+pub(crate) const HASH_FORMAT_VERSION: &[u8] = b"NEB_HASH_BUCKET:2";
+
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 /// Link to the rest of a bucket that has outgrown one cell.
@@ -40,7 +44,9 @@ const HASH_OWNER_FIELD: &'static str = "OWNER";
 pub(crate) const MAX_CHAIN_HOPS: usize = 1_000_000;
 
 lazy_static! {
-    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    // The physical schema id is the format marker in each persisted cell header.
+    pub(crate) static ref HASH_INDEX_SCHEMA_V1_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(&format!("{HASH_SCHEMA}:{HASH_BUCKET_FORMAT_VERSION}")) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
     pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
     pub static ref HASH_OWNER_FIELD_ID: u64 = hash_str(HASH_OWNER_FIELD);
@@ -584,13 +590,19 @@ impl HashIndexer {
                 }
                 hops += 1;
                 if hops > MAX_CHAIN_HOPS {
-                    error!("hash bucket {:?} chain exceeded {} hops during remove", index_id, MAX_CHAIN_HOPS);
+                    error!(
+                        "hash bucket {:?} chain exceeded {} hops during remove",
+                        index_id, MAX_CHAIN_HOPS
+                    );
                     break;
                 }
             }
 
             let Some((seg_id, version, mut ids)) = holder else {
-                debug!("Cell {:?} not in index {:?}, nothing to remove", cell_id, index_id);
+                debug!(
+                    "Cell {:?} not in index {:?}, nothing to remove",
+                    cell_id, index_id
+                );
                 return Ok(());
             };
             ids.retain(|id| id != cell_id);
@@ -606,7 +618,10 @@ impl HashIndexer {
                 .await
             {
                 Ok(Ok(_)) => {
-                    debug!("Successfully removed cell {:?} from index {:?}", cell_id, index_id);
+                    debug!(
+                        "Successfully removed cell {:?} from index {:?}",
+                        cell_id, index_id
+                    );
                     return Ok(());
                 }
                 Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -723,12 +738,12 @@ pub fn hash_index_schema() -> Schema {
             Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
             // Nullable: a bucket that never outgrew one cell has no link.
             Field::new_unindexed_nullable(HASH_NEXT_FIELD, Type::Id),
-            // Nullable: a cell that names no owner is a head of its own chain.
-            Field::new_unindexed_nullable(HASH_OWNER_FIELD, Type::Id),
+            Field::new_unindexed(HASH_OWNER_FIELD, Type::Id),
         ]),
         false,
         false,
     )
+    .with_app_meta(HASH_FORMAT_VERSION.to_vec())
 }
 
 /// What one bucket segment holds.
@@ -738,9 +753,8 @@ pub fn hash_index_schema() -> Schema {
 /// this member's own chunks -- so the decode is written once, against the
 /// `Cell` trait, rather than twice.
 pub(crate) struct BucketSegment {
-    /// The head of the chain this segment belongs to. `None` means the cell
-    /// names no owner, which is what makes it a head.
-    pub(crate) owner: Option<Id>,
+    /// The head of the chain this segment belongs to.
+    pub(crate) owner: Id,
     /// The member ids this segment holds.
     pub(crate) ids: Vec<Id>,
     /// The older segment of the chain, if this one spilled.
@@ -756,24 +770,61 @@ where
 }
 
 /// Read a bucket cell out of any cell form.
-pub(crate) fn bucket_segment<C>(cell: &C) -> BucketSegment
+pub(crate) fn bucket_segment<C>(cell: &C) -> Result<BucketSegment, ReadError>
 where
     C: Cell,
     <C::Value as Value>::Out: ToOwnedValue,
 {
     let ids = match bucket_field(cell, *HASH_INDEX_FIELD_ID) {
         OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids,
-        _ => Vec::new(),
+        _ => return Err(ReadError::ExecError("invalid hash member array".into())),
     };
     let owner = match bucket_field(cell, *HASH_OWNER_FIELD_ID) {
-        OwnedValue::Id(id) => Some(id),
-        _ => None,
+        OwnedValue::Id(id) => id,
+        _ => return Err(ReadError::ExecError("invalid hash owner".into())),
     };
     let next = match bucket_field(cell, *HASH_NEXT_FIELD_ID) {
         OwnedValue::Id(id) => Some(id),
-        _ => None,
+        OwnedValue::Null => None,
+        _ => return Err(ReadError::ExecError("invalid hash next link".into())),
     };
-    BucketSegment { owner, ids, next }
+    Ok(BucketSegment { owner, ids, next })
+}
+
+/// Validate recovered bucket records before startup can repair or serve them.
+pub(crate) fn validate_recovered_buckets(
+    chunks: &Arc<crate::ram::chunk::Chunks>,
+) -> std::io::Result<()> {
+    use crate::ram::entry::EntryContent;
+    for chunk in &chunks.list {
+        for segment in chunk.segments() {
+            for entry in chunk.live_entries(&segment) {
+                let EntryContent::Cell(header) = entry.content else {
+                    continue;
+                };
+                if header.schema == *HASH_INDEX_SCHEMA_V1_ID {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "hash bucket format 1 does not match format 2",
+                    ));
+                }
+                if header.schema != *HASH_INDEX_SCHEMA_ID {
+                    continue;
+                }
+                let invalid =
+                    |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+                if chunk.meta.schemas.get(&header.schema).is_none() {
+                    return Err(invalid("hash bucket schema is absent".into()));
+                }
+                let cell = chunk
+                    .read_cell(header.id().bits())
+                    .map_err(|e| invalid(format!("hash bucket read failed: {e:?}")))?;
+                bucket_segment(&cell)
+                    .map_err(|e| invalid(format!("hash bucket decode failed: {e:?}")))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct HashedIndexClient {
@@ -1104,7 +1155,9 @@ mod tests {
             *BUCKET_CAPACITY
         );
         let total = *BUCKET_CAPACITY + 500;
-        let cell_ids: Vec<Id> = (0..total as u64).map(|i| Id::from_parts(7, i + 1)).collect();
+        let cell_ids: Vec<Id> = (0..total as u64)
+            .map(|i| Id::from_parts(7, i + 1))
+            .collect();
 
         let mut tasks = JoinSet::new();
         for chunk in cell_ids.chunks(total.div_ceil(32)) {
@@ -1157,7 +1210,11 @@ mod tests {
         );
         assert_eq!(seen.len(), total, "every id must survive the spill");
         for cell_id in &cell_ids {
-            assert!(seen.contains(cell_id), "id {:?} lost across the chain", cell_id);
+            assert!(
+                seen.contains(cell_id),
+                "id {:?} lost across the chain",
+                cell_id
+            );
         }
     }
 
