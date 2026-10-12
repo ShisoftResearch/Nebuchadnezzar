@@ -3508,6 +3508,82 @@ mod tests {
             .expect("schema registration rpc");
         (server, client)
     }
+    /// A successful flush can persist cells whose request-local index work
+    /// has not joined the global shutdown drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clean_shutdown_does_not_certify_request_scoped_index_work() {
+        use crate::index::builder::{index_entries_owed, IndexBuilder};
+
+        let dir = crash_scratch();
+        let group = "clean_shutdown_index_counterexample";
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        let initial = scrub_all_indexes(
+            server.chunks(),
+            &server.indexer().unwrap().clients,
+            ScrubMode::Verify,
+        )
+        .await;
+        assert!(initial.is_clean(), "{initial}");
+        let owed_before = index_entries_owed();
+        let mut cell = hash_product_cell(42, 42);
+        // The scope executes the cell write now. Its returned future owns
+        // the index tasks until the request resumes.
+        let request = IndexBuilder::with_request_index_scope(|| {
+            server.chunks().write_cell(&mut cell).unwrap()
+        });
+        assert!(server.chunks().read_cell(&hash_product_id(42)).is_ok());
+        assert!(bucket_ids(&client, sku_bucket(42)).await.is_empty());
+
+        server.shutdown().await;
+        assert_eq!(index_entries_owed(), owed_before);
+        drop(request);
+        drop(client);
+        drop(server);
+
+        // Inspect the durable state without startup repair masking the hole.
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            client
+                .read_cell(hash_product_id(42))
+                .await
+                .unwrap()
+                .unwrap()[SKU_FIELD],
+            OwnedValue::U64(42)
+        );
+        assert!(bucket_ids(&client, sku_bucket(42)).await.is_empty());
+        server.shutdown().await;
+        drop(client);
+        drop(server);
+
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(
+            bucket_ids(&client, sku_bucket(42)).await,
+            vec![hash_product_id(42)]
+        );
+        server.shutdown().await;
+    }
+
     async fn all_bucket_ids(client: &AsyncClient, head: Id) -> (Vec<Id>, Vec<(Id, u64)>) {
         let mut ids = Vec::new();
         let mut versions = Vec::new();
