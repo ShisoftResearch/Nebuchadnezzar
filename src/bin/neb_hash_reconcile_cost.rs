@@ -267,6 +267,11 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
             began.elapsed().as_secs_f64()
         );
         IndexBuilder::await_all_indices().await;
+        // The later verification scrub also allocates. Report the write
+        // phase's peak separately from the whole process's peak RSS.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        println!("WRITE_RSS kb={}", usage.ru_maxrss);
         let healthy = client.scrub_index(false).await.expect("healthy scrub");
         println!("HEALTHY {healthy}");
         assert!(

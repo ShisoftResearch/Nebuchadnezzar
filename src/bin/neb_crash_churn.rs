@@ -1,4 +1,4 @@
-// Crash-churn fuzzer for the ranged index.
+// Crash-churn fuzzer for the ranged and hash indexes.
 //
 // The durability corpses this hunts (TB14/TB16/TB17) share three
 // ingredients none of which needs a terabyte: structural churn (page and
@@ -928,7 +928,11 @@ async fn child_async(
 
     if first {
         let fields = Field::new_schema(vec![
-            Field::new_indexed(KEY_FIELD, Type::U64, vec![IndexType::Ranged]),
+            Field::new_indexed(
+                KEY_FIELD,
+                Type::U64,
+                vec![IndexType::Ranged, IndexType::Hashed],
+            ),
             Field::new_unindexed(PAD_FIELD, Type::String),
         ]);
         let schema = Schema::new_with_id(CHURN_SCHEMA_ID, "churn", None, fields, false, true);
@@ -1037,7 +1041,8 @@ async fn child_async(
         match client.scrub_index(false).await {
             Ok(report) => println!(
                 "SCRUB missing={} unreachable={} present={} derived={} cells={} \
-                 hash_missing={} hash_stale={} hash_unreachable={} took_ms={} index_keys={} stale={} prune_incomplete={}",
+                 hash_missing={} hash_stale={} hash_unreachable={} took_ms={} index_keys={} stale={} prune_incomplete={} \
+                 hash_derived={} hash_ids={} hash_prune_incomplete={}",
                 report.entries_missing,
                 report.entries_unreachable,
                 report.entries_present,
@@ -1049,7 +1054,10 @@ async fn child_async(
                 began.elapsed().as_millis(),
                 report.index_keys_scanned,
                 report.entries_stale,
-                report.prune_incomplete
+                report.prune_incomplete,
+                report.hash_entries_derived,
+                report.hash_index_ids_scanned,
+                report.hash_prune_incomplete
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
