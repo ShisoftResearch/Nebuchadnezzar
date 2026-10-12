@@ -1758,11 +1758,10 @@ impl NebServer {
                 .get(&vid)
                 .ok_or_else(|| ServerError::HashIndexFormatMismatch { found: vec![] })?;
             if schema.vid != expected_hash_schema.vid
-                || schema.app_meta != crate::index::hash::HASH_FORMAT_VERSION
                 || schema.fields != expected_hash_schema.fields
             {
                 return Err(ServerError::HashIndexFormatMismatch {
-                    found: schema.app_meta.clone(),
+                    found: schema.vid.get().to_le_bytes().to_vec(),
                 });
             }
         }

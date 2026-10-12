@@ -20,9 +20,7 @@ use crate::index::full_text::ToOwnedValue;
 
 const MAX_CAS_RETRIES: u32 = 1000;
 
-const HASH_BUCKET_FORMAT_VERSION: u32 = 2;
-
-pub(crate) const HASH_FORMAT_VERSION: &[u8] = b"NEB_HASH_BUCKET:2";
+const HASH_BUCKET_FORMAT_VERSION: u32 = 3;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
@@ -46,6 +44,7 @@ pub(crate) const MAX_CHAIN_HOPS: usize = 1_000_000;
 lazy_static! {
     // The physical schema id is the format marker in each persisted cell header.
     pub(crate) static ref HASH_INDEX_SCHEMA_V1_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    pub(crate) static ref HASH_INDEX_SCHEMA_V2_ID: SchemaVid = SchemaVid(key_hash("HASH_INDEX_SCHEMA:2") as u32);
     pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(&format!("{HASH_SCHEMA}:{HASH_BUCKET_FORMAT_VERSION}")) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
     pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
@@ -795,7 +794,6 @@ pub fn hash_index_schema() -> Schema {
         false,
         false,
     )
-    .with_app_meta(HASH_FORMAT_VERSION.to_vec())
 }
 
 /// What one bucket segment holds.
@@ -854,10 +852,12 @@ pub(crate) fn validate_recovered_buckets(
                 let EntryContent::Cell(header) = entry.content else {
                     continue;
                 };
-                if header.schema == *HASH_INDEX_SCHEMA_V1_ID {
+                if header.schema == *HASH_INDEX_SCHEMA_V1_ID
+                    || header.schema == *HASH_INDEX_SCHEMA_V2_ID
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "hash bucket format 1 does not match format 2",
+                        "hash bucket format does not match format 3",
                     ));
                 }
                 if header.schema != *HASH_INDEX_SCHEMA_ID {

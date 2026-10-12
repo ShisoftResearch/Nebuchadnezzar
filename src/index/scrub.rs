@@ -3789,6 +3789,10 @@ mod tests {
 
     #[test]
     fn hash_malformed_bucket_fields_are_errors() {
+        assert!(
+            crate::index::hash::hash_index_schema().app_meta.is_empty(),
+            "Neb used application-owned metadata"
+        );
         let id = hash_product_id(0);
         let mut map = OwnedMap::new();
         map.insert_key_id(
@@ -4019,55 +4023,65 @@ mod tests {
         }
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn hash_wrong_version_marker_stops_start_even_with_the_current_layout() {
-        let dir = crash_scratch();
-        let group = "hash_marker_rejection";
-        let (server, client) = start_hash_crash_server(
-            dir.path(),
-            group,
-            &crate::utils::test_port::unique_localhost_addr(),
-            true,
-            true,
-        )
-        .await;
-        client
-            .set_schema_app_meta(
-                &crate::index::hash::hash_index_schema().name,
-                b"NEB_HASH_BUCKET:99".to_vec(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        server.shutdown().await;
-        drop(client);
-        drop(server);
-        let opts = ServerOptions {
-            chunk_size: 64 * 1024 * 1024,
-            db_size: 64 * 1024 * 1024,
-            tiered_config: None,
-            backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
-            wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
-            raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
-            index_enabled: true,
-            services: vec![Service::Cell, Service::RangedIndexer],
-            enable_recovery: true,
-            disable_storage_locks: true,
-        };
-        let result = NebServer::new_from_opts(
-            &opts,
-            &crate::utils::test_port::unique_localhost_addr(),
-            &group.to_string(),
-            async |_| {},
-        )
-        .await;
-        assert!(
-            matches!(
-                result,
-                Err(crate::server::ServerError::HashIndexFormatMismatch { .. })
-            ),
-            "a wrong marker started with the current layout"
-        );
+    async fn hash_wrong_physical_version_stops_start_even_with_the_current_layout() {
+        for wrong_version in [
+            *crate::index::hash::HASH_INDEX_SCHEMA_V1_ID,
+            *crate::index::hash::HASH_INDEX_SCHEMA_V2_ID,
+        ] {
+            let dir = crash_scratch();
+            let group = "hash_physical_version_rejection".to_string();
+            let opts = ServerOptions {
+                chunk_size: 16 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+                wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+                raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: true,
+                disable_storage_locks: true,
+            };
+            let addr = crate::utils::test_port::unique_localhost_addr();
+            let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
+                .await
+                .unwrap();
+            let client = server.data_client(&vec![addr]).await.unwrap();
+            let mut old = crate::index::hash::hash_index_schema();
+            // Keep the current fields but persist the wrong physical version.
+            let old = Schema::new_with_id(
+                wrong_version.get(),
+                &old.name,
+                None,
+                old.fields,
+                false,
+                false,
+            );
+            client.new_schema_with_id(old).await.unwrap().unwrap();
+            server.shutdown().await;
+            drop(client);
+            drop(server);
+            for index_enabled in [false, true] {
+                let mut opts = opts.clone();
+                opts.index_enabled = index_enabled;
+                let result = NebServer::new_from_opts(
+                    &opts,
+                    &crate::utils::test_port::unique_localhost_addr(),
+                    &group,
+                    async |_| {},
+                )
+                .await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::server::ServerError::HashIndexFormatMismatch { .. })
+                    ),
+                    "wrong physical version did not stop startup with a typed format error"
+                );
+            }
+        }
     }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn hash_old_bucket_without_its_catalog_still_stops_start() {
         let dir = crash_scratch();
