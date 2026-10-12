@@ -1,4 +1,4 @@
-use crate::ram::cell::{ReadError, WriteError, MAX_CELL_SIZE};
+use crate::ram::cell::{Cell, ReadError, WriteError, MAX_CELL_SIZE};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket-size accounting for the hashed index.
@@ -16,23 +16,39 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::Feature;
+use crate::index::full_text::ToOwnedValue;
 
 const MAX_CAS_RETRIES: u32 = 1000;
+
+const HASH_BUCKET_FORMAT_VERSION: u32 = 3;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 /// Link to the rest of a bucket that has outgrown one cell.
 const HASH_NEXT_FIELD: &'static str = "NEXT";
+/// The head of the chain this segment belongs to.
+///
+/// A bucket id is a one-way hash of (schema, field, value feature), and a
+/// spilled segment's id is a one-way hash of (head, version), so nothing in a
+/// segment's own id says which bucket it is part of. The recovery reconcile
+/// must ask "does the cell this entry names still imply THIS bucket", and it
+/// can only ask that of the bucket, not of a segment. `OWNER` is what makes an
+/// entry self-describing, the way a ranged key already is.
+const HASH_OWNER_FIELD: &'static str = "OWNER";
 
 /// Runaway guard when walking a bucket chain. A well-formed chain is
 /// `bucket_len / BUCKET_CAPACITY` cells; anything beyond this is a cycle or
 /// corruption, and walking it forever would hang a query.
-const MAX_CHAIN_HOPS: usize = 1_000_000;
+pub(crate) const MAX_CHAIN_HOPS: usize = 1_000_000;
 
 lazy_static! {
-    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    // The physical schema id is the format marker in each persisted cell header.
+    pub(crate) static ref HASH_INDEX_SCHEMA_V1_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    pub(crate) static ref HASH_INDEX_SCHEMA_V2_ID: SchemaVid = SchemaVid(key_hash("HASH_INDEX_SCHEMA:2") as u32);
+    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(&format!("{HASH_SCHEMA}:{HASH_BUCKET_FORMAT_VERSION}")) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
     pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
+    pub static ref HASH_OWNER_FIELD_ID: u64 = hash_str(HASH_OWNER_FIELD);
     /// Ids one bucket cell holds before the bucket spills into a chain.
     ///
     /// A cell is capped at `MAX_CELL_SIZE`, so before chaining a bucket could
@@ -243,8 +259,7 @@ impl HashIndexer {
     }
 
     /// Next cell in the bucket chain, if this one has spilled. Null, NA and a
-    /// missing field all mean "end of chain" -- the last covers cells written
-    /// before the link field existed.
+    /// missing field all mean "end of chain".
     fn cell_next(cell: &OwnedCell) -> Option<Id> {
         match &cell[*HASH_NEXT_FIELD_ID] {
             OwnedValue::Id(id) => Some(*id),
@@ -252,7 +267,9 @@ impl HashIndexer {
         }
     }
 
-    fn bucket_cell(index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
+    /// `owner` is the head of the chain this cell belongs to; a head is its own
+    /// owner.
+    fn bucket_cell(owner: &Id, index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
         let mut map = OwnedMap::new();
         map.insert_key_id(
             *HASH_INDEX_FIELD_ID,
@@ -265,6 +282,7 @@ impl HashIndexer {
                 None => OwnedValue::Null,
             },
         );
+        map.insert_key_id(*HASH_OWNER_FIELD_ID, OwnedValue::Id(*owner));
         OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map))
     }
 
@@ -331,7 +349,7 @@ impl HashIndexer {
             // rejected create and falls through to the merge below, which the
             // measurement says is the rare path.
             if retry == 0 {
-                let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                 match self.neb_client.write_cell(cell).await {
                     Ok(Ok(_)) => return Ok(()),
                     // Bucket already there: fall through and merge into it.
@@ -446,7 +464,7 @@ impl HashIndexer {
                     // frozen cells by the same version they both read, so the
                     // contents are identical by construction.
                     let frozen_id = spilled_cell_id(index_id, version);
-                    let frozen = Self::bucket_cell(&frozen_id, head, next);
+                    let frozen = Self::bucket_cell(index_id, &frozen_id, head, next);
                     match self.neb_client.write_cell(frozen).await {
                         Ok(Ok(_)) | Ok(Err(WriteError::CellAlreadyExisted)) => {}
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -460,7 +478,7 @@ impl HashIndexer {
                         }
                     }
 
-                    let new_head = Self::bucket_cell(index_id, fresh, Some(frozen_id));
+                    let new_head = Self::bucket_cell(index_id, index_id, fresh, Some(frozen_id));
                     match self
                         .neb_client
                         .compare_version_and_update_cell(*index_id, version, new_head)
@@ -489,7 +507,7 @@ impl HashIndexer {
                     }
                 }
                 Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                    let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                     match self.neb_client.write_cell(cell).await {
                         Ok(Ok(_)) => return Ok(()),
                         Ok(Err(WriteError::CellAlreadyExisted)) => continue,
@@ -571,13 +589,19 @@ impl HashIndexer {
                 }
                 hops += 1;
                 if hops > MAX_CHAIN_HOPS {
-                    error!("hash bucket {:?} chain exceeded {} hops during remove", index_id, MAX_CHAIN_HOPS);
+                    error!(
+                        "hash bucket {:?} chain exceeded {} hops during remove",
+                        index_id, MAX_CHAIN_HOPS
+                    );
                     break;
                 }
             }
 
             let Some((seg_id, version, mut ids)) = holder else {
-                debug!("Cell {:?} not in index {:?}, nothing to remove", cell_id, index_id);
+                debug!(
+                    "Cell {:?} not in index {:?}, nothing to remove",
+                    cell_id, index_id
+                );
                 return Ok(());
             };
             ids.retain(|id| id != cell_id);
@@ -593,7 +617,10 @@ impl HashIndexer {
                 .await
             {
                 Ok(Ok(_)) => {
-                    debug!("Successfully removed cell {:?} from index {:?}", cell_id, index_id);
+                    debug!(
+                        "Successfully removed cell {:?} from index {:?}",
+                        cell_id, index_id
+                    );
                     return Ok(());
                 }
                 Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -613,6 +640,58 @@ impl HashIndexer {
             "Max CAS retries exceeded for remove_index({:?}, {:?})",
             cell_id, index_id
         );
+        Err(WriteError::CellVersionMismatch)
+    }
+
+    /// Remove a member from the exact segment that the prune inspected.
+    /// Orphan spills are not reachable from the head after a lost head CAS.
+    pub(crate) async fn remove_segment_member(
+        &self,
+        member: &Id,
+        segment: &Id,
+        owner: &Id,
+    ) -> Result<(), WriteError> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let cell = match self.neb_client.read_cell(*segment).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(ReadError::CellDoesNotExisted)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(Err(e)) => return Err(WriteError::ReadError(e)),
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            let mut contents = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+            if contents.owner != *owner {
+                return Err(WriteError::ReadError(ReadError::ExecError(
+                    "hash segment owner changed".into(),
+                )));
+            }
+            let previous = contents.ids.len();
+            contents.ids.retain(|id| id != member);
+            if contents.ids.len() == previous {
+                return Ok(());
+            }
+            match self
+                .neb_client
+                .compare_version_and_set_field(
+                    *segment,
+                    cell.header.version,
+                    *HASH_INDEX_FIELD_ID,
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(contents.ids)),
+                )
+                .await
+            {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_write_error(&e) => tokio::task::yield_now().await,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
         Err(WriteError::CellVersionMismatch)
     }
 
@@ -708,13 +787,96 @@ pub fn hash_index_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-            // Nullable: a bucket that never outgrew one cell has no link, and
-            // so does a bucket written before chaining existed.
+            // Nullable: a bucket that never outgrew one cell has no link.
             Field::new_unindexed_nullable(HASH_NEXT_FIELD, Type::Id),
+            Field::new_unindexed(HASH_OWNER_FIELD, Type::Id),
         ]),
         false,
         false,
     )
+}
+
+/// What one bucket segment holds.
+///
+/// The recovery reconcile reads bucket cells in both cell forms -- `OwnedCell`
+/// when the segment sits on another member and `SharedCell` when it sits in
+/// this member's own chunks -- so the decode is written once, against the
+/// `Cell` trait, rather than twice.
+pub(crate) struct BucketSegment {
+    /// The head of the chain this segment belongs to.
+    pub(crate) owner: Id,
+    /// The member ids this segment holds.
+    pub(crate) ids: Vec<Id>,
+    /// The older segment of the chain, if this one spilled.
+    pub(crate) next: Option<Id>,
+}
+
+fn bucket_field<C>(cell: &C, field_id: u64) -> OwnedValue
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    cell.data().get_in_by_ids(&vec![field_id]).to_owned_value()
+}
+
+/// Read a bucket cell out of any cell form.
+pub(crate) fn bucket_segment<C>(cell: &C) -> Result<BucketSegment, ReadError>
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    let ids = match bucket_field(cell, *HASH_INDEX_FIELD_ID) {
+        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids,
+        _ => return Err(ReadError::ExecError("invalid hash member array".into())),
+    };
+    let owner = match bucket_field(cell, *HASH_OWNER_FIELD_ID) {
+        OwnedValue::Id(id) => id,
+        _ => return Err(ReadError::ExecError("invalid hash owner".into())),
+    };
+    let next = match bucket_field(cell, *HASH_NEXT_FIELD_ID) {
+        OwnedValue::Id(id) => Some(id),
+        OwnedValue::Null => None,
+        _ => return Err(ReadError::ExecError("invalid hash next link".into())),
+    };
+    Ok(BucketSegment { owner, ids, next })
+}
+
+/// Validate recovered bucket records before startup can repair or serve them.
+pub(crate) fn validate_recovered_buckets(
+    chunks: &Arc<crate::ram::chunk::Chunks>,
+) -> std::io::Result<()> {
+    use crate::ram::entry::EntryContent;
+    for chunk in &chunks.list {
+        for segment in chunk.segments() {
+            for entry in chunk.live_entries(&segment) {
+                let EntryContent::Cell(header) = entry.content else {
+                    continue;
+                };
+                if header.schema == *HASH_INDEX_SCHEMA_V1_ID
+                    || header.schema == *HASH_INDEX_SCHEMA_V2_ID
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "hash bucket format does not match format 3",
+                    ));
+                }
+                if header.schema != *HASH_INDEX_SCHEMA_ID {
+                    continue;
+                }
+                let invalid =
+                    |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+                if chunk.meta.schemas.get(&header.schema).is_none() {
+                    return Err(invalid("hash bucket schema is absent".into()));
+                }
+                let cell = chunk
+                    .read_cell(header.id().bits())
+                    .map_err(|e| invalid(format!("hash bucket read failed: {e:?}")))?;
+                bucket_segment(&cell)
+                    .map_err(|e| invalid(format!("hash bucket decode failed: {e:?}")))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct HashedIndexClient {
@@ -1045,7 +1207,9 @@ mod tests {
             *BUCKET_CAPACITY
         );
         let total = *BUCKET_CAPACITY + 500;
-        let cell_ids: Vec<Id> = (0..total as u64).map(|i| Id::from_parts(7, i + 1)).collect();
+        let cell_ids: Vec<Id> = (0..total as u64)
+            .map(|i| Id::from_parts(7, i + 1))
+            .collect();
 
         let mut tasks = JoinSet::new();
         for chunk in cell_ids.chunks(total.div_ceil(32)) {
@@ -1098,7 +1262,11 @@ mod tests {
         );
         assert_eq!(seen.len(), total, "every id must survive the spill");
         for cell_id in &cell_ids {
-            assert!(seen.contains(cell_id), "id {:?} lost across the chain", cell_id);
+            assert!(
+                seen.contains(cell_id),
+                "id {:?} lost across the chain",
+                cell_id
+            );
         }
     }
 

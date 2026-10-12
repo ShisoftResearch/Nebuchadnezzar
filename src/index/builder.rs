@@ -223,6 +223,21 @@ impl IndexRes {
         })
     }
 
+    /// The HASH buckets this cell contributes to, in derivation order.
+    ///
+    /// Exposed for the index scrub, for the same reason `ranged_keys` is: the
+    /// scrub must derive entries through the function the writer uses. Both
+    /// `IndexType::Hashed` and `IndexType::Null` name a bucket, and they differ
+    /// only in which one, so the scrub takes both and never re-derives the rule
+    /// for a NULL value.
+    pub fn hash_buckets(&self) -> impl Iterator<Item = &Id> {
+        self.meta.iter().filter_map(|meta| match meta {
+            IndexMeta::Hashed(hashed) => Some(&hashed.hash_id),
+            IndexMeta::Null(null) => Some(&null.hash_id),
+            _ => None,
+        })
+    }
+
     // Convert index metadata into hash-metadata pairs
     fn to_meta_hash_pairs(self) -> Vec<(u64, IndexMeta)> {
         self.meta
@@ -398,7 +413,7 @@ pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// line. A write is acked on the cell alone: the index task is spawned and
 /// nobody waits for it, so a tree that cannot take an insert costs the store
 /// entries nobody is told about, and a scan then returns fewer rows with no
-/// error anywhere. The entries are DERIVABLE -- `scrub_ranged_index` rebuilds
+/// error anywhere. The entries are DERIVABLE -- `scrub_index` rebuilds
 /// them from the cells through the write path's own probe -- so this is a
 /// repair job, not data loss. What was missing was any way to know a repair
 /// was owed.
@@ -429,7 +444,7 @@ fn note_index_failures(failed: u64, context: &str) {
         log::error!(
             "INDEX DEGRADED: {} index task(s) have failed in this process ({}). Those cells are \
              durable but their index entries are NOT, so scans over them return fewer rows with \
-             no error. Run a repair scrub (client.scrub_ranged_index(true), or \
+             no error. Run a repair scrub (client.scrub_index(true), or \
              NEB_SCRUB_ON_RECOVERY=repair at next start) to rebuild them from the cells.",
             total,
             context
