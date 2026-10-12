@@ -186,8 +186,8 @@ pub struct ScrubReport {
     pub hash_cells_unreadable: u64,
     /// Cells whose schema is not in this member's catalog, seen by the hash walks.
     pub hash_cells_schema_missing: u64,
-    /// The bucket walk stopped before it covered every segment. Its counts are a
-    /// partial account.
+    /// The bucket walk did not judge every entry. This includes foreign
+    /// members that the local bucket walk cannot judge.
     pub hash_prune_incomplete: u64,
 }
 
@@ -1487,6 +1487,12 @@ pub async fn scrub_hash_index(
             let filled = fill_hash_batch(chunks, indexers, owed, mode).await;
             total.merge(&filled);
         }
+    }
+    // Unlike ranged pruning, this walk sees only local bucket segments.
+    // The foreign cell's member does not scan this segment, so the union
+    // cannot turn a foreign abstain into a complete verification.
+    if total.hash_entries_not_local != 0 {
+        total.hash_prune_incomplete += 1;
     }
     total
 }
@@ -2834,6 +2840,15 @@ mod tests {
         let foreign = scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Verify).await;
         assert_eq!(foreign.hash_entries_not_local, 2, "{foreign}");
         assert_eq!(foreign.hash_entries_stale, 0, "{foreign}");
+        assert!(
+            !foreign.is_clean(),
+            "foreign hash members were called clean: {foreign}"
+        );
+        let union = client.scrub_index(false).await.unwrap();
+        assert!(
+            !union.is_clean(),
+            "the union hid foreign stale hash members: {union}"
+        );
         let stable = scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
         assert_eq!(stable.hash_prune_incomplete, 1, "{stable}");
         assert!(bucket_ids(&client, hash_head).await.contains(&ghost));
