@@ -31,7 +31,7 @@ cleanup() {
     jobs -p | xargs -r kill -TERM 2>/dev/null || true
     
     # Clean up temp file
-    rm -f "$RUN_TMP/test_output.log"
+    rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test-binary"
     rmdir "$RUN_TMP" 2>/dev/null || true
     
     echo "Cleanup complete"
@@ -64,12 +64,24 @@ BUILD_LOG=$(mktemp "$RUN_TMP/build.XXXXXX.log")
 BUILD_STAMP=$(mktemp "$RUN_TMP/build.XXXXXX.stamp")
 touch "$BUILD_STAMP"
 
+CARGO_BUILD_COMMAND=(cargo)
+if [ -n "${TEST_BUILD_LOCK:-}" ]; then
+    CARGO_BUILD_COMMAND=(flock "$TEST_BUILD_LOCK" cargo)
+fi
+
+if [ -n "${TEST_PREBUILT_BINARY:-}" ]; then
+    TEST_BINARY="$TEST_PREBUILT_BINARY"
+    if [ ! -x "$TEST_BINARY" ]; then
+        echo "Error: prebuilt test binary is not executable"
+        exit 1
+    fi
+else
 echo "Building tests..."
 if [ -z "$FILTER" ]; then
-    cargo test --lib --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    "${CARGO_BUILD_COMMAND[@]}" test --lib --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
     BUILD_EXIT_CODE=$?
 else
-    cargo test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    "${CARGO_BUILD_COMMAND[@]}" test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
     BUILD_EXIT_CODE=$?
 fi
 
@@ -86,7 +98,7 @@ grep -E "Compiling|Finished" "$BUILD_LOG" || true
 # Find the test binary
 # Try to use jq if available, otherwise fall back to binaries built after BUILD_STAMP
 if command -v jq >/dev/null 2>&1; then
-    TEST_BINARY=$(cargo test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
+    TEST_BINARY=$("${CARGO_BUILD_COMMAND[@]}" test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
         jq -r 'select(.profile.test == true) | select(.target.kind | contains(["lib"])) | .executable' | \
         grep -v "^null$" | head -1)
 fi
@@ -104,8 +116,12 @@ if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
     fi
 fi
 
+fi
+
 rm -f "$BUILD_LOG" "$BUILD_STAMP"
 
+cp "$TEST_BINARY" "$RUN_TMP/test-binary" || exit 1
+TEST_BINARY="$RUN_TMP/test-binary"
 echo "Using test binary: $TEST_BINARY"
 echo ""
 
@@ -222,7 +238,7 @@ fi
 echo ""
 
 # Clean up temp files
-rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test_exit_code.txt" "$TEST_LIST_FILE"
+rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test_exit_code.txt" "$RUN_TMP/test-binary" "$TEST_LIST_FILE"
 rmdir "$RUN_TMP"
 
 # Exit with error if any tests failed
