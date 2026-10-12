@@ -42,3 +42,26 @@
 **Hypothesis:** A future marker needs request quiescence, complete error accounting, a persistent identity for the exact store image, and a cluster-wide consistency boundary. A shutdown reconcile could establish agreement after quiescence, but moves the full scan to shutdown.
 
 **Read:** This change adds no marker format. It adds no version decoder, compatibility path, or migration. If a future marker is added, its version mismatch must produce a typed error. Present malformed records must stop startup under `AGENTS.md` section 10.1.
+
+## Measured optimization
+
+**Read:** The hash pass now runs at most 4 segment workers. All prune workers finish before any fill worker starts. Each worker releases cell guards before an RPC. The authority checks, deletion recheck, inspected-segment CAS, derivation, and walk cap remain unchanged.
+
+**Observed:** Genoa release measurements use 1.2 million initial cells, 4 A/A pairs, and 8 interleaved pairs against `83e3cb71` for each stop type.
+
+| Stop | Baseline startup | Candidate startup | Median paired change |
+|---|---:|---:|---:|
+| Clean | 21.04 s | 17.90 s | -15.04 % |
+| SIGKILL | 21.555 s | 18.215 s | -15.91 % |
+
+**Observed:** Every startup pair improved. The clean paired range is -20.43 % to -13.93 %. The SIGKILL range is -19.96 % to -14.25 %. Separate hash verification fell from 8.09 s to 3.88 s after clean shutdown, and from 8.14 s to 3.99 s after SIGKILL.
+
+**Observed:** A separate whole-machine gate used 4 A/A pairs and 20 write pairs on the same 48 CPUs. Insert, update, delete, shutdown, and write-phase RSS show no regression under the protocol's sign rule. Shutdown has a +6.39 % paired median with a -23.19 % to +35.84 % range. A/A shutdown differences are +5.63 % to +17.77 %. These measurements cannot resolve a general 3 % effect.
+
+**Observed:** The first 8-pair loader RSS result has a +3.26 % regression flag. That peak includes verification. The 20-pair gate reports +0.58 % for write-phase RSS and +1.36 % for the whole loader, both classified as no change. The initial RSS flag does not reproduce in that gate.
+
+**Read:** Parallel work retains up to 4 batches instead of 1. Repeated key derivation and repeated long-bucket walks remain. No write-path function changes.
+
+**Observed:** All 34 scrub tests pass. All 24 compiled mutants are rejected, with 26 assertion failures and 0 timeouts. A 10-cycle campaign includes 5 SIGKILL recoveries and checks up to 1,114,124 hash memberships. Every recovery scrub reports 0 missing, 0 stale, and 0 incomplete entries.
+
+**Observed:** Full logs, scripts, source hashes, sample statistics, and suite audits are in `/mnt/ext/morpheus-fixes/indexperf/`.

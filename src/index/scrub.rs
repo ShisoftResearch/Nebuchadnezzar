@@ -1385,107 +1385,51 @@ pub async fn scrub_hash_index(
     if !can_prune {
         total.hash_prune_incomplete += 1;
     }
-    for chunk in &chunks.list {
-        for segment in chunk.segments() {
-            // --- derive (synchronous; every read guard released before the await)
-            // (bucket, cell) pairs the live cells imply, and (bucket, cell) pairs
-            // a bucket holds with no cell behind it.
-            let mut owed: Vec<(Id, Id)> = Vec::new();
-            let mut stale: Vec<(Id, Id, Id)> = Vec::new();
-            let mut derived = ScrubReport::default();
-            for entry in chunk.live_entries(&segment) {
-                let EntryContent::Cell(header) = entry.content else {
-                    continue;
+    // Complete every prune before any insertion. A chunk can hold bucket
+    // segments whose members live in a different chunk.
+    for prune in [true, false] {
+        let mut workers = tokio::task::JoinSet::new();
+        let mut pending = chunks
+            .list
+            .iter()
+            .enumerate()
+            .flat_map(|(chunk_index, chunk)| {
+                chunk
+                    .segments()
+                    .into_iter()
+                    .map(move |segment| (chunk_index, segment))
+            });
+        loop {
+            while workers.len() < concurrency().min(4) {
+                let Some((chunk_index, segment)) = pending.next() else {
+                    break;
                 };
-                let id = header.id();
-                if header.schema == *HASH_INDEX_SCHEMA_ID {
-                    // The index side. A bucket cell names the head of its own
-                    // chain, so every entry in it can be judged without walking
-                    // anything -- the ranged walk needs a `scan_keys` RPC for the
-                    // same job, because its keys live inside page images.
-                    let cell = match read_local_cell(chunk, id) {
-                        LocalCell::Found(cell, _) => cell,
-                        // `Absent` cannot happen: `live_entries` just said this
-                        // cell is here. An unreadable cell, or one whose schema
-                        // this restart never registered, holds no verdict either
-                        // way, and no opinion is never a delete.
-                        LocalCell::Absent => continue,
-                        LocalCell::Unreadable => {
-                            derived.hash_cells_unreadable += 1;
-                            continue;
-                        }
-                        LocalCell::SchemaMissing => {
-                            derived.hash_cells_schema_missing += 1;
-                            continue;
-                        }
-                    };
-                    let Ok(contents) = bucket_segment(&cell) else {
-                        derived.hash_cells_unreadable += 1;
-                        continue;
-                    };
-                    let head = contents.owner;
-                    if !can_prune {
-                        continue;
-                    }
-                    for member in contents.ids {
-                        derived.hash_index_ids_scanned += 1;
-                        if !owns_slot(indexers, &member) {
-                            derived.hash_entries_not_local += 1;
-                            continue;
-                        }
-                        let holder = chunks.locate_chunk_by_partition(member.locality() as u64);
-                        if judge_local_hash_entry(holder, member, &head, &mut derived) {
-                            stale.push((id, head, member));
-                        }
-                    }
-                    continue;
-                }
-                // The cell side. The catalog and the schema's index declarations
-                // are both consulted before the cell is read, so a store with no
-                // hash index reads nothing here, and a store whose schema this
-                // restart has not registered abstains instead of panicking.
-                let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
-                    derived.hash_cells_schema_missing += 1;
-                    continue;
-                };
-                if !schema_has_hash_index(&schema) {
-                    continue;
-                }
-                let (cell, written_under) = match read_local_cell(chunk, id) {
-                    LocalCell::Found(cell, schema) => (cell, schema),
-                    LocalCell::Absent => continue,
-                    LocalCell::Unreadable => {
-                        derived.hash_cells_unreadable += 1;
-                        continue;
-                    }
-                    LocalCell::SchemaMissing => {
-                        derived.hash_cells_schema_missing += 1;
-                        continue;
-                    }
-                };
-                for res in probe_cell_indices(&cell, &*written_under) {
-                    for bucket in res.hash_buckets() {
-                        owed.push((*bucket, id));
-                    }
+                let chunks = chunks.clone();
+                let indexers = indexers.clone();
+                workers.spawn(async move {
+                    scrub_hash_segment(
+                        &chunks,
+                        &indexers,
+                        mode,
+                        can_prune,
+                        prune,
+                        chunk_index,
+                        &segment,
+                    )
+                    .await
+                });
+            }
+            let Some(result) = workers.join_next().await else {
+                break;
+            };
+            // A failed worker cannot establish a complete verdict.
+            match result {
+                Ok(report) => total.merge(&report),
+                Err(error) => {
+                    total.hash_prune_incomplete += 1;
+                    warn!("Hash reconcile worker failed: {error}");
                 }
             }
-            derived.hash_entries_derived += owed.len() as u64;
-            total.merge(&derived);
-
-            // --- reconcile (asynchronous; nothing borrowed from the chunk)
-            // Prune the inspected segment first, including orphan spills.
-            // The indexer checks its owner before each CAS.
-            for (_, bucket, member) in &stale {
-                report_hash_stale(*member, *bucket);
-            }
-            if mode.repairs() {
-                let (pruned, failed) = prune_hash_batch(indexers, &stale).await;
-                total.hash_entries_pruned += pruned;
-                total.hash_prune_failed += failed;
-            }
-
-            let filled = fill_hash_batch(chunks, indexers, owed, mode).await;
-            total.merge(&filled);
         }
     }
     // Unlike ranged pruning, this walk sees only local bucket segments.
@@ -1494,6 +1438,127 @@ pub async fn scrub_hash_index(
     if total.hash_entries_not_local != 0 {
         total.hash_prune_incomplete += 1;
     }
+    total
+}
+
+/// Bound parallel work to 4 storage segments. Guards remain inside the
+/// synchronous derive phase; each worker releases them before an RPC.
+async fn scrub_hash_segment(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    can_prune: bool,
+    prune: bool,
+    chunk_index: usize,
+    segment: &lightning::aarc::Arc<crate::ram::segs::Segment>,
+) -> ScrubReport {
+    let mut total = ScrubReport::default();
+    let chunk = &chunks.list[chunk_index];
+    // --- derive (synchronous; every read guard released before the await)
+    // (bucket, cell) pairs the live cells imply, and (bucket, cell) pairs
+    // a bucket holds with no cell behind it.
+    let mut owed: Vec<(Id, Id)> = Vec::new();
+    let mut stale: Vec<(Id, Id, Id)> = Vec::new();
+    let mut derived = ScrubReport::default();
+    for entry in chunk.live_entries(&segment) {
+        let EntryContent::Cell(header) = entry.content else {
+            continue;
+        };
+        let id = header.id();
+        if header.schema == *HASH_INDEX_SCHEMA_ID {
+            if !prune {
+                continue;
+            }
+            // The index side. A bucket cell names the head of its own
+            // chain, so every entry in it can be judged without walking
+            // anything -- the ranged walk needs a `scan_keys` RPC for the
+            // same job, because its keys live inside page images.
+            let cell = match read_local_cell(chunk, id) {
+                LocalCell::Found(cell, _) => cell,
+                // `Absent` cannot happen: `live_entries` just said this
+                // cell is here. An unreadable cell, or one whose schema
+                // this restart never registered, holds no verdict either
+                // way, and no opinion is never a delete.
+                LocalCell::Absent => continue,
+                LocalCell::Unreadable => {
+                    derived.hash_cells_unreadable += 1;
+                    continue;
+                }
+                LocalCell::SchemaMissing => {
+                    derived.hash_cells_schema_missing += 1;
+                    continue;
+                }
+            };
+            let Ok(contents) = bucket_segment(&cell) else {
+                derived.hash_cells_unreadable += 1;
+                continue;
+            };
+            let head = contents.owner;
+            if !can_prune {
+                continue;
+            }
+            for member in contents.ids {
+                derived.hash_index_ids_scanned += 1;
+                if !owns_slot(indexers, &member) {
+                    derived.hash_entries_not_local += 1;
+                    continue;
+                }
+                let holder = chunks.locate_chunk_by_partition(member.locality() as u64);
+                if judge_local_hash_entry(holder, member, &head, &mut derived) {
+                    stale.push((id, head, member));
+                }
+            }
+            continue;
+        }
+        if prune {
+            continue;
+        }
+        // The cell side. The catalog and the schema's index declarations
+        // are both consulted before the cell is read, so a store with no
+        // hash index reads nothing here, and a store whose schema this
+        // restart has not registered abstains instead of panicking.
+        let Some(schema) = chunk.meta.schemas.get(&header.schema) else {
+            derived.hash_cells_schema_missing += 1;
+            continue;
+        };
+        if !schema_has_hash_index(&schema) {
+            continue;
+        }
+        let (cell, written_under) = match read_local_cell(chunk, id) {
+            LocalCell::Found(cell, schema) => (cell, schema),
+            LocalCell::Absent => continue,
+            LocalCell::Unreadable => {
+                derived.hash_cells_unreadable += 1;
+                continue;
+            }
+            LocalCell::SchemaMissing => {
+                derived.hash_cells_schema_missing += 1;
+                continue;
+            }
+        };
+        for res in probe_cell_indices(&cell, &*written_under) {
+            for bucket in res.hash_buckets() {
+                owed.push((*bucket, id));
+            }
+        }
+    }
+    derived.hash_entries_derived += owed.len() as u64;
+    total.merge(&derived);
+
+    // --- reconcile (asynchronous; nothing borrowed from the chunk)
+    // Prune the inspected segment first, including orphan spills.
+    // The indexer checks its owner before each CAS.
+    for (_, bucket, member) in &stale {
+        report_hash_stale(*member, *bucket);
+    }
+    if mode.repairs() {
+        let (pruned, failed) = prune_hash_batch(indexers, &stale).await;
+        total.hash_entries_pruned += pruned;
+        total.hash_prune_failed += failed;
+    }
+
+    let filled = fill_hash_batch(chunks, indexers, owed, mode).await;
+    total.merge(&filled);
     total
 }
 
@@ -3508,6 +3573,7 @@ mod tests {
             .expect("schema registration rpc");
         (server, client)
     }
+
     /// A successful flush can persist cells whose request-local index work
     /// has not joined the global shutdown drain.
     #[tokio::test(flavor = "multi_thread")]
