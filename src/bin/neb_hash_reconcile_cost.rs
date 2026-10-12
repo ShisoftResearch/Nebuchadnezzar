@@ -224,7 +224,7 @@ async fn load(client: &Arc<AsyncClient>, cells: u64, batch: usize, lanes: u64) {
         loaded += out.expect("a load lane panicked");
     }
     println!(
-        "LOAD cells={loaded} lanes={lanes} secs={:.1} cells_per_sec={:.0}",
+        "LOAD cells={loaded} lanes={lanes} secs={:.6} cells_per_sec={:.0}",
         began.elapsed().as_secs_f64(),
         loaded as f64 / began.elapsed().as_secs_f64().max(0.001),
     );
@@ -233,21 +233,53 @@ async fn load(client: &Arc<AsyncClient>, cells: u64, batch: usize, lanes: u64) {
 async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port: u16) {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
-    // ---- phase 1: build the store, and shut it down cleanly ------------------
-    let addr = format!("127.0.0.1:{port}");
-    let (server, client) = start(dir, group, &addr, false).await;
-    load(&client, cells, batch, lanes).await;
-    IndexBuilder::await_all_indices().await;
-    let healthy = client.scrub_index(false).await.expect("healthy scrub");
-    println!("HEALTHY {healthy}");
-    assert!(
-        healthy.is_clean(),
-        "the store this harness builds is not clean before the restart: {healthy}"
-    );
-    server.shutdown().await;
-    drop(client);
-    drop(server);
+    let phase = std::env::var("NEB_HRC_PHASE").unwrap_or_else(|_| "both".into());
+    if phase != "recover" {
+        // ---- phase 1: build the store, and shut it down cleanly ------------------
+        let addr = format!("127.0.0.1:{port}");
+        let (server, client) = start(dir, group, &addr, true).await;
+        load(&client, cells, batch, lanes).await;
+        let changed = cells / 100;
+        let began = Instant::now();
+        for i in 0..changed {
+            let mut cell = product_cell(i);
+            cell[PRICE_FIELD] = OwnedValue::U64(cells + i);
+            if with_hash() {
+                cell[SKU_FIELD] = OwnedValue::U64(cells + i);
+            }
+            client.update_cell(cell).await.unwrap().unwrap();
+        }
+        println!(
+            "UPDATE ops={changed} secs={:.6}",
+            began.elapsed().as_secs_f64()
+        );
+        let began = Instant::now();
+        for i in changed..2 * changed {
+            client
+                .remove_cell(Id::from_parts(3, i))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        println!(
+            "DELETE ops={changed} secs={:.6}",
+            began.elapsed().as_secs_f64()
+        );
+        IndexBuilder::await_all_indices().await;
+        let healthy = client.scrub_index(false).await.expect("healthy scrub");
+        println!("HEALTHY {healthy}");
+        assert!(
+            healthy.is_clean(),
+            "the store this harness builds is not clean before the restart: {healthy}"
+        );
+        server.shutdown().await;
+        drop(client);
+        drop(server);
 
+        if phase == "load" {
+            return;
+        }
+    }
     // ---- phase 2: restart, and price what the startup pass costs -------------
     let addr = format!("127.0.0.1:{}", port + 1);
     let began = Instant::now();
@@ -272,6 +304,11 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
     let began = Instant::now();
     let ranged = scrub::scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
     let ranged_secs = began.elapsed().as_secs_f64();
+    assert_eq!(
+        ranged.entries_derived,
+        cells - cells / 100,
+        "recovered cell count"
+    );
     println!("RANGED_VERIFY secs={ranged_secs:.2} {ranged}");
 
     let began = Instant::now();
@@ -322,7 +359,8 @@ fn main() -> std::process::ExitCode {
         .unwrap_or(43100);
     let dir = Path::new(dir.as_str());
     std::fs::create_dir_all(dir).expect("create base dir");
-    let group = format!("hrc_{}", std::process::id());
+    let group =
+        std::env::var("NEB_HRC_GROUP").unwrap_or_else(|_| format!("hrc_{}", std::process::id()));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
