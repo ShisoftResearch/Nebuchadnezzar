@@ -212,6 +212,8 @@ impl ScrubReport {
             && self.hash_entries_stale == 0
             && self.hash_prune_failed == 0
             && self.hash_prune_incomplete == 0
+            && self.hash_cells_unreadable == 0
+            && self.hash_cells_schema_missing == 0
     }
 
     /// Fold another node's report into this one. Public because a
@@ -301,12 +303,11 @@ impl std::fmt::Display for ScrubReport {
 
 /// Start a scrub after recovery, if this deployment asked for one.
 ///
-/// `NEB_SCRUB_ON_RECOVERY`: `off` (default), `verify`, or `repair`.
+/// `NEB_SCRUB_ON_RECOVERY`: `off`, `verify`, or `repair`.
+/// Startup uses `repair` when the variable is absent.
 ///
-/// **Why this is not on by default.** The pass walks every live cell, which
-/// measured 5.7s for 800k cells -- fine there, hours on a store with
-/// billions. A default that silently adds hours to every restart is worse
-/// than the problem it fixes, so the deployment that knows its size chooses.
+/// The pass scans every live cell. Its cost depends on the store size and
+/// the distribution of bucket members. Measure it on the deployment's data.
 ///
 /// What the last reconciliation cost, for anything that wants to report it.
 ///
@@ -347,8 +348,7 @@ pub static LAST_RECONCILE_HASH_PRUNED: std::sync::atomic::AtomicU64 =
 /// index was last known good would bound this to the crash window. One was
 /// built and then removed: every cheap version of that claim was measurably
 /// wrong, hiding the very holes this pass exists to fill. The walk is
-/// affordable anyway -- 1.0-5.9 s for 0.7-4M cells -- so the bound bought
-/// seconds at the risk of silently missing entries.
+/// complete because no durable index watermark can exclude older holes.
 ///
 /// **Why it is worth running at all.** A crash leaves the index holding the
 /// changes that reached disk and losing the ones that had not, and that cuts
@@ -1122,6 +1122,16 @@ async fn bucket_missing(
     head: Id,
     wanted: &[Id],
 ) -> Result<Vec<Id>, ()> {
+    bucket_missing_with_cap(chunks, indexers, head, wanted, HASH_MAX_CHAIN_SEGMENTS).await
+}
+
+async fn bucket_missing_with_cap(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    head: Id,
+    wanted: &[Id],
+    max_segments: usize,
+) -> Result<Vec<Id>, ()> {
     // `still_wanted` shrinks as the walk finds ids, so the walk can stop before
     // the end of a long chain, and so the memory is bounded by what this batch
     // asked about rather than by how big the bucket has grown.
@@ -1130,8 +1140,14 @@ async fn bucket_missing(
     let mut segments = 0usize;
     while !still_wanted.is_empty() {
         let Some(segment) = cursor else { break };
+        if segments >= max_segments {
+            return Err(());
+        }
         match read_bucket_segment(chunks, indexers, segment).await {
             SegmentRead::Found(contents) => {
+                if contents.owner != head {
+                    return Err(());
+                }
                 for id in &contents.ids {
                     still_wanted.remove(id);
                 }
@@ -1153,9 +1169,6 @@ async fn bucket_missing(
             SegmentRead::NoVerdict => return Err(()),
         }
         segments += 1;
-        if segments > HASH_MAX_CHAIN_SEGMENTS {
-            return Err(());
-        }
     }
     // In the order the batch listed them, so a report and its examples do not
     // shuffle between runs.
@@ -1193,11 +1206,16 @@ async fn prune_hash_batch(indexers: &Arc<IndexerClients>, stale: &[(Id, Id)]) ->
 
 /// Take one id out of one bucket, through the writer's own removal.
 ///
-/// `bucket` is the chain head. `remove_index` walks the chain and compares-and-
-/// sets the segment that holds the id, so a concurrent spill is not raced by a
-/// second copy of that rule written here -- which is the whole reason this calls
-/// the indexer rather than rewriting the segment the walk already had in hand.
-async fn remove_hash_entry(indexers: &Arc<IndexerClients>, member: Id, bucket: Id) -> bool {
+/// The indexer checks the owner and CASes the exact inspected segment.
+/// This also covers a spill whose head CAS never linked it into the chain.
+async fn remove_hash_entry(
+    indexers: &Arc<IndexerClients>,
+    member: Id,
+    bucket: Id,
+ ) -> bool {
+    if indexers.conshash.server_count() != 1 || !owns_slot(indexers, &member) {
+        return false;
+    }
     match indexers
         .hashed_client
         .indexer
@@ -1219,9 +1237,8 @@ async fn remove_hash_entry(indexers: &Arc<IndexerClients>, member: Id, bucket: I
 ///
 /// The pairs are grouped by bucket before they are asked about, so a bucket that
 /// this segment holds many members of costs ONE walk rather than one per member.
-/// That is the difference between a bounded pass and a quadratic one on a
-/// low-cardinality indexed field, which is the shape that funnels millions of
-/// cells into a handful of buckets.
+/// This bounds the pending set by a storage segment. A shared bucket can
+/// still require another chain walk for each segment of data cells.
 async fn fill_hash_batch(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
@@ -1230,6 +1247,7 @@ async fn fill_hash_batch(
 ) -> ScrubReport {
     let mut report = ScrubReport::default();
     owed.sort_unstable();
+    owed.dedup();
     let mut groups: Vec<(Id, Vec<Id>)> = Vec::new();
     for (bucket, cell) in &owed {
         match groups.last_mut() {
@@ -1331,10 +1349,8 @@ async fn fill_one_bucket(
 /// 2. The fill half derives every live cell's buckets and reports -- and in
 ///    `Repair` mode inserts -- the ids a bucket lacks.
 ///
-/// Prune first, so a fill that follows re-adds anything a prune took by mistake.
-/// That ordering is not decoration here: a prune can only be wrong about whether
-/// an entry belongs, and a fill is driven by the cells alone, so a wrong prune is
-/// invisible to everything except the fill in the same pass.
+/// Destructive pruning needs the stable singleton authority used by ranged
+/// pruning. Filling missing entries does not make an unsafe delete correct.
 ///
 /// Like the ranged walk, this is batched by segment, and for the same reason: the
 /// derivation half holds cell read guards and the reconciliation half awaits RPCs,
@@ -1364,6 +1380,10 @@ pub async fn scrub_hash_index(
     HASH_STALE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     HASH_MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = ScrubReport::default();
+    let can_prune = prune_placement_authority(indexers, mode).await;
+    if !can_prune {
+        total.hash_prune_incomplete += 1;
+    }
     for chunk in &chunks.list {
         for segment in chunk.segments() {
             // --- derive (synchronous; every read guard released before the await)
@@ -1403,6 +1423,9 @@ pub async fn scrub_hash_index(
                         continue;
                     };
                     let head = contents.owner;
+                    if !can_prune {
+                        continue;
+                    }
                     for member in contents.ids {
                         derived.hash_index_ids_scanned += 1;
                         if !owns_slot(indexers, &member) {
@@ -1449,10 +1472,8 @@ pub async fn scrub_hash_index(
             total.merge(&derived);
 
             // --- reconcile (asynchronous; nothing borrowed from the chunk)
-            // Prune first. `remove_index` is the writer's own removal: it walks
-            // the chain from the head and compares-and-sets the segment that holds
-            // the id, so a concurrent spill is not raced by a second copy of that
-            // rule written here.
+            // Prune the inspected segment first, including orphan spills.
+            // The indexer checks its owner before each CAS.
             for (bucket, member) in &stale {
                 report_hash_stale(*member, *bucket);
             }
@@ -2785,6 +2806,40 @@ mod tests {
             "stable cluster verification: {}",
             healthy
         );
+        let hash_head = sku_bucket(777_777);
+        assert_ne!(crate::slots::slot_of(&hash_head), 3);
+        placement
+            .set_slot_owner(
+                &slot_group,
+                &crate::slots::slot_of(&hash_head),
+                &servers[0].server_id,
+            )
+            .await
+            .unwrap();
+        assert!(servers[0].refresh_slot_placement().await);
+        assert!(servers[1].refresh_slot_placement().await);
+        client.reload_slot_owners().await;
+        let ghost = Id::from_parts(3, 999_998);
+        indexers
+            .hashed_client
+            .insert(&hash_head, &id)
+            .await
+            .unwrap();
+        indexers
+            .hashed_client
+            .insert(&hash_head, &ghost)
+            .await
+            .unwrap();
+        let foreign = scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Verify).await;
+        assert_eq!(foreign.hash_entries_not_local, 2, "{foreign}");
+        assert_eq!(foreign.hash_entries_stale, 0, "{foreign}");
+        let stable = scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(stable.hash_prune_incomplete, 1, "{stable}");
+        assert!(bucket_ids(&client, hash_head).await.contains(&ghost));
+        assert!(
+            !remove_hash_entry(indexers, ghost, hash_head).await,
+            "a delete bypassed the singleton recheck"
+        );
         // During transfer the donor remains the owner. Deliberately install
         // a wrong local cache, reproducing the reviewer's dangerous miss.
         placement
@@ -2806,6 +2861,18 @@ mod tests {
             u64::MAX,
         );
         assert!(servers[0].chunks().read_cell(&id).is_err());
+        let hash_migrating =
+            scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(hash_migrating.hash_prune_incomplete, 1, "{hash_migrating}");
+        assert_eq!(
+            hash_migrating.hash_entries_stale, 0,
+            "untrusted placement judged a hash member"
+        );
+        assert!(
+            bucket_ids(&client, hash_head).await.contains(&id),
+            "migration deleted the remote hash member"
+        );
+
         let report = prune_ranged_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
         assert!(
             indexers.ranged_client.contains(&key).await.unwrap(),
@@ -2829,6 +2896,14 @@ mod tests {
         );
         assert_eq!(after_commit.entries_pruned, 0);
         assert_eq!(after_commit.prune_incomplete, 1);
+        let hash_handover =
+            scrub_hash_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(hash_handover.hash_prune_incomplete, 1);
+        assert!(
+            bucket_ids(&client, hash_head).await.contains(&id),
+            "stable carry-over deleted a hash member"
+        );
+
         assert!(servers[1].chunks().read_cell(&id).is_ok());
         placement
             .set_slot_owner(&slot_group, &3, &owner)
@@ -2900,7 +2975,7 @@ mod tests {
     ) -> (Arc<NebServer>, Arc<AsyncClient>) {
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
+                chunk_size: 16 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
@@ -3271,6 +3346,14 @@ mod tests {
                 "cell {:?} did not come back as expected after the crash",
                 id
             );
+            if live {
+                let cell = client.read_cell(id).await.unwrap().unwrap();
+                assert_eq!(
+                    cell[SKU_FIELD],
+                    OwnedValue::U64(new_sku(i)),
+                    "recovered cell value changed"
+                );
+            }
             if live && !bucket_ids(&client, sku_bucket(sku)).await.contains(&id) {
                 missing.push((id, sku));
             }
@@ -3317,6 +3400,47 @@ mod tests {
         let all = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("post-recovery full scrub: {}", all);
         assert!(all.is_clean(), "recovered index is not clean: {}", all);
+        let versions: Vec<_> = futures::future::join_all((0..updated).map(|i| {
+            let client = &client;
+            async move {
+                client
+                    .read_cell(sku_bucket(new_sku(i)))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .header
+                    .version
+            }
+        }))
+        .await;
+        drop(client);
+        drop(server);
+        let (server, client) = start_hash_crash_server(
+            dir.path(),
+            group,
+            &crate::utils::test_port::unique_localhost_addr(),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(
+            LAST_RECONCILE_HASH_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            LAST_RECONCILE_HASH_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        for i in 0..updated {
+            let cell = client
+                .read_cell(sku_bucket(new_sku(i)))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cell.header.version, versions[i as usize]);
+            assert_eq!(bucket_segment(&cell).unwrap().ids, vec![hash_product_id(i)]);
+        }
+        server.shutdown().await;
     }
 
     /// Registering the schema is the first start's job; a restart finds it in the
@@ -3367,6 +3491,225 @@ mod tests {
             .await
             .expect("schema registration rpc");
         (server, client)
+    }
+    async fn all_bucket_ids(client: &AsyncClient, head: Id) -> (Vec<Id>, Vec<(Id, u64)>) {
+        let mut ids = Vec::new();
+        let mut versions = Vec::new();
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            let cell = client.read_cell(id).await.unwrap().unwrap();
+            let segment = bucket_segment(&cell).unwrap();
+            assert_eq!(segment.owner, head, "a spilled segment lost its owner");
+            ids.extend(segment.ids);
+            versions.push((id, cell.header.version));
+            cursor = segment.next;
+            assert!(versions.len() < 1000);
+        }
+        (ids, versions)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_shared_bucket_spills_across_chunks_and_repairs_without_duplicates() {
+        std::env::set_var("NEB_HASH_BUCKET_CAPACITY", "8");
+        assert_eq!(*crate::index::hash::BUCKET_CAPACITY, 8);
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_shared_spill",
+        )
+        .await;
+        let indexers = &server.indexer().unwrap().clients;
+        for i in 0..1100 {
+            client
+                .write_cell(hash_product_cell(i, 7))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let head = sku_bucket(7);
+        let (before, segments) = all_bucket_ids(&client, head).await;
+        assert_eq!(before.len(), 1100);
+        assert!(segments.len() > 100);
+        let partitions: HashSet<_> = segments
+            .iter()
+            .map(|(id, _)| {
+                server
+                    .chunks()
+                    .locate_chunk_by_partition(id.locality() as u64) as *const _
+                    as usize
+            })
+            .collect();
+        assert!(partitions.len() > 1, "fixture must span chunks");
+        let holes = [0, 511, 1099];
+        for i in holes {
+            indexers
+                .hashed_client
+                .indexer
+                .remove_index(&hash_product_id(i), &head)
+                .await
+                .unwrap();
+        }
+        let ghost = hash_product_id(9999);
+        indexers.hashed_client.insert(&head, &ghost).await.unwrap();
+        // A changed value leaves a stale entry in the shared bucket.
+        client
+            .update_cell(hash_product_cell(5, 55))
+            .await
+            .unwrap()
+            .unwrap();
+        indexers
+            .hashed_client
+            .insert(&head, &hash_product_id(5))
+            .await
+            .unwrap();
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(report.hash_entries_repaired, 3, "{report}");
+        assert_eq!(report.hash_entries_pruned, 2, "{report}");
+        let (after, versions) = all_bucket_ids(&client, head).await;
+        let expected: HashSet<_> = (0..1100).filter(|i| *i != 5).map(hash_product_id).collect();
+        assert_eq!(after.len(), expected.len(), "duplicates survived");
+        assert_eq!(after.into_iter().collect::<HashSet<_>>(), expected);
+        assert_eq!(
+            bucket_ids(&client, sku_bucket(55)).await,
+            vec![hash_product_id(5)]
+        );
+        let second = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(second.hash_entries_repaired, 0, "{second}");
+        assert_eq!(second.hash_entries_pruned, 0, "{second}");
+        assert_eq!(
+            all_bucket_ids(&client, head).await.1,
+            versions,
+            "second pass wrote healthy segments"
+        );
+        assert!(
+            bucket_missing_with_cap(server.chunks(), indexers, head, &[hash_product_id(1)], 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            bucket_missing(server.chunks(), indexers, head, &[hash_product_id(1)])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_unreadable_cell_is_preserved_and_is_not_clean() {
+        use lightning::map::Map as _;
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_unreadable",
+        )
+        .await;
+        write_hash_products(&client, 2).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let id = hash_product_id(0);
+        let wrong = sku_bucket(12345);
+        indexers.hashed_client.insert(&wrong, &id).await.unwrap();
+        let chunk = server.chunks().locate_chunk_by_partition(3);
+        let location = chunk.cell_index.get(&(id.bits() as usize)).unwrap();
+        let other = chunk
+            .cell_index
+            .get(&(hash_product_id(1).bits() as usize))
+            .unwrap();
+        chunk.cell_index.insert(id.bits() as usize, other);
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        chunk.cell_index.insert(id.bits() as usize, location);
+        assert!(bucket_ids(&client, wrong).await.contains(&id));
+        assert!(report.hash_cells_unreadable > 0, "{report}");
+        assert_eq!(report.hash_entries_pruned, 0);
+        assert!(!report.is_clean(), "{report}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_missing_schema_abstains_then_late_schema_repairs() {
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_late_schema",
+        )
+        .await;
+        write_hash_products(&client, 1).await;
+        let indexers = &server.indexer().unwrap().clients;
+        let id = hash_product_id(0);
+        let wrong = sku_bucket(12345);
+        indexers.hashed_client.insert(&wrong, &id).await.unwrap();
+        indexers
+            .hashed_client
+            .indexer
+            .remove_index(&id, &sku_bucket(0))
+            .await
+            .unwrap();
+        client
+            .del_schema(hash_products_schema().name)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.chunks().list[0]
+                .meta
+                .schemas
+                .get(&SchemaVid(HASH_SCHEMA_ID))
+                .is_some()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert!(bucket_ids(&client, wrong).await.contains(&id));
+        assert!(bucket_ids(&client, sku_bucket(0)).await.is_empty());
+        assert!(report.hash_cells_schema_missing > 0, "{report}");
+        assert!(!report.is_clean(), "{report}");
+        client
+            .new_schema_with_id(hash_products_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        let repaired = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(repaired.hash_entries_pruned, 1, "{repaired}");
+        assert_eq!(repaired.hash_entries_repaired, 1, "{repaired}");
+        assert!(bucket_ids(&client, wrong).await.is_empty());
+        assert_eq!(bucket_ids(&client, sku_bucket(0)).await, vec![id]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_broken_chain_abstains_from_insertion() {
+        std::env::set_var("NEB_HASH_BUCKET_CAPACITY", "2");
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_broken_chain",
+        )
+        .await;
+        for i in 0..6 {
+            client
+                .write_cell(hash_product_cell(i, 7))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let head = sku_bucket(7);
+        let cell = client.read_cell(head).await.unwrap().unwrap();
+        let next = bucket_segment(&cell).unwrap().next.unwrap();
+        client.remove_cell(next).await.unwrap().unwrap();
+        let indexers = &server.indexer().unwrap().clients;
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert!(report.hash_buckets_unreachable > 0, "{report}");
+        assert_eq!(
+            report.hash_entries_repaired, 0,
+            "a short chain created duplicates"
+        );
+        assert_eq!(
+            client
+                .read_cell(head)
+                .await
+                .unwrap()
+                .unwrap()
+                .header
+                .version,
+            cell.header.version
+        );
+        assert!(!report.is_clean());
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn hash_old_catalog_format_stops_start_with_a_typed_error() {
@@ -3428,6 +3771,197 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hash_malformed_bucket_fields_are_errors() {
+        let id = hash_product_id(0);
+        let mut map = OwnedMap::new();
+        map.insert_key_id(
+            *crate::index::hash::HASH_INDEX_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::Id(vec![id])),
+        );
+        map.insert_key_id(*crate::index::hash::HASH_OWNER_FIELD_ID, OwnedValue::Id(id));
+        map.insert_key_id(*crate::index::hash::HASH_NEXT_FIELD_ID, OwnedValue::Null);
+        let mut cell = OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &id, OwnedValue::Map(map));
+        assert!(bucket_segment(&cell).is_ok());
+        for field in [
+            *crate::index::hash::HASH_INDEX_FIELD_ID,
+            *crate::index::hash::HASH_OWNER_FIELD_ID,
+            *crate::index::hash::HASH_NEXT_FIELD_ID,
+        ] {
+            let original = cell[field].clone();
+            cell[field] = OwnedValue::U64(99);
+            assert!(
+                bucket_segment(&cell).is_err(),
+                "malformed field {field} decoded"
+            );
+            cell[field] = original;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_null_and_array_members_use_the_writers_derivation() {
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_null_array",
+        )
+        .await;
+        let schema = Schema::new_with_id(
+            4250,
+            "hash_array_null",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed_array("tags", Type::U64, vec![IndexType::Hashed]),
+                Field::new_indexed_nullable("optional", Type::U64, vec![IndexType::Null]),
+            ]),
+            false,
+            false,
+        );
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let id = Id::from_parts(3, 10000);
+        let mut map = OwnedMap::new();
+        map.insert(
+            "tags",
+            OwnedValue::PrimArray(OwnedPrimArray::U64(vec![7, 8, 7])),
+        );
+        map.insert("optional", OwnedValue::Null);
+        let cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(map));
+        client.write_cell(cell.clone()).await.unwrap().unwrap();
+        let buckets: HashSet<_> = probe_cell_indices(&cell, &schema)
+            .iter()
+            .flat_map(|res| res.hash_buckets().copied().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(buckets.len(), 3);
+        let indexers = &server.indexer().unwrap().clients;
+        for bucket in &buckets {
+            indexers
+                .hashed_client
+                .indexer
+                .remove_index(&id, bucket)
+                .await
+                .unwrap();
+        }
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(
+            report.hash_entries_repaired,
+            buckets.len() as u64,
+            "duplicate array values were counted as separate repairs"
+        );
+        for bucket in buckets {
+            assert_eq!(bucket_ids(&client, bucket).await, vec![id]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_chain_across_members_repairs_missing_but_defers_pruning() {
+        std::env::set_var("NEB_HASH_BUCKET_CAPACITY", "2");
+        std::env::set_var("NEB_DISABLE_JOIN_FILL", "1");
+        let addresses: Vec<_> = (0..2)
+            .map(|_| crate::utils::test_port::unique_localhost_addr())
+            .collect();
+        let group = "hash_remote_chain".to_string();
+        let opts = ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell, Service::RangedIndexer],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+        let mut servers = Vec::new();
+        for address in &addresses {
+            servers.push(
+                NebServer::new_cluster_from_opts(&opts, address, &addresses, &group, async |_| {})
+                    .await
+                    .unwrap(),
+            );
+        }
+        std::env::remove_var("NEB_DISABLE_JOIN_FILL");
+        let client = Arc::new(servers[0].data_client(&addresses).await.unwrap());
+        client
+            .new_schema_with_id(hash_products_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        let placement = crate::migration::placement_client(&client);
+        let slot_group = crate::slots::slot_group_id(&group);
+        let head = sku_bucket(7);
+        placement
+            .set_slot_owner(&slot_group, &3, &servers[1].server_id)
+            .await
+            .unwrap();
+        for version in 1u64..10 {
+            let frozen = Id::from_obj(&(head, version, "HASH_BUCKET_SPILL"));
+            assert_ne!(crate::slots::slot_of(&frozen), crate::slots::slot_of(&head));
+            placement
+                .set_slot_owner(
+                    &slot_group,
+                    &crate::slots::slot_of(&frozen),
+                    &servers[1].server_id,
+                )
+                .await
+                .unwrap();
+        }
+        placement
+            .set_slot_owner(
+                &slot_group,
+                &crate::slots::slot_of(&head),
+                &servers[0].server_id,
+            )
+            .await
+            .unwrap();
+        for server in &servers {
+            assert!(server.refresh_slot_placement().await);
+        }
+        client.reload_slot_owners().await;
+        for i in 0..6 {
+            client
+                .write_cell(hash_product_cell(i, 7))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let (_, segments) = all_bucket_ids(&client, head).await;
+        assert!(segments.len() >= 3);
+        assert!(servers[0].chunks().read_cell(&head).is_ok());
+        for (segment, _) in &segments[1..] {
+            assert!(
+                servers[1].chunks().read_cell(segment).is_ok(),
+                "spill fixture is not remote"
+            );
+        }
+        let indexers = &servers[1].indexer().unwrap().clients;
+        indexers
+            .hashed_client
+            .indexer
+            .remove_index(&hash_product_id(0), &head)
+            .await
+            .unwrap();
+        let ghost = hash_product_id(9999);
+        indexers.hashed_client.insert(&head, &ghost).await.unwrap();
+        let report = scrub_hash_index(servers[1].chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(report.hash_entries_repaired, 1, "{report}");
+        assert_eq!(report.hash_prune_incomplete, 1, "{report}");
+        let (members, _) = all_bucket_ids(&client, head).await;
+        assert!(
+            members.contains(&ghost),
+            "multi-member repair pruned a member"
+        );
+        for i in 0..6 {
+            assert!(members.contains(&hash_product_id(i)), "missing id {i}");
+        }
+        assert_eq!(members.len(), 7, "chain membership created duplicates");
+        for server in servers {
+            server.shutdown().await;
+        }
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn hash_wrong_version_marker_stops_start_even_with_the_current_layout() {
         let dir = crash_scratch();
@@ -3478,34 +4012,6 @@ mod tests {
             "a wrong marker started with the current layout"
         );
     }
-
-    #[test]
-    fn hash_malformed_bucket_fields_are_errors() {
-        let id = hash_product_id(0);
-        let mut map = OwnedMap::new();
-        map.insert_key_id(
-            *crate::index::hash::HASH_INDEX_FIELD_ID,
-            OwnedValue::PrimArray(OwnedPrimArray::Id(vec![id])),
-        );
-        map.insert_key_id(*crate::index::hash::HASH_OWNER_FIELD_ID, OwnedValue::Id(id));
-        map.insert_key_id(*crate::index::hash::HASH_NEXT_FIELD_ID, OwnedValue::Null);
-        let mut cell = OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &id, OwnedValue::Map(map));
-        assert!(bucket_segment(&cell).is_ok());
-        for field in [
-            *crate::index::hash::HASH_INDEX_FIELD_ID,
-            *crate::index::hash::HASH_OWNER_FIELD_ID,
-            *crate::index::hash::HASH_NEXT_FIELD_ID,
-        ] {
-            let original = cell[field].clone();
-            cell[field] = OwnedValue::U64(99);
-            assert!(
-                bucket_segment(&cell).is_err(),
-                "malformed field {field} decoded"
-            );
-            cell[field] = original;
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn hash_old_bucket_without_its_catalog_still_stops_start() {
         let dir = crash_scratch();
@@ -3591,5 +4097,94 @@ mod tests {
             result.as_ref().err()
         );
     }
-
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_feature_collision_preserves_both_distinct_values() {
+        let (server, client) = server_with_hash_schema(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "hash_feature_collision",
+        )
+        .await;
+        // U64 and Id encode the same feature for equal bits. Use two physical
+        // layouts in one family to test a real collision without a hash stub.
+        let first = Schema::new_with_id(
+            4270,
+            "hash_collision",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                "value",
+                Type::U64,
+                vec![IndexType::Hashed],
+            )]),
+            false,
+            false,
+        );
+        let mut second = Schema::new_with_id(
+            4271,
+            "hash_collision",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                "value",
+                Type::Id,
+                vec![IndexType::Hashed],
+            )]),
+            false,
+            false,
+        );
+        second.uid = first.uid;
+        second.generation = 1;
+        let values = [OwnedValue::U64(7), OwnedValue::Id(Id::from_parts(0, 7))];
+        assert_ne!(values[0], values[1]);
+        assert_eq!(
+            values[0].hash(),
+            values[1].hash(),
+            "fixture is not a collision"
+        );
+        let mut cells = Vec::new();
+        for (i, schema) in [first, second].into_iter().enumerate() {
+            server.meta().schemas.debug_only_new_schema(schema.clone());
+            let id = Id::from_parts(3, 40000 + i as u64);
+            let mut map = OwnedMap::new();
+            map.insert("value", values[i].clone());
+            let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(map));
+            server.chunks().write_cell(&mut cell).unwrap();
+            cells.push((cell, schema));
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        let heads: Vec<_> = cells
+            .iter()
+            .map(|(cell, schema)| {
+                probe_cell_indices(cell, schema)
+                    .iter()
+                    .flat_map(|res| res.hash_buckets().copied().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(heads[0], heads[1]);
+        let head = heads[0][0];
+        let indexers = &server.indexer().unwrap().clients;
+        indexers
+            .hashed_client
+            .indexer
+            .remove_index(&cells[0].0.header.id, &head)
+            .await
+            .unwrap();
+        let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        assert_eq!(
+            report.hash_entries_pruned, 0,
+            "a feature collision was pruned: {report}"
+        );
+        assert_eq!(report.hash_entries_repaired, 1, "{report}");
+        let held: HashSet<_> = bucket_ids(&client, head).await.into_iter().collect();
+        assert_eq!(held, cells.iter().map(|(cell, _)| cell.header.id).collect());
+        for (i, (cell, _)) in cells.iter().enumerate() {
+            assert_eq!(
+                server
+                    .chunks()
+                    .read_cell(&cell.header.id)
+                    .unwrap()
+                    .to_owned()["value"],
+                values[i]
+            );
+        }
+    }
 }
