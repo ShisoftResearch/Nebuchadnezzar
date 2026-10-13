@@ -853,7 +853,8 @@ mod tests {
             .unwrap();
 
         let hub = hub_for(&client);
-        hub.ensure_workers();
+        // Drive the idle retry directly. A background worker can remove the batch
+        // from the retry lane before its RPC finishes and restores the barrier.
 
         // A worker gave up on a page it could not place: the barrier is down
         // and stays down while the image is outstanding.
