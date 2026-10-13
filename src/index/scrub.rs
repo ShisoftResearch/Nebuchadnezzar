@@ -506,38 +506,33 @@ async fn reconcile_cell_entries(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    const BATCH_CELLS: usize = 1024;
+
     let mut total = ScrubReport::default();
     for chunk in &chunks.list {
-        for segment in chunk.segments() {
-            // --- derive (synchronous; all guards released before the await)
+        // Snapshot the authoritative IDs once. The cleaner changes addresses,
+        // so resolve each ID when we visit it. New segments and later writes
+        // cannot extend this finite walk.
+        let ids = chunk.live_cell_ids();
+        for ids in ids.chunks(BATCH_CELLS) {
+            // Release all cell guards before the index RPCs.
             let mut batch: Vec<EntryKey> = Vec::new();
             let mut derived_report = ScrubReport::default();
-            for entry in chunk.live_entries(&segment) {
-                let EntryContent::Cell(header) = entry.content else {
+            for &id in ids {
+                let Ok(header) = chunk.head_cell(id) else {
+                    derived_report.cells_unreadable += 1;
                     continue;
                 };
                 derived_report.cells_scanned += 1;
-                // The entry header already names the schema, so check the
-                // catalog BEFORE asking for the cell. `read_cell` treats a
-                // missing schema as "this shall never happen" and panics in a
-                // debug build, which is a fair rule for the write path and the
-                // wrong one here: this pass walks whatever the store contains,
-                // including cells whose schema the catalog has not registered
-                // yet or has dropped. Reading first turned a countable
-                // condition into a crash at startup.
+                // Check the schema before decoding the value. A missing schema
+                // is a reportable condition; read_cell would panic instead.
                 match chunk.meta.schemas.get(&header.schema) {
                     None => {
                         derived_report.cells_schema_missing += 1;
                         continue;
                     }
                     Some(schema) if schema.index_fields.is_empty() && !schema.is_scannable => {
-                        // Derives nothing, so reading it can only confirm
-                        // that. This is not a rare case: the b-tree's own
-                        // pages are cells in these very chunks, and a flush
-                        // writes a great many of them right before the
-                        // shutdown whose mark bounds the next pass -- so
-                        // without this the cheap bounded pass spends most of
-                        // its time reading the index it is there to check.
+                        // Index pages need no value decode.
                         derived_report.cells_no_indices += 1;
                         continue;
                     }
@@ -548,7 +543,6 @@ async fn reconcile_cell_entries(
             derived_report.entries_derived += batch.len() as u64;
             total.merge(&derived_report);
 
-            // --- reconcile (asynchronous; nothing borrowed from the chunk)
             let batch_report = reconcile(indexers, &batch, mode).await;
             total.merge(&batch_report);
         }
@@ -2029,6 +2023,199 @@ mod tests {
             after
         );
         assert_eq!(after.entries_present, baseline.entries_present);
+    }
+
+    // ---- the cleaner, and the segment snapshot the INSERT walk trusts ------
+
+    const RACE_SCHEMA_ID: u32 = 4213;
+    const RACE_PAD_FIELD: &str = "pad";
+    /// Padded cells, so a few thousand of them fill several 8 MiB segments and
+    /// the combine cleaner has at least two same-class candidates to work on.
+    const RACE_CELLS: u64 = 3_000;
+    const RACE_PAD_BYTES: usize = 8 * 1024;
+
+    /// Which cells the pass owes an entry to. The hammer rewrites the even ids
+    /// only, and a value-unchanged update re-asserts a ranged entry
+    /// (`IndexBuilder::ensure_indices_`), which would otherwise fill the holes
+    /// underneath the walk.
+    fn race_holed(seq: u64) -> bool {
+        seq % 2 == 1
+    }
+
+    fn race_cell(seq: u64, tag: u64) -> OwnedCell {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[PRICE_FIELD] = OwnedValue::U64(seq);
+        value[RACE_PAD_FIELD] =
+            OwnedValue::String(format!("{tag:0>width$}", width = RACE_PAD_BYTES));
+        OwnedCell::new_with_id(SchemaVid(RACE_SCHEMA_ID), &Id::from_parts(3, seq), value)
+    }
+
+    async fn race_server(
+        addr: &str,
+        group: &str,
+        dir: &TempDir,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        let backup = dir.path().join("backup");
+        let wal = dir.path().join("wal");
+        let raft = dir.path().join("raft");
+        for d in [&backup, &wal, &raft] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(backup.to_str().unwrap().to_string()),
+                wal_storage: Some(wal.to_str().unwrap().to_string()),
+                raft_storage: Some(raft.to_str().unwrap().to_string()),
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &addr.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let schema = Schema::new_with_id(
+            RACE_SCHEMA_ID,
+            "race_products",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(PRICE_FIELD, Type::U64, vec![IndexType::Ranged]),
+                Field::new_unindexed(RACE_PAD_FIELD, Type::String),
+            ]),
+            false,
+            true,
+        );
+        let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
+        client
+            .new_schema_with_id(schema)
+            .await
+            .unwrap()
+            .unwrap();
+        (server, Arc::new(client))
+    }
+
+    /// The walk enumerates a chunk's segment list ONCE, then awaits index RPCs
+    /// per segment. A combine that finishes inside that window repoints the cell
+    /// index at its destination segment and unpublishes the sources, so
+    /// `live_entries` calls the source copy dead and the walk never enumerates
+    /// the destination. The cell is derived by neither: its entry is never
+    /// checked, never inserted, and the store serves a scan short by exactly
+    /// those rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reconcile_walk_covers_cells_the_cleaner_moved_while_it_ran() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) = race_server(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_cleaner_race",
+            &dir,
+        )
+        .await;
+
+        for seq in 0..RACE_CELLS {
+            client.write_cell(race_cell(seq, 0)).await.unwrap().unwrap();
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        // The test drives the combines, so the background cleaner must not take
+        // the dead space first.
+        server.cleaner().pause();
+
+        // Dead space for the first collection: rewrite the even cells, whose
+        // entries the walk does not owe anything to. The price is unchanged, so
+        // this moves cells without touching the index the walk reads.
+        for seq in (0..RACE_CELLS).step_by(2) {
+            let mut cell = race_cell(seq, 1);
+            server.chunks().update_cell(&mut cell).unwrap();
+        }
+
+        // The crash shape: cells durable, the entries they imply absent.
+        let indexers = &server.indexer().unwrap().clients;
+        let mut keys: Vec<EntryKey> = Vec::new();
+        for chunk in &server.chunks().list {
+            for segment in chunk.segments() {
+                for entry in chunk.live_entries(&segment) {
+                    let EntryContent::Cell(header) = entry.content else {
+                        continue;
+                    };
+                    let mut derived = Vec::new();
+                    let mut ignored = ScrubReport::default();
+                    derive_into(chunk, header.id(), &mut derived, &mut ignored);
+                    keys.extend(
+                        derived
+                            .into_iter()
+                            .filter(|key| race_holed(key.id().sequence())),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            RACE_CELLS as usize,
+            "one ranged key and one enumeration key for each of the {} holed cells",
+            RACE_CELLS / 2
+        );
+        for key in &keys {
+            indexers.ranged_client.delete(key).await.unwrap();
+        }
+        let holed = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        assert_eq!(
+            holed.entries_missing,
+            keys.len() as u64,
+            "precondition: {holed}"
+        );
+
+        // Keep combining while the walk runs: rewrite a rotating slice of the
+        // even cells, which makes their segments dead-heavy again, then ask for
+        // a full collection, which accepts any segment with dead space.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer_stop = stop.clone();
+        let hammer_chunks = server.chunks().clone();
+        let hammer = tokio::task::spawn_blocking(move || {
+            let mut cleaned = 0usize;
+            let mut round = 0u64;
+            while !hammer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for k in 0..200u64 {
+                    let seq = 2 * ((round * 200 + k) % (RACE_CELLS / 2));
+                    let mut cell = race_cell(seq, round + 1);
+                    let _ = hammer_chunks.update_cell(&mut cell);
+                }
+                cleaned += hammer_chunks
+                    .list
+                    .iter()
+                    .filter(|chunk| crate::ram::cleaner::Cleaner::clean(chunk, true, true))
+                    .count();
+                round += 1;
+            }
+            cleaned
+        });
+
+        let repaired = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cleaned = hammer.await.unwrap();
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        println!(
+            "combine passes={cleaned} reconcile derived={} repaired={} verify={after}",
+            repaired.entries_derived, repaired.entries_repaired
+        );
+        assert!(
+            cleaned > 0,
+            "precondition: the combine never ran, so the walk was never raced"
+        );
+        assert_eq!(
+            after.entries_missing, 0,
+            "{} index entries are still missing after a reconcile that reported {} repairs. \
+             The walk enumerated the segment list once and the combine moved live cells into a \
+             segment that snapshot never contained: {after}",
+            after.entries_missing, repaired.entries_repaired
+        );
     }
 
     /// A typo must not silently mean "off". A store running for months in
