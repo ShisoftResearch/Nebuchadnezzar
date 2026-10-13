@@ -167,47 +167,36 @@ Worth a test if someone touches that path.
 
 ---
 
-## 7. `tests/storage_lock_process` has been dead since 2026-04-08
+## 7. RESOLVED: the storage-lock integration test passed an obsolete argument
 
-**Status: broken, cause known, not fixed.** `tests/storage_lock_process.rs`
-and `src/bin/neb_storage_lock_probe.rs`.
+**Status: resolved by the test correction on 2026-10-13.**
 
-Both tests in this binary fail, and have since 2026-04-08. Confirmed still
-failing on `.239` on 2026-08-26.
-
-**The defect.** The test spawns the probe with EIGHT arguments
-(`tests/storage_lock_process.rs:48-56`):
-
-```
-server_addr, group, database, backup, wal, undo, raft, HOLD_SECS
-```
-
-The probe parses SEVEN (`src/bin/neb_storage_lock_probe.rs:21-39`):
+**Read:** `src/bin/neb_storage_lock_probe.rs` accepts these arguments:
 
 ```
 server_addr, group_name, database_name, backup_storage, wal_storage,
 raft_storage, hold_secs
 ```
 
-There is no `undo` parameter on the probe side. So the probe reads
-`paths.undo` as its `raft_storage`, then reads `paths.raft` -- a path -- where
-`hold_secs` expects an integer, and exits before signalling ready. Both tests
-then fail at `wait_ready()`, at
-`storage_lock_process.rs:134:44` and `:171:44`.
+**Read:** The probe configures backup, WAL, and raft storage.
+`StorageDirectoryLocks::acquire_impl` locks those 3 storage directories.
+The test passed an unused undo path before the raft path.
+The probe then parsed the raft path as `hold_secs` and exited before `READY`.
+The correction removes the obsolete argument from both spawn sites and the unused fixture field.
+All existing assertions remain unchanged. No production code changes.
 
-**Why it stayed invisible for four months.** It is an integration binary.
-`cargo test --lib` -- the gate this project actually runs -- never builds or
-runs `tests/`, so a green lib suite says nothing about it. It is only visible
-to `cargo test` with no target filter, or `--test storage_lock_process`.
+**Observed:** The local baseline at Neb `ff29a266` failed both tests:
+0 passed, 2 failed, with exit status 64 and `invalid hold_secs`.
+The corrected target passed both tests: 2 passed, 0 failed in 8.38 s.
+Both runs used fresh temporary stores, a 24 GiB memory scope, and a 180 s timeout.
+Builds used the shared compile lock and an isolated target directory.
+Logs and source/binary identities are under
+`/mnt/ext/morpheus-fixes/storage-test-closure/`.
 
-**What would close it.** Decide which side is right. Either add an `undo`
-parameter to the probe in the correct position, or drop `.arg(&paths.undo)`
-from the spawn. The probe's own storage setup will say which one the storage
-lock actually needs; do not guess from the argument names.
-
-**Worth knowing generally:** whatever gate this project runs should include
-the integration binaries, or the next one to rot will also take months to
-notice.
+**Recommended final gate:** Include Neb's `--test storage_lock_process` target explicitly.
+Compile it with `cargo test --locked --test storage_lock_process --no-run` under the shared compile lock.
+Run its emitted test executable without the lock, with a bounded timeout in a 24 GiB memory scope.
+`cargo test --lib` does not run this integration target and cannot verify it.
 
 ---
 

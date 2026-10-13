@@ -13,7 +13,6 @@ mod tests {
         _root: TempDir,
         backup: PathBuf,
         wal: PathBuf,
-        undo: PathBuf,
         raft: PathBuf,
     }
 
@@ -23,7 +22,6 @@ mod tests {
             Self {
                 backup: root.path().join("backup"),
                 wal: root.path().join("wal"),
-                undo: root.path().join("undo"),
                 raft: root.path().join("raft"),
                 _root: root,
             }
@@ -51,7 +49,6 @@ mod tests {
                 .arg(database)
                 .arg(&paths.backup)
                 .arg(&paths.wal)
-                .arg(&paths.undo)
                 .arg(&paths.raft)
                 .arg(HOLD_SECS)
                 .stdout(Stdio::piped())
@@ -140,7 +137,6 @@ mod tests {
             .arg(database)
             .arg(&paths.backup)
             .arg(&paths.wal)
-            .arg(&paths.undo)
             .arg(&paths.raft)
             .arg("1")
             .stdout(Stdio::piped())
