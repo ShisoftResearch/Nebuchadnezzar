@@ -6,6 +6,7 @@
 //!   neb_perf_probe txn      --base DIR [--txns 20000] [--tasks 16,64] [--workers 4]
 //!   neb_perf_probe mix      --base DIR [--txns 20000] [--abort-every 10]
 //!   neb_perf_probe abortprof --base DIR [--txns 20000] [--tasks 1] [--decision abort|commit] [--op insert|update|delete]
+//!   neb_perf_probe plain    --base DIR [--ops 20000] [--threads 1]
 //!   neb_perf_probe heads    --base DIR [--ops 200000] [--threads 1,16]
 //!
 //! `populate` starts a fresh durable server (WAL, backup and raft directories
@@ -16,6 +17,8 @@
 //! lifecycle (prepare, apply, commit or abort, end) through a `DataManager`:
 //! sequential latency and concurrent throughput. `heads` claims and releases
 //! write heads from many threads with no WAL: the head pool's own cost.
+//! `plain` measures WAL append throughput and p50/p95/p99 latency for inserts
+//! and updates. Run it with `--threads 1` and `--threads 16`.
 //! Output is `METRIC <name> <value>` lines.
 
 use dovahkiin::types::custom_types::id::Id;
@@ -347,6 +350,60 @@ async fn txn_lifecycle(base: &str, txns: u64, task_counts: &[u64]) {
 
 /// Head acquire/release under contention, with no WAL and no cells: the
 /// claim, the per-entry ownership window and its release, nothing else.
+async fn plain_writes(base: &str, threads: u64, ops: u64) {
+    let addr = format!("127.0.0.1:{}", 47400 + std::process::id() % 100);
+    let server =
+        NebServer::new_from_opts(&options(base, false), &addr, "plain_probe", async |_| {})
+            .await
+            .expect("server start");
+    server.meta().schemas.register_internal_schema(schema());
+    for update in [false, true] {
+        let barrier = std::sync::Barrier::new(threads as usize);
+        let started = Instant::now();
+        let mut latencies = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let barrier = &barrier;
+                    let server = &server;
+                    scope.spawn(move || {
+                        let mut latencies = Vec::with_capacity(ops as usize);
+                        barrier.wait();
+                        for i in 0..ops {
+                            let index = thread * ops + i;
+                            let mut value = cell(index, index + u64::from(update));
+                            let start = Instant::now();
+                            if update {
+                                server.chunks().update_cell(&mut value)
+                            } else {
+                                server.chunks().write_cell(&mut value)
+                            }
+                            .expect("plain write");
+                            latencies.push(start.elapsed().as_nanos() as u64);
+                        }
+                        latencies
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("writer"))
+                .collect::<Vec<_>>()
+        });
+        let phase = if update { "update" } else { "insert" };
+        rate(&format!("plain_{phase}_t{threads}"), threads * ops, started);
+        latencies.sort_unstable();
+        for (name, percentile) in [("p50", 50usize), ("p95", 95), ("p99", 99)] {
+            let index = (latencies.len() - 1) * percentile / 100;
+            println!(
+                "METRIC plain_{phase}_t{threads}_{name}_us {:.3}",
+                latencies[index] as f64 / 1000.0
+            );
+        }
+    }
+    println!("METRIC plain_peak_rss_kb {}", peak_rss_kb());
+    server.shutdown().await;
+}
+
 fn heads(threads: u64, ops: u64) {
     let bytes = (threads * ops * 64) as usize;
     let size = (bytes + 64 * 1024 * 1024).next_power_of_two();
@@ -686,6 +743,15 @@ fn main() {
             let operation = arg(&args, "--op").unwrap_or_else(|| "insert".to_string());
             runtime.block_on(abort_profile(&base, txns, tasks, abort, &operation))
         }
+        Some("plain") => {
+            let ops = arg(&args, "--ops")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000);
+            let threads = arg(&args, "--threads")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            runtime.block_on(plain_writes(&base, threads, ops));
+        }
         Some("heads") => {
             let ops: u64 = arg(&args, "--ops")
                 .and_then(|v| v.parse().ok())
@@ -699,7 +765,7 @@ fn main() {
             }
         }
         _ => eprintln!(
-            "usage: neb_perf_probe <populate|recover|txn|mix|heads> --base DIR [--cells N] \
+            "usage: neb_perf_probe <populate|recover|txn|mix|plain|heads> --base DIR [--cells N] \
              [--txns N --tasks 16,64 --workers W] [--ops N --threads 1,16]"
         ),
     }
