@@ -847,6 +847,8 @@ impl BlockResidency {
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
     pub wal: Option<File>,
+    /// Length through the last complete frame.
+    wal_len: u64,
 }
 
 /// Reopens a segment's journal gate unless the archive actually sealed it.
@@ -929,6 +931,7 @@ impl Segment {
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
+                wal_len: 0,
             }),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
@@ -2480,6 +2483,13 @@ image, not an empty segment; archiving it would persist the damage.",
                 .create_wal_file(self.chunk_id, self.id, self.seq_id)?;
         }
 
+        if let Some(file) = &state.wal {
+            if state.wal_len == 0 {
+                state.wal_len = file.metadata()?.len();
+            }
+        }
+        let original_len = state.wal_len;
+        let mut new_len = original_len;
         if let Some(ref mut file) = state.wal {
             // Framed: the record carries the segment offset it belongs at and
             // a CRC over both. One write_all keeps the frame and its payload
@@ -2489,46 +2499,69 @@ image, not an empty segment; archiving it would persist the damage.",
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 crate::ram::wal_format::frame_record((addr - self.addr) as u64, data_block)
             };
-            file.write_all(&framed)?;
+            if let Err(error) = file.write_all(&framed) {
+                // Remove the refused frame before another append can follow it.
+                // A failed truncation closes this head instead.
+                if let Err(truncate_error) = file.set_len(original_len) {
+                    self.retire_tail();
+                    error!("WAL tail truncation failed after {error}: {truncate_error}");
+                }
+                return Err(error);
+            }
+            new_len += framed.len() as u64;
             WAL_BYTES.fetch_add(framed.len() as u64, Relaxed);
             WAL_WRITES.fetch_add(1, Relaxed);
-            // Transactions control their own sync at commit time
-            // For non-transactional writes, use group commit batching
-            if skip_sync {
-                // Transaction context: no sync, will be synced at commit
-                trace!(
-                    "WAL sync skipped for segment {} (transactional write, will sync at commit)",
-                    self.id
-                );
-                return Ok(());
-            }
+            if !skip_sync {
+                // Group commit for non-transactional writes. The timer path
+                // belongs to the WAL syncer thread — with ~63 segments absorbing
+                // an import, per-segment 10ms timers produced 6,302 fsyncs/s
+                // with every writer thread blocking inline on its own sync. Only
+                // the byte threshold remains inline, as backpressure against one
+                // segment accumulating unbounded unsynced bytes.
+                let written =
+                    self.wal_bytes_written.fetch_add(size as usize, Relaxed) + size as usize;
+                let bytes_written = written - self.wal_bytes_synced.load(Acquire);
 
-            // Group commit for non-transactional writes. The timer path
-            // belongs to the WAL syncer thread — with ~63 segments absorbing
-            // an import, per-segment 10ms timers produced 6,302 fsyncs/s
-            // with every writer thread blocking inline on its own sync. Only
-            // the byte threshold remains inline, as backpressure against one
-            // segment accumulating unbounded unsynced bytes.
-            let written = self.wal_bytes_written.fetch_add(size as usize, Relaxed) + size as usize;
-            let bytes_written = written - self.wal_bytes_synced.load(Acquire);
-
-            if bytes_written >= WAL_SYNC_BATCH_SIZE {
-                WAL_SYNCS.fetch_add(1, Relaxed);
-                file.sync_data()?;
-                self.wal_bytes_synced.fetch_max(written, Release);
-                trace!(
-                    "WAL synced inline for segment {} ({} bytes)",
-                    self.id,
-                    bytes_written
-                );
-            } else {
-                trace!(
+                if bytes_written >= WAL_SYNC_BATCH_SIZE {
+                    WAL_SYNCS.fetch_add(1, Relaxed);
+                    if let Err(error) = file.sync_data() {
+                        if let Err(truncate_error) = file.set_len(original_len) {
+                            self.retire_tail();
+                            error!("WAL tail truncation failed after {error}: {truncate_error}");
+                        }
+                        self.wal_bytes_written.fetch_sub(size as usize, Relaxed);
+                        return Err(error);
+                    }
+                    self.wal_bytes_synced.fetch_max(written, Release);
+                    trace!(
+                        "WAL synced inline for segment {} ({} bytes)",
+                        self.id,
+                        bytes_written
+                    );
+                } else {
+                    trace!(
                     "WAL write buffered for segment {} ({} bytes accumulated; syncer owns the timer)",
                     self.id,
                     bytes_written
                 );
+                }
             }
         }
+        state.wal_len = new_len;
+        Ok(())
+    }
+
+    pub(crate) fn wal_append_position(&self) -> u64 {
+        self.file_state.lock().wal_len
+    }
+
+    /// Remove decision records from a refused transaction's private tail.
+    pub(crate) fn truncate_wal_to(&self, position: u64) -> io::Result<()> {
+        let mut state = self.file_state.lock();
+        if let Some(file) = &state.wal {
+            file.set_len(position)?;
+        }
+        state.wal_len = position;
         Ok(())
     }
 

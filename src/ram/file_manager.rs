@@ -95,7 +95,12 @@ impl SegmentFileManager {
             let existing_len = file.metadata()?.len();
             if existing_len == 0 {
                 use std::io::Write;
-                file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))?;
+                if let Err(error) = file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))
+                {
+                    // This new file has no accepted records.
+                    std::fs::remove_file(&wal_path)?;
+                    return Err(error);
+                }
                 file.sync_data()?;
             } else {
                 // Appending framed records to an unframed log would leave one

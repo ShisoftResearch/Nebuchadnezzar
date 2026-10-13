@@ -171,6 +171,7 @@ pub enum DMCommitResult {
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum AbortResult {
+    WriteError(WriteError),
     CheckFailed(CheckError),
     Success(Option<Vec<RollbackFailure>>),
 }
@@ -183,6 +184,7 @@ pub struct LockReleaseFailure {
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum EndResult {
+    WriteError(WriteError),
     StoreFull(WriteError),
     CheckFailed(CheckError),
     SomeLocksNotReleased {

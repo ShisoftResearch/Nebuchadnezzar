@@ -58,6 +58,11 @@ pub struct WriteToChunkResult {
 pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
+    /// The WAL append failed. The write was not published.
+    IOError {
+        os_error: Option<i32>,
+        message: String,
+    },
     CellIsTooLarge(usize),
     CellAlreadyExisted,
     CellDoesNotExisted,
@@ -128,6 +133,19 @@ pub enum WriteError {
     /// would make that entry survive a crash the rest of the transaction does
     /// not.
     TransactionHeadUnavailable,
+}
+
+impl WriteError {
+    pub(crate) fn from_wal_io(error: std::io::Error) -> Self {
+        if error.raw_os_error() == Some(libc::ENOSPC) {
+            Self::CannotAllocateSpace
+        } else {
+            Self::IOError {
+                os_error: error.raw_os_error(),
+                message: error.to_string(),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -994,8 +1012,7 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
 ///
 /// Zeroing the version makes the abandoned image lose to every live version
 /// and every tombstone. The patch happens while the entry's `PendingEntry`
-/// is still alive, so the WAL append (which runs at its drop) carries the
-/// patched bytes.
+/// is still alive. The caller's explicit append carries the patched bytes.
 /// Abandon an appended image whose write lost its race.
 ///
 /// The bytes stay where they are -- the span is claimed and has to remain

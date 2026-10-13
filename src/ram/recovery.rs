@@ -3386,6 +3386,7 @@ mod tests {
                 .write_cell_to_chunk(&loser, &write_plan, &pending, loser.header.version)
                 .unwrap();
             crate::ram::cell::abandon_entry(result.addr);
+            pending.append().unwrap();
             result.addr
         };
         assert_eq!(
@@ -3695,6 +3696,7 @@ mod tests {
                 .write_cell_to_chunk(&ghost, &write_plan, &pending, ghost.header.version)
                 .unwrap();
             crate::ram::cell::abandon_entry(result.addr);
+            pending.append().unwrap();
             result.addr
         };
         let ghost_entry = entry_bytes_at(ghost_addr);
@@ -4492,6 +4494,7 @@ mod tests {
                     let filler = (remaining - 16) & !7;
                     let pending = chunk.try_acquire(filler as u32, false).expect("filler");
                     crate::ram::entry::stamp_reservation_padding(pending.addr, filler as u32);
+                    pending.append().unwrap();
                     drop(pending);
                     drop(scope);
                     // The caller is told this succeeded.

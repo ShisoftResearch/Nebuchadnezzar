@@ -36,6 +36,7 @@ pub fn cell_rw() {
     // first entry across the second allocation would force a second head
     // the store cannot provide. Production paths never overlap entries;
     // this test only did so by keeping them in scope for convenience.
+    pending_entry.append().unwrap();
     drop(pending_entry);
     {
         let (stored_cell, _) =

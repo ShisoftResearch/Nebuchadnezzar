@@ -531,12 +531,9 @@ impl DataManager {
                     // transaction read it, or its schema is unknown here) is
                     // refused like an insert: it would fail certification
                     // anyway, and "nothing to protect" is a check-then-act race.
-                    match self
-                        .chunks()
-                        .head_cell(&op.id)
-                        .ok()
-                        .and_then(|header| self.database_runtime.schemas().uid_of_vid(&header.schema))
-                    {
+                    match self.chunks().head_cell(&op.id).ok().and_then(|header| {
+                        self.database_runtime.schemas().uid_of_vid(&header.schema)
+                    }) {
                         Some(family) => fence.would_refuse(Some(family)),
                         None => true,
                     }
@@ -767,18 +764,21 @@ impl DataManager {
         txn: &mut Transaction,
         guarded_cell_ids: &[Id],
         cell_guards: &mut [parking_lot::MutexGuard<'_, CellMeta>],
-    ) -> Option<Vec<RollbackFailure>> {
+    ) -> Result<Option<Vec<RollbackFailure>>, WriteError> {
         debug!(
             ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
             txn.history.len(),
             tid
         );
         #[cfg(feature = "abort_profile")]
-        let rollback_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rollback);
+        let rollback_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rollback);
         let failures = self.rollback(&txn.history);
         for (id, history) in &txn.history {
             if failures.iter().all(|failure| failure.id != *id) {
-                let position = guarded_cell_ids.binary_search(id).expect("an applied cell has a metadata guard");
+                let position = guarded_cell_ids
+                    .binary_search(id)
+                    .expect("an applied cell has a metadata guard");
                 cell_guards[position].write = history.previous_write.clone();
             }
         }
@@ -789,7 +789,8 @@ impl DataManager {
         txn.state = TxnState::Aborted;
         let store = self.chunks().address_range();
         #[cfg(feature = "abort_profile")]
-        let _rewind_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rewind);
+        let _rewind_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rewind);
         let ended = match failures {
             None => crate::ram::chunk::rewind_transaction_writes(tid, &store),
             Some(_) => crate::ram::chunk::retire_transaction_leases(tid, &store),
@@ -799,8 +800,9 @@ impl DataManager {
                 "transaction {:?} aborted but its write heads did not end cleanly: {}",
                 tid, error
             );
+            return Err(error.into_write_error());
         }
-        failures
+        Ok(failures)
     }
 
     /// The abort decision, with the transaction lock held.
@@ -835,6 +837,7 @@ impl DataManager {
                      end cleanly: {}",
                     tid, error
                 );
+                return AbortResult::WriteError(error.into_write_error());
             }
             drop(guards_to_drop);
             return AbortResult::Success(None);
@@ -863,10 +866,14 @@ impl DataManager {
         // Keep segment references and metadata guards alive throughout rollback so the owner
         // cannot be reclaimed between validation and the storage mutations.
         let guards_to_drop = std::mem::take(&mut txn.segment_guards);
-        let rollback_failures = self.rollback_and_rewind(tid, txn, &guarded_cell_ids, &mut cell_guards);
+        let rollback_failures =
+            self.rollback_and_rewind(tid, txn, &guarded_cell_ids, &mut cell_guards);
         drop(cell_guards);
         drop(guards_to_drop);
-        AbortResult::Success(rollback_failures)
+        match rollback_failures {
+            Ok(failures) => AbortResult::Success(failures),
+            Err(error) => AbortResult::WriteError(error),
+        }
     }
 
     /// One pass of the participant's lease sweeper.
@@ -949,8 +956,8 @@ impl DataManager {
     /// written after that would commit nothing -- while a ram layer that finds
     /// no leases answers `Ok`. So a transaction that is gone, or no longer in
     /// the applied-and-undecided state, is refused here and the coordinator
-    /// is not told it committed. `decided_commit` is set before the first
-    /// record is written, which from then on keeps every abort path away.
+    /// is not told it committed. A failed append retracts the decision records
+    /// and rolls the prepared writes back before the metadata locks are released.
     fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), EndResult> {
         let Some(txn_lock) = self.find_transaction(tid) else {
             return Err(EndResult::CheckFailed(CheckError::CannotEnd));
@@ -959,11 +966,23 @@ impl DataManager {
         if txn.state != TxnState::Committed {
             return Err(EndResult::CheckFailed(CheckError::CannotEnd));
         }
-        txn.decided_commit = true;
         let store = self.chunks().address_range();
-        self.chunks()
-            .commit_transaction_brackets(tid)
-            .map_err(EndResult::StoreFull)?;
+        if let Err(error) = self.chunks().commit_transaction_brackets(tid) {
+            // Metadata locks still belong to this participant.
+            // Restore the prepared writes before readers can acquire them.
+            let rollback = self.abort_locked(tid, &mut txn);
+            error!(
+                "refused COMMIT for {:?}: {:?}; rollback: {:?}",
+                tid, error, rollback
+            );
+            return Err(match error {
+                WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
+                    EndResult::StoreFull(error)
+                }
+                _ => EndResult::WriteError(error),
+            });
+        }
+        txn.decided_commit = true;
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -1642,8 +1661,10 @@ impl DataManager {
 
                             match self.chunks().write_cell(&mut cell) {
                                 Ok(header) => {
-                                    txn.history
-                                        .insert(cell_id, CellHistory::new(0, header.version, write_ts));
+                                    txn.history.insert(
+                                        cell_id,
+                                        CellHistory::new(0, header.version, write_ts),
+                                    );
                                     meta.write = effective_ts.clone();
                                     #[cfg(test)]
                                     if take_apply_panic_hook(tid, &cell_id) {
@@ -1675,20 +1696,20 @@ impl DataManager {
                                 continue;
                             }
 
-                            let (cell_addr, guard) = match self
-                                .capture_transaction_version(cell_id, expected_version)
-                            {
-                                Ok(source) => source,
-                                Err(error) => {
-                                    write_error = Some((*cell_id, error));
-                                    break;
-                                }
-                            };
+                            let (cell_addr, guard) =
+                                match self.capture_transaction_version(cell_id, expected_version) {
+                                    Ok(source) => source,
+                                    Err(error) => {
+                                        write_error = Some((*cell_id, error));
+                                        break;
+                                    }
+                                };
                             match self.chunks().apply_transaction_remove(cell_id, |cell| {
                                 cell.header.version == expected_version
                             }) {
                                 Ok(()) => {
-                                    txn.history.insert(*cell_id, CellHistory::new(cell_addr, 0, write_ts));
+                                    txn.history
+                                        .insert(*cell_id, CellHistory::new(cell_addr, 0, write_ts));
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
                                 }
@@ -1741,7 +1762,11 @@ impl DataManager {
                                 Ok(updated_cell) => {
                                     txn.history.insert(
                                         cell_id,
-                                        CellHistory::new(cell_addr, updated_cell.header.version, write_ts),
+                                        CellHistory::new(
+                                            cell_addr,
+                                            updated_cell.header.version,
+                                            write_ts,
+                                        ),
                                     );
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
@@ -1766,7 +1791,8 @@ impl DataManager {
                      the panic continues",
                     tid
                 );
-                let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
+                let _ =
+                    self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
                 drop(crate::ram::chunk::take_transactional_segments());
                 std::panic::resume_unwind(panic);
             }
@@ -2579,14 +2605,60 @@ mod tests {
         let older = server.hlc.now();
         manager.get_or_create_transaction(&older);
         let newer = server.hlc.now();
-        let op = PrepareOp { id, expectation: CellExpectation::Present(version), intent: PrepareIntent::Write };
-        assert_eq!(prepare_ops_local(&manager, 0, &newer, vec![op.clone()]).await, DMPrepareResult::Success);
-        assert_eq!(commit_ops_local(&manager, &newer, vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "aborted"))]).await, DMCommitResult::Success);
+        let op = PrepareOp {
+            id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 0, &newer, vec![op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &newer,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    id,
+                    50,
+                    "aborted"
+                ))]
+            )
+            .await,
+            DMCommitResult::Success
+        );
         abort_and_end_local(&manager, &newer).await;
-        assert_eq!(prepare_ops_local(&manager, 0, &older, vec![op]).await, DMPrepareResult::Success);
-        assert_eq!(commit_ops_local(&manager, &older, vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 15, "older"))]).await, DMCommitResult::Success);
-        assert_eq!(<DataManager as Service>::end(&manager, older, older).await.payload, EndResult::Success);
-        assert_eq!(runtime.chunks().read_cell(&id).unwrap().data["score"].u64().copied(), Some(15));
+        assert_eq!(
+            prepare_ops_local(&manager, 0, &older, vec![op]).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &older,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    id,
+                    15,
+                    "older"
+                ))]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, older, older)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().data["score"]
+                .u64()
+                .copied(),
+            Some(15)
+        );
         server.shutdown().await;
     }
 
@@ -2635,7 +2707,8 @@ mod tests {
                 } else {
                     CommitOp::Update(counter_cell(schema_id, id, 50, "new"))
                 };
-                let result = handle.block_on(commit_ops_local(&writer_manager, &writer_tid, vec![op]));
+                let result =
+                    handle.block_on(commit_ops_local(&writer_manager, &writer_tid, vec![op]));
                 done_tx.send(result).unwrap();
             });
             started_rx
@@ -2705,7 +2778,8 @@ mod tests {
         } else {
             default_fields()
         };
-        let mut schema = Schema::new_with_id(992, "memory_rollback_index", None, fields, false, false);
+        let mut schema =
+            Schema::new_with_id(992, "memory_rollback_index", None, fields, false, false);
         schema.is_scannable = !nullable;
         runtime
             .meta()
@@ -3330,6 +3404,502 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// A store whose chunk can spare a head (so transactional writes really
+    /// are bracketed) and whose WAL lives in `wal_dir`.
+    async fn start_wal_lease_test_server(
+        address: &str,
+        group: &str,
+        wal_dir: &std::path::Path,
+    ) -> Arc<NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 4 * SEGMENT_SIZE,
+                db_size: 4 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: Some(wal_dir.to_string_lossy().into_owned()),
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Make every directory under `root` unwritable, so no WAL file can be
+    /// created in it. This is the shape a full WAL filesystem leaves behind:
+    /// the log for a segment cannot be opened, so its records cannot be
+    /// journaled. Returns the directories it froze, for `thaw_wal_dir`.
+    fn freeze_wal_dir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut frozen = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        stack.push(entry.path());
+                    }
+                }
+            }
+            if std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).is_ok() {
+                frozen.push(dir);
+            }
+        }
+        frozen
+    }
+
+    fn thaw_wal_dir(frozen: &[std::path::PathBuf]) {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in frozen {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Prepare `id` as a remove of a cell at `version`: the participant's
+    /// state right before the decision.
+    fn prepare_local_remove(manager: &Arc<DataManager>, tid: &TxnId, id: Id, version: u64) {
+        let owner = TxnPriority::new(tid.clone(), 0);
+        let txn_lock = manager.get_or_create_transaction(tid);
+        let mut txn = txn_lock.lock();
+        txn.state = TxnState::Prepared;
+        txn.certified = [(
+            id,
+            PrepareOp {
+                id,
+                expectation: CellExpectation::Present(version),
+                intent: PrepareIntent::Write,
+            },
+        )]
+        .into_iter()
+        .collect();
+        txn.affected_cells = vec![id];
+        txn.coordinator_id = Some(0);
+        txn.history.clear();
+        txn.last_activity = get_time();
+        drop(txn);
+        let lock_time = get_time();
+        let meta = manager.cell_meta_mutex(&id);
+        let mut meta = meta.lock();
+        meta.owner = Some(owner.clone());
+        meta.lock_acquired_at = Some(lock_time);
+    }
+
+    /// Ledger #26b: a refused delete must preserve an acknowledged row.
+    /// The test closes WAL descriptors and refuses the next append at prepare.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_commit_decision_leaves_no_applied_write_behind() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_wal_full_decision";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+
+        // 1. An acknowledged create: the row is there for readers.
+        let cell = Id::allocated(0, 0, 9200);
+        let mut created = counter_cell(schema.vid.get(), cell, 1, "acked");
+        runtime
+            .chunks()
+            .write_cell(&mut created)
+            .expect("create the acknowledged row before refusing appends");
+        let version = runtime
+            .chunks()
+            .read_cell(&cell)
+            .expect("the acknowledged row is readable")
+            .header
+            .version;
+
+        // Close the descriptors so the refused transaction must reopen the WAL.
+        for chunk in &runtime.chunks().list {
+            for segment in chunk.segments() {
+                segment.file_state.lock().wal.take();
+            }
+        }
+        let frozen = freeze_wal_dir(wal.path());
+        use std::os::unix::fs::PermissionsExt;
+        for dir in &frozen {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                if entry.path().is_file() {
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+            }
+        }
+
+        // 2. Refuse the delete at prepare because its entry cannot reach the WAL.
+        let tid = test_hlc(1, 9200);
+        prepare_local_remove(&manager, &tid, cell, version);
+        let applied = commit_ops_local(&manager, &tid, vec![CommitOp::Remove(cell)]).await;
+        assert!(
+            matches!(
+                applied,
+                DMCommitResult::WriteError(
+                    _,
+                    WriteError::IOError {
+                        os_error: Some(libc::EACCES),
+                        ..
+                    }
+                )
+            ),
+            "the delete must be refused or applied, not fail with something else: {applied:?}"
+        );
+        if applied == DMCommitResult::Success {
+            let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+                .await
+                .payload;
+            thaw_wal_dir(&frozen);
+            assert_eq!(
+                end,
+                EndResult::StoreFull(WriteError::CannotAllocateSpace),
+                "the decision is refused: no durable COMMIT"
+            );
+        } else {
+            thaw_wal_dir(&frozen);
+        }
+
+        // 3. The client was told the delete failed. The row it acknowledged
+        //    must therefore still be readable.
+        assert!(
+            runtime.chunks().read_cell(&cell).is_ok(),
+            "a refused commit must not leave its write visible: the acknowledged \
+             row vanished while the server runs"
+        );
+        server.shutdown().await;
+    }
+
+    fn refuse_wal_appends(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        root: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        for chunk in &runtime.chunks().list {
+            for segment in chunk.segments() {
+                segment.file_state.lock().wal.take();
+            }
+        }
+        let frozen = freeze_wal_dir(root);
+        for dir in &frozen {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                if entry.path().is_file() {
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o400))
+                        .unwrap();
+                }
+            }
+        }
+        frozen
+    }
+
+    async fn check_refused_cell_append(path: &str) {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, path, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let id = Id::allocated(0, 0, 9201);
+        let absent = Id::allocated(0, 0, 9202);
+        let mut original = counter_cell(schema.vid.get(), id, 1, "acked");
+        runtime.chunks().write_cell(&mut original).unwrap();
+        let before = runtime.chunks().read_cell(&id).unwrap().to_owned();
+        let frozen = refuse_wal_appends(&runtime, wal.path());
+        let target = if matches!(
+            path,
+            "insert" | "upsert_insert" | "guard_insert" | "index_page"
+        ) {
+            absent
+        } else {
+            id
+        };
+        let mut changed = counter_cell(schema.vid.get(), target, 2, "refused");
+        if path == "index_page" {
+            let page_schema = crate::index::ranged::tree::btree::page_schema();
+            runtime
+                .schemas()
+                .register_internal_schema(page_schema.clone());
+            let mut data = OwnedMap::new();
+            data.insert(&"next".to_string(), OwnedValue::Id(Id::unit_id()));
+            data.insert(&"prev".to_string(), OwnedValue::Id(Id::unit_id()));
+            data.insert(&"keys".to_string(), OwnedValue::Array(Vec::new()));
+            changed = OwnedCell::new_with_id(page_schema.vid, &absent, OwnedValue::Map(data));
+        }
+        let chunks = runtime.chunks();
+        let result = match path {
+            "insert" => chunks.write_cell(&mut changed).map(|_| ()),
+            "update" => chunks.update_cell(&mut changed).map(|_| ()),
+            "upsert_insert" | "upsert_update" => chunks.upsert_cell(&mut changed).map(|_| ()),
+            "update_by" => chunks
+                .update_cell_by(&id, |_| Some(changed.clone()))
+                .map(|_| ()),
+            "remove" => chunks.remove_cell(&id),
+            "remove_by" => chunks.remove_cell_by(&id, |_| true),
+            "migration_remove" => chunks.remove_cell_keeping_indices(&id),
+            "guard_update" => chunks.list[0]
+                .lock_or_insert_cell(id.bits())
+                .update_cell(&mut changed)
+                .map(|_| ()),
+            "guard_insert" | "guard_upsert" => chunks.list[0]
+                .lock_or_insert_cell(target.bits())
+                .upsert_cell(&mut changed)
+                .map(|_| ()),
+            "index_page" => chunks.list[0]
+                .upsert_run(&[changed.clone()])
+                .remove(0)
+                .map(|_| ()),
+            "run" => chunks.list[0]
+                .upsert_run(&[
+                    changed.clone(),
+                    counter_cell(schema.vid.get(), absent, 3, "later"),
+                ])
+                .remove(0)
+                .map(|_| ()),
+            _ => panic!("unknown path {path}"),
+        };
+        thaw_wal_dir(&frozen);
+        assert!(
+            matches!(
+                result,
+                Err(WriteError::IOError {
+                    os_error: Some(libc::EACCES),
+                    ..
+                })
+            ),
+            "{path}: {result:?}"
+        );
+        let after = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(after.header.version, before.header.version, "{path}");
+        assert_eq!(after.data, before.data, "{path}");
+        assert!(
+            chunks.read_cell(&absent).is_err(),
+            "{path}: refused insert became visible"
+        );
+        server.shutdown().await;
+    }
+
+    macro_rules! refused_append_test {
+        ($name:ident, $path:literal) => {
+            #[tokio::test(flavor = "multi_thread")]
+            async fn $name() {
+                check_refused_cell_append($path).await;
+            }
+        };
+    }
+    refused_append_test!(wal_append_refuses_plain_insert, "insert");
+    refused_append_test!(wal_append_refuses_plain_update, "update");
+    refused_append_test!(wal_append_refuses_upsert_insert, "upsert_insert");
+    refused_append_test!(wal_append_refuses_upsert_update, "upsert_update");
+    refused_append_test!(wal_append_refuses_update_by, "update_by");
+    refused_append_test!(wal_append_refuses_plain_remove, "remove");
+    refused_append_test!(wal_append_refuses_conditional_remove, "remove_by");
+    refused_append_test!(wal_append_refuses_migration_remove, "migration_remove");
+    refused_append_test!(wal_append_refuses_guard_update, "guard_update");
+    refused_append_test!(wal_append_refuses_guard_insert, "guard_insert");
+    refused_append_test!(wal_append_refuses_guard_upsert, "guard_upsert");
+    refused_append_test!(wal_append_refuses_run, "run");
+    refused_append_test!(wal_append_refuses_index_page, "index_page");
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_append_refuses_decision_and_restores_prepared_remove() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "wal_append_refused_decision";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, &address, group).await;
+        let id = Id::allocated(0, 0, 9203);
+        let mut original = counter_cell(schema.vid.get(), id, 1, "acked");
+        runtime.chunks().write_cell(&mut original).unwrap();
+        let version = original.header.version;
+        let tid = test_hlc(1, 9203);
+        prepare_local_remove(&manager, &tid, id, version);
+        assert_eq!(
+            commit_ops_local(&manager, &tid, vec![CommitOp::Remove(id)]).await,
+            DMCommitResult::Success
+        );
+        let frozen = refuse_wal_appends(&runtime, wal.path());
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+            .await
+            .payload;
+        thaw_wal_dir(&frozen);
+        assert!(
+            matches!(
+                result,
+                EndResult::WriteError(WriteError::IOError {
+                    os_error: Some(libc::EACCES),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let restored = runtime.chunks().read_cell(&id).unwrap();
+        assert_eq!(restored.header.version, version);
+        assert_eq!(restored.data, original.data.shared());
+        drop(restored);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_append_refuses_abort_padding_but_restores_memory() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "wal_append_refused_abort";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, &address, group).await;
+        let id = Id::allocated(0, 0, 9204);
+        let tid = test_hlc(1, 9204);
+        apply_inserts(&manager, &schema, &tid, &[id]).await;
+        let frozen = refuse_wal_appends(&runtime, wal.path());
+        let result = <DataManager as Service>::abort(&manager, tid.clone(), tid)
+            .await
+            .payload;
+        thaw_wal_dir(&frozen);
+        assert!(
+            matches!(
+                result,
+                AbortResult::WriteError(WriteError::IOError {
+                    os_error: Some(libc::EACCES),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(runtime.chunks().read_cell(&id).is_err());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_append_refuses_partial_decision_across_chunks() {
+        use std::os::unix::fs::PermissionsExt;
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "wal_append_partial_decision";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 4 * SEGMENT_SIZE,
+                db_size: 8 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: Some(wal.path().to_string_lossy().into_owned()),
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let runtime = server.current_database();
+        assert_eq!(runtime.chunks().list.len(), 2);
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, &address, group).await;
+        let ids = [Id::allocated(0, 0, 9205), Id::allocated(1, 0, 9206)];
+        let mut originals = Vec::new();
+        for id in ids {
+            let mut cell = counter_cell(schema.vid.get(), id, 1, "acked");
+            runtime.chunks().write_cell(&mut cell).unwrap();
+            originals.push(cell);
+        }
+        let tid = test_hlc(1, 9205);
+        for original in &originals {
+            prepare_local_remove(&manager, &tid, original.id(), original.header.version);
+        }
+        {
+            let lock = manager.find_transaction(&tid).unwrap();
+            let mut txn = lock.lock();
+            txn.certified = originals
+                .iter()
+                .map(|cell| {
+                    (
+                        cell.id(),
+                        PrepareOp {
+                            id: cell.id(),
+                            expectation: CellExpectation::Present(cell.header.version),
+                            intent: PrepareIntent::Write,
+                        },
+                    )
+                })
+                .collect();
+            txn.affected_cells = ids.to_vec();
+        }
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                ids.into_iter().map(CommitOp::Remove).collect()
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let parts =
+            crate::ram::chunk::transaction_leased_segments(&tid, &runtime.chunks().address_range());
+        assert_eq!(parts.len(), 2);
+        let mut checkpoints = Vec::new();
+        for part in &parts {
+            let path = part
+                .file_state
+                .lock()
+                .manager
+                .wal_path(part.chunk_id, part.id, part.seq_id)
+                .unwrap();
+            checkpoints.push((
+                part.chunk_id,
+                path.clone(),
+                std::fs::metadata(&path).unwrap().len(),
+            ));
+            if part.chunk_id == 1 {
+                part.file_state.lock().wal.take();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            }
+        }
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+            .await
+            .payload;
+        assert!(
+            matches!(
+                result,
+                EndResult::WriteError(WriteError::IOError {
+                    os_error: Some(libc::EACCES),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        for original in &originals {
+            let restored = runtime
+                .chunks()
+                .read_cell(&original.id())
+                .unwrap()
+                .to_owned();
+            assert_eq!(restored.header.version, original.header.version);
+            assert_eq!(restored.data, original.data);
+        }
+        for (chunk_id, path, before_len) in checkpoints {
+            if chunk_id == 0 {
+                // The rollback leaves one framed PADDING header after the entries.
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), before_len + 20 + 8);
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for part in parts {
+            assert!(!part.bracket_is_committed());
+        }
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_a_stale_present_version() {
         let _ = env_logger::try_init();
@@ -3500,7 +4070,10 @@ mod tests {
             .payload;
         assert_eq!(end, EndResult::Success);
 
-        let hold = engaging.await.unwrap().expect("engages once the writer is done");
+        let hold = engaging
+            .await
+            .unwrap()
+            .expect("engages once the writer is done");
         let stored = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*stored.data["score"].u64().unwrap(), 2);
         drop(hold);
@@ -3534,7 +4107,10 @@ mod tests {
             DMPrepareResult::Success
         );
         let err = runtime
-            .engage_write_fence([schema.uid].into_iter().collect(), Duration::from_millis(100))
+            .engage_write_fence(
+                [schema.uid].into_iter().collect(),
+                Duration::from_millis(100),
+            )
             .await
             .err()
             .expect("must time out");
@@ -6133,6 +6709,16 @@ impl Service for DataManager {
             )
         };
 
+        if txn_state == TxnState::Committed {
+            if let Err(reason) = self.close_committed_brackets(&tid) {
+                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
+                self.record_decision(&tid, TxnOutcome::Aborted);
+                self.wipe_out_transaction(&tid);
+                self.cleanup_signal.store(true, Relaxed);
+                return self.response_with(reason);
+            }
+        }
+
         // Attempt lock release with retries
         let mut retry_attempt = 0;
         let mut lock_release_result = None;
@@ -6201,42 +6787,8 @@ impl Service for DataManager {
         async move {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard = phase_guard;
-            // The transaction keeps its old versions referenced through the decision.
-            // A failed close keeps those references for a later retry.
-            // The bracket closes HERE, with the decision.
-            //
-            // This is where a transaction is actually committed or aborted;
-            // the misleadingly named `commit` above runs in the PREPARE phase
-            // and only makes the ENTRIES durable. Writing the COMMIT there
-            // would make the participant recoverable-as-committed before
-            // anyone decided to commit -- and an abort that then could not
-            // physically rewind (a sealed segment) would leave that COMMIT
-            // standing, installing a transaction that was explicitly
-            // refused.
-            //
-            // So a durable COMMIT now means exactly what 2PC needs it to
-            // mean: this participant was told to commit. A participant that
-            // crashes before its `end` arrives has no COMMIT, and recovery
-            // discards its bracket -- the presumed-abort outcome, which is
-            // safe on its own only while no OTHER participant has committed.
-            // Closing that last gap needs the coordinator's decision to be
-            // durable, or the participant set to be resolvable; both are
-            // Phase 6 and neither is fixed by moving this write.
-            if txn_state == TxnState::Committed {
-                if let Err(reason) = self.close_committed_brackets(&tid) {
-                    // Refusing is the honest answer: without a durable COMMIT
-                    // the next restart discards this transaction, so telling
-                    // the coordinator "ended" would be telling it something
-                    // recovery will contradict.
-                    error!(
-                        "transaction {:?} could not close its bracket at the decision: {:?}",
-                        tid, reason
-                    );
-                    self.cleanup_signal.store(true, Relaxed);
-                    return self.response_with(reason).await;
-                }
-            }
-
+            // The decision completed before lock release. Old versions stayed
+            // referenced through the append result and any required rollback.
             // Recorded only once the outcome is real: for a commit that means
             // after the bracket closed, because a failed close is refused
             // above and this site is then NOT committed.
