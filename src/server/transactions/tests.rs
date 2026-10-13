@@ -703,6 +703,7 @@ async fn commit_refused_by_an_unwritable_wal_keeps_its_type() {
     data_map.insert(&String::from("name"), OwnedValue::String(String::from("wal-full")));
     data_map.insert(&String::from("score"), OwnedValue::U64(7));
     let cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
+    let cell_id = cell.id();
     assert!(matches!(
         txn.write(txn_id.to_owned(), cell).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
@@ -716,21 +717,15 @@ async fn commit_refused_by_an_unwritable_wal_keeps_its_type() {
     }
     std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o555)).unwrap();
     let prepared = txn.prepare(txn_id.to_owned()).await.unwrap();
-    assert_eq!(
-        prepared,
-        Ok(TMPrepareResult::Success),
-        "prepare makes the entries durable"
-    );
-    let end = txn.commit(txn_id.to_owned()).await.unwrap().unwrap();
     std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
     for entry in std::fs::read_dir(&wal).unwrap().flatten() {
         std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
     }
-    // Required: the refused commit names the resource that ran out, so the
-    // caller can answer 507 store_full rather than 500. Observed today: the
-    // generic CannotEnd, because the DM stringified the WriteError.
-    assert!(
-        matches!(end, EndResult::StoreFull(WriteError::CannotAllocateSpace)),
-        "the commit refusal did not preserve CannotAllocateSpace: {end:?}"
-    );
+    assert!(matches!(
+        prepared,
+        Ok(TMPrepareResult::DMCommitError(DMCommitResult::WriteError(
+            _, WriteError::IOError { os_error: Some(libc::EACCES), .. },
+        )))
+    ), "the WAL refusal must reach prepare with its type: {prepared:?}");
+    assert!(server.chunks().read_cell(&cell_id).is_err());
 }

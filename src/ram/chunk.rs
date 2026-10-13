@@ -49,7 +49,7 @@ pub static WRITE_STATS_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ALLOC_SPIN_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_DRAIN_NANOS: AtomicU64 = AtomicU64::new(0);
-/// Entries whose WAL journal failed at PendingEntry drop (sealed underneath).
+/// Entries whose explicit WAL append failed.
 pub static WAL_JOURNAL_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Allocation refusals because the chunk had no room left.
 ///
@@ -602,6 +602,7 @@ pub enum LeaseExitError {
         chunk_id: usize,
         segment_id: u64,
         reason: String,
+        write_error: WriteError,
     },
     /// A rewind was asked for a bracket that already carries its COMMIT. The
     /// span is left as it is: padding over a committed bracket loses a
@@ -619,6 +620,7 @@ impl std::fmt::Display for LeaseExitError {
                 chunk_id,
                 segment_id,
                 reason,
+                ..
             } => write!(
                 f,
                 "could not rewind the aborted span in segment {segment_id} (chunk {chunk_id}): \
@@ -637,6 +639,18 @@ impl std::fmt::Display for LeaseExitError {
 }
 
 impl std::error::Error for LeaseExitError {}
+
+impl LeaseExitError {
+    pub(crate) fn into_write_error(self) -> WriteError {
+        match self {
+            Self::RewindFailed { write_error, .. } => write_error,
+            error => WriteError::IOError {
+                os_error: None,
+                message: error.to_string(),
+            },
+        }
+    }
+}
 
 /// How a transaction's leases end.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -721,6 +735,7 @@ fn end_lease(
                         chunk_id,
                         segment_id: seg.id,
                         reason: error.to_string(),
+                        write_error: WriteError::from_wal_io(error),
                     });
                 }
             }
@@ -1877,7 +1892,7 @@ impl Chunk {
                          {:?}: {}. The commit FAILS.",
                         self.id, head.id, txn, error
                     );
-                    return Err(WriteError::CannotAllocateSpace);
+                    return Err(WriteError::from_wal_io(error));
                 }
             }
         }
@@ -1887,10 +1902,7 @@ impl Chunk {
     /// Write `content` as a COMMIT behind the transaction's entries in `head`
     /// and journal it, reporting the journal's outcome.
     ///
-    /// Not through `PendingEntry`: its drop logs a failed journal write and
-    /// carries on, which is right for an entry whose caller has nothing
-    /// better to do, and wrong for the one record that decides whether a
-    /// transaction happened. `Ok(false)` means no room (nothing written).
+    /// The caller receives the append result. `Ok(false)` means no room.
     fn place_commit(head: &AArc<Segment>, content: &[u8]) -> io::Result<bool> {
         let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
         if !head.incr_references() {
@@ -1972,7 +1984,7 @@ impl Chunk {
                 );
             },
         );
-        drop(pending);
+        pending.append()?;
         Ok(())
     }
 
@@ -2073,6 +2085,7 @@ impl Chunk {
                     size,
                     skip_sync: true,
                     leased: true,
+                    journaled: std::cell::Cell::new(false),
                 })
             }
             None => {
@@ -2294,9 +2307,7 @@ impl Chunk {
             // The claim could not take a lease -- the head was being
             // reclaimed underneath it, the chunk could no longer spare it, or
             // the transaction was revoked. Without a lease there is no bracket
-            // to open: writing a BEGIN nobody owns would leave a marker with
-            // no COMMIT and make ordinary entries after it look
-            // transactional. The claimed span is journaled as padding.
+            // to open. Cancel the reservation before another writer uses the head.
             drop(pending);
             return Ok(false);
         }
@@ -2324,7 +2335,7 @@ impl Chunk {
                 self.id, pending.seg.id
             );
         }
-        // Dropping it journals the BEGIN, exactly like any other entry.
+        pending.append()?;
         drop(pending);
         Ok(true)
     }
@@ -2466,6 +2477,7 @@ impl Chunk {
                             size,
                             skip_sync: is_in_transaction(),
                             leased,
+                            journaled: std::cell::Cell::new(false),
                         });
                     }
                     // No space in this segment: give everything back and
@@ -3202,6 +3214,10 @@ impl Chunk {
                     cell.header.id.bits(),
                 );
 
+                if let Err(error) = pending_entry.append() {
+                    guard.remove();
+                    return Err(error);
+                }
                 *guard = cell_loc;
                 drop(guard);
                 self.slot_bytes
@@ -3281,6 +3297,7 @@ impl Chunk {
             } else {
                 0
             };
+            pending_entry.append()?;
             cell_guard.set_ptr(new_cell_loc);
             drop(cell_guard);
             self.slot_bytes.add(hash, write_result.content_length);
@@ -3293,18 +3310,6 @@ impl Chunk {
             cell.header.timestamp = write_result.new_timestamp;
             cell.header.schema = write_result.new_schema;
         } else {
-            // Optimistic update will remove the new inserted one
-            let write_result = self.write_cell_to_chunk(
-                cell,
-                &write_plan,
-                &pending_entry,
-                cell.header.version,
-            )?;
-            let new_cell_loc = write_result.addr;
-            // The image carries `old_version + 1`: recovery would pick it
-            // over the tombstone of a deleted cell and resurrect the data.
-            abandon_entry(new_cell_loc);
-            self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
         Ok(cell.header)
@@ -3389,14 +3394,13 @@ impl Chunk {
                 // line; a new one keeps what the caller set, which is how a
                 // migration lands a cell on the version it had.
                 let t_index = std::time::Instant::now();
-                let existing = CellGuard::for_write(hash, true, self);
+                let mut guard = self.lock_or_insert_cell(hash);
                 WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                let (old_version, old_loc) = match &existing {
-                    Some(guard) => {
-                        let loc = guard.get_ptr();
-                        (cell_version_from_chunk_raw(loc).unwrap_or(0), Some(loc))
-                    }
-                    None => (self.create_version(&cells[j]), None),
+                let loc = guard.get_ptr();
+                let (old_version, old_loc) = if loc == 0 {
+                    (self.create_version(&cells[j]), None)
+                } else {
+                    (cell_version_from_chunk_raw(loc).unwrap_or(0), Some(loc))
                 };
 
                 let entry_addr = addr;
@@ -3404,62 +3408,38 @@ impl Chunk {
                 let t_copy = std::time::Instant::now();
                 let encoded = cells[j].write_to_addr(&plans[j], entry_addr, old_version);
                 WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                // Journalled per entry, matching `PendingEntry`; see the note
-                // on `PendingRun::journal` for why it is not coalesced.
-                if run.journal(entry_addr, sizes[j]).is_err() {
-                    results.push(Err(WriteError::CannotAllocateSpace));
-                    continue;
-                }
                 let write_result = match encoded {
                     Ok(result) => result,
-                    Err(e) => {
-                        results.push(Err(e));
-                        continue;
+                    Err(error) => {
+                        results.extend((j..cells.len()).map(|_| Err(error.clone())));
+                        return results;
                     }
                 };
-
-                match existing {
-                    Some(mut guard) => {
-                        let old_indices = guard.old_index_res(&*plans[j].schema).ok().flatten();
-                        guard.set_ptr(write_result.addr);
-                        drop(guard);
-                        self.slot_bytes.add(hash, write_result.content_length);
-                        if let Some(loc) = old_loc.filter(|loc| *loc != 0) {
-                            let old_len = Entry::decode_from(loc, |_, _| {}).0.content_length;
-                            self.slot_bytes.sub(hash, old_len);
-                        }
-                        self.ensure_indices_with_res(&cells[j], old_indices, &*plans[j].schema);
-                        if let Some(loc) = old_loc.filter(|loc| *loc != 0) {
-                            self.mark_dead_entry_with_cell(loc, &cells[j]);
-                        }
+                if let Err(error) = run.journal(entry_addr, sizes[j]) {
+                    if old_loc.is_none() {
+                        guard.remove_cell();
                     }
-                    None => match self.cell_index.try_insert_locked(hash as usize) {
-                        Some(mut guard) => {
-                            *guard = write_result.addr;
-                            drop(guard);
-                            self.slot_bytes.add(hash, write_result.content_length);
-                            self.ensure_indices(&cells[j], None, &*plans[j].schema);
-                        }
-                        None => {
-                            // Someone inserted between the check and here. The
-                            // bytes are already in the claimed span, which must
-                            // stay filled, so the loser becomes dead space --
-                            // the same outcome `write_cell` gives this race.
-                            abandon_entry(write_result.addr);
-                            // Re-journal the abandoned span. This entry was
-                            // already journaled as a CELL above, so without a
-                            // second record the log and the resident image
-                            // disagree about it forever -- the image says
-                            // PADDING, the log says live cell, and a recovery
-                            // from the log resurrects a write that was
-                            // refused. Records are applied by declared
-                            // offset, so the later one supersedes.
-                            let _ = run.journal(write_result.addr, sizes[j]);
-                            self.mark_dead_entry_with_cell(write_result.addr, &cells[j]);
-                            results.push(Err(WriteError::CellAlreadyExisted));
-                            continue;
-                        }
-                    },
+                    let error = WriteError::from_wal_io(error);
+                    results.push(Err(error));
+                    results.extend((j + 1..cells.len()).map(|_| Err(WriteError::BatchAborted)));
+                    return results;
+                }
+
+                let old_indices = if old_loc.is_some() {
+                    guard.old_index_res(&*plans[j].schema).ok().flatten()
+                } else {
+                    None
+                };
+                guard.set_ptr(write_result.addr);
+                drop(guard);
+                self.slot_bytes.add(hash, write_result.content_length);
+                if let Some(loc) = old_loc.filter(|loc| *loc != 0) {
+                    let old_len = Entry::decode_from(loc, |_, _| {}).0.content_length;
+                    self.slot_bytes.sub(hash, old_len);
+                    self.ensure_indices_with_res(&cells[j], old_indices, &*plans[j].schema);
+                    self.mark_dead_entry_with_cell(loc, &cells[j]);
+                } else {
+                    self.ensure_indices(&cells[j], None, &*plans[j].schema);
                 }
 
                 let mut header = cells[j].header;
@@ -3470,8 +3450,7 @@ impl Chunk {
                 WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
             }
             i += covered;
-            // `run` drops here: ONE WAL record for the whole span, and the
-            // segment reference released once.
+            // Drop releases the run after all accepted frames reached the WAL.
         }
         self.refresh_statistics_for_schema(schema_id);
         results
@@ -3522,6 +3501,7 @@ impl Chunk {
                 } else {
                     0
                 };
+                pending_entry.append()?;
                 cell_guard.set_ptr(new_cell_loc);
                 drop(cell_guard);
                 self.slot_bytes.add(hash, write_result.content_length);
@@ -3557,6 +3537,10 @@ impl Chunk {
                         hash,
                     );
 
+                    if let Err(error) = pending_entry.append() {
+                        guard.remove();
+                        return Err(error);
+                    }
                     *guard = new_cell_loc;
                     drop(guard);
                     self.slot_bytes.add(hash, write_result.content_length);
@@ -3632,6 +3616,7 @@ impl Chunk {
                         #[cfg(debug_assertions)]
                         self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
 
+                        pending_entry.append()?;
                         **cell_guard.word_mutex_guard() = new_cell_loc;
                         self.slot_bytes.add(hash, write_result.content_length);
                         self.slot_bytes.sub(hash, old_entry_size.unwrap_or(0));
@@ -3675,6 +3660,8 @@ impl Chunk {
         };
         let cell_location = guard.get_ptr();
 
+        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
+
         if let Some(indexer) = &self.index_builder {
             match SharedCell::from_chunk_raw(hash, guard, self) {
                 Ok((cell, schema)) => {
@@ -3686,7 +3673,6 @@ impl Chunk {
         } else {
             guard.remove_cell();
         }
-        let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
         self.slot_bytes.sub(hash, removed_len);
         Ok(())
     }
@@ -3714,8 +3700,8 @@ impl Chunk {
             Err(e) => return Err(WriteError::ReadError(e)),
         };
         let cell_location = guard.get_ptr();
+        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
         guard.remove_cell();
-        let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
         self.slot_bytes.sub(hash, removed_len);
         Ok(())
     }
@@ -4165,6 +4151,7 @@ impl Chunk {
             cell_header.version,
             cell_header.id,
         );
+        pending_entry.append()?;
         if record_deleted_version {
             self.note_deleted_version(cell_header.id.bits(), cell_header.version);
         }
@@ -4619,16 +4606,10 @@ impl Chunk {
 
 /// A contiguous span of a segment claimed for a run of entries.
 ///
-/// The batched form of [`PendingEntry`]. One reference, one CAS and one WAL
-/// record for a whole run, instead of one of each per cell -- which is the
-/// difference between 1024 of each and 3 for a default migration batch, all
-/// of them on the SAME segment because a batch shares a locality and locality
-/// picks the chunk.
-///
-/// The caller must fill the entire span: the append cursor has already moved
-/// past it, so anything left unwritten is garbage that recovery would try to
-/// parse. `receive_migrated_cells` satisfies this by planning every cell
-/// before claiming anything, so the only fallible step happens first.
+/// The batched form of [`PendingEntry`]. A run holds one segment reference
+/// and one reservation. Each accepted cell has its own WAL frame.
+/// The caller appends each entry before it publishes the cell pointer.
+/// Drop cancels the unused suffix before it releases the head.
 pub struct PendingRun {
     pub seg: AArc<Segment>,
     pub base: usize,
@@ -4676,6 +4657,9 @@ impl Drop for PendingRun {
         if self.consumed.get() < self.size {
             let from = self.base + self.consumed.get() as usize;
             crate::ram::entry::stamp_reservation_padding(from, self.size - self.consumed.get());
+            if self.seg.can_still_append() {
+                self.seg.rewind_to(from);
+            }
         }
         self.seg.end_pending_journal();
         // Same ordering as PendingEntry::drop: the run's journal writes all
@@ -4703,63 +4687,47 @@ pub struct PendingEntry {
     /// decision. Releasing here would let another writer append behind the
     /// transaction, which is exactly what makes an abort unable to rewind.
     pub leased: bool,
+    journaled: std::cell::Cell<bool>,
+}
+
+impl PendingEntry {
+    /// Wait for the append result before the caller publishes the entry.
+    /// A future durable wait can extend this step.
+    pub fn append(&self) -> Result<(), WriteError> {
+        assert!(!self.journaled.get(), "an entry is appended only once");
+        match self.seg.write_wal(self.addr, self.size, self.skip_sync) {
+            Ok(()) => {
+                self.journaled.set(true);
+                if self.skip_sync {
+                    note_transactional_write(&self.seg);
+                } else {
+                    crate::ram::segs::queue_wal_sync(&self.seg);
+                }
+                self.seg.set_dirty();
+                Ok(())
+            }
+            Err(error) => {
+                WAL_JOURNAL_FAILURES.fetch_add(1, Ordering::Relaxed);
+                Err(WriteError::from_wal_io(error))
+            }
+        }
+    }
 }
 
 impl Drop for PendingEntry {
-    // dealing with entry write ahead log
     fn drop(&mut self) {
-        let journal_result = self.seg.write_wal(self.addr, self.size, self.skip_sync);
-        // Release the journal slot as soon as the attempt is over, whatever
-        // its outcome: a seal waiting on this segment must not be held up by
-        // a writer that has already finished trying.
+        // An unsubmitted reservation has no WAL record and no published cell.
+        // The owner still holds the head, so cancellation can restore its cursor.
+        if !self.journaled.get() {
+            crate::ram::entry::stamp_reservation_padding(self.addr, self.size);
+            if self.seg.can_still_append() {
+                self.seg.rewind_to(self.addr);
+            }
+        }
         self.seg.end_pending_journal();
-        // Ownership ends HERE, after the journal write -- that ordering IS
-        // the invariant. Released earlier, the next owner could append and
-        // journal before this record reached the log, and the segment's WAL
-        // would no longer be offset-ordered: a crash would then leave a gap
-        // the "torn tail = end of segment" rule mistakes for the end,
-        // silently dropping every later owner's durable entries.
-        //
-        // A leased head is the exception, and for the same reason stated the
-        // other way round: its owner is the TRANSACTION, not this entry, and
-        // it is released at the decision.
         if !self.leased {
             self.seg.release_own();
         }
-        if let Err(error) = journal_result {
-            // A straggler whose segment was sealed (archived) between its
-            // append and this journal write cannot journal -- the recorded
-            // seal-vs-pending-writer race. The entry's durability is already
-            // decided at this point (the archive that sealed the segment
-            // either carried the bytes or did not), and this Drop runs on
-            // WHATEVER thread holds the last handle: unwrap here took down
-            // the b-tree write-back workers, which silently ended index
-            // durability for the whole process -- every insert after the
-            // panic lived only in memory, and the next restart lost them
-            // all. Scream, count, survive.
-            crate::ram::chunk::WAL_JOURNAL_FAILURES.fetch_add(1, Ordering::Relaxed);
-            error!(
-                "WAL journal failed for segment {} (chunk of addr {:#x}, size {}): {error}; \
-                 the entry rides the segment's archive if one carried it, and the caller's \
-                 next write-back supersedes it -- but this indicates the seal/pending-writer \
-                 race and must stay loud",
-                self.seg.id, self.addr, self.size
-            );
-            // Give the reference back even here. Returning early used to skip
-            // it, so every straggler pinned its segment against eviction and
-            // reclamation permanently -- a leak that grew with exactly the
-            // race this counter exists to close.
-            self.seg.decr_references();
-            return;
-        }
-        if !self.skip_sync {
-            // Timer-based group commit rides the WAL syncer thread now;
-            // transactional entries keep syncing at commit instead.
-            crate::ram::segs::queue_wal_sync(&self.seg);
-        } else {
-            note_transactional_write(&self.seg);
-        }
-        self.seg.set_dirty();
         self.seg.decr_references();
     }
 }
@@ -5223,9 +5191,8 @@ impl Chunks {
     ///
     /// `Ok` means every open part of the transaction carries its own COMMIT
     /// and every one of those records is fsynced; nothing less. Any failure
-    /// is a failed commit the caller must not acknowledge, and a retry
-    /// finishes what an earlier attempt started (parts already closed are
-    /// skipped).
+    /// refuses the commit. The caller retains the heads during rollback.
+    /// The failure path retracts decision records from each private WAL tail.
     ///
     /// A transaction holding no lease here has nothing bracketed to close: a
     /// read-only one, one whose writes all failed, or one whose writes could
@@ -5248,29 +5215,45 @@ impl Chunks {
             ids.dedup();
             ids
         };
-        for chunk_id in chunk_ids {
-            let Some(chunk) = self.list.get(chunk_id as usize) else {
-                error!(
-                    "transaction {:?} leased a head in chunk {} which this store does not have",
-                    txn, chunk_id
-                );
-                return Err(WriteError::CannotAllocateSpace);
-            };
-            chunk.close_transaction_bracket(txn, &manifest)?;
-        }
-        // Make the COMMIT records durable HERE, not through the thread-local
-        // touched-segment list: this runs at the decision, on whatever thread
-        // delivered it, and that list belongs to the thread that applied the
-        // writes. Reading it here would sync nothing and report success.
         let segments = transaction_leased_segments(txn, &self.address_range());
-        for segment in segments {
-            if let Err(error) = segment.force_wal_sync() {
-                error!(
-                    "could not sync the COMMIT bracket for segment {} (chunk {}): {:?}",
-                    segment.id, segment.chunk_id, error
-                );
-                return Err(WriteError::CannotAllocateSpace);
+        let checkpoints: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.wal_append_position(),
+                    segment.append_header.load(Ordering::Acquire),
+                )
+            })
+            .collect();
+        let decision = (|| {
+            for chunk_id in chunk_ids {
+                let chunk = self
+                    .list
+                    .get(chunk_id as usize)
+                    .ok_or(WriteError::CannotAllocateSpace)?;
+                chunk.close_transaction_bracket(txn, &manifest)?;
             }
+            for segment in &segments {
+                segment.force_wal_sync().map_err(WriteError::from_wal_io)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = decision {
+            for (segment, (position, cursor)) in segments.iter().zip(checkpoints) {
+                if let Err(truncate_error) = segment.truncate_wal_to(position) {
+                    error!(
+                        "cannot retract refused COMMIT in segment {}: {truncate_error}",
+                        segment.id
+                    );
+                    segment.retire_tail();
+                }
+                let end = segment.append_header.load(Ordering::Acquire);
+                if end > cursor {
+                    crate::ram::entry::stamp_reservation_padding(cursor, (end - cursor) as u32);
+                }
+                segment.mark_bracket_open();
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -6115,6 +6098,7 @@ impl<'a> CellGuard<'a> {
         let schema = &*write_plan.schema;
         let old_indices = self.old_index_res(schema)?;
         let guard = self.guard.as_mut().unwrap();
+        pending_entry.append()?;
         **guard = new_cell_loc;
         self.chunk
             .ensure_indices_with_res(cell, old_indices, schema);
@@ -6154,6 +6138,7 @@ impl<'a> CellGuard<'a> {
             // Update case - cell already exists
             let old_indices = self.old_index_res(&*schema)?;
             let guard = self.guard.as_mut().unwrap();
+            pending_entry.append()?;
             **guard = new_cell_loc;
             self.chunk
                 .ensure_indices_with_res(cell, old_indices, &*schema);
@@ -6161,6 +6146,7 @@ impl<'a> CellGuard<'a> {
         } else {
             // Insert case - new cell
             let guard = self.guard.as_mut().unwrap();
+            pending_entry.append()?;
             **guard = new_cell_loc;
             self.chunk.ensure_indices(cell, None, &*schema);
         }
@@ -6460,6 +6446,7 @@ mod tests {
         let first_seg = first.seg.id;
         assert!(first.leased, "a transactional claim must take a lease");
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
+        first.append().unwrap();
         drop(first);
 
         // The head is STILL owned after the entry finished, so the next
@@ -6475,6 +6462,7 @@ mod tests {
             1,
             "reusing a leased head must not open a second lease"
         );
+        second.append().unwrap();
         drop(second);
         drop(scope);
 
@@ -6513,6 +6501,7 @@ mod tests {
                 );
             }
             ids.insert(segment_id);
+            entry.append().unwrap();
             drop(entry);
             drop(scope);
             if abort {
@@ -6577,8 +6566,10 @@ mod tests {
                 .unwrap()
                 .pre_cursor
         };
+        first.append().unwrap();
         drop(first);
         let second = chunk.try_acquire(64, false).expect("second entry");
+        second.append().unwrap();
         drop(second);
         drop(scope);
         let after = seg.append_header.load(Ordering::Acquire);
@@ -6646,6 +6637,7 @@ mod tests {
         let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("entry");
         let seg = entry.seg.clone();
+        entry.append().unwrap();
         drop(entry);
         drop(scope);
         let begin_at = seg.addr;
@@ -6691,6 +6683,7 @@ mod tests {
         let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("entry");
         let seg = entry.seg.clone();
+        entry.append().unwrap();
         drop(entry);
         drop(scope);
 
@@ -6711,6 +6704,7 @@ mod tests {
         // elsewhere.
         let plain = chunk.try_acquire(64, false).expect("plain entry");
         assert_ne!(plain.seg.id, seg.id);
+        plain.append().unwrap();
         drop(plain);
 
         // The single release point refuses on its own, too.
@@ -6743,6 +6737,7 @@ mod tests {
         let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("owner's first write");
         let seg = entry.seg.clone();
+        entry.append().unwrap();
         drop(entry);
 
         // Expiry (= abort) on another thread: rewind, then the head goes back.
@@ -6753,6 +6748,7 @@ mod tests {
             // Reassignment: an ordinary writer elsewhere takes the head.
             s.spawn(|| {
                 let plain = chunks.list[0].try_acquire(64, false).expect("plain write");
+                plain.append().unwrap();
                 drop(plain);
             })
             .join()
@@ -6793,7 +6789,9 @@ mod tests {
         let range = chunks.address_range();
 
         let scope = TransactionScope::enter(txn.clone());
-        drop(chunk.try_acquire(64, false).expect("first write"));
+        let first = chunk.try_acquire(64, false).expect("first write");
+        first.append().unwrap();
+        drop(first);
         let in_flight = chunk.try_acquire(64, false).expect("second write, claimed");
         let seg = in_flight.seg.clone();
         let in_flight_end = in_flight.addr + in_flight.size as usize;
@@ -6805,6 +6803,7 @@ mod tests {
                 !rewind.is_finished(),
                 "the rewind must wait for the claimed write"
             );
+            in_flight.append().unwrap();
             drop(in_flight);
             assert_eq!(rewind.join().unwrap(), Ok(1));
         });
@@ -6912,6 +6911,7 @@ mod tests {
         let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("entry");
         let first_seg = entry.seg.clone();
+        entry.append().unwrap();
         drop(entry);
         // Fill the part: ask for exactly what is left. The reserve refuses
         // it, so it continues in a fresh part instead of eating the room the
@@ -6920,6 +6920,7 @@ mod tests {
         let filler = chunk.try_acquire(left as u32, false).expect("filler");
         assert_ne!(filler.seg.id, first_seg.id, "the reserve must not be spent");
         let second_seg = filler.seg.clone();
+        filler.append().unwrap();
         drop(filler);
         // And the largest entry the first part can still take leaves exactly
         // the reserve.
@@ -7150,6 +7151,7 @@ mod tests {
         let scope = TransactionScope::enter(txn.clone());
         let entry = chunk.try_acquire(64, false).expect("entry");
         let seg = entry.seg.clone();
+        entry.append().unwrap();
         drop(entry);
         drop(scope);
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
@@ -7234,9 +7236,8 @@ mod tests {
             0,
             "inside our own section the retirement must still be blocked -- by us"
         );
-        let freed = crate::ram::qsbr::segment_qsbr().suspended(|| {
-            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5))
-        });
+        let freed = crate::ram::qsbr::segment_qsbr()
+            .suspended(|| drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)));
         assert_eq!(freed, 1, "suspended, the same thread's collection reclaims");
         assert_eq!(chunk.retired_segment_count(), 0);
     }
