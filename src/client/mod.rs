@@ -19,8 +19,8 @@ use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
-    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema, SetAppMetaError,
-    SchemaEdit, SchemaVid,
+    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+    SchemaEdit, SchemaVid, SetAppMetaError,
 };
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
@@ -646,7 +646,10 @@ impl AsyncClient {
                 out[index] = Some(head);
             }
         }
-        Ok(out.into_iter().map(|head| head.expect("every id was routed")).collect())
+        Ok(out
+            .into_iter()
+            .map(|head| head.expect("every id was routed"))
+            .collect())
     }
 
     /// Fence writes to `families` on every member and wait for in-flight writes
@@ -696,7 +699,11 @@ impl AsyncClient {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut total = 0;
         for member in members {
-            total += self.client_by_server_id(member.id).await?.live_cell_count().await?;
+            total += self
+                .client_by_server_id(member.id)
+                .await?
+                .live_cell_count()
+                .await?;
         }
         Ok(total)
     }
@@ -811,6 +818,264 @@ impl AsyncClient {
                     .await?;
                 client
                     .compare_version_and_set_field(id, version, field, value)
+                    .await
+            }
+            other => Ok(other),
+        }
+    }
+    pub async fn write_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // Local-shortcut RPC futures can complete without ever returning
+        // Pending, so a hot caller loop never yields to the runtime: it
+        // starves timers and peer tasks, and JoinHandle::abort can never
+        // land (the task must return from poll to be cancelled). Consuming
+        // coop budget bounds such loops to tokio's task budget. The yield
+        // sits AFTER the call so that on the all-local path a cancellation
+        // can only land once the write's side effects are complete -- never
+        // between the caller reserving work and the cell landing.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.write_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.write_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.write_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    pub async fn update_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.update_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.update_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.update_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    pub async fn upsert_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            // Clone only for the rare schema-miss retry path, not on every call.
+            match client.upsert_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.upsert_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.upsert_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    pub async fn remove_cell_durable(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client.remove_cell_durable(id).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.remove_cell_durable(id).await
+            }
+            Err(WriteError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
+                owner_client.remove_cell_durable(id).await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Certify current WAL prefixes on every member of this database.
+    pub async fn flush_wal_durable(&self) -> Result<Result<(), WriteError>, RPCError> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .group_members(&self.group_name, false)
+            .await
+            .map_err(|error| {
+                RPCError::IOError(std::io::Error::other(format!(
+                    "membership query failed: {error:?}"
+                )))
+            })?
+            .ok_or_else(|| RPCError::IOError(std::io::Error::other("database group is missing")))?;
+        let mut waits: FuturesUnordered<_> = members
+            .into_iter()
+            .map(|member| async move {
+                self.client_by_server_id(member.id)
+                    .await?
+                    .flush_wal_durable()
+                    .await
+            })
+            .collect();
+        let mut first = None;
+        while let Some(result) = waits.next().await {
+            if let Err(error) = result? {
+                first.get_or_insert(error);
+            }
+        }
+        Ok(first.map_or(Ok(()), Err))
+    }
+
+    pub async fn write_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> Result<Vec<Result<CellHeader, WriteError>>, RPCError> {
+        // Preserve input order: tag each cell with its index, group by server.
+        let mut by_server: HashMap<u64, Vec<(usize, OwnedCell)>> = HashMap::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let server_id = self.locate_server_id(&cell.id())?;
+            by_server.entry(server_id).or_default().push((i, cell));
+        }
+        let total: usize = by_server.values().map(|v| v.len()).sum();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<OwnedCell>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let results = client.write_all_cells_durable(batch).await?;
+                Ok::<_, RPCError>((indices, results))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
+        while let Some(res) = batches.next().await {
+            let (indices, results) = res?;
+            for (idx, r) in indices.into_iter().zip(results) {
+                out[idx] = Some(r);
+            }
+        }
+        Ok(out.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    pub async fn upsert_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> Result<Vec<Result<CellHeader, WriteError>>, RPCError> {
+        // Preserve input order: tag each cell with its index, group by server.
+        let mut by_server: HashMap<u64, Vec<(usize, OwnedCell)>> = HashMap::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let server_id = self.locate_server_id(&cell.id())?;
+            by_server.entry(server_id).or_default().push((i, cell));
+        }
+        let total: usize = by_server.values().map(|v| v.len()).sum();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<OwnedCell>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let results = client.upsert_all_cells_durable(batch).await?;
+                Ok::<_, RPCError>((indices, results))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
+        while let Some(res) = batches.next().await {
+            let (indices, results) = res?;
+            for (idx, r) in indices.into_iter().zip(results) {
+                out[idx] = Some(r);
+            }
+        }
+        Ok(out.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    pub async fn compare_version_and_update_cell_durable(
+        &self,
+        id: Id,
+        version: u64,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client
+            .compare_version_and_update_cell_durable(id, version, cell.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_update_cell_durable(id, version, cell)
+                    .await
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub async fn compare_version_and_set_field_durable(
+        &self,
+        id: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client
+            .compare_version_and_set_field_durable(id, version, field, value.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_set_field_durable(id, version, field, value)
                     .await
             }
             other => Ok(other),
