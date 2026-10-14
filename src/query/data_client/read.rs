@@ -343,7 +343,7 @@ impl IndexedDataClient {
         let mut tasks = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
+            .filter_map(|(i, id)| self.conshash.get_server_id_for_slot(crate::slots::slot_of(id) as u64).map(|sid| (i, sid, *id)))
             .sorted_by_key(|(_i, sid, _id)| *sid)
             .chunk_by(|(_i, sid, _id)| *sid)
             .into_iter()
@@ -452,7 +452,7 @@ impl CellReader {
         let mut tasks = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
+            .filter_map(|(i, id)| self.conshash.get_server_id_for_slot(crate::slots::slot_of(id) as u64).map(|sid| (i, sid, *id)))
             .sorted_by_key(|(_i, sid, _id)| *sid)
             .chunk_by(|(_i, sid, _id)| *sid)
             .into_iter()
@@ -564,7 +564,7 @@ impl CellReader {
                 if slot.is_some() || !expect_full_batch {
                     continue;
                 }
-                let Some(sid) = self.conshash.get_server_id_by(&ids[idx]) else {
+                let Some(sid) = self.conshash.get_server_id_for_slot(crate::slots::slot_of(&ids[idx]) as u64) else {
                     warn!("Missing server mapping for id {:?}", ids[idx]);
                     continue;
                 };
