@@ -2,7 +2,7 @@
 use bifrost_hasher::hash_str;
 use dovahkiin::{
     expr::serde::Expr,
-    types::{Id, OwnedMap, OwnedValue, Type, Value},
+    types::{Id, Map, OwnedMap, OwnedValue, Type},
 };
 use neb::{
     client::ScanOrder,
