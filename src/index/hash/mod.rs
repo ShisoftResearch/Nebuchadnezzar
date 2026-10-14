@@ -710,11 +710,10 @@ impl HashIndexer {
     /// the bucket. Duplicates are possible at all because write-side dedup
     /// checks only the head segment: scanning the chain on every insert would
     /// put a chain-length read on the write path.
-    pub async fn query(
+    async fn query_ids(
         &self,
         index_id: Id,
-        field_id: u64,
-        value: &OwnedValue,
+        check: Option<&crate::index::verification::IndexCheck>,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let mut result = Vec::new();
         let mut emitted = HashSet::new();
@@ -746,24 +745,16 @@ impl HashIndexer {
                 if emitted.contains(&id) {
                     continue;
                 }
-                // Each candidate is re-read and checked: a bucket is keyed by
-                // a hash, so it holds collisions as well as matches.
-                let cell_res = self
-                    .neb_client
-                    .read_cell_select(id, &vec![field_id], false)
-                    .await;
-                if let Ok(Ok(cell)) = &cell_res {
-                    let field_val = &cell[0usize];
-                    if values_semantically_equal(field_val, value) {
-                        emitted.insert(id);
-                        result.push(id);
-                    } else {
-                        debug!(
-                            "Cell {:?} has field {:?} with value {:?}, but expected {:?}",
-                            id, field_id, field_val, value
-                        );
+                if let Some(check) = check {
+                    if !matches!(
+                        self.neb_client.read_indexed_cell(id, check.clone()).await,
+                        Ok(Ok(_))
+                    ) {
+                        continue;
                     }
                 }
+                emitted.insert(id);
+                result.push(id);
             }
 
             hops += 1;
@@ -777,6 +768,26 @@ impl HashIndexer {
         }
 
         Ok(Ok(result))
+    }
+    pub(crate) async fn candidates(
+        &self,
+        index_id: Id,
+    ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        self.query_ids(index_id, None).await
+    }
+
+    pub async fn query(
+        &self,
+        index_id: Id,
+        field_id: u64,
+        value: &OwnedValue,
+    ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        let check = crate::index::verification::IndexCheck::Hashed {
+            buckets: vec![index_id],
+            field: field_id,
+            value: value.clone(),
+        };
+        self.query_ids(index_id, Some(&check)).await
     }
 }
 

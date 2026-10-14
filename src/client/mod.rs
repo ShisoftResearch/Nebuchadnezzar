@@ -19,8 +19,8 @@ use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
-    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema, SetAppMetaError,
-    SchemaEdit, SchemaVid,
+    DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
+    SchemaEdit, SchemaVid, SetAppMetaError,
 };
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
@@ -400,6 +400,24 @@ impl AsyncClient {
             .collect())
     }
 
+    pub(crate) async fn read_indexed_cell(
+        &self,
+        id: Id,
+        check: crate::index::verification::IndexCheck,
+    ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        let mut cells = client
+            .read_all_cells_verified(
+                &vec![id],
+                &vec![],
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &vec![check],
+            )
+            .await?;
+        Ok(cells.pop().unwrap_or(Err(ReadError::CellDoesNotExisted)))
+    }
+
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,
@@ -646,7 +664,10 @@ impl AsyncClient {
                 out[index] = Some(head);
             }
         }
-        Ok(out.into_iter().map(|head| head.expect("every id was routed")).collect())
+        Ok(out
+            .into_iter()
+            .map(|head| head.expect("every id was routed"))
+            .collect())
     }
 
     /// Fence writes to `families` on every member and wait for in-flight writes
@@ -696,7 +717,11 @@ impl AsyncClient {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut total = 0;
         for member in members {
-            total += self.client_by_server_id(member.id).await?.live_cell_count().await?;
+            total += self
+                .client_by_server_id(member.id)
+                .await?
+                .live_cell_count()
+                .await?;
         }
         Ok(total)
     }

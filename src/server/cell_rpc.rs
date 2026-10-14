@@ -1,4 +1,3 @@
-use std::sync::atomic::{self, AtomicU64};
 use crate::index::scrub::{ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
@@ -14,10 +13,11 @@ use bifrost_hasher::hash_str;
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
 use dovahkiin::integrated::lisp;
-use dovahkiin::types::OwnedValue;
+use dovahkiin::types::{OwnedValue, Value};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{self, AtomicU64};
 
 use bifrost_plugins::hash_ident;
 
@@ -81,6 +81,7 @@ service! {
     rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>, need_header: bool) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells_verified(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr, checks: &Vec<crate::index::verification::IndexCheck>) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc head_cell(key: Id) -> Result<CellHeader, ReadError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -836,83 +837,18 @@ impl Service for NebRPCService {
         filter: &Expr,
         proc: &Expr,
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
-        let filter_empty = filter.is_empty();
-        let proc_empty = proc.is_empty();
-        let mut interpreter = if !filter_empty || !proc_empty {
-            Some(lisp::get_interpreter())
-        } else {
-            None
-        };
-        let filter_sexpr = if !filter_empty {
-            Some(filter.clone().to_sexpr())
-        } else {
-            None
-        };
+        self.read_cells_checked(keys, colums, filter, proc, &[])
+    }
 
-        // Process cells one at a time: read → filter (SharedCell guard held) → to_owned
-        // only for cells that pass. This ensures:
-        //   1. Only one WordMutexGuard is live at a time — prevents the self-deadlock
-        //      that occurs when the same cell ID appears twice in the batch.
-        //   2. to_owned() (a full data clone) is skipped for cells rejected by the filter.
-        let mut cells: Vec<Result<OwnedCell, ReadError>> = Vec::with_capacity(keys.len());
-        for id in keys.iter() {
-            let cell_res = if colums.is_empty() {
-                self.database_runtime.chunks.read_cell(id)
-            } else {
-                self.database_runtime
-                    .chunks()
-                    .read_selected(id, colums.as_slice(), true)
-            };
-            let owned = cell_res.and_then(|cell| {
-                if let Some(filter) = &filter_sexpr {
-                    // Filter is evaluated while the SharedCell guard is still held so the
-                    // raw cell bytes remain valid. to_owned() is called only on a match;
-                    // misses drop the SharedCell (and release the guard) without cloning.
-                    let interp = interpreter.as_mut().unwrap();
-                    unsafe {
-                        interp.unsafe_set_global_val(&cell.data);
-                    }
-                    let check_res = filter.clone().eval(interp.get_env());
-                    interp.unset_global_val();
-                    match check_res {
-                        Ok(sexp) if is_true(&sexp) => Ok(cell.to_owned()),
-                        Ok(_) => Err(ReadError::NotMatch),
-                        Err(e) => Err(ReadError::ExecError(e)),
-                    }
-                } else {
-                    Ok(cell.to_owned())
-                }
-                // SharedCell (and its WordMutexGuard) is dropped here in all branches
-            });
-            cells.push(owned);
-        }
-
-        if !proc_empty {
-            let proc_sexpr = proc.clone().to_sexpr();
-            let interp = interpreter.as_mut().unwrap();
-            let cells = cells
-                .into_iter()
-                .map(|cell_res| {
-                    cell_res.and_then(|cell| {
-                        let shared = cell.data.shared();
-                        unsafe {
-                            interp.unsafe_set_global_val(&shared);
-                        }
-                        let proc_res = proc_sexpr.clone().eval(interp.get_env());
-                        interp.unset_global_val();
-                        match proc_res {
-                            Ok(sexp) => Ok(OwnedCell {
-                                header: cell.header,
-                                data: sexp.owned_val().unwrap_or(OwnedValue::NA),
-                            }),
-                            Err(e) => Err(ReadError::ExecError(e)),
-                        }
-                    })
-                })
-                .collect();
-            return future::ready(cells).boxed();
-        }
-        return future::ready(cells).boxed();
+    fn read_all_cells_verified(
+        &self,
+        keys: &Vec<Id>,
+        colums: &Vec<u64>,
+        filter: &Expr,
+        proc: &Expr,
+        checks: &Vec<crate::index::verification::IndexCheck>,
+    ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        self.read_cells_checked(keys, colums, filter, proc, checks)
     }
 
     /// Re-derive this node's index entries and report (or fill) the holes, in
@@ -978,11 +914,7 @@ impl Service for NebRPCService {
         future::ready(id).boxed()
     }
 
-    fn cell_scan_next(
-        &self,
-        cursor: u64,
-        max: u32,
-    ) -> BoxFuture<'_, Result<CellScanPage, String>> {
+    fn cell_scan_next(&self, cursor: u64, max: u32) -> BoxFuture<'_, Result<CellScanPage, String>> {
         let max = (max as usize).max(1);
         let result = (|| {
             let chunks = self.database_runtime.chunks();
@@ -1071,12 +1003,16 @@ impl Service for NebRPCService {
                         let holds = leases.holds.lock();
                         match holds.get(&token) {
                             None => return,
-                            Some(held) => held.expires.saturating_duration_since(std::time::Instant::now()),
+                            Some(held) => held
+                                .expires
+                                .saturating_duration_since(std::time::Instant::now()),
                         }
                     };
                     if wait.is_zero() {
                         if leases.holds.lock().remove(&token).is_some() {
-                            warn!("write fence lease {token} lapsed without a renewal; fence lifted");
+                            warn!(
+                                "write fence lease {token} lapsed without a renewal; fence lifted"
+                            );
                         }
                         return;
                     }
@@ -1092,8 +1028,8 @@ impl Service for NebRPCService {
         let mut holds = self.fence_leases.holds.lock();
         let renewed = match holds.get_mut(&token) {
             Some(held) => {
-                held.expires = std::time::Instant::now()
-                    + std::time::Duration::from_millis(lease_ms.max(1));
+                held.expires =
+                    std::time::Instant::now() + std::time::Duration::from_millis(lease_ms.max(1));
                 true
             }
             None => false,
@@ -1184,6 +1120,145 @@ impl Service for NebRPCService {
 dispatch_rpc_service_functions!(NebRPCService);
 
 impl NebRPCService {
+    fn read_cells_checked(
+        &self,
+        keys: &Vec<Id>,
+        colums: &Vec<u64>,
+        filter: &Expr,
+        proc: &Expr,
+        checks: &[crate::index::verification::IndexCheck],
+    ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        let filter_empty = filter.is_empty();
+        let proc_empty = proc.is_empty();
+        let mut interpreter = if !filter_empty || !proc_empty {
+            Some(lisp::get_interpreter())
+        } else {
+            None
+        };
+        let filter_sexpr = if !filter_empty {
+            Some(filter.clone().to_sexpr())
+        } else {
+            None
+        };
+
+        // Process cells one at a time: read → filter (SharedCell guard held) → to_owned
+        // only for cells that pass. This ensures:
+        //   1. Only one WordMutexGuard is live at a time — prevents the self-deadlock
+        //      that occurs when the same cell ID appears twice in the batch.
+        //   2. to_owned() (a full data clone) is skipped for cells rejected by the filter.
+        let mut cells: Vec<Result<OwnedCell, ReadError>> = Vec::with_capacity(keys.len());
+        let mut query_schemas = std::collections::HashMap::new();
+        for id in keys.iter() {
+            let cell_res = if colums.is_empty() || !checks.is_empty() {
+                self.database_runtime.chunks.read_cell(id)
+            } else {
+                self.database_runtime
+                    .chunks()
+                    .read_selected(id, colums.as_slice(), true)
+            };
+            let owned = cell_res.and_then(|cell| {
+                if !checks.is_empty() {
+                    let schema = self
+                        .database_runtime
+                        .schemas()
+                        .get(&cell.header.schema)
+                        .ok_or_else(|| {
+                            ReadError::ExecError("index candidate schema is absent".into())
+                        })?;
+                    let selected = query_schemas.entry(cell.header.schema).or_insert_with(|| {
+                        crate::index::verification::query_schema(&schema, checks)
+                    });
+                    crate::index::verification::matches(&cell, selected, checks)?;
+                }
+                if !checks.is_empty() {
+                    let mut owned = cell.to_owned();
+                    if !colums.is_empty() {
+                        let schema = self
+                            .database_runtime
+                            .schemas()
+                            .get(&cell.header.schema)
+                            .unwrap();
+                        owned.data = OwnedValue::Array(
+                            colums
+                                .iter()
+                                .map(|field| {
+                                    let path = schema
+                                        .id_index
+                                        .get(field)
+                                        .cloned()
+                                        .unwrap_or_else(|| vec![*field]);
+                                    owned.data.get_in_by_ids(&path).clone()
+                                })
+                                .collect(),
+                        );
+                    }
+                    if let Some(filter) = &filter_sexpr {
+                        let interp = interpreter.as_mut().unwrap();
+                        let shared = owned.data.shared();
+                        unsafe {
+                            interp.unsafe_set_global_val(&shared);
+                        }
+                        let result = filter.clone().eval(interp.get_env());
+                        interp.unset_global_val();
+                        match result {
+                            Ok(value) if is_true(&value) => {}
+                            Ok(_) => return Err(ReadError::NotMatch),
+                            Err(error) => return Err(ReadError::ExecError(error)),
+                        }
+                    }
+                    return Ok(owned);
+                }
+                if let Some(filter) = &filter_sexpr {
+                    // Filter is evaluated while the SharedCell guard is still held so the
+                    // raw cell bytes remain valid. to_owned() is called only on a match;
+                    // misses drop the SharedCell (and release the guard) without cloning.
+                    let interp = interpreter.as_mut().unwrap();
+                    unsafe {
+                        interp.unsafe_set_global_val(&cell.data);
+                    }
+                    let check_res = filter.clone().eval(interp.get_env());
+                    interp.unset_global_val();
+                    match check_res {
+                        Ok(sexp) if is_true(&sexp) => Ok(cell.to_owned()),
+                        Ok(_) => Err(ReadError::NotMatch),
+                        Err(e) => Err(ReadError::ExecError(e)),
+                    }
+                } else {
+                    Ok(cell.to_owned())
+                }
+                // SharedCell (and its WordMutexGuard) is dropped here in all branches
+            });
+            cells.push(owned);
+        }
+
+        if !proc_empty {
+            let proc_sexpr = proc.clone().to_sexpr();
+            let interp = interpreter.as_mut().unwrap();
+            let cells = cells
+                .into_iter()
+                .map(|cell_res| {
+                    cell_res.and_then(|cell| {
+                        let shared = cell.data.shared();
+                        unsafe {
+                            interp.unsafe_set_global_val(&shared);
+                        }
+                        let proc_res = proc_sexpr.clone().eval(interp.get_env());
+                        interp.unset_global_val();
+                        match proc_res {
+                            Ok(sexp) => Ok(OwnedCell {
+                                header: cell.header,
+                                data: sexp.owned_val().unwrap_or(OwnedValue::NA),
+                            }),
+                            Err(e) => Err(ReadError::ExecError(e)),
+                        }
+                    })
+                })
+                .collect();
+            return future::ready(cells).boxed();
+        }
+        return future::ready(cells).boxed();
+    }
+
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
         neb_client: Arc<AsyncClient>,
@@ -1291,16 +1366,20 @@ impl NebRPCService {
         id: &Id,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
         use crate::server::write_fence::KeyedFamily;
-        self.database_runtime.write_fence().enter_keyed(id.bits(), || {
-            match self.database_runtime.chunks().head_cell(id) {
-                Ok(header) => match self.database_runtime.schemas().uid_of_vid(&header.schema) {
-                    Some(uid) => KeyedFamily::Family(uid),
-                    None => KeyedFamily::Unknown,
-                },
-                Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
-                Err(_) => KeyedFamily::Unknown,
-            }
-        })
+        self.database_runtime
+            .write_fence()
+            .enter_keyed(id.bits(), || {
+                match self.database_runtime.chunks().head_cell(id) {
+                    Ok(header) => {
+                        match self.database_runtime.schemas().uid_of_vid(&header.schema) {
+                            Some(uid) => KeyedFamily::Family(uid),
+                            None => KeyedFamily::Unknown,
+                        }
+                    }
+                    Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
+                    Err(_) => KeyedFamily::Unknown,
+                }
+            })
     }
 
     /// Refuse a write for a slot this member does not own.

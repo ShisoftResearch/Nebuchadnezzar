@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::index::ranged::client::cursor::ClientCursor;
+use crate::client::ranged::RangedCursor;
 use crate::{
     index::{ranged::tree::btree::Ordering, IndexerClients},
     query::data_client::ValueRange,
@@ -18,7 +18,7 @@ use crate::ram::schema::SchemaUid;
 const BUFFER_SIZE: u16 = 64;
 
 pub struct CellIds {
-    cursor: UnsafeCell<ClientCursor>, // Resolve lifetime problem
+    cursor: UnsafeCell<RangedCursor>, // Resolve lifetime problem
     ongoing: RefCell<Option<Pin<Box<dyn Future<Output = Option<Id>>>>>>,
 }
 
@@ -38,10 +38,26 @@ impl DataSource<Id, CellIdQuery> for CellIds {
         let range = params.range.to_key_range(schema, field, ordering);
         let cursor = params
             .index_client
-            .range_seek(range, BUFFER_SIZE, None)
+            .range_seek(range.clone(), BUFFER_SIZE, None)
             .await
             .map_err(|e| format!("RPC error: {:?}", e))?;
         if let Some(cursor) = cursor {
+            let client = &params.index_client.neb_client;
+            let reader = crate::query::data_client::read::CellReader::new(
+                client.conshash.clone(),
+                client.group_name(),
+                client.database_name(),
+            );
+            let cursor = RangedCursor::new(
+                cursor,
+                reader,
+                vec![
+                    crate::index::verification::IndexCheck::Schema(schema),
+                    crate::index::verification::IndexCheck::Ranged(range),
+                ],
+            )
+            .await
+            .map_err(|error| format!("RPC error: {error:?}"))?;
             return Ok(Self {
                 cursor: UnsafeCell::new(cursor),
                 ongoing: RefCell::new(None),
