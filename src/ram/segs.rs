@@ -2546,7 +2546,7 @@ image, not an empty segment; archiving it would persist the damage.",
                     self.wal_bytes_written.fetch_add(size as usize, Relaxed) + size as usize;
                 let bytes_written = written - self.wal_bytes_synced.load(Acquire);
 
-                if bytes_written >= WAL_SYNC_BATCH_SIZE && !crate::ram::durability::capturing() {
+                if bytes_written >= WAL_SYNC_BATCH_SIZE && !capturing {
                     WAL_SYNCS.fetch_add(1, Relaxed);
                     let sync_started = std::time::Instant::now();
                     #[cfg(test)]

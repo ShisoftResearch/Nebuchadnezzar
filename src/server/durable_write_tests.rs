@@ -342,3 +342,192 @@ async fn durable_ack_indexed_write_covers_its_derived_wals() {
     assert!(files > 0);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn durable_ack_specialized_batch_keeps_successful_prefix_and_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let before = super::SPECIALIZED_BATCH_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut missing = cell(2, 2);
+    missing.header.schema = crate::ram::schema::SchemaVid(u32::MAX);
+    let results = rpc
+        .upsert_all_cells_durable(vec![cell(1, 1), missing, cell(3, 3)])
+        .await;
+    assert!(results[0].is_ok());
+    assert!(matches!(
+        results[1],
+        Err(WriteError::SchemaDoesNotExisted(_))
+    ));
+    assert!(matches!(results[2], Err(WriteError::BatchAborted)));
+    assert_covered(&server);
+    assert_eq!(
+        super::SPECIALIZED_BATCH_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1
+    );
+    let token = rpc
+        .fence_engage(&vec![schema().uid.0], 1000, 60000)
+        .await
+        .unwrap();
+    let blocked = rpc.upsert_all_cells_durable(vec![cell(4, 4)]).await;
+    assert!(
+        blocked[0].is_err(),
+        "specialized application bypassed the write fence"
+    );
+    rpc.fence_release(token).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_ack_captured_calls_wait_once_for_the_aggregate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let mut tokens = Vec::new();
+    for i in 1..=1024 {
+        let (result, captured) = rpc.write_cell_captured(cell(i, i)).await;
+        assert!(result.is_ok());
+        tokens.extend(captured);
+    }
+    assert_eq!(tokens.len(), 1024);
+    let before = crate::ram::durability::WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let end_before = server
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segs.iter_values())
+        .filter_map(|seg| seg.durable_file())
+        .filter(|file| file.end() > file.watermark())
+        .count();
+    assert!(end_before > 0, "application performed a durable wait");
+    rpc.finish_captured_receipts(tokens, true).await.unwrap();
+    assert_covered(&server);
+    assert_eq!(
+        crate::ram::durability::WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before,
+        end_before as u64
+    );
+    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_ack_captured_receipts_fail_on_sync_expiry_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let (result, tokens) = rpc.write_cell_captured(cell(1, 1)).await;
+    result.unwrap();
+    let old_token = tokens[0];
+    for chunk in &server.chunks().list {
+        for segment in chunk.segs.iter_values() {
+            if let Some(file) = segment.durable_file() {
+                file.inject_failure();
+            }
+        }
+    }
+    assert!(matches!(
+        rpc.finish_captured_receipts(tokens, true).await,
+        Err(WriteError::Durability(
+            crate::ram::durability::DurabilityError::Sync { .. }
+        ))
+    ));
+    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    // Missing tokens cannot be mistaken for records created after restart.
+    let fresh = super::CapturedReceipts::default();
+    let missing = Id::from_parts(fresh.incarnation.wrapping_add(1), 1);
+    assert!(super::CapturedReceipts::default()
+        .take(vec![missing])
+        .is_err());
+    server.shutdown().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let (_, tokens) = rpc.write_cell_captured(cell(1, 1)).await;
+    rpc.captured_receipts
+        .lock()
+        .entries
+        .get_mut(&tokens[0])
+        .unwrap()
+        .1 -= std::time::Duration::from_secs(600);
+    assert!(matches!(
+        rpc.finish_captured_receipts(tokens, true).await,
+        Err(WriteError::Durability(_))
+    ));
+    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    server.shutdown().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let (result, new_tokens) = rpc.write_cell_captured(cell(1, 1)).await;
+    result.unwrap();
+    assert!(
+        matches!(
+            rpc.finish_captured_receipts(vec![old_token], true).await,
+            Err(WriteError::Durability(_))
+        ),
+        "a previous runtime's token certified a replacement write"
+    );
+    rpc.finish_captured_receipts(new_tokens, true)
+        .await
+        .unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_ack_captured_client_groups_by_rpc_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = fixture(&dir).await;
+    let capture = crate::client::CapturedWriteBatch::new();
+    let client = server.current_database().neb_client.clone();
+    let syncs_before =
+        crate::ram::durability::GROUP_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    for i in 1..=128 {
+        let h = client
+            .write_cell_captured(&capture, cell(i, i))
+            .await
+            .unwrap()
+            .unwrap();
+        let h = client
+            .compare_version_and_update_cell_captured(&capture, h.id, h.version, cell(i, i + 1))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .compare_version_and_set_field_captured(
+                &capture,
+                h.id,
+                h.version,
+                bifrost_hasher::hash_str("value"),
+                OwnedValue::U64(i + 2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        if i % 4 == 0 {
+            client
+                .remove_cell_captured(&capture, h.id)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        crate::ram::durability::GROUP_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+        syncs_before,
+        "a captured operation used an immediate durability barrier"
+    );
+    let touched = server
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segs.iter_values())
+        .filter(|seg| seg.durable_file().is_some())
+        .count();
+    let before = crate::ram::durability::WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    capture.finish().await.unwrap().unwrap();
+    assert_covered(&server);
+    assert_eq!(
+        crate::ram::durability::WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before,
+        touched as u64
+    );
+    assert!(
+        capture.finish().await.unwrap().is_err(),
+        "a deferred scope was certified twice"
+    );
+    server.shutdown().await;
+}

@@ -55,6 +55,89 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError),
 }
 
+/// A deferred covering barrier. Captured calls acknowledge application only;
+/// finish must succeed before a caller acknowledges durability.
+pub struct CapturedWriteBatch {
+    clients: parking_lot::Mutex<Vec<(Arc<plain_server::AsyncServiceClient>, Vec<Id>)>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl CapturedWriteBatch {
+    pub fn new() -> Self {
+        Self {
+            clients: parking_lot::Mutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn record_call<T>(
+        &self,
+        client: Arc<plain_server::AsyncServiceClient>,
+        response: Result<(Result<T, WriteError>, Vec<Id>), RPCError>,
+    ) -> Result<Result<T, WriteError>, RPCError> {
+        let (result, tokens) = response?;
+        if !tokens.is_empty() {
+            let mut clients = self.clients.lock();
+            if let Some((_, old)) = clients.iter_mut().find(|(old, _)| {
+                let same = old.service_id == client.service_id
+                    && old.client.server_id == client.client.server_id;
+                #[cfg(test)]
+                let same = if std::env::var_os("NEB_TEST_REVERT_CAPTURE_TARGET_GROUP").is_some() {
+                    Arc::ptr_eq(old, &client)
+                } else {
+                    same
+                };
+                same
+            }) {
+                old.extend(tokens);
+            } else {
+                clients.push((client, tokens));
+            }
+        }
+        Ok(result)
+    }
+    pub async fn finish(&self) -> Result<Result<(), WriteError>, RPCError> {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(Err(WriteError::Durability(
+                crate::ram::durability::DurabilityError::Rpc {
+                    message: "captured batch already completed".into(),
+                },
+            )));
+        }
+        let clients = std::mem::take(&mut *self.clients.lock());
+        let results =
+            futures::future::join_all(clients.into_iter().map(|(client, tokens)| async move {
+                client.finish_captured_receipts(tokens, true).await
+            }))
+            .await;
+        let mut error = None;
+        for result in results {
+            match result {
+                Err(error) => return Err(error),
+                Ok(Err(failure)) => {
+                    error.get_or_insert(failure);
+                }
+                Ok(Ok(())) => {}
+            }
+        }
+        Ok(error.map_or(Ok(()), Err))
+    }
+}
+impl Drop for CapturedWriteBatch {
+    fn drop(&mut self) {
+        let clients = std::mem::take(self.clients.get_mut());
+        if clients.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for (client, tokens) in clients {
+                    let _ = client.finish_captured_receipts(tokens, false).await;
+                }
+            });
+        }
+        // Lost replies and unavailable peers expire their server receipts.
+    }
+}
+
 pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
@@ -973,6 +1056,140 @@ impl AsyncClient {
             }
         }
         Ok(first.map_or(Ok(()), Err))
+    }
+
+    pub async fn write_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // Local-shortcut RPC futures can complete without ever returning
+        // Pending, so a hot caller loop never yields to the runtime: it
+        // starves timers and peer tasks, and JoinHandle::abort can never
+        // land (the task must return from poll to be cancelled). Consuming
+        // coop budget bounds such loops to tokio's task budget. The yield
+        // sits AFTER the call so that on the all-local path a cancellation
+        // can only land once the write's side effects are complete -- never
+        // between the caller reserving work and the cell landing.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match capture.record_call(
+                client.clone(),
+                client.write_cell_captured(cell.clone()).await,
+            )? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    capture.record_call(client.clone(), client.write_cell_captured(cell).await)
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    capture.record_call(
+                        owner_client.clone(),
+                        owner_client.write_cell_captured(cell).await,
+                    )
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    pub async fn remove_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+    ) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(client.clone(), client.remove_cell_captured(id).await)? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(client.clone(), client.remove_cell_captured(id).await)
+            }
+            Err(WriteError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
+                capture.record_call(
+                    owner_client.clone(),
+                    owner_client.remove_cell_captured(id).await,
+                )
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Certify current WAL prefixes on every member of this database.
+    pub async fn compare_version_and_update_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+        version: u64,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_REVERT_CAPTURE_CAS_ROUTING").is_some() { return self.compare_version_and_update_cell_durable(id, version, cell).await; }
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(
+            client.clone(),
+            client
+                .compare_version_and_update_cell_captured(id, version, cell.clone())
+                .await,
+        )? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(
+                    client.clone(),
+                    client
+                        .compare_version_and_update_cell_captured(id, version, cell)
+                        .await,
+                )
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub async fn compare_version_and_set_field_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_REVERT_CAPTURE_CAS_ROUTING").is_some() { return self.compare_version_and_set_field_durable(id, version, field, value).await; }
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(
+            client.clone(),
+            client
+                .compare_version_and_set_field_captured(id, version, field, value.clone())
+                .await,
+        )? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(
+                    client.clone(),
+                    client
+                        .compare_version_and_set_field_captured(id, version, field, value)
+                        .await,
+                )
+            }
+            other => Ok(other),
+        }
     }
 
     pub async fn write_all_cells_durable(
