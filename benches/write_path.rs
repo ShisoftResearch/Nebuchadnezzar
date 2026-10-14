@@ -143,8 +143,8 @@ async fn run() {
     let group = "write_path_bench".to_string();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 256 * 1024 * 1024,
-            db_size: 1024 * 1024 * 1024,
+            chunk_size: 2 * 1024 * 1024 * 1024,
+            db_size: 8 * 1024 * 1024 * 1024,
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into_owned()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into_owned()),
@@ -187,6 +187,10 @@ async fn run() {
     let mut next_base = 1000;
     for concurrency in numbers("NEB_WP_CONCURRENCY", &[1, 8, 64]) {
         for batch in numbers("NEB_WP_BATCHES", &[1, 64]) {
+            let total = std::env::var(format!("NEB_WP_OPS_C{concurrency}"))
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(total);
             let per_lane = total.div_ceil(concurrency * batch) * batch;
             let ops = per_lane * concurrency;
             let base = next_base;
