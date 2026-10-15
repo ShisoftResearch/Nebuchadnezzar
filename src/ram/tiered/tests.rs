@@ -3704,6 +3704,9 @@ fn blocks_faulted_into_cold_segments_are_accounted_and_released() {
     );
 
     let chunk = &chunks.list[0];
+    // This fixture needs a cold segment. Rotation archives asynchronously,
+    // and eviction must skip a segment until that seal job finishes.
+    chunk.wait_for_segment_jobs_for_test();
     assert!(manager.explicit_evict(chunk, 4).expect("evict") > 0);
 
     // Read a handful of cells to fault blocks into cold segments.
