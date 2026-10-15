@@ -159,6 +159,9 @@ async fn cut_with_batch(durable: bool, batch: u64) -> usize {
     for result in results {
         result.unwrap();
     }
+    let artifacts = std::env::var_os("NEB_TEST_POWER_CUT_ARTIFACTS").map(|root| {
+        std::path::PathBuf::from(root).join(format!("cut-{}-{durable}-{batch}", std::process::id()))
+    });
     // Copy every WAL and discard all bytes above its certified prefix.
     // Shutdown happens only after this independent crash image is complete.
     let wal = cut.path().join("wal");
@@ -180,7 +183,7 @@ async fn cut_with_batch(durable: bool, batch: u64) -> usize {
             std::fs::copy(source, &destination).unwrap();
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(destination)
+                .open(&destination)
                 .unwrap()
                 .set_len(
                     seg.durable_file()
@@ -188,7 +191,18 @@ async fn cut_with_batch(durable: bool, batch: u64) -> usize {
                         .unwrap_or(crate::ram::wal_format::FILE_HEADER_SIZE as u64),
                 )
                 .unwrap();
+            if let Some(root) = &artifacts {
+                let raw = root.join("wal").join(relative);
+                std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+                std::fs::copy(&destination, raw).unwrap();
+            }
         }
+    }
+    if let Some(root) = &artifacts {
+        std::fs::write(root.join("fixture.txt"), format!(
+            "durable={durable}\nbatch={batch}\nacknowledged_operations={}\nexpected_live_cells={}\n",
+            96 + batch, 48 + batch,
+        )).unwrap();
     }
     let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(schema());

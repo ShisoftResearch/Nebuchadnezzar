@@ -3466,7 +3466,11 @@ mod tests {
             for (bits, address, version, data) in before {
                 let current_address = chunk.cell_location_and_version(bits).unwrap().0;
                 let cell = chunk.read_cell(bits).unwrap();
-                assert_eq!(cell.header.version, version, "movement changed version");
+                assert_eq!(
+                    cell.header.version, version,
+                    "movement changed version for {bits:x}, schema {:?}",
+                    cell.header.schema
+                );
                 assert_eq!(cell.data.to_owned_value(), data, "movement changed data");
                 if cell.header.schema == SchemaVid(HASH_SCHEMA_ID) && current_address != address {
                     moved += 1;
