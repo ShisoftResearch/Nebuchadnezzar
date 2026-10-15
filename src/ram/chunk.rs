@@ -1248,6 +1248,10 @@ pub struct Chunk {
     /// the alternative is silent corruption with no durable copy left.
     pub retired_segments: Mutex<Vec<RetiredSegment>>,
     pub(crate) retired_segment_files: AtomicUsize,
+    /// Segments, by seq id, that hold decision evidence a site still needs:
+    /// see `crate::ram::evidence`. The cleaner does not compact them. The
+    /// value counts the transactions that pin the segment.
+    evidence_pins: Mutex<std::collections::HashMap<u64, u32>>,
     /// Set once shutdown has begun archiving; no entry may be acquired after.
     ///
     /// Shutdown archives every dirty segment and only then stops the RPC
@@ -1526,6 +1530,7 @@ impl Chunk {
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
             retired_segment_files: AtomicUsize::new(0),
+            evidence_pins: Mutex::new(std::collections::HashMap::new()),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
@@ -1591,6 +1596,29 @@ impl Chunk {
             }
         }
         repaired
+    }
+
+    pub fn pin_evidence_segment(&self, seq_id: u64) {
+        *self.evidence_pins.lock().entry(seq_id).or_insert(0) += 1;
+    }
+
+    pub fn unpin_evidence_segment(&self, seq_id: u64) {
+        let mut pins = self.evidence_pins.lock();
+        if let Some(count) = pins.get_mut(&seq_id) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&seq_id);
+            }
+        }
+    }
+
+    /// Whether a segment holds decision evidence a site still needs.
+    pub fn is_evidence_pinned(&self, seq_id: u64) -> bool {
+        self.evidence_pins.lock().contains_key(&seq_id)
+    }
+
+    pub fn evidence_pinned_segments(&self) -> usize {
+        self.evidence_pins.lock().len()
     }
 
     pub fn is_active_head(&self, seg_id: u64) -> bool {
@@ -1960,10 +1988,11 @@ impl Chunk {
     /// transaction the peers resolved into one this store will still agree is
     /// committed after the next crash. Leaving it in a buffer would make the
     /// resolution itself something a crash could undo.
+    /// Returns the seq id of the segment that holds the record.
     pub fn write_resolved_commit(
         &self,
         txn: &crate::server::transactions::TxnId,
-    ) -> Result<(), WriteError> {
+    ) -> Result<u64, WriteError> {
         // Empty manifest, deliberately. A manifest lets a reader check that
         // every part of a bracket is present, and every member it could name
         // here is one this store already has; naming none says "decide on the
@@ -1971,6 +2000,10 @@ impl Chunk {
         let content = crate::ram::bracket::encode_commit(txn, &[]);
         let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
         let pending = self.try_acquire(size, false)?;
+        let seq_id = self
+            .locate_segment(pending.addr)
+            .map(|segment| segment.seq_id)
+            .ok_or(WriteError::CannotAllocateSpace)?;
         crate::ram::entry::stamp_reservation_padding(pending.addr, size);
         crate::ram::entry::Entry::encode_to(
             pending.addr,
@@ -1985,7 +2018,7 @@ impl Chunk {
             },
         );
         pending.append()?;
-        Ok(())
+        Ok(seq_id)
     }
 
     /// This chunk's lease key: unique across every store in the process.
@@ -4746,10 +4779,6 @@ pub enum DurableTxnStatus {
     Aborted,
 }
 
-/// How many committed transaction ids a restarted store remembers, so a peer
-/// in doubt can be answered. Same order as the live decision record.
-const RECOVERED_DECISION_MEMORY: usize = 64 * 1024;
-
 pub struct Chunks {
     pub list: Vec<Chunk>,
     /// Live bytes per slot across the whole store; the same instance every
@@ -4773,14 +4802,9 @@ pub struct Chunks {
     /// can ask its peers about them. Empty on a fresh store and after
     /// resolution.
     pub recovered_brackets: Mutex<crate::ram::recovery::RecoveredBrackets>,
-    /// Transactions this store durably COMMITTED, as found by recovery.
-    ///
-    /// A restarted site has no live decision record, so a peer asking "what
-    /// happened to T" would be told "never heard of it" -- presume-abort --
-    /// about a transaction sitting committed in its own segments. Newest
-    /// first, because the only transactions anyone asks about are the ones
-    /// that were in flight when something died.
-    recovered_commits: Mutex<std::collections::BTreeSet<crate::server::transactions::TxnId>>,
+    /// Committed transactions a peer, or this store's next recovery, may
+    /// still need the evidence of. See `crate::ram::evidence`.
+    evidence: crate::ram::evidence::DecisionEvidence,
     /// Set when the owning server goes away, so the background sweeper exits
     /// without waiting for the store itself to be dropped. The store can
     /// outlive its server -- an RPC service still holds it -- and a thread that
@@ -4802,27 +4826,33 @@ impl Chunks {
 
     /// Keep what recovery learned about transactions, for termination.
     ///
-    /// The committed set is capped and keeps the NEWEST, which is the right
-    /// end to keep: a peer only ever asks about a transaction that was in
-    /// flight when something died, and `TxnId` is an HLC so newest is just
-    /// the back of the set.
-    pub fn remember_recovered_brackets(&self, brackets: crate::ram::recovery::RecoveredBrackets) {
-        {
-            let mut commits = self.recovered_commits.lock();
-            commits.extend(brackets.committed.iter().cloned());
-            while commits.len() > RECOVERED_DECISION_MEMORY {
-                let Some(oldest) = commits.iter().next().cloned() else {
-                    break;
-                };
-                commits.remove(&oldest);
-            }
-        }
+    /// Every committed transaction is retained, with no cap: a restarted
+    /// store does not know which of them a peer is still in doubt about, so
+    /// it keeps all of them until the peers report what they hold open. The
+    /// pins are in place before the cleaner can run.
+    pub fn remember_recovered_brackets(
+        &self,
+        mut brackets: crate::ram::recovery::RecoveredBrackets,
+    ) {
+        let committed = std::mem::take(&mut brackets.committed);
+        let in_doubt: Vec<_> = brackets
+            .in_doubt
+            .iter()
+            .map(|bracket| bracket.txn.clone())
+            .collect();
+        self.evidence
+            .retain_recovered(&self.list, committed, in_doubt);
         *self.recovered_brackets.lock() = brackets;
     }
 
-    /// Whether recovery found a durable COMMIT for this transaction.
-    pub fn committed_at_recovery(&self, txn: &crate::server::transactions::TxnId) -> bool {
-        self.recovered_commits.lock().contains(txn)
+    /// Committed transactions whose evidence this store still keeps.
+    pub fn evidence(&self) -> &crate::ram::evidence::DecisionEvidence {
+        &self.evidence
+    }
+
+    /// Whether this store committed `txn` and keeps the evidence of it.
+    pub fn holds_commit_evidence(&self, txn: &crate::server::transactions::TxnId) -> bool {
+        self.evidence.holds_commit(txn)
     }
 
     /// Take the transactions recovery could not decide, for resolution.
@@ -5028,7 +5058,7 @@ impl Chunks {
                     .collect(),
             ),
             recovered_brackets: Mutex::new(crate::ram::recovery::RecoveredBrackets::empty()),
-            recovered_commits: Mutex::new(std::collections::BTreeSet::new()),
+            evidence: crate::ram::evidence::DecisionEvidence::new(),
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,

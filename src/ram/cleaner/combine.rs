@@ -187,6 +187,11 @@ impl CombinedCleaner {
                 if chunk.is_active_head(seg.id) {
                     return None;
                 }
+                // Compaction drops COMMIT records. A pinned segment holds one
+                // that a site still needs to decide a transaction.
+                if chunk.is_evidence_pinned(seg.seq_id) {
+                    return None;
+                }
                 // Check references first to avoid locking if busy (fast path)
                 if !seg.no_references() {
                     return None;

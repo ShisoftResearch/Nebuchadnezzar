@@ -188,38 +188,22 @@ async fn torn_transaction(
     client: &Arc<AsyncClient>,
     base_score: u64,
 ) -> (TxnId, Vec<Id>, Vec<u64>) {
-    let seed_id = cluster.site(SEED).server_id;
-    let a_id = cluster.site(A).server_id;
-    let b_id = cluster.site(B).server_id;
-    let plan = crate::migration::MigrationPlan {
-        batch_cells: 8,
-        ..Default::default()
-    };
-    for (slot, to) in [(HERE, a_id), (THERE, b_id)] {
-        crate::migration::migrate_slot(client, slot as u32, seed_id, to, &plan)
-            .await
-            .expect("slot should move to its site");
-    }
-    client.reload_slot_owners().await;
-    let ids = vec![Id::from_parts(HERE as u64, 1), Id::from_parts(THERE as u64, 1)];
-    assert_eq!(client.locate_server_id(&ids[0]).unwrap(), a_id);
-    assert_eq!(client.locate_server_id(&ids[1]).unwrap(), b_id);
+    torn_transaction_with(cluster, client, base_score, 0).await
+}
 
-    // The coordinator runs on the seed, whose slot table the migrations above
-    // updated. Its death is simulated by the end fan-out limit below.
-    let txn = super::new_async_client_for_database(&cluster.addresses[SEED], &cluster.group, &cluster.group)
-        .await
-        .unwrap();
-    let tid = txn.begin().await.unwrap().unwrap();
-    let scores = vec![base_score, base_score + 1];
-    for (id, score) in ids.iter().zip(scores.iter()) {
-        txn.write(tid.clone(), cell_of(*id, *score))
-            .await
-            .unwrap()
-            .unwrap();
-    }
-    txn.prepare(tid.clone()).await.unwrap().unwrap();
-    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), b_id);
+/// `torn_transaction`, with `bulk_on_a` extra 512 KiB cells written on A in
+/// the same transaction. They keep A's bracket segment mostly live, so the
+/// background cleaner does not pick it.
+async fn torn_transaction_with(
+    cluster: &Cluster,
+    client: &Arc<AsyncClient>,
+    base_score: u64,
+    bulk_on_a: u64,
+) -> (TxnId, Vec<Id>, Vec<u64>) {
+    let (txn, tid, ids, scores) =
+        prepared_transaction(cluster, client, base_score, bulk_on_a).await;
+    let limit =
+        super::manager::stop_end_fanout_after_server(tid.clone(), cluster.site(B).server_id);
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -237,6 +221,70 @@ async fn torn_transaction(
     (tid, ids, scores)
 }
 
+/// A transaction over both sites, prepared: both sites hold durable entries
+/// and no decision yet. Returns the coordinator client too.
+async fn prepared_transaction(
+    cluster: &Cluster,
+    client: &Arc<AsyncClient>,
+    base_score: u64,
+    bulk_on_a: u64,
+) -> (
+    Arc<super::manager::AsyncServiceClient>,
+    TxnId,
+    Vec<Id>,
+    Vec<u64>,
+) {
+    let seed_id = cluster.site(SEED).server_id;
+    let a_id = cluster.site(A).server_id;
+    let b_id = cluster.site(B).server_id;
+    let plan = crate::migration::MigrationPlan {
+        batch_cells: 8,
+        ..Default::default()
+    };
+    for (slot, to) in [(HERE, a_id), (THERE, b_id)] {
+        crate::migration::migrate_slot(client, slot as u32, seed_id, to, &plan)
+            .await
+            .expect("slot should move to its site");
+    }
+    client.reload_slot_owners().await;
+    let ids = vec![
+        Id::from_parts(HERE as u64, 1),
+        Id::from_parts(THERE as u64, 1),
+    ];
+    assert_eq!(client.locate_server_id(&ids[0]).unwrap(), a_id);
+    assert_eq!(client.locate_server_id(&ids[1]).unwrap(), b_id);
+
+    // The coordinator runs on the seed, whose slot table the migrations above
+    // updated. Its death is simulated by the end fan-out limit below.
+    let txn = super::new_async_client_for_database(
+        &cluster.addresses[SEED],
+        &cluster.group,
+        &cluster.group,
+    )
+    .await
+    .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let scores = vec![base_score, base_score + 1];
+    for (id, score) in ids.iter().zip(scores.iter()) {
+        txn.write(tid.clone(), cell_of(*id, *score))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    for n in 0..bulk_on_a {
+        let mut cell = cell_of(Id::from_parts(HERE as u64, 100 + n), base_score);
+        if let OwnedValue::Map(map) = &mut cell.data {
+            map.insert(
+                &String::from("name"),
+                OwnedValue::String("b".repeat(512 * 1024)),
+            );
+        }
+        txn.write(tid.clone(), cell).await.unwrap().unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+    (txn, tid, ids, scores)
+}
+
 /// What each site holds of the transaction.
 fn halves(cluster: &Cluster, ids: &[Id], scores: &[u64]) -> (bool, bool) {
     let a = score_on(cluster.site(A), &ids[0]) == Some(scores[0]);
@@ -246,12 +294,30 @@ fn halves(cluster: &Cluster, ids: &[Id], scores: &[u64]) -> (bool, bool) {
 
 fn assert_all_or_nothing(cluster: &Cluster, ids: &[Id], scores: &[u64], what: &str) {
     let (a, b) = halves(cluster, ids, scores);
-    warn!("CROSSSITE {}: site A holds its half: {}, site B holds its half: {}", what, a, b);
+    warn!(
+        "CROSSSITE {}: site A holds its half: {}, site B holds its half: {}",
+        what, a, b
+    );
     assert_eq!(
         a, b,
         "{}: the transaction is torn -- site A holds its half: {}, site B holds its half: {}",
         what, a, b
     );
+}
+
+fn segment_holds_begin_of(segment: &crate::ram::segs::Segment, tid: &TxnId) -> bool {
+    segment.entry_iter().any(|meta| {
+        if meta.entry_header.entry_type != EntryType::BEGIN {
+            return false;
+        }
+        let content = unsafe {
+            std::slice::from_raw_parts(
+                meta.body_pos as *const u8,
+                meta.entry_header.content_length as usize,
+            )
+        };
+        crate::ram::bracket::decode_begin(content).map_or(false, |txn| txn == *tid)
+    })
 }
 
 fn segment_holds_commit_of(segment: &crate::ram::segs::Segment, tid: &TxnId) -> bool {
@@ -284,82 +350,141 @@ fn rotate_out(chunk: &Chunk, seg_id: u64) {
     chunk.finish_rotated_head(seg_id);
 }
 
-/// Compact every segment of `server` that holds the COMMIT of `tid`.
-///
-/// This is what the cleaner does to such a segment once it is no longer a
-/// head: the live cells move to a new segment and the bracket markers stay
-/// behind. Done explicitly so the test does not depend on cleaner timing.
-fn compact_commit_evidence(server: &NebServer, tid: &TxnId) {
-    let chunks = server.chunks();
-    let mut compacted = 0;
-    for chunk in chunks.list.iter() {
-        let holding: Vec<u64> = chunk
-            .segments()
-            .iter()
-            .filter(|seg| segment_holds_commit_of(seg, tid))
-            .map(|seg| seg.id)
-            .collect();
-        if holding.is_empty() {
-            continue;
+/// One combine of the segments of `chunk` that hold the COMMIT of `tid`.
+enum CompactAttempt {
+    /// No segment of this chunk holds the COMMIT (any more).
+    Gone,
+    /// The combiner refused, and every such segment is evidence-pinned.
+    Pinned,
+    /// The combiner did not run for another reason: a reader, or the
+    /// background cleaner, held a segment. Try again.
+    Busy,
+}
+
+fn compact_attempt(
+    chunks: &crate::ram::chunk::Chunks,
+    chunk: &Chunk,
+    tid: &TxnId,
+) -> CompactAttempt {
+    let holding: Vec<u64> = chunk
+        .segments()
+        .iter()
+        .filter(|seg| segment_holds_commit_of(seg, tid))
+        .map(|seg| seg.id)
+        .collect();
+    if holding.is_empty() {
+        return CompactAttempt::Gone;
+    }
+    for seg_id in &holding {
+        if chunk.is_active_head(*seg_id) {
+            rotate_out(chunk, *seg_id);
         }
-        for seg_id in &holding {
-            if chunk.is_active_head(*seg_id) {
-                rotate_out(chunk, *seg_id);
-            }
-        }
-        // A second, unrelated candidate in the same chunk: the combiner works
-        // on two or more segments.
-        let locality = (0u16..u16::MAX)
-            .find(|l| *l as usize % chunks.list.len() == chunk.id)
-            .unwrap();
-        let filler = Id::from_parts(locality as u64, 900_001);
-        chunks
-            .write_cell(&mut cell_of(filler, 1))
-            .expect("filler cell");
-        let filler_seg = chunk
-            .locate_segment(chunks.address_of(&filler))
-            .expect("filler segment")
-            .id;
-        assert!(!holding.contains(&filler_seg));
-        if chunk.is_active_head(filler_seg) {
-            rotate_out(chunk, filler_seg);
-        }
-        let candidates: Vec<_> = chunk
-            .segments()
-            .into_iter()
-            .filter(|seg| holding.contains(&seg.id) || seg.id == filler_seg)
-            .collect();
-        let (_, reduced) =
-            crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
-        assert!(reduced > 0, "test setup: the combine must run");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while chunk
-            .retired_segment_files
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "test setup: the combined sources were never retired"
-            );
-            chunk.drain_retired_segments();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
+    }
+    // A second, unrelated candidate in the same chunk: the combiner works on
+    // two or more segments.
+    let locality = (0u16..u16::MAX)
+        .find(|l| *l as usize % chunks.list.len() == chunk.id)
+        .unwrap();
+    static FILLERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(900_001);
+    let filler = Id::from_parts(
+        locality as u64,
+        FILLERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+    chunks
+        .write_cell(&mut cell_of(filler, 1))
+        .expect("filler cell");
+    let filler_seg = chunk
+        .locate_segment(chunks.address_of(&filler))
+        .expect("filler segment")
+        .id;
+    assert!(!holding.contains(&filler_seg));
+    if chunk.is_active_head(filler_seg) {
+        rotate_out(chunk, filler_seg);
+    }
+    let candidates: Vec<_> = chunk
+        .segments()
+        .into_iter()
+        .filter(|seg| holding.contains(&seg.id) || seg.id == filler_seg)
+        .collect();
+    let (_, reduced) =
+        crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+    drop(candidates);
+    if reduced == 0 {
+        let pinned = holding.iter().all(|seg_id| {
             chunk
                 .segments()
                 .iter()
-                .all(|seg| !holding.contains(&seg.id)),
-            "test setup: the segments with the COMMIT must be gone"
-        );
-        compacted += holding.len();
+                .any(|seg| seg.id == *seg_id && chunk.is_evidence_pinned(seg.seq_id))
+        });
+        return if pinned {
+            CompactAttempt::Pinned
+        } else {
+            CompactAttempt::Busy
+        };
     }
-    assert!(compacted > 0, "test setup: no segment held the COMMIT");
-    assert_ne!(
-        chunks.durable_txn_status(tid),
-        DurableTxnStatus::Committed,
-        "test setup: the COMMIT must be gone after compaction"
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while chunk
+        .retired_segment_files
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test setup: the combined sources were never retired"
+        );
+        chunk.drain_retired_segments();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    CompactAttempt::Busy
+}
+
+/// Ask the cleaner to compact every segment of `server` that holds the
+/// COMMIT of `tid`, and return whether the COMMIT is gone afterwards.
+///
+/// This is what the cleaner does to such a segment once it is no longer a
+/// head: the live cells move to a new segment and the bracket markers stay
+/// behind. Done explicitly so the test does not depend on cleaner timing. The
+/// segments are handed to the combiner directly; the combiner itself decides
+/// which of them it may take. The background cleaner runs too, so a round
+/// that it disturbs is tried again.
+fn compact_commit_evidence(server: &NebServer, tid: &TxnId) -> bool {
+    let chunks = server.chunks();
+    if chunks.durable_txn_status(tid) != DurableTxnStatus::Committed {
+        // The background cleaner was first.
+        warn!("CROSSSITE the COMMIT of {:?} was already compacted", tid);
+        return true;
+    }
+    for _ in 0..50 {
+        let attempts: Vec<CompactAttempt> = chunks
+            .list
+            .iter()
+            .map(|chunk| compact_attempt(chunks, chunk, tid))
+            .collect();
+        if attempts.iter().all(|a| matches!(a, CompactAttempt::Gone)) {
+            break;
+        }
+        if attempts
+            .iter()
+            .all(|a| matches!(a, CompactAttempt::Gone | CompactAttempt::Pinned))
+        {
+            warn!(
+                "CROSSSITE compaction of the COMMIT segments of {:?}: refused, pinned",
+                tid
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let gone = chunks.durable_txn_status(tid) != DurableTxnStatus::Committed;
+    warn!(
+        "CROSSSITE compaction of the COMMIT segments of {:?}: COMMIT removed: {}",
+        tid, gone
     );
+    assert!(
+        gone,
+        "test setup: the combiner never took the unpinned COMMIT segments"
+    );
+    gone
 }
 
 /// Ask the live in-doubt site to resolve, the way its lease sweeper does.
@@ -377,8 +502,10 @@ async fn resolve_live(cluster: &Cluster, tid: &TxnId) {
         // participants, then commit, hold, or presume abort and roll back.
         site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
             .await;
-        if crate::ram::chunk::transaction_lease_count(tid, &cluster.site(A).chunks().address_range())
-            == 0
+        if crate::ram::chunk::transaction_lease_count(
+            tid,
+            &cluster.site(A).chunks().address_range(),
+        ) == 0
         {
             return;
         }
@@ -414,7 +541,12 @@ async fn a_compacted_peer_commit_then_peer_restart_keeps_the_restarted_site_atom
     );
     cluster.restart(A).await;
 
-    assert_all_or_nothing(&cluster, &ids, &scores, "compacted COMMIT, B restart, A restart");
+    assert_all_or_nothing(
+        &cluster,
+        &ids,
+        &scores,
+        "compacted COMMIT, B restart, A restart",
+    );
     cluster.shutdown().await;
 }
 
@@ -435,7 +567,12 @@ async fn a_compacted_peer_commit_then_peer_restart_keeps_the_live_site_atomic() 
     );
     resolve_live(&cluster, &tid).await;
 
-    assert_all_or_nothing(&cluster, &ids, &scores, "compacted COMMIT, B restart, A live");
+    assert_all_or_nothing(
+        &cluster,
+        &ids,
+        &scores,
+        "compacted COMMIT, B restart, A live",
+    );
     cluster.shutdown().await;
 }
 
@@ -505,7 +642,12 @@ async fn control_an_uncompacted_peer_commit_survives_the_peer_restart() {
     cluster.restart(A).await;
 
     let (a, b) = halves(&cluster, &ids, &scores);
-    assert!(a && b, "the control must commit on both sites: A {}, B {}", a, b);
+    assert!(
+        a && b,
+        "the control must commit on both sites: A {}, B {}",
+        a,
+        b
+    );
     cluster.shutdown().await;
 }
 
@@ -531,5 +673,158 @@ async fn a_resolved_site_stays_committed_through_a_second_restart() {
     cluster.restart(A).await;
 
     assert_all_or_nothing(&cluster, &ids, &scores, "resolved site, second restart");
+    cluster.shutdown().await;
+}
+
+fn retained_on(cluster: &Cluster, index: usize) -> (usize, usize) {
+    cluster.site(index).chunks().evidence().counts()
+}
+
+fn pinned_on(cluster: &Cluster, index: usize) -> usize {
+    cluster
+        .site(index)
+        .chunks()
+        .list
+        .iter()
+        .map(|chunk| chunk.evidence_pinned_segments())
+        .sum()
+}
+
+/// Run release rounds until the site no longer retains `tid`. The background
+/// loop runs them too; either may release it.
+async fn wait_released(cluster: &Cluster, index: usize, tid: &TxnId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while cluster.site(index).chunks().holds_commit_evidence(tid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the evidence of {:?} was never released",
+            tid
+        );
+        release_round(cluster, index).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn release_round(cluster: &Cluster, index: usize) -> usize {
+    cluster
+        .site(index)
+        .database_runtime()
+        .data_site()
+        .expect("the site runs a data site")
+        .release_decision_evidence()
+        .await
+}
+
+/// Liveness: the evidence goes once every participant has decided, and the
+/// cleaner can then compact the COMMIT segment.
+///
+/// While A is in doubt, a release round keeps the evidence and the cleaner
+/// does not take the segment. After A resolves, one round releases it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_peer_evidence_is_released_once_every_participant_decided() {
+    let (cluster, client) = Cluster::start("crosssite_release").await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 7000).await;
+    drop(client);
+
+    assert_eq!(retained_on(&cluster, B).0, 1, "B retains the commit");
+    assert!(pinned_on(&cluster, B) > 0, "B pins its COMMIT segment");
+    assert_eq!(
+        release_round(&cluster, B).await,
+        0,
+        "A is in doubt: keep it"
+    );
+    assert!(
+        !compact_commit_evidence(cluster.site(B), &tid),
+        "the cleaner must not take the COMMIT while A is in doubt"
+    );
+
+    resolve_live(&cluster, &tid).await;
+    assert_all_or_nothing(&cluster, &ids, &scores, "release, A resolved live");
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "A must commit what B was told to commit");
+
+    wait_released(&cluster, B, &tid).await;
+    assert_eq!(retained_on(&cluster, B), (0, 0));
+    assert_eq!(pinned_on(&cluster, B), 0);
+    assert!(
+        compact_commit_evidence(cluster.site(B), &tid),
+        "once released, the cleaner compacts the COMMIT segment"
+    );
+    assert_eq!(score_on(cluster.site(B), &ids[1]), Some(scores[1]));
+    cluster.shutdown().await;
+}
+
+/// Liveness after a restart: a restarted site retains every commit recovery
+/// found, because it lost the participant sets. Once the membership view has
+/// settled and every member reports nothing open, it releases them all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_site_releases_recovered_evidence_when_no_member_holds_it_open() {
+    let (mut cluster, client) = Cluster::start("crosssite_release_restart").await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 8000).await;
+    drop(client);
+    resolve_live(&cluster, &tid).await;
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "test setup: A must commit");
+
+    cluster.restart(B).await;
+    assert!(
+        cluster.site(B).chunks().holds_commit_evidence(&tid),
+        "a restarted site retains what recovery found"
+    );
+    assert!(pinned_on(&cluster, B) > 0);
+    wait_released(&cluster, B, &tid).await;
+    assert_eq!(retained_on(&cluster, B), (0, 0));
+    assert_eq!(pinned_on(&cluster, B), 0);
+    cluster.shutdown().await;
+}
+
+/// The resolved site's own COMMIT record must outlive the peer's evidence.
+///
+/// After a restart, A resolves the transaction and writes its COMMIT into a
+/// new segment; the BEGIN stays in the old one. B then releases its evidence
+/// (A no longer holds the transaction open) and forgets the decision. If the
+/// cleaner could now compact A's new segment, A's next restart would find the
+/// BEGIN without a COMMIT, ask B, hear Unknown and drop its half.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resolved_sites_own_commit_record_outlives_the_peer_evidence() {
+    let (mut cluster, client) = Cluster::start("crosssite_fragile").await;
+    let (tid, ids, scores) = torn_transaction_with(&cluster, &client, 9000, 6).await;
+    drop(client);
+
+    cluster.restart(A).await;
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "test setup: the restart must resolve COMMIT");
+
+    // B lets go: A decided, and the decision memory moves on.
+    wait_released(&cluster, B, &tid).await;
+    cluster
+        .site(B)
+        .database_runtime()
+        .data_site()
+        .unwrap()
+        .fill_decision_memory_with_later_decisions();
+    assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Unknown);
+
+    // The cleaner reaches A's resolved COMMIT record.
+    let removed = compact_commit_evidence(cluster.site(A), &tid);
+    warn!(
+        "CROSSSITE resolved COMMIT record on A removed by compaction: {}",
+        removed
+    );
+    assert!(
+        cluster.site(A).chunks().list.iter().any(|chunk| chunk
+            .segments()
+            .iter()
+            .any(|seg| segment_holds_begin_of(seg, &tid))),
+        "test setup: A's old segment with the open BEGIN must still be there"
+    );
+    cluster.restart(A).await;
+
+    assert_all_or_nothing(
+        &cluster,
+        &ids,
+        &scores,
+        "resolved record, peer forgot, A restart",
+    );
     cluster.shutdown().await;
 }

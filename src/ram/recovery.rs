@@ -440,6 +440,13 @@ pub struct BracketLedger {
     pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
     commits:
         Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
+    /// Where each COMMIT was found, per transaction.
+    commit_segments:
+        Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::evidence::SegmentRef>>>,
+    /// Segments in which a transaction's BEGIN is not closed by a COMMIT in
+    /// the same segment.
+    open_parts:
+        Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::evidence::SegmentRef>>>,
     /// Every plain (unbracketed) tombstone the scan met, newest version per
     /// `(chunk, hash)`. Segment order is NOT write order across segments (a
     /// chunk writes into several heads at once), so the scan cannot decide
@@ -492,6 +499,8 @@ impl BracketLedger {
                 .collect(),
             pending: Mutex::new(HashMap::new()),
             commits: Mutex::new(HashMap::new()),
+            commit_segments: Mutex::new(HashMap::new()),
+            open_parts: Mutex::new(HashMap::new()),
             plain_deletes: Mutex::new(Vec::new()),
             ties: Mutex::new(HashMap::new()),
             late_losers: Mutex::new(Vec::new()),
@@ -526,8 +535,26 @@ impl BracketLedger {
         &self,
         txn: &crate::server::transactions::TxnId,
         manifest: Vec<crate::ram::bracket::ManifestEntry>,
+        at: crate::ram::evidence::SegmentRef,
     ) {
         self.commits.lock().insert(txn.clone(), manifest);
+        self.commit_segments
+            .lock()
+            .entry(txn.clone())
+            .or_default()
+            .push(at);
+    }
+
+    fn note_open_part(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        at: crate::ram::evidence::SegmentRef,
+    ) {
+        self.open_parts
+            .lock()
+            .entry(txn.clone())
+            .or_default()
+            .push(at);
     }
 
     /// Apply every committed bracket and report the rest.
@@ -544,6 +571,8 @@ impl BracketLedger {
     /// peers before deciding: see [`RecoveredBrackets`].
     pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, RecoveryCellReadError> {
         let commits = std::mem::take(&mut *self.commits.lock());
+        let mut commit_segments = std::mem::take(&mut *self.commit_segments.lock());
+        let mut open_parts = std::mem::take(&mut *self.open_parts.lock());
         let mut pending = std::mem::take(&mut *self.pending.lock());
         // Floors count physical tombstones, including undecided brackets.
         // Their versions constrain a future create without deciding the bracket.
@@ -555,7 +584,11 @@ impl BracketLedger {
         let mut committed_txns = Vec::with_capacity(commits.len());
         let mut committed_cells: Vec<PendingBracketCell> = Vec::new();
         for (txn, manifest) in commits {
-            committed_txns.push(txn.clone());
+            committed_txns.push(crate::ram::evidence::RecoveredCommit {
+                txn: txn.clone(),
+                commits: commit_segments.remove(&txn).unwrap_or_default(),
+                open: open_parts.remove(&txn).unwrap_or_default(),
+            });
             let missing: Vec<_> = manifest
                 .iter()
                 .filter(|member| !self.present.contains(&(member.chunk_id, member.seq_id)))
@@ -635,7 +668,13 @@ impl BracketLedger {
                 let mut chunks: Vec<usize> = cells.iter().map(|cell| cell.chunk_id).collect();
                 chunks.sort_unstable();
                 chunks.dedup();
-                InDoubtBracket { txn, cells, chunks }
+                let open = open_parts.remove(&txn).unwrap_or_default();
+                InDoubtBracket {
+                    txn,
+                    cells,
+                    chunks,
+                    open,
+                }
             })
             .collect();
         Ok(RecoveredBrackets {
@@ -658,6 +697,8 @@ pub struct InDoubtBracket {
     /// these are the cells that must be installed. The entries themselves are
     /// still in the segments -- only the index placement is deferred.
     pub cells: Vec<PendingBracketCell>,
+    /// The segments that hold its parts. No COMMIT in them closes a part.
+    pub open: Vec<crate::ram::evidence::SegmentRef>,
 }
 
 /// What recovery learned about transactions, for cooperative termination.
@@ -668,7 +709,7 @@ pub struct InDoubtBracket {
 /// read that as abort and tear the transaction the restart was supposed to
 /// preserve.
 pub struct RecoveredBrackets {
-    pub committed: Vec<crate::server::transactions::TxnId>,
+    pub committed: Vec<crate::ram::evidence::RecoveredCommit>,
     pub in_doubt: Vec<InDoubtBracket>,
 }
 
@@ -1335,6 +1376,7 @@ fn current_segment_entry_content_length(
 fn scan_segment_from_data(
     chunk: &Chunk,
     seg_id: u64,
+    seq_id: u64,
     segment_base: usize,
     data: &[u8],
     version_map: &mut VersionMap,
@@ -1566,6 +1608,7 @@ fn scan_segment_from_data(
                     )
                 };
                 if let Some((start, txn)) = open_bracket.take() {
+                    ledger.note_open_part(&txn, (chunk.id, seq_id));
                     // One writer per segment means this cannot happen from a
                     // legal interleaving; say so rather than guess, and treat
                     // the older bracket as unfinished, which is the safe read.
@@ -1609,10 +1652,11 @@ fn scan_segment_from_data(
                         // not decided in this segment: a cross-chunk
                         // transaction is committed as a whole, so the ledger
                         // settles it once every COMMIT is known.
-                        ledger.note_commit(&commit_txn, manifest);
+                        ledger.note_commit(&commit_txn, manifest, (chunk.id, seq_id));
                         open_bracket = None;
                     }
                     (Some((start, open_txn)), Some((commit_txn, _))) => {
+                        ledger.note_open_part(open_txn, (chunk.id, seq_id));
                         warn!(
                             "Recovered segment {} has a COMMIT for {:?} at offset {} while the \
                              open bracket belongs to {:?} (from offset {}); neither is applied",
@@ -1624,15 +1668,27 @@ fn scan_segment_from_data(
                         );
                         open_bracket = None;
                     }
-                    (None, _) => {
-                        // A COMMIT whose BEGIN is not in this segment: the
-                        // final part of a chain, which Step 3 resolves. On its
-                        // own it closes nothing here.
+                    (None, Some((commit_txn, manifest))) => {
+                        // A COMMIT whose BEGIN is not in this segment. The
+                        // writer closes every part in its own segment, so
+                        // this is the record a site writes when its peers
+                        // resolve an in-doubt transaction as committed
+                        // (`Chunk::write_resolved_commit`). It closes nothing
+                        // here, and it decides the transaction wherever its
+                        // parts are: ignoring it put the resolved transaction
+                        // in doubt again at every later restart.
                         debug!(
-                            "Recovered segment {} has a COMMIT at offset {} with no open bracket",
-                            seg_id, offset
+                            "Recovered segment {} has a COMMIT for {:?} at offset {} with no open \
+                             bracket",
+                            seg_id, commit_txn, offset
                         );
+                        ledger.note_commit(&commit_txn, manifest, (chunk.id, seq_id));
                     }
+                    (None, None) => warn!(
+                        "Recovered segment {} has an undecodable COMMIT at offset {} with no open \
+                         bracket",
+                        seg_id, offset
+                    ),
                     (Some(_), None) => warn!(
                         "Recovered segment {} has an undecodable COMMIT at offset {}; its bracket \
                          stays uncommitted",
@@ -1887,6 +1943,11 @@ fn scan_segment_from_data(
             break;
         }
         cursor = new_cursor;
+    }
+    if let Some((_, txn)) = &open_bracket {
+        // No COMMIT in this segment closes this part. If the transaction is
+        // committed, it depends on a COMMIT in another segment.
+        ledger.note_open_part(txn, (chunk.id, seq_id));
     }
     let final_append_offset = append_header - data_base;
     let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
@@ -2177,6 +2238,7 @@ pub fn recover_chunks(
                         let scan_result = scan_segment_from_data(
                             chunk,
                             file_info.seg_id,
+                            file_info.seq_id,
                             segment_base,
                             &file_data,
                             version_map,
@@ -2747,6 +2809,7 @@ mod tests {
         scan_segment_from_data(
             chunk,
             1,
+            1,
             chunk.allocator.addr_by_id(1),
             data,
             &mut version_map,
@@ -2768,6 +2831,7 @@ mod tests {
             .collect();
         scan_segment_from_data(
             chunk,
+            1,
             1,
             chunk.allocator.addr_by_id(1),
             data,

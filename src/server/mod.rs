@@ -3389,11 +3389,16 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
 /// unconditionally before.
 async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
     let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
-    if in_doubt.is_empty() {
-        return;
-    }
-    let me = database_runtime.rpc.server_id;
     let Some(txn_manager) = database_runtime.txn_manager().cloned() else {
+        // No peer can ask this database anything, so there is no commit
+        // evidence to keep for one.
+        database_runtime
+            .chunks
+            .evidence()
+            .release_all_retained(&database_runtime.chunks.list);
+        if in_doubt.is_empty() {
+            return;
+        }
         warn!(
             "{} transaction(s) are in doubt after recovery but this database runs no transaction \
              service, so there is nothing to ask with; all are presumed abort",
@@ -3404,6 +3409,10 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
         }
         return;
     };
+    if in_doubt.is_empty() {
+        return;
+    }
+    let me = database_runtime.rpc.server_id;
 
     // WAIT for the membership to know its peers before believing it has none.
     //
@@ -3450,6 +3459,10 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
         );
         for bracket in &in_doubt {
             discard_in_doubt(bracket, "no peer in the group to ask");
+            database_runtime
+                .chunks
+                .evidence()
+                .end_resolving(&bracket.txn);
         }
         return;
     }
@@ -3491,11 +3504,20 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
                 }
             }
             if committed {
-                apply_resolved_commit(database_runtime, &bracket);
+                if apply_resolved_commit(database_runtime, &bracket) {
+                    database_runtime
+                        .chunks
+                        .evidence()
+                        .end_resolving(&bracket.txn);
+                }
                 continue;
             }
             if answered == roster.len() {
                 discard_in_doubt(&bracket, "every peer answered and none had committed it");
+                database_runtime
+                    .chunks
+                    .evidence()
+                    .end_resolving(&bracket.txn);
                 continue;
             }
             still_waiting.push(bracket);
@@ -3515,6 +3537,10 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
             resolve_answer_timeout()
         );
         discard_in_doubt(bracket, "peers did not answer in time");
+        database_runtime
+            .chunks
+            .evidence()
+            .end_resolving(&bracket.txn);
     }
 }
 
@@ -3561,17 +3587,25 @@ fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
 /// are still on disk. Same reasoning as the per-part rule in
 /// `close_transaction_bracket`, at chunk granularity: as precise as this path
 /// can be, since the transaction's own segments are full or sealed.
+///
+/// The records land in new segments, because a recovered segment never
+/// becomes a write head again, while the BEGINs stay where they were. So the
+/// segments with the records are pinned until the segments with the BEGINs
+/// are gone: compacting a record first would put the transaction in doubt
+/// again at the next restart.
+///
+/// Returns whether the transaction is decided here.
 fn apply_resolved_commit(
     database_runtime: &Arc<DatabaseRuntime>,
     bracket: &crate::ram::recovery::InDoubtBracket,
-) {
-    let mut placed = 0usize;
+) -> bool {
+    let mut placed = Vec::new();
     for chunk_id in &bracket.chunks {
         let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
             continue;
         };
         match chunk.write_resolved_commit(&bracket.txn) {
-            Ok(()) => placed += 1,
+            Ok(seq_id) => placed.push((*chunk_id, seq_id)),
             Err(error) => warn!(
                 "chunk {} holds part of resolved transaction {:?} but could not take its COMMIT: \
                  {:?}",
@@ -3579,7 +3613,7 @@ fn apply_resolved_commit(
             ),
         }
     }
-    if placed == 0 {
+    if placed.is_empty() {
         error!(
             "transaction {:?} was resolved COMMITTED by a peer but none of its {} chunk(s) could \
              hold a COMMIT; leaving it in doubt rather than installing cells this store would \
@@ -3587,23 +3621,29 @@ fn apply_resolved_commit(
             bracket.txn,
             bracket.chunks.len()
         );
-        return;
+        return false;
     }
-    if placed < bracket.chunks.len() {
+    if placed.len() < bracket.chunks.len() {
         warn!(
-            "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely on \
-             those records surviving compaction",
+            "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); recovery decides \
+             it from any one of them",
             bracket.txn,
-            placed,
+            placed.len(),
             bracket.chunks.len()
         );
     }
+    database_runtime.chunks.evidence().retain_fragile(
+        &database_runtime.chunks.list,
+        bracket.txn.clone(),
+        placed,
+        bracket.open.clone(),
+    );
     for cell in &bracket.cells {
         if let Err(error) =
             crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell)
         {
             error!("cannot install resolved transaction {:?}: {}", bracket.txn, error);
-            return;
+            return false;
         }
     }
     warn!(
@@ -3614,6 +3654,7 @@ fn apply_resolved_commit(
     );
     crate::ram::recovery::BRACKETS_APPLIED
         .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000

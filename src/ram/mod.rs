@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod cleaner;
 pub mod compression;
 pub mod entry;
+pub mod evidence;
 pub mod file_manager;
 pub mod io;
 pub mod qsbr;

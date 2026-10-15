@@ -15,7 +15,7 @@ use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -269,6 +269,16 @@ fn termination_answer_grace() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
+/// How long a restarted site waits for its membership view before it asks
+/// every member about the commits recovery found.
+fn evidence_membership_settle() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_SETTLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(10))
+}
+
 fn txn_lease_timeout() -> std::time::Duration {
     std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
         .ok()
@@ -370,9 +380,11 @@ pub struct DataManager {
     /// other half committed.
     ///
     /// Bounded and ordered. `TxnId` is an HLC, so oldest-first eviction is
-    /// just the front of the map, and the retention that matters is measured
-    /// against how long a coordinator can be gone before the lease sweeper
-    /// gives up -- seconds, against tens of thousands of entries.
+    /// just the front of the map. Eviction alone is not safe for a commit: a
+    /// peer can stay in doubt for longer than any bound, for example while it
+    /// is down. So a commit with other participants is also kept in the
+    /// store's decision evidence (`crate::ram::evidence`), durably and until
+    /// no participant holds it open; this map is the fast path.
     decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
     /// When each in-doubt transaction was first found unresolvable because a
     /// participant would not answer. Bounds how long its write heads stay
@@ -380,6 +392,8 @@ pub struct DataManager {
     /// refill path, so waiting forever trades one wrong answer for a
     /// different one.
     in_doubt_since: Mutex<BTreeMap<TxnId, std::time::Instant>>,
+    /// When this site started; see `release_decision_evidence`.
+    started: std::time::Instant,
 }
 
 /// How many finished transactions a site remembers the fate of. Sized to
@@ -412,6 +426,11 @@ service! {
     // coordinator. That is the whole point -- the coordinator is the thing
     // that went away.
     rpc txn_status(tid: TxnId) -> DataSiteResponse<TxnOutcome>;
+
+    // The transactions this site holds open: it can still ask a peer about
+    // each of them. A peer keeps the evidence of a commit until no site that
+    // can ask reports it here.
+    rpc open_transactions() -> DataSiteResponse<Vec<TxnId>>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -433,6 +452,7 @@ impl DataManager {
             cleanup_signal: cleanup_signal.clone(),
             decided: Mutex::new(BTreeMap::new()),
             in_doubt_since: Mutex::new(BTreeMap::new()),
+            started: std::time::Instant::now(),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -446,6 +466,15 @@ impl DataManager {
                     .sweep_idle_transactions(txn_lease_timeout(), termination_answer_grace())
                     .await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        // Separate from the sweep, so a peer that is slow to answer does not
+        // delay it.
+        let manager_clone = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                manager_clone.release_decision_evidence().await;
             }
         });
 
@@ -967,6 +996,9 @@ impl DataManager {
             return Err(EndResult::CheckFailed(CheckError::CannotEnd));
         }
         let store = self.chunks().address_range();
+        // The segments that will hold this site's COMMITs. Read while the
+        // leases are held: they name the heads the brackets live in.
+        let manifest = crate::ram::chunk::transaction_manifest(tid, &store);
         if let Err(error) = self.chunks().commit_transaction_brackets(tid) {
             // Metadata locks still belong to this participant.
             // Restore the prepared writes before readers can acquire them.
@@ -983,6 +1015,8 @@ impl DataManager {
             });
         }
         txn.decided_commit = true;
+        // Before the leases go: until then no COMMIT segment can be compacted.
+        self.retain_commit_evidence(tid, &txn.participants, &manifest);
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -1227,6 +1261,161 @@ impl DataManager {
         }
     }
 
+    fn has_other_participants(&self, participants: &[u64]) -> bool {
+        let me = self.database_runtime.rpc.server_id;
+        participants.iter().any(|peer| *peer != me)
+    }
+
+    /// Keep the answer `Committed` for `tid` until no other participant can
+    /// ask. A transaction with no other participant needs none: no peer can
+    /// be in doubt about it.
+    fn retain_commit_evidence(
+        &self,
+        tid: &TxnId,
+        participants: &[u64],
+        manifest: &[crate::ram::bracket::ManifestEntry],
+    ) {
+        if !self.has_other_participants(participants) {
+            return;
+        }
+        let me = self.database_runtime.rpc.server_id;
+        let peers: BTreeSet<u64> = participants
+            .iter()
+            .copied()
+            .filter(|peer| *peer != me)
+            .collect();
+        let chunks = self.chunks();
+        chunks.evidence().retain_commit(
+            &chunks.list,
+            tid.clone(),
+            Some(peers),
+            manifest
+                .iter()
+                .map(|member| (member.chunk_id as usize, member.seq_id))
+                .collect(),
+        );
+    }
+
+    /// The transactions this site can still ask a peer about: every live
+    /// transaction object, and every bracket recovery left in doubt that is
+    /// not resolved yet.
+    pub(crate) fn open_transaction_ids(&self) -> Vec<TxnId> {
+        let mut open: Vec<TxnId> = self.txns_sorted.lock().iter().cloned().collect();
+        open.extend(self.chunks().evidence().resolving());
+        open
+    }
+
+    /// One release round for the commit evidence this site retains.
+    ///
+    /// A transaction is released when every site that can ask about it
+    /// answered and none holds it open. A site that holds a transaction open
+    /// prepared it before this site committed it, so a site that does not
+    /// hold it open now has decided it and never asks again. SILENCE IS NOT
+    /// AN ANSWER: a site that cannot be reached keeps every transaction it
+    /// could ask about retained.
+    ///
+    /// After a restart the participant sets are gone, so every member of the
+    /// group must answer. Those transactions wait until the membership view
+    /// has had the settle time to fill, for the same reason as
+    /// `resolve_in_doubt_after_recovery`.
+    pub(crate) async fn release_decision_evidence(&self) -> usize {
+        let chunks = self.chunks().clone();
+        chunks.evidence().release_settled_fragile(&chunks.list);
+        let candidates = chunks.evidence().release_candidates();
+        if candidates.is_empty() {
+            return 0;
+        }
+        let Some(txn_manager) = self.database_runtime.txn_manager().cloned() else {
+            return 0;
+        };
+        let me = self.database_runtime.rpc.server_id;
+        let roster: Option<BTreeSet<u64>> = if candidates
+            .iter()
+            .any(|candidate| candidate.participants.is_none())
+            && self.started.elapsed() >= evidence_membership_settle()
+        {
+            match self
+                .database_runtime
+                .consh
+                .membership()
+                .all_members(false)
+                .await
+            {
+                Ok((members, _)) => Some(
+                    members
+                        .into_iter()
+                        .map(|member| member.id)
+                        .filter(|id| *id != me)
+                        .collect(),
+                ),
+                Err(error) => {
+                    debug!(
+                        "membership not readable for an evidence release round: {:?}",
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut ask: BTreeSet<u64> = BTreeSet::new();
+        for candidate in &candidates {
+            match (&candidate.participants, &roster) {
+                (Some(participants), _) => ask.extend(participants.iter().copied()),
+                (None, Some(roster)) => ask.extend(roster.iter().copied()),
+                (None, None) => {}
+            }
+        }
+        let mut open_at: HashMap<u64, HashSet<TxnId>> = HashMap::new();
+        for peer in ask {
+            let site = match txn_manager.data_site_for(peer).await {
+                Ok(site) => site,
+                Err(error) => {
+                    debug!(
+                        "cannot reach site {} for an evidence release round: {}",
+                        peer, error
+                    );
+                    continue;
+                }
+            };
+            match site.open_transactions().await {
+                Ok(response) => {
+                    self.update_clock(response.clock);
+                    open_at.insert(peer, response.payload.into_iter().collect());
+                }
+                Err(error) => debug!(
+                    "site {} did not report its open transactions: {:?}",
+                    peer, error
+                ),
+            }
+        }
+        let releasable: Vec<TxnId> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                let must_answer = match (&candidate.participants, &roster) {
+                    (Some(participants), _) => participants,
+                    (None, Some(roster)) => roster,
+                    (None, None) => return false,
+                };
+                must_answer.iter().all(|peer| {
+                    open_at
+                        .get(peer)
+                        .map_or(false, |open| !open.contains(&candidate.txn))
+                })
+            })
+            .map(|candidate| candidate.txn)
+            .collect();
+        let released = chunks.evidence().release(&chunks.list, &releasable);
+        if released > 0 {
+            debug!(
+                "released the commit evidence of {} transaction(s)",
+                released
+            );
+        }
+        released
+    }
+
     /// Remember what this site decided, so a peer in doubt can be told.
     ///
     /// Recorded at `end` and at `abort`, which are the only two places a
@@ -1259,12 +1448,11 @@ impl DataManager {
         if let Some(outcome) = self.decided.lock().get(tid) {
             return *outcome;
         }
-        // A RESTART empties the live record but not the segments. Without
-        // this a site that durably committed answers "never heard of it"
-        // about its own committed transaction, and the peer asking reads that
-        // as abort -- tearing the transaction the durable COMMIT existed to
-        // preserve.
-        if self.chunks().committed_at_recovery(tid) {
+        // The live record is bounded and a RESTART empties it. The commit
+        // evidence is kept until no participant can ask, so a site that
+        // durably committed never answers "never heard of it" to a peer
+        // that is still in doubt.
+        if self.chunks().holds_commit_evidence(tid) {
             return TxnOutcome::Committed;
         }
         // Still live here. Anything short of a decision is in doubt --
@@ -6687,6 +6875,11 @@ impl Service for DataManager {
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
         let outcome = self.txn_outcome(&tid);
         async move { self.response_with(outcome).await }.boxed()
+    }
+
+    fn open_transactions(&self) -> BoxFuture<'_, DataSiteResponse<Vec<TxnId>>> {
+        let open = self.open_transaction_ids();
+        async move { self.response_with(open).await }.boxed()
     }
 
     fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
