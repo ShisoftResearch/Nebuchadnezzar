@@ -732,6 +732,21 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
     );
 }
 
+// Eviction policy assertions need eligible victims. Rotation archives on a
+// background thread, which pins its source until the durable image is complete.
+// Wait for that setup work, rather than racing eviction against the archive.
+fn wait_for_rotated_archive(segment: &crate::ram::segs::Segment) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(segment.is_sealed() && segment.no_references()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rotated segment {} must finish its archive before eviction",
+            segment.id
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn test_blob_segments_evict_before_regular_segments() {
     let _guard = test_lock();
@@ -839,6 +854,10 @@ fn test_blob_segments_evict_before_regular_segments() {
         "setup should keep the blob non-head hot before eviction"
     );
 
+    for id in [regular_non_head, blob_non_head] {
+        wait_for_rotated_archive(&chunk.segs.get(&(id as usize)).unwrap());
+    }
+
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -940,6 +959,10 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         .copied()
         .find(|(_, segment_id)| *segment_id != blob_head)
         .expect("setup should create a non-head blob segment to evict");
+
+    wait_for_rotated_archive(
+        &chunk.segs.get(&(cold_target_segment_id as usize)).unwrap(),
+    );
 
     let evicted = manager
         .explicit_evict(chunk, 1)
