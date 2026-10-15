@@ -4051,6 +4051,9 @@ mod tests {
         assert_eq!(hash_report.hash_entries_missing, 0);
         assert_eq!(hash_report.hash_entries_stale, 0);
 
+        // The controlled move runs once. Its destination can be the only
+        // segment left when the next verification starts.
+        std::env::remove_var("NEB_TEST_HASH_SCRUB_MOVE");
         let all = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("post-recovery full scrub: {}", all);
         assert!(all.is_clean(), "recovered index is not clean: {}", all);
