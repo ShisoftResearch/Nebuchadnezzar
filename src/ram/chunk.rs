@@ -2910,6 +2910,16 @@ impl Chunk {
         (head_or_none(self.get_head_seg_id()), first_blob)
     }
 
+    #[cfg(test)]
+    pub(crate) fn rotate_heads_for_scrub_test(&self) {
+        for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
+            let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
+            if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
+                self.finish_rotated_head(old);
+            }
+        }
+    }
+
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
         for slot in self.blob_head_pool.iter() {
             slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
