@@ -8169,6 +8169,8 @@ mod tests {
             .segs
             .get(&(segment_id as usize))
             .expect("segment is published");
+        // Seal before the reader pins the segment; sealing requires exclusive access.
+        chunk.rotate_heads_for_scrub_test();
         assert!(
             segment.incr_references(),
             "the reader takes a live reference, as the read paths do"
@@ -8181,7 +8183,6 @@ mod tests {
             "precondition: the cell has non-zero bytes to lose"
         );
 
-        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(segment_id);
 
         let after = unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
@@ -8307,9 +8308,10 @@ mod tests {
             .segs
             .get(&(segment_id as usize))
             .expect("segment is published");
+        // Seal before the reader pins the segment; sealing requires exclusive access.
+        chunk.rotate_heads_for_scrub_test();
         assert!(reader.incr_references(), "reader takes a live reference");
 
-        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(segment_id);
         assert!(
             chunk.segs.get(&(segment_id as usize)).is_none(),
