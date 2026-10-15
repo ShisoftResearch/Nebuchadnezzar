@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// Bytes removed from the chunk space charge by the combine cleaner.
+pub static CLEANER_RECLAIMED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub mod combine;
 #[cfg(test)]
 mod tests;
@@ -318,6 +322,7 @@ impl Cleaner {
         }
 
         let combined_cleaned_space = combiner_cleaned_space;
+        CLEANER_RECLAIMED_BYTES.fetch_add(combiner_cleaned_space as u64, Ordering::Relaxed);
         chunk
             .total_space
             .fetch_sub(combiner_cleaned_space, Ordering::Relaxed); // only subtract combiner cleaned space, compacter cleaned does not reclaim segments

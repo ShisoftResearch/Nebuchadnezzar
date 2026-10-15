@@ -108,3 +108,7 @@ harness = false
 [[bench]]
 name = "write_path"
 harness = false
+
+[[bench]]
+name = "index_write_path"
+harness = false
