@@ -2691,6 +2691,11 @@ impl Chunk {
                     if head_slot.load(Ordering::Acquire) != head_seg_id {
                         continue;
                     }
+                    if self.wait_for_capacity_progress(full_gc, segment_class, &mut queueing_since)
+                    {
+                        tried_gc = false;
+                        continue;
+                    }
                     debug!(
                         "chunk-allocation-failure: chunk={}, live_bytes={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
                         self.id,
@@ -2796,6 +2801,10 @@ impl Chunk {
                     backoff.spin();
                     continue;
                 }
+                if self.wait_for_capacity_progress(full_gc, segment_class, &mut queueing_since) {
+                    tried_gc = false;
+                    continue;
+                }
                 self.log_allocation_exhausted(segment_class);
                 // COUNTED HERE TOO, and that omission cost a day.
                 //
@@ -2859,6 +2868,39 @@ impl Chunk {
                 }
             }
         }
+    }
+
+    /// A GC snapshot can exclude segments that the sealer or reclaimer still
+    /// owns. They are not proof that the store is full. Only callers permitted
+    /// to wait for GC may wait here: a best-effort caller can hold a cell word
+    /// or a reference needed by that work. Transaction leases cannot wait on
+    /// their own heads either. Use the existing head-queue deadline.
+    fn wait_for_capacity_progress(
+        &self,
+        full_gc: bool,
+        segment_class: SegmentClass,
+        waiting_since: &mut Option<std::time::Instant>,
+    ) -> bool {
+        if !full_gc || self.current_txn_holds_head_here(segment_class) {
+            return false;
+        }
+        let pending = self.retired_segment_files.load(Ordering::Acquire) != 0
+            || self.gc_lock.is_locked()
+            || self.segments().iter().any(|segment| {
+                segment.protection.seal_pending.load(Ordering::Acquire)
+                    && !segment.protection.transaction_pending()
+            });
+        if !pending
+            || waiting_since
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed()
+                >= HEAD_QUEUE_DEADLINE
+        {
+            return false;
+        }
+        // Release CPU time so the work that makes capacity available can run.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
     }
 
     /// Drain, sync, archive and seal a segment that has just stopped being the
@@ -8443,6 +8485,93 @@ mod tests {
         );
         assert!(chunks.head_cell(&id).unwrap().version > version);
         drop(pins);
+    }
+
+    #[test]
+    fn allocation_waits_for_pending_seals_before_repeating_gc() {
+        allocation_waits_for_reclamation(false);
+    }
+
+    #[test]
+    fn allocation_waits_for_retired_readers_before_refusing_capacity() {
+        allocation_waits_for_reclamation(true);
+    }
+
+    fn allocation_waits_for_reclamation(retired: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        let mut seals = Vec::new();
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            let seq = seg.seq_id;
+            chunk.put_segment(seg);
+            let seg = chunk.segs.get(&(id as usize)).unwrap();
+            if retired {
+                pins.push(SegmentReferenceGuard::new(seg.clone()).unwrap());
+                chunk.remove_segment(id);
+            } else {
+                seg.protection.seal_pending.store(true, Ordering::Release);
+                seals.push((id, seq));
+            }
+        }
+        // A caller holding a cell word must not wait for these same segments.
+        assert!(matches!(
+            chunk.try_acquire(64, false),
+            Err(WriteError::CannotAllocateSpace)
+        ));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || ready_tx.send(()).unwrap()));
+                });
+                let result = chunks.list[0]
+                    .try_acquire(64, true)
+                    .map(|entry| drop(entry));
+                done_tx.send(result).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        // Complete the deferred work. The next GC must see the newly eligible
+        // sealed segments, or drain the retired segments after their reader.
+        for (id, seq) in seals {
+            let segment = chunk.segs.get(&(id as usize)).unwrap();
+            chunk.finish_rotated_head(id, seq);
+            assert!(!segment.protection.seal_pending.load(Ordering::Acquire));
+        }
+        drop(pins);
+        let waited = early.is_err();
+        let result =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(
+            waited,
+            "allocation refused before deferred reclamation finished: {:?}",
+            result
+        );
+        assert!(
+            result.is_ok(),
+            "reclaimed space was not retried: {:?}",
+            result
+        );
     }
 
     #[test]
