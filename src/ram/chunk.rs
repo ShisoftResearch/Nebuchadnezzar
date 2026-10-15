@@ -2361,6 +2361,10 @@ impl Chunk {
         // the guard has already pinned its own segment by reference, and a
         // pinned segment is never freed; the section's lookup-to-pin job is
         // done before allocation starts.
+        #[cfg(test)]
+        TEST_CAS_HEAD_WAIT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() { hook(); }
+        });
         let _outside_section = crate::ram::qsbr::segment_qsbr().suspend();
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
@@ -2964,6 +2968,10 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64, has_read: bool) -> Option<CellWriteGuard<'_>> {
+        #[cfg(test)]
+        TEST_BEFORE_WORD.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() { hook(); }
+        });
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -4568,16 +4576,21 @@ impl Chunk {
         version: u64,
         cell: &mut OwnedCell,
     ) -> Result<CellHeader, WriteError> {
-        let mut guard = self
-            .lock_cell_for_write(hash, true)
-            .map_err(WriteError::ReadError)?;
-        let cell_version = guard.cell_version().map_err(WriteError::ReadError)?;
-        if cell_version == version {
-            cell.header.version = version; // update version to the latest version
-            guard.update_cell(cell)?;
-            return Ok(cell.header);
+        // Match ordinary upserts: claim a head before taking the cell word.
+        // The expected version is checked after allocation, under that word.
+        cell.header.version = version;
+        let write_plan = cell.plan_write(self)?;
+        let pending_entry = write_plan.allocate(self, false)?;
+        let mut guard = self.lock_cell_for_write(hash, true).map_err(WriteError::ReadError)?;
+        if guard.cell_version().map_err(WriteError::ReadError)? != version {
+            return Err(WriteError::CellVersionMismatch);
         }
-        return Err(WriteError::CellVersionMismatch);
+        let result = guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)?;
+        drop(write_plan);
+        cell.header.version = result.new_version;
+        cell.header.timestamp = result.new_timestamp;
+        cell.header.schema = result.new_schema;
+        Ok(cell.header)
     }
 
     pub fn compare_version_and_set_field(
@@ -4587,17 +4600,17 @@ impl Chunk {
         field: u64,
         value: OwnedValue,
     ) -> Result<CellHeader, WriteError> {
-        let mut guard = self
-            .lock_cell_for_write(hash, true)
-            .map_err(WriteError::ReadError)?;
-        let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
-        if cell.header.version == version {
-            cell.data[field] = value;
-            guard.update_cell(&mut cell)?;
-            return Ok(cell.header);
+        let mut cell = {
+            let mut guard = self.lock_cell_for_write(hash, true).map_err(WriteError::ReadError)?;
+            guard.read_cell_owned().map_err(WriteError::ReadError)?
+        };
+        if cell.header.version != version {
+            return Err(WriteError::CellVersionMismatch);
         }
-        return Err(WriteError::CellVersionMismatch);
+        cell.data[field] = value;
+        self.compare_version_and_update_cell(hash, version, &mut cell)
     }
+
 }
 
 /// A contiguous span of a segment claimed for a run of entries.
@@ -6101,7 +6114,6 @@ impl<'a> CellGuard<'a> {
     }
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = self.get_ptr();
         if cell.header.version < self.version {
             cell.header.version = self.version;
         }
@@ -6110,11 +6122,27 @@ impl<'a> CellGuard<'a> {
         }
         let write_plan = cell.plan_write(self.chunk)?;
         let pending_entry = write_plan.allocate(self.chunk, false)?;
+        let write_result = self.update_cell_in_entry(cell, &write_plan, &pending_entry, cell.header.version)?;
+        drop(write_plan);
+        cell.header.version = write_result.new_version;
+        cell.header.timestamp = write_result.new_timestamp;
+        cell.header.schema = write_result.new_schema;
+        Ok(cell.header)
+    }
+
+    fn update_cell_in_entry(
+        &mut self,
+        cell: &OwnedCell,
+        write_plan: &WritePlan<'_>,
+        pending_entry: &PendingEntry,
+        version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        let old_cell_loc = self.get_ptr();
         let write_result = self.chunk.write_cell_to_chunk(
             cell,
-            &write_plan,
-            &pending_entry,
-            cell.header.version,
+            write_plan,
+            pending_entry,
+            version,
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
@@ -6126,11 +6154,7 @@ impl<'a> CellGuard<'a> {
             .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         self.chunk.refresh_statistics_for_schema(schema.vid);
-        drop(write_plan);
-        cell.header.version = write_result.new_version;
-        cell.header.timestamp = write_result.new_timestamp;
-        cell.header.schema = write_result.new_schema;
-        Ok(cell.header)
+        Ok(write_result)
     }
 
     /// Upsert a cell - updates if the guard points to an existing cell, inserts if empty.
@@ -6231,6 +6255,12 @@ impl<'a> Deref for CellGuard<'a> {
     fn deref(&self) -> &Self::Target {
         &**self.guard.as_ref().unwrap()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_WORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_CAS_HEAD_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -8035,6 +8065,79 @@ mod tests {
             header: CellHeader::new(SchemaVid(schema_id), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
+    }
+
+    // Prepare the observed CAS word -> head / upsert head -> word cycle.
+    // The recovery phase frees a second head, so even the failing control joins.
+    #[test]
+    fn cas_field_allocation_does_not_hold_the_cell_word() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let fields = Field::new_schema(vec![Field::new_unindexed("id", Type::I32), Field::new_unindexed_array("data", Type::U8)]);
+        let schema = Schema::new("cas_head_word_cycle", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(1, 12 * SEGMENT_SIZE, Arc::new(ServerMeta { schemas }), None, None, None, None);
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 4242);
+        let mut seed = payload_cell(schema.vid.get(), &id, 64);
+        let version = chunks.write_cell(&mut seed).unwrap().version;
+        let mut exclusive = Vec::new();
+        for slot in chunk.head_pool.iter().skip(1) {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let seg_id = seg.id;
+            chunk.put_segment(seg);
+            slot.store(seg_id, Ordering::Release);
+            let seg = chunk.segs.get(&(seg_id as usize)).unwrap();
+            assert!(seg.obtain_exclusive_references());
+            exclusive.push(seg_id);
+        }
+        let head = chunk.segs.get(&(chunk.head_pool[0].load(Ordering::Acquire) as usize)).unwrap().clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (owned_tx, owned_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (cas_tx, cas_rx) = mpsc::channel();
+        let (upsert_tx, upsert_rx) = mpsc::channel();
+        let cas = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_CAS_HEAD_WAIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(head.is_head_owned(), "upsert must own the only available head");
+                    go_tx.send(()).unwrap();
+                })));
+                cas_tx.send(chunks.list[0].compare_version_and_set_field(
+                    id.bits(), version, hash_str("id"), OwnedValue::I32(7)
+                )).unwrap();
+            }
+        });
+        let upsert = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                ready_rx.recv().unwrap();
+                TEST_BEFORE_WORD.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    owned_tx.send(()).unwrap();
+                    go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                })));
+                let mut cell = payload_cell(schema.vid.get(), &id, 80);
+                upsert_tx.send(chunks.list[0].upsert_cell(&mut cell)).unwrap();
+            }
+        });
+        let cas_result = cas_rx.recv_timeout(Duration::from_secs(5));
+        let upsert_result = upsert_rx.recv_timeout(Duration::from_secs(5));
+        let stalled = cas_result.is_err() || upsert_result.is_err();
+        for seg_id in exclusive {
+            chunk.segs.get(&(seg_id as usize)).unwrap().release_exclusive_references();
+        }
+        if cas_result.is_err() { assert!(cas_rx.recv_timeout(Duration::from_secs(5)).is_ok()); }
+        if upsert_result.is_err() { assert!(upsert_rx.recv_timeout(Duration::from_secs(5)).is_ok()); }
+        cas.join().unwrap();
+        upsert.join().unwrap();
+        assert!(!stalled, "CAS held the cell word while awaiting a head owned by upsert; freeing another head broke the cycle");
+        assert!(matches!(cas_result.unwrap(), Err(WriteError::CellVersionMismatch)), "CAS must revalidate after upsert changes the version");
+        assert!(upsert_result.unwrap().is_ok());
+        assert!(chunks.head_cell(&id).unwrap().version > version);
     }
 
     #[test]
