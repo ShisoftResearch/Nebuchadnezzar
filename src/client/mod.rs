@@ -483,6 +483,24 @@ impl AsyncClient {
             .collect())
     }
 
+    pub(crate) async fn read_indexed_cell(
+        &self,
+        id: Id,
+        check: crate::index::verification::IndexCheck,
+    ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        let mut cells = client
+            .read_all_cells_verified(
+                &vec![id],
+                &vec![],
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &vec![check],
+            )
+            .await?;
+        Ok(cells.pop().unwrap_or(Err(ReadError::CellDoesNotExisted)))
+    }
+
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,

@@ -24,10 +24,10 @@ mod execute;
 mod ids;
 mod plan;
 mod projection;
-mod read;
+pub(crate) mod read;
 mod sort;
 
-use crate::ram::schema::SchemaUid;
+use crate::ram::{cell::OwnedCell, schema::SchemaUid};
 use aggregate::{
     collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
     AggregateGroupState,
@@ -184,13 +184,26 @@ impl IndexedDataClient {
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
         let range = range.to_key_range(schema, field, ordering);
+        let checks = vec![
+            crate::index::verification::IndexCheck::Schema(schema),
+            crate::index::verification::IndexCheck::Ranged(range.clone()),
+        ];
         let index_cursor = self
             .index_clients
             .range_seek(range, SCAN_BUFFER_SIZE, None)
             .await?;
-        Ok(self
-            .new_cursor(index_cursor, projection, selection, proc)
-            .await)
+        let mut cursor = DataCursor {
+            index_cursor,
+            checks,
+            projection,
+            selection,
+            proc,
+            client: self.clone(),
+            buffer: vec![],
+            pos: 0,
+        };
+        cursor.refresh_batch().await;
+        Ok(cursor)
     }
     pub async fn scan_all<'a>(
         &'a self,
@@ -200,15 +213,27 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: QueryOrdering,
     ) -> Result<DataCursor, RPCError> {
-        let mut id_cursor = self.query_ids(schema, selection, ordering).await?;
+        let mut id_cursor = self
+            .query_ids_with_options_cached(
+                schema, selection, ordering, None, None, None, None, &mut None, true,
+            )
+            .await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
             ids.push(id);
         }
-        let cells = self
-            .read_cells_from_ids(&ids, &projection, &Expr::nothing(), &proc)
-            .await;
+        let cells = if id_cursor.cells.is_empty() {
+            self.read_cells_from_ids(&ids, &projection, &Expr::nothing(), &proc)
+                .await
+        } else {
+            let full = self
+                .materialize_query_cells(&ids, &mut id_cursor.cells)
+                .await;
+            self.project_and_process_cells(full, &projection, &proc)
+                .await?
+        };
         Ok(DataCursor {
+            checks: vec![],
             index_cursor: None,
             buffer: cells,
             projection: vec![],
@@ -244,7 +269,7 @@ impl IndexedDataClient {
         projection: Vec<ProjectionField>,
     ) -> Result<QueryResultCursor, RPCError> {
         let mut id_cursor = self
-            .query_ids_with_options(
+            .query_ids_with_options_cached(
                 schema,
                 selection,
                 ordering,
@@ -252,13 +277,47 @@ impl IndexedDataClient {
                 distinct_fields,
                 limit,
                 offset,
+                &mut None,
+                true,
             )
             .await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
             ids.push(id);
         }
-        self.project_ids_to_rows(&ids, projection).await
+        if id_cursor.cells.is_empty() {
+            self.project_ids_to_rows(&ids, projection).await
+        } else {
+            let cells = self
+                .materialize_query_cells(&ids, &mut id_cursor.cells)
+                .await;
+            let fields = projection.iter().map(|field| field.field_id).collect();
+            let cells = self
+                .project_and_process_cells(cells, &fields, &Expr::nothing())
+                .await?;
+            Ok(QueryResultCursor {
+                buffer: cells
+                    .into_iter()
+                    .map(|cell| QueryRow {
+                        id: Some(cell.id()),
+                        columns: projection
+                            .iter()
+                            .enumerate()
+                            .map(|(index, field)| {
+                                (
+                                    field
+                                        .alias
+                                        .clone()
+                                        .unwrap_or_else(|| field.field_id.to_string()),
+                                    cell[index].clone(),
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                pos: 0,
+            })
+        }
     }
 
     pub async fn query_with_options_and_hits<'a>(
@@ -273,7 +332,7 @@ impl IndexedDataClient {
         hit_table: &mut QueryHitTable,
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
-            .query_ids_with_options_and_hits(
+            .query_ids_with_options_cached(
                 schema,
                 selection.clone(),
                 ordering,
@@ -282,6 +341,7 @@ impl IndexedDataClient {
                 limit,
                 offset,
                 hit_table,
+                true,
             )
             .await?;
         let mut ids = vec![];
@@ -289,9 +349,10 @@ impl IndexedDataClient {
             ids.push(id);
         }
         let cells = self
-            .read_cells_from_ids(&ids, &vec![], &Expr::nothing(), &Expr::nothing())
+            .materialize_query_cells(&ids, &mut id_cursor.cells)
             .await;
         Ok(DataCursor {
+            checks: vec![],
             index_cursor: None,
             buffer: cells,
             projection: vec![],
@@ -363,7 +424,7 @@ impl IndexedDataClient {
 
         let validated = self.validate_aggregate_query(schema, &query).await?;
         let mut id_cursor = self
-            .query_ids_with_options(
+            .query_ids_with_options_cached(
                 schema,
                 query.selection.clone(),
                 QueryOrdering::Asc,
@@ -371,6 +432,8 @@ impl IndexedDataClient {
                 None,
                 None,
                 None,
+                &mut None,
+                true,
             )
             .await?;
         let mut ids = vec![];
@@ -384,9 +447,25 @@ impl IndexedDataClient {
             .enumerate()
             .map(|(index, field_id)| (*field_id, index))
             .collect::<HashMap<_, _>>();
-        let rows = self
-            .read_projected_rows_from_ids(&ids, &required_fields)
-            .await;
+        let rows = if id_cursor.cells.is_empty() {
+            self.read_projected_rows_from_ids(&ids, &required_fields)
+                .await
+        } else {
+            let full = self
+                .materialize_query_cells(&ids, &mut id_cursor.cells)
+                .await;
+            self.project_and_process_cells(full, &required_fields, &Expr::nothing())
+                .await?
+                .into_iter()
+                .map(|cell| {
+                    required_fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| cell[index].clone())
+                        .collect()
+                })
+                .collect()
+        };
 
         let mut groups = HashMap::default();
         let mut states = Vec::<AggregateGroupState>::new();
@@ -530,9 +609,36 @@ impl IndexedDataClient {
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
     ) -> Result<IdCursor, RPCError> {
+        self.query_ids_with_options_cached(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            distinct_fields,
+            limit,
+            offset,
+            hit_table,
+            false,
+        )
+        .await
+    }
+
+    async fn query_ids_with_options_cached(
+        &self,
+        schema: SchemaUid,
+        selection: Expr,
+        ordering: QueryOrdering,
+        order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        hit_table: &mut QueryHitTable,
+        retain_cells: bool,
+    ) -> Result<IdCursor, RPCError> {
         if matches!(limit, Some(0)) {
             return Ok(IdCursor {
                 buffer: vec![],
+                cells: HashMap::default(),
                 pos: 0,
             });
         }
@@ -594,29 +700,44 @@ impl IndexedDataClient {
             };
             return Ok(IdCursor {
                 buffer: selected_ids,
+                cells: HashMap::default(),
                 pos: 0,
             });
         }
+        let mut cache_fields = distinct_fields.clone().unwrap_or_default();
+        cache_fields.extend(explicit_order_by_field.or(inferred_order_field));
+        let mut verified_cells = HashMap::default();
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
                 (vec![], false)
             } else {
                 (
-                    self.execute_predicate_plan_ids(schema, &plan, ordering, hit_table)
-                        .await?,
+                    self.execute_predicate_plan_ids(
+                        schema,
+                        &plan,
+                        ordering,
+                        hit_table,
+                        &mut verified_cells,
+                        retain_cells,
+                        &cache_fields,
+                    )
+                    .await?,
                     false,
                 )
             }
         } else {
-            (
-                self.scan_schema_ids(schema, ordering).await?,
-                selection_requires_post_filter,
-            )
+            (self.scan_schema_ids(schema, ordering).await?, true)
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = explicit_order_by_field {
-            self.reorder_ids_by_field(schema.get(), field_id, &candidate_ids, ordering)
-                .await?
+            self.reorder_ids_by_field(
+                schema.get(),
+                field_id,
+                &candidate_ids,
+                ordering,
+                &verified_cells,
+            )
+            .await?
         } else {
             candidate_ids
         };
@@ -660,19 +781,31 @@ impl IndexedDataClient {
             effective_limit
         };
         let mut selected_ids = if requires_selection_filter {
-            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, filter_limit)
-                .await
+            self.filter_ids_by_selection_limit(
+                &ordered_candidate_ids,
+                schema,
+                &selection,
+                filter_limit,
+            )
+            .await
         } else {
             ordered_candidate_ids
         };
         if let Some(field_id) = inferred_order_field {
-            self.sort_ids_by_field_postprocessing(field_id, &mut selected_ids, ordering)
-                .await;
+            self.sort_ids_by_field_postprocessing(
+                field_id,
+                &mut selected_ids,
+                ordering,
+                &verified_cells,
+            )
+            .await;
         } else if explicit_order_by_field.is_none() && !preserve_relevance_order {
             sort_ids_by_query_order(&mut selected_ids, ordering);
         }
         if let Some(field_ids) = distinct_fields.as_ref() {
-            selected_ids = self.distinct_ids_by_fields(field_ids, selected_ids).await;
+            selected_ids = self
+                .distinct_ids_by_fields(field_ids, selected_ids, &verified_cells)
+                .await;
         }
         if let Some(limit) = effective_limit {
             selected_ids.truncate(limit);
@@ -687,7 +820,10 @@ impl IndexedDataClient {
             selected_ids.truncate(limit);
         }
 
+        let selected_set: std::collections::HashSet<_> = selected_ids.iter().copied().collect();
+        verified_cells.retain(|id, _| selected_set.contains(id));
         Ok(IdCursor {
+            cells: verified_cells,
             buffer: selected_ids,
             pos: 0,
         })
@@ -745,6 +881,85 @@ impl IndexedDataClient {
             .await
     }
 
+    async fn materialize_query_cells(
+        &self,
+        ids: &[Id],
+        cached: &mut HashMap<Id, OwnedCell>,
+    ) -> Vec<OwnedCell> {
+        let missing: Vec<Id> = ids
+            .iter()
+            .filter(|id| !cached.contains_key(id))
+            .copied()
+            .collect();
+        for cell in self
+            .read_cells_from_ids(&missing, &vec![], &Expr::nothing(), &Expr::nothing())
+            .await
+        {
+            cached.insert(cell.id(), cell);
+        }
+        ids.iter().filter_map(|id| cached.remove(id)).collect()
+    }
+
+    async fn project_and_process_cells(
+        &self,
+        cells: Vec<OwnedCell>,
+        fields: &Vec<u64>,
+        proc: &Expr,
+    ) -> Result<Vec<OwnedCell>, RPCError> {
+        use dovahkiin::types::Value;
+        let mut schemas = HashMap::default();
+        let mut result = Vec::with_capacity(cells.len());
+        let mut interpreter = dovahkiin::integrated::lisp::get_interpreter();
+        for mut cell in cells {
+            if !fields.is_empty() {
+                let vid = cell.header.schema;
+                if !schemas.contains_key(&vid) {
+                    let schema = self
+                        .index_clients
+                        .neb_client
+                        .schema_by_id(vid.get())
+                        .await
+                        .map_err(|error| RPCError::IOError(io::Error::other(error.to_string())))?
+                        .ok_or_else(|| {
+                            RPCError::IOError(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "query cell schema is absent",
+                            ))
+                        })?;
+                    schemas.insert(vid, schema);
+                }
+                let schema = &schemas[&vid];
+                cell.data = OwnedValue::Array(
+                    fields
+                        .iter()
+                        .map(|field| {
+                            let path = schema
+                                .id_index
+                                .get(field)
+                                .cloned()
+                                .unwrap_or_else(|| vec![*field]);
+                            cell.data.get_in_by_ids(&path).clone()
+                        })
+                        .collect(),
+                );
+            }
+            if !proc.is_empty() {
+                let shared = cell.data.shared();
+                unsafe {
+                    interpreter.unsafe_set_global_val(&shared);
+                }
+                let evaluated = proc.clone().to_sexpr().eval(interpreter.get_env());
+                interpreter.unset_global_val();
+                match evaluated {
+                    Ok(value) => cell.data = value.owned_val().unwrap_or(OwnedValue::NA),
+                    Err(_) => continue,
+                }
+            }
+            result.push(cell);
+        }
+        Ok(result)
+    }
+
     pub fn hashed_index_id(schema: SchemaUid, field: u64, value: &OwnedValue) -> Id {
         get_hash_id_from_value(schema, field, value)
     }
@@ -792,3 +1007,6 @@ impl IndexedDataClient {
 mod alignment_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod verification_tests;
