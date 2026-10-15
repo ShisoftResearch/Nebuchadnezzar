@@ -2006,6 +2006,17 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         databases.push((chunks, schema_dir, backup_dir, wal_dir));
     }
 
+    // All writes are complete. Make their rotated segments eligible before
+    // asking the policy to reach a watermark that includes those victims.
+    for (chunks, _, _, _) in &databases {
+        let chunk = &chunks.list[0];
+        for segment in chunk.segments() {
+            if !chunk.is_active_head(segment.id) {
+                wait_for_rotated_archive(&segment);
+            }
+        }
+    }
+
     let hot_before: usize = databases
         .iter()
         .map(|(chunks, _, _, _)| total_hot_segments(chunks))
