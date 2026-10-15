@@ -4615,7 +4615,8 @@ mod tests {
             );
         }
         assert!(!chunk.is_active_head(seg_id));
-        chunk.finish_rotated_head(seg_id);
+        let seq_id = chunk.segs.get(&(seg_id as usize)).unwrap().seq_id;
+        chunk.finish_rotated_head(seg_id, seq_id);
     }
 
     /// Fill and rotate the head with ORDINARY cells, so the cleaner has a

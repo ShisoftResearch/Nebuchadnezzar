@@ -3824,7 +3824,7 @@ mod tests {
             // Close and archive while the first sync still owns its cloned descriptor.
             std::thread::scope(|scope| {
                 scope
-                    .spawn(|| chunk.finish_rotated_head(id))
+                    .spawn(|| chunk.finish_rotated_head(id, seg.seq_id))
                     .join()
                     .unwrap();
             });

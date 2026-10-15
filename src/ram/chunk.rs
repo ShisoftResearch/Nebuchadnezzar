@@ -1081,7 +1081,8 @@ pub fn is_in_transaction() -> bool {
 /// to answer "no" for backpressure -- past `SEAL_QUEUE_LIMIT` the rotating
 /// writer archives inline, throttling writers to what archiving sustains.
 pub struct SealQueue {
-    pending: parking_lot::Mutex<Vec<(usize, u64)>>,
+    // The sequence distinguishes generations that reuse the same physical slot.
+    pending: parking_lot::Mutex<Vec<(usize, u64, u64)>>,
 }
 
 /// Beyond this backlog, rotation archives inline. Small on purpose: the queue
@@ -1096,15 +1097,15 @@ impl SealQueue {
         }
     }
     /// True if accepted; false means the caller must do the work inline.
-    fn enqueue(&self, chunk_id: usize, seg_id: u64) -> bool {
+    fn enqueue(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> bool {
         let mut pending = self.pending.lock();
         if pending.len() >= SEAL_QUEUE_LIMIT {
             return false;
         }
-        pending.push((chunk_id, seg_id));
+        pending.push((chunk_id, seg_id, seq_id));
         true
     }
-    pub fn drain(&self) -> Vec<(usize, u64)> {
+    pub fn drain(&self) -> Vec<(usize, u64, u64)> {
         std::mem::take(&mut *self.pending.lock())
     }
     pub fn len(&self) -> usize {
@@ -2382,7 +2383,7 @@ impl Chunk {
             // writer can OWN takes the entry; a full one becomes the
             // rotation target; an EMPTY slot is the fallback target so the
             // pool grows exactly when contention demands it.
-            let mut rotate_target: Option<(&AtomicU64, u64)> = None;
+            let mut rotate_target: Option<(&AtomicU64, u64, u64)> = None;
             let mut empty_slot: Option<&AtomicU64> = None;
             for i in 0..slots.len() {
                 let slot = &slots[(start + i) % slots.len()];
@@ -2487,7 +2488,7 @@ impl Chunk {
                     head.end_pending_journal();
                     head.decr_references();
                     head.release_own();
-                    rotate_target = Some((slot, head_seg_id));
+                    rotate_target = Some((slot, head_seg_id, head.seq_id));
                     break;
                 } else {
                     // This head is sealing; it will never accept another
@@ -2502,10 +2503,10 @@ impl Chunk {
             // rotates; failing that, an EMPTY slot gets its first segment;
             // failing THAT, every slot is owned or allocating -- spin
             // briefly and rescan.
-            let (head_slot, head_seg_id) = match rotate_target {
+            let (head_slot, head_seg_id, head_seq_id) = match rotate_target {
                 Some(target) => target,
                 None => match empty_slot {
-                    Some(slot) => (slot, HEAD_SEG_ID_EMPTY),
+                    Some(slot) => (slot, HEAD_SEG_ID_EMPTY, 0),
                     None => {
                         if self.current_txn_holds_head_here(segment_class) {
                             error!(
@@ -2781,9 +2782,9 @@ impl Chunk {
                 // behind.
                 let sealed_in_background = std::env::var("NEB_SYNC_SEAL_ARCHIVE").as_deref()
                     != Ok("1")
-                    && self.seal_queue.enqueue(self.id, head_seg_id);
+                    && self.seal_queue.enqueue(self.id, head_seg_id, head_seq_id);
                 if !sealed_in_background {
-                    self.finish_rotated_head(head_seg_id);
+                    self.finish_rotated_head(head_seg_id, head_seq_id);
                 }
             }
         }
@@ -2793,54 +2794,32 @@ impl Chunk {
     /// head. Runs inline from rotation (under backpressure or the
     /// NEB_SYNC_SEAL_ARCHIVE toggle) or on the background sealer; the sequence
     /// is identical either way.
-    pub(crate) fn finish_rotated_head(&self, head_seg_id: u64) {
+    pub(crate) fn finish_rotated_head(&self, head_seg_id: u64, head_seq_id: u64) {
+        let lookup = crate::ram::qsbr::QsbrSection::new();
         if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-            // Let the writers that acquired from this segment finish
-            // before it stops being writable.
-            //
-            // Rotation only publishes a new head; entries acquired from
-            // the old one moments earlier are still in flight, and each
-            // holds a reference until its `PendingEntry` drops (which is
-            // where the WAL write happens). Closing its WAL and
-            // archiving underneath them is what made the twin: the late
-            // write found no WAL and re-created one beside a backup that
-            // did not contain it. Sealing turned that silent corruption
-            // into a refused write -- 3,958 failed batches in one import
-            // -- which is the same race being reported instead of
-            // hidden. Draining first is the actual fix.
-            //
-            // Bounded, because a reference can also be a long-lived read
-            // guard and rotation runs on the write path. If it does not
-            // drain, the archive is simply skipped: the segment stays
-            // dirty and unsealed, so late writes still land in its WAL
-            // and eviction, shutdown or recovery archive it later.
-            let t_drain = std::time::Instant::now();
-            let drain = Backoff::new();
-            let mut drained = old_head.no_references();
-            for _ in 0..512 {
-                if drained {
-                    break;
-                }
-                // We are waiting on other threads to finish their
-                // writes; the head slot already points at the new
-                // segment, so nothing is blocked behind this. Yield
-                // periodically rather than burning a core on a wait
-                // that is normally over in microseconds.
-                drain.spin();
-                std::thread::yield_now();
-                drained = old_head.no_references();
-            }
-            ROTATE_DRAIN_NANOS.fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if !drained {
-                debug!(
-                    "Segment {} (chunk {}) still has {} references at rotation; leaving it \
-                         dirty and unsealed rather than archiving under an active writer",
-                    head_seg_id,
-                    self.id,
-                    old_head.references_count()
-                );
+            // The cleaner can reclaim and reuse a queued physical slot.
+            if old_head.seq_id != head_seq_id {
                 return;
             }
+            // Keep the lookup protected until the exact generation is pinned.
+            // A reference snapshot alone permits reclamation during the archive.
+            let t_drain = std::time::Instant::now();
+            let drain = Backoff::new();
+            let mut exclusive = crate::ram::segs::SegmentExclusiveRefGuard::new(&old_head);
+            for _ in 0..512 {
+                if exclusive.is_some() {
+                    break;
+                }
+                drain.spin();
+                std::thread::yield_now();
+                exclusive = crate::ram::segs::SegmentExclusiveRefGuard::new(&old_head);
+            }
+            ROTATE_DRAIN_NANOS.fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let Some(_exclusive) = exclusive else {
+                // A later archive or recovery handles a segment with active readers.
+                return;
+            };
+            drop(lookup);
             if let Err(e) = old_head.force_wal_sync() {
                 warn!(
                     "Failed to sync WAL for old head segment {}: {}",
@@ -5063,9 +5042,9 @@ impl Chunks {
                         break;
                     }
                     let Some(chunks) = weak.upgrade() else { break };
-                    for (chunk_id, seg_id) in chunks.seal_queue().drain() {
+                    for (chunk_id, seg_id, seq_id) in chunks.seal_queue().drain() {
                         if let Some(chunk) = chunks.list.get(chunk_id) {
-                            chunk.finish_rotated_head(seg_id);
+                            chunk.finish_rotated_head(seg_id, seq_id);
                         }
                     }
                 })
@@ -6222,6 +6201,132 @@ mod tests {
     use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
+
+    #[test]
+    fn rotated_seal_protects_its_generation_until_archive_finishes() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.get_head_seg_id();
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        let sequence = segment.seq_id;
+        crate::ram::entry::stamp_reservation_padding(segment.addr, 8);
+        segment
+            .append_header
+            .store(segment.addr + 8, Ordering::Release);
+        for slot in chunk.head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
+        // Hold the archive at its first file operation after it takes the pin.
+        let file_state = segment.file_state.lock();
+        let worker_chunks = chunks.clone();
+        let worker = std::thread::spawn(move || {
+            worker_chunks.list[0].finish_rotated_head(id, sequence);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while segment.no_references() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let pinned = !segment.no_references();
+        let reclaimed = if pinned {
+            chunk.remove_segment(id);
+            chunk.drain_retired_segments()
+        } else {
+            0
+        };
+        drop(file_state);
+        worker.join().unwrap();
+        assert!(
+            pinned,
+            "the sealer must pin the selected generation during file operations"
+        );
+        assert_eq!(
+            reclaimed, 0,
+            "the cleaner must not recycle the archive source"
+        );
+        assert!(
+            segment.is_sealed(),
+            "a matching request must still archive the original segment"
+        );
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1
+        );
+    }
+
+    fn delayed_seal_preserves_reused_segment(active_head: bool) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let old_id = chunk.get_head_seg_id();
+        let old_sequence = chunk.segs.get(&(old_id as usize)).unwrap().seq_id;
+        let queue = SealQueue::new();
+        assert!(queue.enqueue(chunk.id, old_id, old_sequence));
+        for slot in chunk.head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
+        chunk.remove_segment(old_id);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1
+        );
+
+        let replacement = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        assert_eq!(
+            replacement.id, old_id,
+            "the allocator must reuse the physical slot"
+        );
+        assert_ne!(replacement.seq_id, old_sequence);
+        crate::ram::entry::stamp_reservation_padding(replacement.addr, 8);
+        replacement
+            .append_header
+            .store(replacement.addr + 8, Ordering::Release);
+        chunk.put_segment(replacement);
+        if active_head {
+            chunk.head_pool[0].store(old_id, Ordering::Release);
+        }
+        let replacement = chunk.segs.get(&(old_id as usize)).unwrap();
+        for (chunk_id, segment_id, sequence_id) in queue.drain() {
+            assert_eq!(chunk_id, chunk.id);
+            chunk.finish_rotated_head(segment_id, sequence_id);
+        }
+        assert!(
+            !replacement.is_sealed(),
+            "a delayed seal must not close a different segment generation"
+        );
+        assert!(
+            replacement.begin_pending_journal(),
+            "the replacement must still accept journal claims"
+        );
+        replacement.end_pending_journal();
+        assert!(!std::path::Path::new(
+            &chunk
+                .file_manager
+                .backup_path(chunk.id, replacement.id, replacement.seq_id)
+                .unwrap()
+        )
+        .exists());
+    }
+
+    #[test]
+    fn delayed_seal_does_not_close_a_reused_head() {
+        delayed_seal_preserves_reused_segment(true);
+    }
+
+    #[test]
+    fn delayed_seal_does_not_archive_a_reused_non_head() {
+        delayed_seal_preserves_reused_segment(false);
+    }
 
     #[test]
     fn deleted_version_map_memory_cost() {
