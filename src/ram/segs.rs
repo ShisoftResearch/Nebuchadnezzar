@@ -120,6 +120,10 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
     });
 }
 fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
+    let Some(_job) = seg.protection.job() else {
+        WAL_DIRTY.lock().push(seg.clone());
+        return;
+    };
     // Bytes journaled during this sync must enqueue another pass.
     seg.wal_sync_queued.store(false, Ordering::Release);
     #[cfg(test)]
@@ -631,6 +635,7 @@ pub fn wal_sync_interval_ms() -> i64 {
 ///   consulted (the combine cleaner skips cold segments).
 #[repr(C, align(64))]
 pub struct Segment {
+    pub(crate) protection: Box<crate::ram::cleaner::protection::Protection>,
     // --- identity & geometry: written at construction, read everywhere ---
     pub id: u64,
     pub seq_id: u64,
@@ -930,6 +935,7 @@ impl Segment {
             dead_bits: parking_lot::RwLock::new(None),
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
+            protection: Box::default(),
             references: AtomicUsize::new(0),
             pending_journals: AtomicUsize::new(0),
             file_state: parking_lot::Mutex::new(SegmentFileState {
@@ -1935,6 +1941,24 @@ impl Segment {
     // archive this segment and write the data to backup storage
     // Backup files are opened on demand and closed immediately after use
     pub fn archive(&self) -> Result<bool, io::Error> {
+        self.archive_inner(false)
+    }
+
+    pub(crate) fn archive_rotated(&self) -> Result<bool, io::Error> {
+        self.archive_inner(true)
+    }
+
+    fn archive_inner(&self, seal_job: bool) -> Result<bool, io::Error> {
+        let Some(_maintenance) = self.protection.maintenance() else {
+            return Ok(false);
+        };
+        if self.protection.head.load(Acquire)
+            || (!seal_job && self.protection.seal_pending.load(Acquire))
+            || self.is_head_owned()
+            || self.protection.transaction_pending()
+        {
+            return Ok(false);
+        }
         // Let in-flight journal writes land before this takes `file_state`.
         //
         // This is the seal-vs-pending-writer race, at its source. A writer
@@ -2698,10 +2722,19 @@ image, not an empty segment; archiving it would persist the damage.",
     where
         F: FnOnce(&File) -> io::Result<()>,
     {
+        let _job = self.protection.job().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "segment is being cleaned or retired",
+            )
+        })?;
         #[cfg(feature = "abort_profile")]
         let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
         let (file, written, end, durability, epoch) = {
-            let state = self.file_state.lock();
+            let mut state = self.file_state.lock();
+            if force && state.wal.is_some() && state.durability.is_none() {
+                self.init_durability(&mut state)?;
+            }
             if let Some(error) = state.durability.as_ref().and_then(|d| d.failure()) {
                 return Err(io::Error::other(error));
             }
@@ -2753,6 +2786,11 @@ image, not an empty segment; archiving it would persist the damage.",
         };
         #[cfg(not(test))]
         let result = sync(&file);
+        let result = result.and_then(|()| {
+            durability
+                .as_ref()
+                .map_or(Ok(()), |d| d.publish_namespace())
+        });
         WAL_SYNC_SERVICE_NS.fetch_add(sync_started.elapsed().as_nanos() as u64, Relaxed);
         if let Some(d) = durability {
             d.complete(end, epoch, &result);
@@ -4838,6 +4876,14 @@ mod seal_race_tests {
             });
 
             for index in 0..4_000u64 {
+                if index == 1_000 {
+                    for slot in chunk.head_pool.iter() {
+                        let id = slot.swap(u64::MAX, Ordering::AcqRel);
+                        if let Some(segment) = chunk.segs.get(&(id as usize)) {
+                            segment.protection.head.store(false, Ordering::Release);
+                        }
+                    }
+                }
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value["DATA"] = OwnedValue::U64(index);
                 let mut cell = OwnedCell {

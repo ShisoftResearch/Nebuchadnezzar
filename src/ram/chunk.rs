@@ -719,6 +719,7 @@ fn end_lease(
             match outcome {
                 Ok(()) => {
                     seg.mark_bracket_disowned();
+                    seg.protection.abort_transaction(txn);
                     TXN_SPANS_REWOUND.fetch_add(1, Ordering::Relaxed);
                     // The group-commit timer makes the padding durable.
                     if lease.pre_cursor < end {
@@ -1533,6 +1534,10 @@ impl Chunk {
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
+        bootstrap_segment
+            .protection
+            .head
+            .store(true, Ordering::Release);
         chunk.put_segment(bootstrap_segment);
         return chunk;
     }
@@ -1802,6 +1807,7 @@ impl Chunk {
             // Idle time for expiry counts from the first head held.
             leases.opened_at = std::time::Instant::now();
         }
+        head.protection.retain_transaction(&txn);
         leases
             .per_chunk
             .entry(self.lease_key())
@@ -2794,6 +2800,11 @@ impl Chunk {
             // Publish new head segment id FIRST
             // This creates a window where the head_seg_id points to a segment not yet in self.segs.
             // Readers of head_seg_id must handle this by retrying.
+            new_seg.protection.head.store(true, Ordering::Release);
+            if let Some(old) = self.segs.get(&(head_seg_id as usize)) {
+                old.protection.seal_pending.store(true, Ordering::Release);
+                old.protection.head.store(false, Ordering::Release);
+            }
             restore.publish(new_seg_id);
 
             self.put_segment(new_seg);
@@ -2835,10 +2846,24 @@ impl Chunk {
     pub(crate) fn finish_rotated_head(&self, head_seg_id: u64, head_seq_id: u64) {
         let lookup = crate::ram::qsbr::QsbrSection::new();
         if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-            // The cleaner can reclaim and reuse a queued physical slot.
+            // Reject an obsolete physical-slot generation before touching protection.
             if old_head.seq_id != head_seq_id {
                 return;
             }
+            let Some(_job) = old_head.protection.job() else {
+                return;
+            };
+            struct SealDone<'a>(&'a crate::ram::cleaner::protection::Protection);
+            impl Drop for SealDone<'_> {
+                fn drop(&mut self) {
+                    self.0.seal_pending.store(false, Ordering::Release);
+                }
+            }
+            let _seal = SealDone(&old_head.protection);
+            if self.is_active_head(old_head.id) || old_head.is_head_owned() {
+                return;
+            }
+            old_head.protection.head.store(false, Ordering::Release);
             // Keep the lookup protected until the exact generation is pinned.
             // A reference snapshot alone permits reclamation during the archive.
             let t_drain = std::time::Instant::now();
@@ -2897,7 +2922,12 @@ impl Chunk {
             // 977 such segments against 20,697 archived ones; TB13
             // carried 18,336 of them into the restart that lost data.
             let t_archive = std::time::Instant::now();
-            let archive_result = old_head.archive();
+            old_head
+                .protection
+                .seal_pending
+                .store(true, Ordering::Release);
+            drop(_job);
+            let archive_result = old_head.archive_rotated();
             ROTATE_ARCHIVE_NANOS
                 .fetch_add(t_archive.elapsed().as_nanos() as u64, Ordering::Relaxed);
             match archive_result {
@@ -2930,15 +2960,44 @@ impl Chunk {
     }
 
     #[cfg(test)]
-    pub(crate) fn rotate_heads_for_scrub_test(&self) {
+    pub(crate) fn release_append_heads_for_test(&self) -> Vec<u64> {
+        let mut heads = Vec::new();
         for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
             let lookup = crate::ram::qsbr::QsbrSection::new();
             let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
             if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
-                let sequence = self.segs.get(&(old as usize)).unwrap().seq_id;
-                drop(lookup);
-                self.finish_rotated_head(old, sequence);
+                if let Some(segment) = self.segs.get(&(old as usize)) {
+                    segment.protection.head.store(false, Ordering::Release);
+                }
+                heads.push(old);
             }
+        }
+        self.wait_for_segment_jobs_for_test();
+        heads
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotate_heads_for_scrub_test(&self) {
+        for old in self.release_append_heads_for_test() {
+            let sequence = self.segs.get(&(old as usize)).unwrap().seq_id;
+            self.finish_rotated_head(old, sequence);
+        }
+        self.wait_for_segment_jobs_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_segment_jobs_for_test(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.segments().iter().any(|segment| {
+            segment.wal_sync_queued.load(Ordering::Acquire)
+                || segment.protection.seal_pending.load(Ordering::Acquire)
+                || !segment.protection.jobs_drained()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "segment jobs did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -2965,6 +3024,7 @@ impl Chunk {
         // process stopped: at most one per chunk, bounded by the segment
         // size, and reclaimed by the cleaner like any other dead space.
         for segment in self.segments() {
+            segment.protection.head.store(false, Ordering::Release);
             if !segment.is_sealed() {
                 segment.seal();
             }
@@ -3916,6 +3976,29 @@ impl Chunk {
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
+        let Some(segment) = self.segs.get(&(segment_id as usize)) else {
+            return;
+        };
+        if !segment.protection.claim_cleaner() {
+            return;
+        }
+        self.remove_segment_for_cleaner(segment_id);
+        segment.protection.release_cleaner();
+    }
+
+    pub(crate) fn remove_segment_for_cleaner(&self, segment_id: u64) {
+        let Some(segment) = self.segs.get(&(segment_id as usize)) else {
+            return;
+        };
+        if self.is_active_head(segment_id)
+            || segment.protection.in_progress()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            return;
+        }
+        segment.protection.retire();
         debug!(
             "Removing segment for chunk {} with id {}",
             self.id, segment_id
@@ -4010,7 +4093,7 @@ impl Chunk {
             // that took it, which QSBR's per-thread accounting cannot see.
             let quiesced = qsbr.is_quiesced(entry.stamp);
             let unreferenced = entry.segment.no_references();
-            if quiesced && unreferenced {
+            if quiesced && unreferenced && entry.segment.protection.jobs_drained() {
                 entry.segment.free_memory();
                 entry.segment.dispense();
                 for (hash, count) in entry.deleted_ids {
@@ -4363,6 +4446,9 @@ impl Chunk {
                 *utilization < 1.0
                     && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
+                    && !seg.protection.in_progress()
+                    && !seg.is_head_owned()
+                    && !seg.wal_sync_queued.load(Ordering::Acquire)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     // A reservation in flight means the image may hold a gap:
                     // the cursor moves before the bytes land, and the combine
@@ -5277,27 +5363,51 @@ impl Chunks {
                     .ok_or(WriteError::CannotAllocateSpace)?;
                 chunk.close_transaction_bracket(txn, &manifest)?;
             }
+            let mut receipts = Vec::new();
+            let mut all_parts_proven = true;
+            for segment in &segments {
+                {
+                    let state = segment.file_state.lock();
+                    if state.wal.is_none()
+                        && (state.manager.wal_storage().is_some()
+                            || state.manager.backup_storage().is_some())
+                    {
+                        all_parts_proven = false;
+                    }
+                }
+                if let Some(receipt) = segment.durable_receipt().map_err(WriteError::from_wal_io)? {
+                    receipts.push(receipt);
+                }
+            }
             for segment in &segments {
                 segment.force_wal_sync().map_err(WriteError::from_wal_io)?;
             }
-            Ok(())
+            Ok((Arc::new(receipts), all_parts_proven))
         })();
-        if let Err(error) = decision {
-            for (segment, (position, cursor)) in segments.iter().zip(checkpoints) {
-                if let Err(truncate_error) = segment.truncate_wal_to(position) {
-                    error!(
-                        "cannot retract refused COMMIT in segment {}: {truncate_error}",
-                        segment.id
-                    );
-                    segment.retire_tail();
+        let (receipts, all_parts_proven) = match decision {
+            Ok(proof) => proof,
+            Err(error) => {
+                for (segment, (position, cursor)) in segments.iter().zip(checkpoints) {
+                    if let Err(truncate_error) = segment.truncate_wal_to(position) {
+                        error!(
+                            "cannot retract refused COMMIT in segment {}: {truncate_error}",
+                            segment.id
+                        );
+                        segment.retire_tail();
+                    }
+                    let end = segment.append_header.load(Ordering::Acquire);
+                    if end > cursor {
+                        crate::ram::entry::stamp_reservation_padding(cursor, (end - cursor) as u32);
+                    }
+                    segment.mark_bracket_open();
                 }
-                let end = segment.append_header.load(Ordering::Acquire);
-                if end > cursor {
-                    crate::ram::entry::stamp_reservation_padding(cursor, (end - cursor) as u32);
-                }
-                segment.mark_bracket_open();
+                return Err(error);
             }
-            return Err(error);
+        };
+        if all_parts_proven {
+            for segment in &segments {
+                segment.protection.decide_transaction(txn, receipts.clone());
+            }
         }
         Ok(())
     }
@@ -5459,6 +5569,14 @@ impl Chunks {
         let mut total_errors = 0;
 
         for chunk in &self.list {
+            if chunk.writes_closed.load(Ordering::Acquire) {
+                for slot in chunk.head_pool.iter().chain(chunk.blob_head_pool.iter()) {
+                    let id = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
+                    if let Some(segment) = chunk.segs.get(&(id as usize)) {
+                        segment.protection.head.store(false, Ordering::Release);
+                    }
+                }
+            }
             for segment in chunk.segs.iter_values() {
                 // Check if segment needs archiving
                 let is_clean = !segment.is_dirty();
@@ -7475,6 +7593,7 @@ mod tests {
         let chunk = &chunks.list[0];
         let seg_id = chunk.get_head_seg_id();
         let _section = crate::ram::qsbr::QsbrSection::new();
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(seg_id);
         assert_eq!(chunk.retired_segment_count(), 1);
         assert_eq!(
@@ -7504,6 +7623,7 @@ mod tests {
         assert!(seg_a.incr_references());
 
         let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.rotate_heads_for_scrub_test();
         chunk_b.remove_segment(b_seg_id);
         assert_eq!(chunk_b.retired_segment_count(), 1);
 
@@ -7537,6 +7657,7 @@ mod tests {
         let reading = CellGuard::for_read(id.bits(), chunk_a).expect("read guard");
 
         let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.rotate_heads_for_scrub_test();
         chunk_b.remove_segment(b_seg_id);
         assert_eq!(
             chunk_b.drain_retired_segments(),
@@ -7598,6 +7719,7 @@ mod tests {
         releasing.join().expect("releasing thread");
 
         let seg_id = chunk.get_head_seg_id();
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(seg_id);
         assert_eq!(
             drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
@@ -7919,6 +8041,7 @@ mod tests {
             "precondition: the cell has non-zero bytes to lose"
         );
 
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(segment_id);
 
         let after = unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
@@ -8046,6 +8169,7 @@ mod tests {
             .expect("segment is published");
         assert!(reader.incr_references(), "reader takes a live reference");
 
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(segment_id);
         assert!(
             chunk.segs.get(&(segment_id as usize)).is_none(),

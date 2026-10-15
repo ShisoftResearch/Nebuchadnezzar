@@ -439,7 +439,7 @@ impl DurableFile {
         }
     }
 
-    fn publish_namespace(&self) -> io::Result<()> {
+    pub(crate) fn publish_namespace(&self) -> io::Result<()> {
         let directory = {
             let p = self.progress.lock();
             if p.namespaced {

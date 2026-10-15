@@ -434,6 +434,10 @@ fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AAr
 /// bracketed entries are BUFFERED here and applied once every segment has
 /// been read and every COMMIT is known.
 pub struct BracketLedger {
+    parts:
+        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
+    closed_parts:
+        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
     /// Every (chunk, seq) this recovery discovered. A manifest member counts
     /// as present iff it is here.
     present: std::collections::HashSet<(u16, u64)>,
@@ -486,6 +490,8 @@ pub static BRACKETS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 impl BracketLedger {
     pub fn new(files: &[SegmentFileInfo]) -> Self {
         BracketLedger {
+            parts: Mutex::new(HashMap::new()),
+            closed_parts: Mutex::new(HashMap::new()),
             present: files
                 .iter()
                 .map(|file| (file.chunk_id as u16, file.seq_id))
@@ -542,8 +548,27 @@ impl BracketLedger {
     /// "this transaction aborted", because another participant may have been
     /// told to commit. Both halves are handed back so the store can ask its
     /// peers before deciding: see [`RecoveredBrackets`].
-    pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, RecoveryCellReadError> {
+    pub(crate) fn settle(
+        &self,
+        chunks: &[Chunk],
+    ) -> Result<RecoveredBrackets, RecoveryCellReadError> {
         let commits = std::mem::take(&mut *self.commits.lock());
+        let closed = self.closed_parts.lock();
+        for (txn, parts) in self.parts.lock().iter() {
+            // A missing local decision cannot be replaced by lease absence.
+            // Keep every part, including the surviving COMMIT, until settlement.
+            if !parts
+                .iter()
+                .all(|part| closed.get(txn).is_some_and(|set| set.contains(part)))
+            {
+                for &(chunk_id, segment_id) in parts {
+                    if let Some(segment) = chunks[chunk_id].segs.get(&(segment_id as usize)) {
+                        segment.protection.retain_transaction(txn);
+                    }
+                }
+            }
+        }
+        drop(closed);
         let mut pending = std::mem::take(&mut *self.pending.lock());
         // Floors count physical tombstones, including undecided brackets.
         // Their versions constrain a future create without deciding the bracket.
@@ -1581,6 +1606,12 @@ fn scan_segment_from_data(
                 }
                 match crate::ram::bracket::decode_begin(content) {
                     Some(txn) => {
+                        ledger
+                            .parts
+                            .lock()
+                            .entry(txn.clone())
+                            .or_default()
+                            .insert((chunk.id, seg_id));
                         open_bracket = Some((cursor + entry_size, txn));
                     }
                     None => warn!(
@@ -1609,6 +1640,12 @@ fn scan_segment_from_data(
                         // not decided in this segment: a cross-chunk
                         // transaction is committed as a whole, so the ledger
                         // settles it once every COMMIT is known.
+                        ledger
+                            .closed_parts
+                            .lock()
+                            .entry(commit_txn.clone())
+                            .or_default()
+                            .insert((chunk.id, seg_id));
                         ledger.note_commit(&commit_txn, manifest);
                         open_bracket = None;
                     }
@@ -2302,7 +2339,17 @@ pub fn recover_chunks(
                         .map(|segment| segment.is_hot())
                         .unwrap_or(false);
 
-                    let recover_as_cold = if segment_class == SegmentClass::Blob {
+                    let undecided_wal = !file_info.is_backup && {
+                        let parts = bracket_ledger.parts.lock();
+                        let closed = bracket_ledger.closed_parts.lock();
+                        parts.iter().any(|(txn, members)| {
+                            members.contains(&(chunk_id, file_info.seg_id))
+                                && !closed.get(txn).is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id)))
+                        })
+                    };
+                    let recover_as_cold = if undecided_wal {
+                        false
+                    } else if segment_class == SegmentClass::Blob {
                         true
                     } else if chunk.tiered_manager.is_some() {
                         let current_hot_segments =
@@ -3035,6 +3082,7 @@ mod tests {
             .backup_path(segment.chunk_id, segment.id, segment.seq_id)
             .expect("backup path");
 
+        chunk.rotate_heads_for_scrub_test();
         segment.archive().expect("first archive");
         assert!(
             Path::new(&backup_file).exists(),
@@ -3104,7 +3152,8 @@ mod tests {
         // Shutdown archives the open head -- this is `archive_all`'s job, and
         // the head is not sealed by rotation because it never stopped being
         // the head.
-        head.archive().expect("archive the open head");
+        chunk.rotate_heads_for_scrub_test();
+        head.archive().expect("archive the relinquished head");
         assert!(head.is_sealed(), "archiving must close the incarnation");
         assert!(
             !Path::new(&wal_file).exists(),
@@ -4615,8 +4664,10 @@ mod tests {
             );
         }
         assert!(!chunk.is_active_head(seg_id));
+        chunk.wait_for_segment_jobs_for_test();
         let seq_id = chunk.segs.get(&(seg_id as usize)).unwrap().seq_id;
         chunk.finish_rotated_head(seg_id, seq_id);
+        chunk.wait_for_segment_jobs_for_test();
     }
 
     /// Fill and rotate the head with ORDINARY cells, so the cleaner has a
@@ -5761,6 +5812,7 @@ mod tests {
             chunks.write_cell(&mut cell).unwrap();
 
             for chunk in &chunks.list {
+                chunk.rotate_heads_for_scrub_test();
                 for seg in chunk.segments() {
                     seg.archive().unwrap();
                 }
@@ -6212,6 +6264,7 @@ mod tests {
                 "each version should reside in a different segment"
             );
 
+            chunk.release_append_heads_for_test();
             let mut archived_segments = Vec::new();
             for seg in chunk.segments() {
                 let archived = seg.archive().unwrap();
@@ -7122,6 +7175,7 @@ mod tests {
 
             for chunks in [&db1_chunks, &db2_chunks] {
                 for chunk in &chunks.list {
+                    chunk.rotate_heads_for_scrub_test();
                     for seg in chunk.segments() {
                         seg.archive().unwrap();
                     }
@@ -7353,5 +7407,343 @@ mod tests {
         );
         assert_eq!(recovered.slot_bytes.get(41), expected_41);
         assert_eq!(recovered.total_live_bytes(), expected_40 + expected_41);
+    }
+    #[test]
+    fn cleaner_keeps_transaction_after_lease_retirement() {
+        let store = BracketCleanerStore::new(8933, "cleaner_lease_retired");
+        let chunks = store.open_sized(false, TEST_SEGMENT_SIZE * 8);
+        let chunk = &chunks.list[0];
+        let txn = crate::server::transactions::test_hlc(8933, 1);
+        let id = Id::allocated(35, 0, 1);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&id, 1024)).unwrap();
+        }
+        let segment = segment_of(&chunks, &id);
+        assert!(crate::ram::cleaner::SegmentCandidate::for_cleaner(&segment).is_none());
+        crate::ram::chunk::retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        rotate_out(chunk, segment.id);
+        assert!(!segment.is_head_owned());
+        assert!(segment.no_references());
+        assert!(crate::ram::cleaner::SegmentCandidate::for_cleaner(&segment).is_none());
+        assert!(!segment.archive().unwrap());
+        chunk.remove_segment(segment.id);
+        assert!(chunk.segs.get(&(segment.id as usize)).is_some());
+        drop(crate::ram::chunk::take_transactional_segments());
+    }
+
+    #[test]
+    fn prepare_sync_proves_wal_durability_without_receipt_capture() {
+        let store = BracketCleanerStore::new(8935, "cleaner_prepare_proof");
+        let chunks = store.open_sized(false, TEST_SEGMENT_SIZE * 8);
+        let txn = crate::server::transactions::test_hlc(8935, 1);
+        let id = Id::allocated(35, 0, 3);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&id, 1024)).unwrap();
+        }
+        let segment = segment_of(&chunks, &id);
+        segment.force_wal_sync().unwrap();
+        assert!(
+            segment.durable_receipt().unwrap().is_none(),
+            "the prepare sync must cover both the WAL prefix and its namespace"
+        );
+        chunks.commit_transaction_brackets(&txn).unwrap();
+        crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        drop(crate::ram::chunk::take_transactional_segments());
+    }
+
+    #[test]
+    fn cleaner_keeps_transaction_without_durable_decision_evidence() {
+        let store = BracketCleanerStore::new(8934, "cleaner_archive_only");
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(store.schema.clone());
+        let chunks = Chunks::new(
+            1,
+            TEST_SEGMENT_SIZE * 8,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(store.backup_dir.path().to_string_lossy().into_owned()),
+            None,
+            None,
+        );
+        let txn = crate::server::transactions::test_hlc(8934, 1);
+        let id = Id::allocated(35, 0, 2);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            chunks.write_cell(&mut store.cell(&id, 1024)).unwrap();
+        }
+        let segment = segment_of(&chunks, &id);
+        chunks.commit_transaction_brackets(&txn).unwrap();
+        crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        rotate_out(&chunks.list[0], segment.id);
+        assert!(segment.protection.transaction_pending());
+        assert!(crate::ram::cleaner::SegmentCandidate::for_cleaner(&segment).is_none());
+        assert!(!segment.archive().unwrap());
+        drop(crate::ram::chunk::take_transactional_segments());
+    }
+
+    /// A compacted part must not lose the only surviving transaction decision.
+    #[test]
+    fn non_durable_commit_power_cut_after_compacting_one_part_is_atomic() {
+        power_cut_after_compacting_one_part(false);
+    }
+
+    #[test]
+    fn durable_commit_power_cut_after_compacting_one_part_is_atomic() {
+        power_cut_after_compacting_one_part(true);
+    }
+
+    fn power_cut_after_compacting_one_part(durable: bool) {
+        let store = BracketCleanerStore::new(8931, "txn_power_cut_compact");
+        let chunks = store.open_sized(false, TEST_SEGMENT_SIZE * 16);
+        let chunk = &chunks.list[0];
+        let (ordinary, ordinary_seg) = ordinary_rotated_segment(&store, &chunks, 500);
+        let txn = crate::server::transactions::test_hlc(8931, 1);
+        let ids: Vec<_> = (1..=18).map(|n| Id::allocated(33, 0, n)).collect();
+        let (_, _receipts) = crate::ram::durability::capture(|| {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            for id in &ids {
+                chunks.write_cell(&mut store.cell(id, 512 * 1024)).unwrap();
+            }
+        });
+        let first = segment_of(&chunks, ids.last().unwrap());
+        let last = segment_of(&chunks, &ids[0]);
+        assert_ne!(first.id, last.id, "the transaction must span parts");
+        let entries = crate::ram::chunk::take_transactional_segments();
+        for segment in &entries {
+            segment.force_wal_sync().unwrap();
+        }
+        let entries_synced = last.wal_append_position();
+        let (result, _receipts) = crate::ram::durability::capture(|| {
+            if durable {
+                chunks.commit_transaction_brackets(&txn)
+            } else {
+                chunks.commit_transaction_brackets_without_decision_sync(&txn)
+            }
+        });
+        result.unwrap();
+        let last_synced = last.durable_file().unwrap().watermark();
+        assert!(last.wal_append_position() > entries_synced);
+        if durable {
+            assert_eq!(last_synced, last.wal_append_position());
+        } else {
+            assert_eq!(last_synced, entries_synced);
+        }
+        crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        // Compact only the small part. Keep the full part's COMMIT above its synced prefix.
+        rotate_out(chunk, first.id);
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|seg| seg.id == first.id || seg.id == ordinary_seg)
+            .collect();
+        assert_eq!(candidates.len(), 2);
+        let (_, collected) =
+            crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+        if durable {
+            assert!(collected > 0);
+            assert!(chunk.segments().iter().all(|seg| seg.id != first.id));
+        }
+        // Complete physical retirement before copying the crash image.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !chunk.retired_segments.lock().is_empty() {
+            chunk.drain_retired_segments();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retired files did not drain"
+            );
+            std::thread::yield_now();
+        }
+        let cut = BracketCleanerStore::new(8931, "txn_power_cut_compact");
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for item in std::fs::read_dir(from).unwrap() {
+                let item = item.unwrap();
+                let destination = to.join(item.file_name());
+                if item.path().is_dir() {
+                    copy_tree(&item.path(), &destination);
+                } else {
+                    std::fs::copy(item.path(), destination).unwrap();
+                }
+            }
+        }
+        copy_tree(store.backup_dir.path(), cut.backup_dir.path());
+        copy_tree(store.wal_dir.path(), cut.wal_dir.path());
+        let source = chunk
+            .file_manager
+            .wal_path(last.chunk_id, last.id, last.seq_id)
+            .unwrap();
+        let relative = std::path::Path::new(&source)
+            .strip_prefix(store.wal_dir.path())
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cut.wal_dir.path().join(relative))
+            .unwrap()
+            .set_len(last_synced)
+            .unwrap();
+        let recovered = cut.open_sized(true, TEST_SEGMENT_SIZE * 16);
+        let present = ids
+            .iter()
+            .filter(|id| recovered.read_cell(id).is_ok())
+            .count();
+        assert!(
+            present == 0 || present == ids.len(),
+            "power loss recovered {present}/{} transaction cells",
+            ids.len()
+        );
+        if !durable {
+            assert_eq!(collected, 0, "an unsynced part must prevent compaction");
+            assert!(chunk.segments().iter().any(|seg| seg.id == first.id));
+        }
+        for id in ordinary {
+            assert!(recovered.read_cell(&id).is_ok());
+        }
+    }
+    fn transaction_cut_across_chunks(sync_commits: usize, durable: bool, refuse: bool) -> usize {
+        let live = BracketCleanerStore::new(8932, "txn_power_cut_chunks");
+        let cut = BracketCleanerStore::new(8932, "txn_power_cut_chunks");
+        let open = |store: &BracketCleanerStore, recover| {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(store.schema.clone());
+            Chunks::new_with_recovery(
+                2,
+                TEST_SEGMENT_SIZE * 16,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(store.backup_dir.path().to_string_lossy().into_owned()),
+                Some(store.wal_dir.path().to_string_lossy().into_owned()),
+                None,
+                recover,
+                Some(store.raft_path.clone()),
+            )
+        };
+        let chunks = open(&live, false);
+        let txn = crate::server::transactions::test_hlc(8932, 1);
+        let ids: Vec<_> = (0..2)
+            .flat_map(|locality| (1..=18).map(move |n| Id::allocated(locality, 0, n)))
+            .collect();
+        let (_, _receipts) = crate::ram::durability::capture(|| {
+            let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
+            for id in &ids {
+                chunks.write_cell(&mut live.cell(id, 512 * 1024)).unwrap();
+            }
+        });
+        let entries = crate::ram::chunk::take_transactional_segments();
+        assert_eq!(entries.len(), 4, "2 parts in each of 2 chunks");
+        for segment in &entries {
+            segment.force_wal_sync().unwrap();
+        }
+        if refuse {
+            // Chunk 0 closes before chunk 1 refuses its first COMMIT.
+            let segment = entries
+                .iter()
+                .find(|segment| segment.chunk_id == 1)
+                .unwrap();
+            segment.retire_tail();
+        }
+        let (result, _receipts) = crate::ram::durability::capture(|| {
+            if durable {
+                chunks.commit_transaction_brackets(&txn)
+            } else {
+                chunks.commit_transaction_brackets_without_decision_sync(&txn)
+            }
+        });
+        if refuse {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+            crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        }
+        for segment in entries.iter().take(sync_commits) {
+            segment.force_wal_sync().unwrap();
+        }
+        for chunk in &chunks.list {
+            for segment in chunk.segments() {
+                let source = chunk
+                    .file_manager
+                    .wal_path(segment.chunk_id, segment.id, segment.seq_id)
+                    .unwrap();
+                if !std::path::Path::new(&source).exists() {
+                    continue;
+                }
+                let relative = std::path::Path::new(&source)
+                    .strip_prefix(live.wal_dir.path())
+                    .unwrap();
+                let destination = cut.wal_dir.path().join(relative);
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                std::fs::copy(source, &destination).unwrap();
+                let synced = segment
+                    .durable_file()
+                    .map(|file| file.watermark())
+                    .unwrap_or(crate::ram::wal_format::FILE_HEADER_SIZE as u64);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(destination)
+                    .unwrap()
+                    .set_len(synced)
+                    .unwrap();
+            }
+        }
+        let recovered = open(&cut, true);
+        let present = ids
+            .iter()
+            .filter(|id| recovered.read_cell(id).is_ok())
+            .count();
+        assert!(
+            present == 0 || present == ids.len(),
+            "recovered {present}/{} cells",
+            ids.len()
+        );
+        if !durable && sync_commits < entries.len() {
+            let parts: Vec<_> = recovered
+                .list
+                .iter()
+                .flat_map(|chunk| chunk.segments())
+                .filter(|segment| segment.protection.transaction_pending())
+                .collect();
+            assert_eq!(
+                parts.len(),
+                4,
+                "every recovered part needs its own decision proof"
+            );
+            for part in parts {
+                assert!(crate::ram::cleaner::SegmentCandidate::for_cleaner(&part).is_none());
+            }
+        }
+        if !refuse && present == 0 {
+            assert_eq!(recovered.take_in_doubt_brackets().len(), 1);
+        }
+        if refuse {
+            crate::ram::chunk::retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+        }
+        present
+    }
+
+    #[test]
+    fn non_durable_transaction_cut_before_any_commit_sync_is_absent() {
+        assert_eq!(transaction_cut_across_chunks(0, false, false), 0);
+    }
+
+    #[test]
+    fn non_durable_transaction_cut_after_one_commit_sync_is_complete() {
+        assert_eq!(transaction_cut_across_chunks(1, false, false), 36);
+    }
+
+    #[test]
+    fn non_durable_transaction_cut_after_all_commit_syncs_is_complete() {
+        assert_eq!(transaction_cut_across_chunks(4, false, false), 36);
+    }
+
+    #[test]
+    fn durable_transaction_cut_after_ack_is_complete() {
+        assert_eq!(transaction_cut_across_chunks(0, true, false), 36);
+    }
+
+    #[test]
+    fn refused_commit_cut_retracts_the_closed_chunk() {
+        assert_eq!(transaction_cut_across_chunks(0, false, true), 0);
+        assert_eq!(transaction_cut_across_chunks(0, true, true), 0);
     }
 }

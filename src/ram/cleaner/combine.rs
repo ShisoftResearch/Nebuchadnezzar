@@ -192,7 +192,7 @@ impl CombinedCleaner {
                     return None;
                 }
 
-                SegmentCandidate::new(&seg)
+                SegmentCandidate::for_cleaner(&seg)
             })
             .collect_vec();
 
@@ -678,7 +678,7 @@ impl CombinedCleaner {
     fn cleanup_segments(chunk: &Chunk, segments: Vec<SegmentCandidate>) {
         debug!("Unpublishing {} source segments", segments.len());
         for old_seg in &segments {
-            chunk.remove_segment(old_seg.id);
+            chunk.remove_segment_for_cleaner(old_seg.id);
         }
         // Releases our references; from here the segments can go quiescent.
         drop(segments);

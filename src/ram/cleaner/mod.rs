@@ -13,6 +13,7 @@ pub static CLEANER_RECLAIMED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub mod combine;
+pub(crate) mod protection;
 #[cfg(test)]
 mod tests;
 
@@ -381,9 +382,34 @@ impl Drop for Cleaner {
 
 pub struct SegmentCandidate {
     segment: lightning::aarc::Arc<Segment>,
+    cleaning: bool,
 }
 
 impl SegmentCandidate {
+    pub(crate) fn for_cleaner(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
+        if !segment.protection.claim_cleaner() {
+            return None;
+        }
+        if segment.protection.in_progress()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            segment.protection.release_cleaner();
+            return None;
+        }
+        match Self::new(segment) {
+            Some(mut candidate) => {
+                candidate.cleaning = true;
+                Some(candidate)
+            }
+            None => {
+                segment.protection.release_cleaner();
+                None
+            }
+        }
+    }
+
     pub fn new(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
         if !segment.incr_references() {
             return None;
@@ -394,6 +420,7 @@ impl SegmentCandidate {
         }
         Some(Self {
             segment: segment.clone(),
+            cleaning: false,
         })
     }
 }
@@ -402,6 +429,9 @@ impl Drop for SegmentCandidate {
     fn drop(&mut self) {
         self.segment.decr_references();
         self.segment.set_hot();
+        if self.cleaning {
+            self.segment.protection.release_cleaner();
+        }
     }
 }
 
