@@ -695,7 +695,8 @@ fn end_lease(
             // the revocation (claims are taken under the lock that revoked
             // it). Let that entry land first, so the padding covers it.
             #[cfg(feature = "abort_profile")]
-            let drain_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
+            let drain_timer =
+                crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
             let drained = seg.drain_pending_journals(std::time::Duration::from_secs(5));
             #[cfg(feature = "abort_profile")]
             drop(drain_timer);
@@ -2908,6 +2909,16 @@ impl Chunk {
             .map(|slot| slot.load(Ordering::Acquire))
             .find(|id| *id != HEAD_SEG_ID_EMPTY && *id != HEAD_SEG_ID_ALLOCATING);
         (head_or_none(self.get_head_seg_id()), first_blob)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotate_heads_for_scrub_test(&self) {
+        for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
+            let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
+            if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
+                self.finish_rotated_head(old);
+            }
+        }
     }
 
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
@@ -5267,7 +5278,7 @@ impl Chunks {
                 // A swallowed sync failure here is a store that reports
                 // itself synced while its log is not on disk -- the exact
                 // shape of promise this campaign exists to stop making.
-                if let Err(error) = segment.force_wal_sync() {
+                if let Err(error) = segment.drain_wal_sync() {
                     error!(
                         "sync_all could not sync segment {} (chunk {}): {:?}",
                         segment.id, segment.chunk_id, error
@@ -5556,6 +5567,32 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }
+    /// Certify existing cell WAL prefixes. Queued ranged tree writeback is excluded.
+    pub async fn flush_wal_durable(&self) -> Result<(), WriteError> {
+        let mut receipts = Vec::new();
+        for chunk in &self.list {
+            for segment in chunk.segments() {
+                if let Some(receipt) = segment.durable_receipt().map_err(WriteError::from_wal_io)? {
+                    receipts.push(receipt);
+                }
+            }
+        }
+        crate::ram::durability::wait(receipts).await
+    }
+
+    pub fn durability_failures(&self) -> Vec<crate::ram::durability::DurabilityError> {
+        self.list
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .segs
+                    .iter_values()
+                    .filter_map(|seg| seg.durability_failure())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.write_cell(cell);
@@ -7864,12 +7901,18 @@ mod tests {
         let (chunks, schema) = setup_test_chunks();
         let id = Id::allocated(1, 0, 43);
         let count = chunks.list[0].cell_count();
-        assert_eq!(chunks.restore_transaction_cell(&id, 0, 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(
+            chunks.restore_transaction_cell(&id, 0, 1),
+            Err(WriteError::CellVersionMismatch)
+        );
         assert_eq!(chunks.list[0].cell_count(), count);
         let mut cell = payload_cell(schema.vid.get(), &id, 64);
         let header = chunks.write_cell(&mut cell).unwrap();
         let address = chunks.address_of(&id);
-        assert_eq!(chunks.restore_transaction_cell(&id, 0, header.version + 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(
+            chunks.restore_transaction_cell(&id, 0, header.version + 1),
+            Err(WriteError::CellVersionMismatch)
+        );
         assert_eq!(chunks.address_of(&id), address);
         assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
     }

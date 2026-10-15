@@ -56,6 +56,8 @@
 //! one-way hash and a spilled segment's id names nothing. That is the `OWNER`
 //! field of `HASH_INDEX_SCHEMA`.
 
+#[cfg(test)]
+use crate::index::full_text::ToOwnedValue;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1393,9 +1395,73 @@ pub async fn scrub_hash_index(
                     .into_iter()
                     .map(move |segment| (chunk_index, segment))
             });
+        #[cfg(test)]
+        let mut moved_snapshot = if !prune
+            && mode == ScrubMode::Verify
+            && std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some()
+        {
+            let snapshot = pending.by_ref().collect::<Vec<_>>();
+            let mut moved_bytes = 0;
+            for (chunk_index, chunk) in chunks.list.iter().enumerate() {
+                let selected = snapshot
+                    .iter()
+                    .filter(|(index, _)| *index == chunk_index)
+                    .map(|(_, segment)| segment.clone())
+                    .collect::<Vec<_>>();
+                let before = chunk
+                    .live_cell_ids()
+                    .into_iter()
+                    .map(|bits| {
+                        let cell = chunk.read_cell(bits).unwrap();
+                        (bits, cell.header.version, cell.data.to_owned_value())
+                    })
+                    .collect::<Vec<_>>();
+                chunk.rotate_heads_for_scrub_test();
+                for segment in &selected {
+                    eprintln!(
+                        "scrub source id={} used={} active={} refs={} cold={} class={:?}",
+                        segment.id,
+                        segment.used_spaces(),
+                        chunk.is_active_head(segment.id),
+                        segment.references_count(),
+                        segment.is_cold(),
+                        segment.segment_class()
+                    );
+                }
+                let (collected, _) =
+                    crate::ram::cleaner::combine::CombinedCleaner::combine_segments(
+                        chunk, &selected,
+                    );
+                moved_bytes += collected;
+                for (bits, version, data) in before {
+                    let cell = chunk.read_cell(bits).unwrap();
+                    assert_eq!(
+                        cell.header.version, version,
+                        "movement changed cell version"
+                    );
+                    assert_eq!(
+                        cell.data.to_owned_value(),
+                        data,
+                        "movement changed cell data"
+                    );
+                }
+            }
+            eprintln!("deterministic hash snapshot movement: collected {moved_bytes} bytes; authoritative cells unchanged");
+            assert!(moved_bytes > 0, "movement hook did not relocate a segment");
+            Some(snapshot.into_iter())
+        } else {
+            None
+        };
         loop {
             while workers.len() < concurrency().min(4) {
-                let Some((chunk_index, segment)) = pending.next() else {
+                #[cfg(test)]
+                let next = match moved_snapshot.as_mut() {
+                    Some(snapshot) => snapshot.next(),
+                    None => pending.next(),
+                };
+                #[cfg(not(test))]
+                let next = pending.next();
+                let Some((chunk_index, segment)) = next else {
                     break;
                 };
                 let chunks = chunks.clone();
@@ -2092,11 +2158,7 @@ mod tests {
             true,
         );
         let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
-        client
-            .new_schema_with_id(schema)
-            .await
-            .unwrap()
-            .unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
         (server, Arc::new(client))
     }
 
@@ -3601,6 +3663,12 @@ mod tests {
         )
         .await;
         let indexers = &server.indexer().unwrap().clients;
+        if std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some() {
+            server.cleaner().pause();
+            // Allow an already-running cleaner round to finish before the
+            // controlled snapshot. No production scheduling is changed.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
 
         let mut missing = Vec::new();
         let mut stale = Vec::new();

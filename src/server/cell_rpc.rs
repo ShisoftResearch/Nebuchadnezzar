@@ -1,4 +1,3 @@
-use std::sync::atomic::{self, AtomicU64};
 use crate::index::scrub::{ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
@@ -18,6 +17,7 @@ use dovahkiin::types::OwnedValue;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{self, AtomicU64};
 
 use bifrost_plugins::hash_ident;
 
@@ -30,8 +30,12 @@ pub static INDEX_TASK_FAILURES: AtomicU64 = AtomicU64::new(0);
 ///
 /// `with_indices_ensured` is generic over what the write returns, so folding
 /// an index failure into that value needs a hook rather than a match.
+#[cfg(test)]
+pub(crate) static SPECIALIZED_BATCH_CALLS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
 pub trait IndexOutcome {
     fn fail_with_index_error(self, detail: String) -> Self;
+    fn note_index_tasks(&mut self, _count: usize) {}
 }
 
 impl<T> IndexOutcome for Result<T, WriteError> {
@@ -43,6 +47,21 @@ impl<T> IndexOutcome for Result<T, WriteError> {
             Ok(_) => Err(WriteError::IndexIncomplete(detail)),
             err => err,
         }
+    }
+}
+
+struct DurableOutcome<T> {
+    result: Result<T, WriteError>,
+    receipts: Vec<crate::ram::durability::Receipt>,
+    derived: bool,
+}
+impl<T> IndexOutcome for DurableOutcome<T> {
+    fn fail_with_index_error(mut self, detail: String) -> Self {
+        self.result = self.result.fail_with_index_error(detail);
+        self
+    }
+    fn note_index_tasks(&mut self, count: usize) {
+        self.derived = count != 0;
     }
 }
 
@@ -112,6 +131,21 @@ service! {
     rpc fence_engage(families: &Vec<u32>, drain_ms: u64, lease_ms: u64) -> Result<u64, String>;
     rpc fence_renew(token: u64, lease_ms: u64) -> bool;
     rpc fence_release(token: u64) -> ();
+
+    rpc write_cell_durable(cell:OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc update_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc upsert_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc remove_cell_durable(key: Id) -> Result<(), WriteError>;
+    rpc write_cell_captured(cell: OwnedCell) -> (Result<CellHeader, WriteError>, Vec<Id>);
+    rpc remove_cell_captured(key: Id) -> (Result<(), WriteError>, Vec<Id>);
+    rpc compare_version_and_update_cell_captured(key: Id, version: u64, cell: OwnedCell) -> (Result<CellHeader, WriteError>, Vec<Id>);
+    rpc compare_version_and_set_field_captured(key: Id, version: u64, field: u64, value: OwnedValue) -> (Result<CellHeader, WriteError>, Vec<Id>);
+    rpc finish_captured_receipts(tokens: Vec<Id>, commit: bool) -> Result<(), WriteError>;
+    rpc flush_wal_durable() -> Result<(), WriteError>;
+    rpc write_all_cells_durable(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
+    rpc upsert_all_cells_durable(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
+    rpc compare_version_and_update_cell_durable(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc compare_version_and_set_field_durable(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
 }
 
 /// One page of a cell scan.
@@ -183,10 +217,123 @@ fn available_bytes_for(path: &str) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+tokio::task_local! {
+    static RPC_CAPTURE_HAS_INDICES: std::cell::Cell<bool>;
+    static RPC_CAPTURE: std::cell::RefCell<Vec<crate::ram::durability::Receipt>>;
+}
+
+struct CapturedReceipts {
+    incarnation: u64,
+    next: u64,
+    entries: std::collections::HashMap<
+        Id,
+        (
+            crate::ram::durability::Receipt,
+            std::time::Instant,
+            bool,
+            bool,
+        ),
+    >,
+    last_cleanup: Option<std::time::Instant>,
+}
+impl Default for CapturedReceipts {
+    fn default() -> Self {
+        let incarnation = rand::random();
+        #[cfg(test)]
+        let incarnation = if std::env::var_os("NEB_TEST_REVERT_RECEIPT_INCARNATION").is_some() {
+            0
+        } else {
+            incarnation
+        };
+        Self {
+            incarnation,
+            next: 0,
+            entries: Default::default(),
+            last_cleanup: None,
+        }
+    }
+}
+impl CapturedReceipts {
+    // Abandoned RPC replies must not pin descriptors indefinitely. An expired
+    // token is an error at certification, so expiry cannot produce success.
+    fn store(
+        &mut self,
+        receipts: Vec<crate::ram::durability::Receipt>,
+        derived: bool,
+        acknowledge: bool,
+    ) -> Vec<Id> {
+        let now = std::time::Instant::now();
+        if self
+            .last_cleanup
+            .is_none_or(|last| now.duration_since(last).as_secs() >= 600)
+        {
+            self.entries
+                .retain(|_, (_, at, _, _)| now.duration_since(*at).as_secs() < 600);
+            self.last_cleanup = Some(now);
+        }
+        receipts
+            .into_iter()
+            .enumerate()
+            .map(|(index, receipt)| {
+                self.next = self
+                    .next
+                    .checked_add(1)
+                    .expect("receipt token space exhausted");
+                let token = Id::from_parts(self.incarnation, self.next);
+                self.entries
+                    .insert(token, (receipt, now, derived, acknowledge && index == 0));
+                token
+            })
+            .collect()
+    }
+    fn take(
+        &mut self,
+        tokens: Vec<Id>,
+    ) -> Result<(Vec<crate::ram::durability::Receipt>, bool, u64), WriteError> {
+        let mut receipts: Vec<crate::ram::durability::Receipt> = Vec::new();
+        let mut missing = false;
+        let mut derived = false;
+        let mut acknowledged = 0;
+        for token in tokens {
+            let Some((receipt, at, has_indices, acknowledge)) = self.entries.remove(&token) else {
+                missing = true;
+                continue;
+            };
+            #[cfg(test)]
+            let lease_reverted = std::env::var_os("NEB_TEST_REVERT_RECEIPT_LEASE").is_some();
+            #[cfg(not(test))]
+            let lease_reverted = false;
+            if at.elapsed().as_secs() >= 600 && !lease_reverted {
+                missing = true;
+                continue;
+            }
+            derived |= has_indices;
+            acknowledged += u64::from(acknowledge);
+            if let Some(old) = receipts.iter_mut().find(|old| {
+                std::sync::Arc::ptr_eq(&old.file, &receipt.file) && old.epoch == receipt.epoch
+            }) {
+                old.offset = old.offset.max(receipt.offset);
+            } else {
+                receipts.push(receipt);
+            }
+        }
+        if missing {
+            Err(WriteError::Durability(
+                crate::ram::durability::DurabilityError::Rpc {
+                    message: "captured WAL receipt is missing or expired".into(),
+                },
+            ))
+        } else {
+            Ok((receipts, derived, acknowledged))
+        }
+    }
+}
+
 pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
     cell_scans: CellScans,
+    captured_receipts: parking_lot::Mutex<CapturedReceipts>,
     fence_leases: Arc<FenceLeases>,
 }
 
@@ -978,11 +1125,7 @@ impl Service for NebRPCService {
         future::ready(id).boxed()
     }
 
-    fn cell_scan_next(
-        &self,
-        cursor: u64,
-        max: u32,
-    ) -> BoxFuture<'_, Result<CellScanPage, String>> {
+    fn cell_scan_next(&self, cursor: u64, max: u32) -> BoxFuture<'_, Result<CellScanPage, String>> {
         let max = (max as usize).max(1);
         let result = (|| {
             let chunks = self.database_runtime.chunks();
@@ -1071,12 +1214,16 @@ impl Service for NebRPCService {
                         let holds = leases.holds.lock();
                         match holds.get(&token) {
                             None => return,
-                            Some(held) => held.expires.saturating_duration_since(std::time::Instant::now()),
+                            Some(held) => held
+                                .expires
+                                .saturating_duration_since(std::time::Instant::now()),
                         }
                     };
                     if wait.is_zero() {
                         if leases.holds.lock().remove(&token).is_some() {
-                            warn!("write fence lease {token} lapsed without a renewal; fence lifted");
+                            warn!(
+                                "write fence lease {token} lapsed without a renewal; fence lifted"
+                            );
                         }
                         return;
                     }
@@ -1092,8 +1239,8 @@ impl Service for NebRPCService {
         let mut holds = self.fence_leases.holds.lock();
         let renewed = match holds.get_mut(&token) {
             Some(held) => {
-                held.expires = std::time::Instant::now()
-                    + std::time::Duration::from_millis(lease_ms.max(1));
+                held.expires =
+                    std::time::Instant::now() + std::time::Duration::from_millis(lease_ms.max(1));
                 true
             }
             None => false,
@@ -1179,10 +1326,322 @@ impl Service for NebRPCService {
         }
         .boxed()
     }
+    fn write_cell_durable(
+        &self,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            let result = self
+                .with_durable_indices(|| self.database_runtime.chunks().write_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| {
+                        self.database_runtime.chunks().write_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
+    fn update_cell_durable(
+        &self,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            let result = self
+                .with_durable_indices(|| self.database_runtime.chunks().update_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| {
+                        self.database_runtime.chunks().update_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
+    fn upsert_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            self.upsert_cell_durable_unchecked(cell).await
+        }
+        .boxed()
+    }
+
+    fn remove_cell_durable(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
+            self.remove_cell_durable_unchecked(key).await
+        }
+        .boxed()
+    }
+
+    fn flush_wal_durable(&self) -> BoxFuture<'_, Result<(), WriteError>> {
+        self.database_runtime.chunks().flush_wal_durable().boxed()
+    }
+
+    fn write_cell_captured(
+        &self,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
+        self.with_captured_indices(async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            let result = self
+                .with_captured_op(|| {
+                    self.capture_for_rpc(|| self.database_runtime.chunks().write_cell(&mut cell))
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_captured_op(|| {
+                        self.capture_for_rpc(|| {
+                            self.database_runtime.chunks().write_cell(&mut cell)
+                        })
+                    })
+                    .await
+                }
+                other => other,
+            }
+        })
+        .boxed()
+    }
+
+    fn remove_cell_captured(&self, key: Id) -> BoxFuture<'_, (Result<(), WriteError>, Vec<Id>)> {
+        self.with_captured_indices(async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
+            let result = self
+                .with_captured_op(|| {
+                    self.capture_for_rpc(|| self.database_runtime.chunks().remove_cell(&key))
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(schema)) => {
+                    self.refresh_local_schema_cache_for_write(schema).await?;
+                    self.with_captured_op(|| {
+                        self.capture_for_rpc(|| self.database_runtime.chunks().remove_cell(&key))
+                    })
+                    .await
+                }
+                other => other,
+            }
+        })
+        .boxed()
+    }
+
+    fn compare_version_and_update_cell_captured(
+        &self,
+        key: Id,
+        version: u64,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
+        self.with_captured_indices(async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            let result = self
+                .with_captured_op(|| {
+                    self.capture_for_rpc(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_update_cell(&key, version, &mut cell)
+                    })
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_captured_op(|| {
+                        self.capture_for_rpc(|| {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_update_cell(&key, version, &mut cell)
+                        })
+                    })
+                    .await
+                }
+                other => other,
+            }
+        })
+        .boxed()
+    }
+
+    fn compare_version_and_set_field_captured(
+        &self,
+        key: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
+        self.with_captured_indices(async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
+            let first_value = value.clone();
+            let result = self
+                .with_captured_op(|| {
+                    self.capture_for_rpc(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_set_field(&key, version, field, first_value)
+                    })
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_captured_op(|| {
+                        self.capture_for_rpc(|| {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_set_field(&key, version, field, value)
+                        })
+                    })
+                    .await
+                }
+                other => other,
+            }
+        })
+        .boxed()
+    }
+    fn finish_captured_receipts(
+        &self,
+        tokens: Vec<Id>,
+        commit: bool,
+    ) -> BoxFuture<'_, Result<(), WriteError>> {
+        async move {
+            let (receipts, derived, acknowledged) = self.captured_receipts.lock().take(tokens)?;
+            if !commit {
+                return Ok(());
+            }
+            if derived {
+                self.certify_derived_writes().await?;
+                crate::ram::durability::wait_uncovered(receipts).await?;
+            } else {
+                crate::ram::durability::wait(receipts).await?;
+            }
+            crate::ram::durability::ACKNOWLEDGED_WRITES
+                .fetch_add(acknowledged, atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        .boxed()
+    }
+    fn write_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> BoxFuture<'_, Vec<Result<CellHeader, WriteError>>> {
+        crate::ram::durability::batch_with_derived(
+            self.apply_durable_batch(cells, true, false),
+            self.certify_derived_writes(),
+        )
+        .boxed()
+    }
+
+    fn upsert_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> BoxFuture<'_, Vec<Result<CellHeader, WriteError>>> {
+        crate::ram::durability::batch_with_derived(
+            self.apply_durable_batch(cells, false, true),
+            self.certify_derived_writes(),
+        )
+        .boxed()
+    }
+
+    fn compare_version_and_update_cell_durable(
+        &self,
+        key: Id,
+        version: u64,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_body(&cell)?;
+            let result = self
+                .with_durable_indices(|| {
+                    self.database_runtime
+                        .chunks()
+                        .compare_version_and_update_cell(&key, version, &mut cell)
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_update_cell(&key, version, &mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
+    fn compare_version_and_set_field_durable(
+        &self,
+        key: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
+            let first_value = value.clone();
+            let result = self
+                .with_durable_indices(|| {
+                    self.database_runtime
+                        .chunks()
+                        .compare_version_and_set_field(&key, version, field, first_value)
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_set_field(&key, version, field, value)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
 }
 
 dispatch_rpc_service_functions!(NebRPCService);
-
 impl NebRPCService {
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
@@ -1192,6 +1651,7 @@ impl NebRPCService {
             database_runtime,
             neb_client,
             cell_scans: CellScans::default(),
+            captured_receipts: parking_lot::Mutex::new(CapturedReceipts::default()),
             fence_leases: Arc::new(FenceLeases::default()),
         })
     }
@@ -1253,6 +1713,47 @@ impl NebRPCService {
         .boxed()
     }
 
+    fn upsert_cell_durable_unchecked(
+        &self,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            let result = self
+                .with_durable_indices(|| self.database_runtime.chunks().upsert_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| {
+                        self.database_runtime.chunks().upsert_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
+    fn remove_cell_durable_unchecked(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
+        async move {
+            let result = self
+                .with_durable_indices(|| self.database_runtime.chunks().remove_cell(&key))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_durable_indices(|| self.database_runtime.chunks().remove_cell(&key))
+                        .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
     /// Admit a write of `cell` through the database's write fence.
     ///
     /// The cell names its own generation, which resolves to the family the
@@ -1291,16 +1792,20 @@ impl NebRPCService {
         id: &Id,
     ) -> Result<crate::server::write_fence::WriteGuard<'_>, WriteError> {
         use crate::server::write_fence::KeyedFamily;
-        self.database_runtime.write_fence().enter_keyed(id.bits(), || {
-            match self.database_runtime.chunks().head_cell(id) {
-                Ok(header) => match self.database_runtime.schemas().uid_of_vid(&header.schema) {
-                    Some(uid) => KeyedFamily::Family(uid),
-                    None => KeyedFamily::Unknown,
-                },
-                Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
-                Err(_) => KeyedFamily::Unknown,
-            }
-        })
+        self.database_runtime
+            .write_fence()
+            .enter_keyed(id.bits(), || {
+                match self.database_runtime.chunks().head_cell(id) {
+                    Ok(header) => {
+                        match self.database_runtime.schemas().uid_of_vid(&header.schema) {
+                            Some(uid) => KeyedFamily::Family(uid),
+                            None => KeyedFamily::Unknown,
+                        }
+                    }
+                    Err(ReadError::CellDoesNotExisted) => KeyedFamily::Missing,
+                    Err(_) => KeyedFamily::Unknown,
+                }
+            })
     }
 
     /// Refuse a write for a slot this member does not own.
@@ -1374,6 +1879,240 @@ impl NebRPCService {
         }
     }
 
+    async fn certify_derived_writes(&self) -> Result<(), WriteError> {
+        self.neb_client.flush_wal_durable().await.map_err(|error| {
+            WriteError::Durability(crate::ram::durability::DurabilityError::Rpc {
+                message: format!("{error:?}"),
+            })
+        })?
+    }
+
+    fn capture_for_rpc<T>(&self, op: impl FnOnce() -> T) -> T {
+        let (result, receipts) = crate::ram::durability::capture(op);
+        RPC_CAPTURE.with(|capture| capture.borrow_mut().extend(receipts));
+        result
+    }
+
+    async fn with_captured_op<T, F>(&self, op: F) -> Result<T, WriteError>
+    where
+        T: Send,
+        F: FnOnce() -> Result<T, WriteError> + Send,
+    {
+        let outcome = self
+            .with_indices_ensured(|| DurableOutcome {
+                result: op(),
+                receipts: Vec::new(),
+                derived: false,
+            })
+            .await;
+        if outcome.derived {
+            RPC_CAPTURE_HAS_INDICES.with(|flag| flag.set(true));
+        }
+        outcome.result
+    }
+
+    async fn with_captured_indices<T>(
+        &self,
+        op: impl std::future::Future<Output = Result<T, WriteError>>,
+    ) -> (Result<T, WriteError>, Vec<Id>) {
+        RPC_CAPTURE_HAS_INDICES
+            .scope(
+                std::cell::Cell::new(false),
+                RPC_CAPTURE.scope(std::cell::RefCell::new(Vec::new()), async {
+                    let result = op.await;
+                    let receipts = RPC_CAPTURE.with(|capture| capture.take());
+                    #[cfg(test)]
+                    if std::env::var_os("NEB_TEST_REVERT_DEFERRED_WAIT").is_some() {
+                        crate::ram::durability::wait(receipts.clone())
+                            .await
+                            .unwrap();
+                    }
+                    let derived = RPC_CAPTURE_HAS_INDICES.with(|flag| flag.get());
+                    let tokens =
+                        self.captured_receipts
+                            .lock()
+                            .store(receipts, derived, result.is_ok());
+                    (result, tokens)
+                }),
+            )
+            .await
+    }
+
+    fn apply_batch_cell(
+        &self,
+        cell: &mut OwnedCell,
+        insert: bool,
+    ) -> Result<CellHeader, WriteError> {
+        self.refuse_if_not_owner(&cell.header.id)?;
+        let _fence = self.fence_for_cell_body(cell)?;
+        if insert {
+            self.database_runtime.chunks().write_cell(cell)
+        } else {
+            self.database_runtime.chunks().upsert_cell(cell)
+        }
+    }
+
+    async fn apply_indexed_batch_cell(
+        &self,
+        cell: &mut OwnedCell,
+        insert: bool,
+    ) -> Result<CellHeader, WriteError> {
+        self.refuse_if_not_owner(&cell.header.id)?;
+        let _fence = self.fence_for_cell_body(cell)?;
+        let (result, tasks) = IndexBuilder::with_request_index_scope(|| {
+            crate::ram::durability::capture(|| {
+                if insert {
+                    self.database_runtime.chunks().write_cell(cell)
+                } else {
+                    self.database_runtime.chunks().upsert_cell(cell)
+                }
+            })
+            .0
+        })
+        .await;
+        if !tasks.is_empty() {
+            crate::ram::durability::note_derived_writes();
+        }
+        let mut failed = 0;
+        let mut first = None;
+        for task in tasks {
+            let error = match task {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => format!("{error:?}"),
+                Err(error) => format!("index task join: {error}"),
+            };
+            failed += 1;
+            first.get_or_insert(error);
+        }
+        if let Some(detail) = first {
+            INDEX_TASK_FAILURES.fetch_add(failed, atomic::Ordering::Relaxed);
+            result.fail_with_index_error(format!("{failed} index task(s) failed, first: {detail}"))
+        } else {
+            result
+        }
+    }
+
+    /// Keep the common unindexed loop synchronous under one capture scope.
+    /// Only a missing schema or actual index work needs to suspend application.
+    async fn apply_durable_batch(
+        &self,
+        cells: Vec<OwnedCell>,
+        insert: bool,
+        stop: bool,
+    ) -> Vec<Result<CellHeader, WriteError>> {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_REVERT_SPECIALIZED_BATCH").is_some() {
+            let mut results = Vec::with_capacity(cells.len());
+            let mut aborted = false;
+            for cell in cells {
+                let result = if aborted {
+                    Err(WriteError::BatchAborted)
+                } else if insert {
+                    self.write_cell_durable(cell).await
+                } else {
+                    self.upsert_cell_durable(cell).await
+                };
+                if stop && result.is_err() {
+                    aborted = true;
+                }
+                results.push(result);
+            }
+            return results;
+        }
+        #[cfg(test)]
+        SPECIALIZED_BATCH_CALLS.fetch_add(1, atomic::Ordering::Relaxed);
+        let indexed = self.database_runtime.indexer().is_some();
+        let mut pending = cells.into_iter();
+        let mut results = Vec::with_capacity(pending.len());
+        loop {
+            let retry = if indexed {
+                match pending.next() {
+                    None => break,
+                    Some(mut cell) => {
+                        let result = self.apply_indexed_batch_cell(&mut cell, insert).await;
+                        Some((cell, result))
+                    }
+                }
+            } else {
+                crate::ram::durability::capture(|| {
+                    for mut cell in pending.by_ref() {
+                        let result = self.apply_batch_cell(&mut cell, insert);
+                        if matches!(result, Err(WriteError::SchemaDoesNotExisted(_))) {
+                            return Some((cell, result));
+                        }
+                        let failed = result.is_err();
+                        results.push(result);
+                        if stop && failed {
+                            return None;
+                        }
+                    }
+                    None
+                })
+                .0
+            };
+            if let Some((mut cell, mut result)) = retry {
+                if let Err(WriteError::SchemaDoesNotExisted(schema)) = result {
+                    result = match self.refresh_local_schema_cache_for_write(schema).await {
+                        Err(error) => Err(error),
+                        Ok(()) if indexed => self.apply_indexed_batch_cell(&mut cell, insert).await,
+                        Ok(()) => {
+                            crate::ram::durability::capture(|| {
+                                self.apply_batch_cell(&mut cell, insert)
+                            })
+                            .0
+                        }
+                    };
+                }
+                let failed = result.is_err();
+                results.push(result);
+                if stop && failed {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        results.extend(pending.map(|_| Err(WriteError::BatchAborted)));
+        results
+    }
+
+    fn with_durable_indices<'a, T, F>(&'a self, op: F) -> BoxFuture<'a, Result<T, WriteError>>
+    where
+        T: Send + 'a,
+        F: FnOnce() -> Result<T, WriteError> + Send + 'a,
+    {
+        async move {
+            let mut outcome = self
+                .with_indices_ensured(|| {
+                    let (result, receipts) = crate::ram::durability::capture(op);
+                    DurableOutcome {
+                        result,
+                        receipts,
+                        derived: false,
+                    }
+                })
+                .await;
+            if crate::ram::durability::defer_to_batch(&mut outcome.receipts) {
+                if outcome.derived {
+                    crate::ram::durability::note_derived_writes();
+                }
+            } else {
+                if outcome.derived {
+                    self.certify_derived_writes().await?;
+                    crate::ram::durability::wait_uncovered(outcome.receipts).await?;
+                } else {
+                    crate::ram::durability::wait(outcome.receipts).await?;
+                }
+                if outcome.result.is_ok() {
+                    crate::ram::durability::ACKNOWLEDGED_WRITES
+                        .fetch_add(1, atomic::Ordering::Relaxed);
+                }
+            }
+            outcome.result
+        }
+        .boxed()
+    }
+
     fn with_indices_ensured<'a, R, F>(&'a self, op: F) -> BoxFuture<'a, R>
     where
         R: Send + IndexOutcome + 'a,
@@ -1387,7 +2126,8 @@ impl NebRPCService {
                 // concurrency turned into a convoy instead of throughput.
                 // Unscoped tasks are drained by the background reaper (and by
                 // await_all_indices at shutdown).
-                let (res, request_results) = IndexBuilder::with_request_index_scope(op).await;
+                let (mut res, request_results) = IndexBuilder::with_request_index_scope(op).await;
+                res.note_index_tasks(request_results.len());
 
                 // The scope has already awaited these, so the outcome of this
                 // write's index work is in hand right here. It used to be
@@ -1430,3 +2170,7 @@ impl NebRPCService {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "durable_write_tests.rs"]
+mod durable_ack_tests;
