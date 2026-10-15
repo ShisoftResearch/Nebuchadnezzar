@@ -4007,7 +4007,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wal_sync_racing_a_head_close_credits_only_covered_bytes() {
+    fn seal_waits_for_in_flight_sync_and_credits_all_covered_bytes() {
         use std::io::Read;
         let dir = tempfile::TempDir::new().unwrap();
         let chunks = crate::ram::chunk::Chunks::new(
@@ -4039,14 +4039,15 @@ mod tests {
             assert_eq!(seg.wal_pending_bytes(), 8);
             seg.write_wal(seg.addr + 8, 8, false)?;
             assert_eq!(seg.wal_pending_bytes(), 16);
-            // Close and archive while the first sync still owns its cloned descriptor.
+            // The seal can sync both records, but the active sync job prevents its archive.
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| chunk.finish_rotated_head(id, seg.seq_id))
                     .join()
                     .unwrap();
             });
-            assert!(seg.file_state.lock().wal.is_none());
+            assert!(seg.file_state.lock().wal.is_some());
+            assert!(seg.protection.seal_pending.load(Acquire));
             assert_eq!(seg.wal_pending_bytes(), 0, "close must cover both records");
             file.sync_all()?;
 
@@ -4059,6 +4060,8 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        chunk.wait_for_segment_jobs_for_test();
+        assert!(seg.file_state.lock().wal.is_none());
         assert_eq!(seg.wal_bytes_written.load(Relaxed), 16);
         assert_eq!(
             seg.wal_bytes_synced.load(Acquire),
