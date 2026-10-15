@@ -59,6 +59,8 @@ pub static WAL_JOURNAL_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// harness judging durability has to be able to tell the two apart, so the
 /// refusal is counted where it happens.
 pub static ALLOCATION_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// Bytes marked dead, including versions replaced by the cleaner.
+pub static DEAD_BYTES_PRODUCED: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
 /// Within rotation: allocating the fresh segment (including its WAL file
@@ -4213,6 +4215,7 @@ impl Chunk {
             addr,
             seg.id
         );
+        DEAD_BYTES_PRODUCED.fetch_add(size as u64, Ordering::Relaxed);
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
         seg.mark_dead_bit(addr);
         seg.note_dead_bytes_change();

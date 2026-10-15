@@ -26,6 +26,10 @@ use std::time::Duration;
 pub static INDEX_PAGES_ABANDONED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Successful page images, including retries, for write amplification measurements.
+pub static INDEX_PAGE_IMAGES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub struct WriteBackHub {
     // Page upserts. Drained in batches by any worker.
     queue: SegQueue<(usize, external::ChangingNode)>,
@@ -392,7 +396,9 @@ impl WriteBackHub {
                                 Ok(results) => {
                                     for (r, cell) in results.into_iter().zip(pending.into_iter()) {
                                         match r {
-                                            Ok(_) => {}
+                                            Ok(_) => {
+                                                INDEX_PAGE_IMAGES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                                            }
                                             Err(
                                                 crate::ram::cell::WriteError::CannotAllocateSpace
                                                 | crate::ram::cell::WriteError::BatchAborted,
@@ -598,7 +604,10 @@ impl WriteBackHub {
                     let mut retry: Vec<crate::ram::cell::OwnedCell> = Vec::new();
                     for (r, cell) in results.into_iter().zip(cells.into_iter()) {
                         match r {
-                            Ok(_) => landed += 1,
+                            Ok(_) => {
+                                landed += 1;
+                                INDEX_PAGE_IMAGES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                            }
                             Err(
                                 crate::ram::cell::WriteError::CannotAllocateSpace
                                 | crate::ram::cell::WriteError::BatchAborted,
