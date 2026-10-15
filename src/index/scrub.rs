@@ -1572,7 +1572,7 @@ async fn scrub_hash_cells(
     total.merge(&derived);
 
     // --- reconcile (asynchronous; nothing borrowed from the chunk)
-    // Prune the inspected segment first, including orphan spills.
+    // Prune this batch first, including orphan spills.
     // The indexer checks its owner before each CAS.
     for (_, bucket, member) in &stale {
         report_hash_stale(*member, *bucket);
