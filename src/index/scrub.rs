@@ -3561,6 +3561,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn compose_captured_receipts_survive_scrub_movement() {
+        let (server, client, _dir) = movement_fixture().await;
+        let capture = crate::client::CapturedWriteBatch::new();
+        for i in 0..120 {
+            client
+                .update_cell_captured(&capture, hash_product_cell(i, i))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let chunks = server.chunks();
+        let indexers = &server.indexer().unwrap().clients;
+        let mut hook = |prune: bool| {
+            if !prune {
+                move_scrub_cells(chunks, false);
+            }
+        };
+        let report =
+            scrub_hash_index_inner(chunks, indexers, ScrubMode::Verify, Some(&mut hook)).await;
+        assert!(report.is_clean(), "{report}");
+        assert_eq!(report.hash_entries_derived, 120);
+        capture.finish().await.unwrap().unwrap();
+        let after = scrub_all_indexes(chunks, indexers, ScrubMode::Verify).await;
+        assert!(after.is_clean(), "{after}");
+        assert_eq!(after.entries_derived, 240);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn scrub_movement_full_verify() {
         check_scrub_movement(false, ScrubMode::Verify, false).await;
     }

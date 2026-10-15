@@ -531,3 +531,71 @@ async fn durable_ack_captured_client_groups_by_rpc_target() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn compose_durable_receipts_preserve_verified_reads() {
+    use crate::index::verification::IndexCheck;
+    use crate::ram::schema::{IndexType, SchemaUid};
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture_with_indices(&dir, true).await;
+    let client = server.current_database().neb_client.clone();
+    client
+        .new_schema_with_id(Schema::new_with_id(
+            8903,
+            "compose_verified_durable",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                "value",
+                Type::U64,
+                vec![IndexType::Hashed],
+            )]),
+            false,
+            false,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut initial = cell(1, 1);
+    initial.header.schema = SchemaVid(8903);
+    rpc.write_cell_durable(initial).await.unwrap();
+    let mut changed = cell(1, 2);
+    changed.header.schema = SchemaVid(8903);
+    let (result, tokens) = rpc.update_cell_captured(changed).await;
+    result.unwrap();
+    assert!(!tokens.is_empty());
+    let checks = |value| {
+        vec![IndexCheck::Hashed {
+            buckets: vec![
+                crate::query::data_client::IndexedDataClient::hashed_index_id(
+                    SchemaUid(8903),
+                    bifrost_hasher::hash_str("value"),
+                    &OwnedValue::U64(value),
+                ),
+            ],
+            field: bifrost_hasher::hash_str("value"),
+            value: OwnedValue::U64(value),
+        }]
+    };
+    let ids = vec![Id::from_parts(1, 1)];
+    let empty = Expr::List(vec![]);
+    for _ in 0..2 {
+        let rejected = rpc
+            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(1))
+            .await;
+        assert!(matches!(&rejected[0], Err(ReadError::NotMatch)));
+        let accepted = rpc
+            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(2))
+            .await;
+        assert_eq!(
+            accepted[0].as_ref().unwrap().data["value"],
+            OwnedValue::U64(2)
+        );
+        if !rpc.captured_receipts.lock().entries.is_empty() {
+            rpc.finish_captured_receipts(tokens.clone(), true)
+                .await
+                .unwrap();
+        }
+    }
+    assert_covered(&server);
+    server.shutdown().await;
+}
