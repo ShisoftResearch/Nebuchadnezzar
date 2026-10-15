@@ -485,12 +485,18 @@ fn test_cold_segment_promotion() {
         chunk.wait_for_segment_jobs_for_test();
     }
 
-    // Force eviction to make sure we have cold segments
+    // This test checks promotion, so choose a sealed victim without CLOCK's extra chances.
     for chunk in &chunks.list {
-        if let Some(ref manager) = chunk.tiered_manager {
-            match manager.explicit_evict(chunk, 2) {
-                Ok(evicted) => info!("Explicitly evicted {} segments", evicted),
-                Err(e) => error!("Explicit eviction failed: {:?}", e),
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|segment| !chunk.is_active_head(segment.id))
+            .collect();
+        assert!(!candidates.is_empty(), "the fixture must rotate a segment");
+        for segment in candidates {
+            if segment.is_hot() {
+                crate::ram::tiered::eviction::evict_segment(&segment, chunk)
+                    .expect("a sealed fixture segment must be evictable");
             }
         }
     }
