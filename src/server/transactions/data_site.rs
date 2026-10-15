@@ -396,6 +396,14 @@ pub struct DataManager {
     started: std::time::Instant,
 }
 
+/// Why `close_committed_brackets` did not commit.
+enum CloseRefusal {
+    /// The transaction was rolled back and is over here.
+    RolledBack(EndResult),
+    /// The transaction stays decided COMMIT and is finished later.
+    Pending(EndResult),
+}
+
 /// How many finished transactions a site remembers the fate of. Sized to
 /// outlast the in-doubt window by orders of magnitude rather than tuned.
 const DECISION_MEMORY: usize = 64 * 1024;
@@ -987,32 +995,53 @@ impl DataManager {
     /// the applied-and-undecided state, is refused here and the coordinator
     /// is not told it committed. A failed append retracts the decision records
     /// and rolls the prepared writes back before the metadata locks are released.
-    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), EndResult> {
+    ///
+    /// The rollback applies only when this site is the only participant. The
+    /// coordinator sends the decision to every participant at once, so with
+    /// more than one, another site can already hold a durable COMMIT, and a
+    /// rollback here would tear the transaction. Such a refusal leaves the
+    /// transaction decided instead: its entries stay, its heads stay held,
+    /// and the lease sweeper finishes it (`terminate_in_doubt_transactions`).
+    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), CloseRefusal> {
         let Some(txn_lock) = self.find_transaction(tid) else {
-            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
+            return Err(CloseRefusal::RolledBack(EndResult::CheckFailed(
+                CheckError::CannotEnd,
+            )));
         };
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Committed {
-            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
+            return Err(CloseRefusal::RolledBack(EndResult::CheckFailed(
+                CheckError::CannotEnd,
+            )));
         }
         let store = self.chunks().address_range();
         // The segments that will hold this site's COMMITs. Read while the
         // leases are held: they name the heads the brackets live in.
         let manifest = crate::ram::chunk::transaction_manifest(tid, &store);
         if let Err(error) = self.chunks().commit_transaction_brackets(tid) {
+            let reason = match error {
+                WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
+                    EndResult::StoreFull(error)
+                }
+                _ => EndResult::WriteError(error),
+            };
+            if self.has_other_participants(&txn.participants) {
+                txn.decided_commit = true;
+                error!(
+                    "refused COMMIT for {:?}: {:?}; another participant may already be \
+                     committed, so this site keeps the transaction decided and finishes it later",
+                    tid, reason
+                );
+                return Err(CloseRefusal::Pending(reason));
+            }
             // Metadata locks still belong to this participant.
             // Restore the prepared writes before readers can acquire them.
             let rollback = self.abort_locked(tid, &mut txn);
             error!(
                 "refused COMMIT for {:?}: {:?}; rollback: {:?}",
-                tid, error, rollback
+                tid, reason, rollback
             );
-            return Err(match error {
-                WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
-                    EndResult::StoreFull(error)
-                }
-                _ => EndResult::WriteError(error),
-            });
+            return Err(CloseRefusal::RolledBack(reason));
         }
         txn.decided_commit = true;
         // Before the leases go: until then no COMMIT segment can be compacted.
@@ -1457,9 +1486,15 @@ impl DataManager {
         }
         // Still live here. Anything short of a decision is in doubt --
         // including `TxnState::Committed`, which only means the entries are
-        // durable.
-        match self.find_transaction(tid).map(|txn| txn.lock().state) {
-            Some(TxnState::Aborted) => TxnOutcome::Aborted,
+        // durable. A site that was told to commit and could not close its
+        // brackets yet (`decided_commit`) holds the decision: only a
+        // coordinator that decided commit sends `end`.
+        match self.find_transaction(tid).map(|txn| {
+            let txn = txn.lock();
+            (txn.state, txn.decided_commit)
+        }) {
+            Some((_, true)) => TxnOutcome::Committed,
+            Some((TxnState::Aborted, false)) => TxnOutcome::Aborted,
             Some(_) => TxnOutcome::InDoubt,
             None => TxnOutcome::Unknown,
         }
@@ -6912,12 +6947,17 @@ impl Service for DataManager {
         };
 
         if txn_state == TxnState::Committed {
-            if let Err(reason) = self.close_committed_brackets(&tid) {
-                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
-                self.record_decision(&tid, TxnOutcome::Aborted);
-                self.wipe_out_transaction(&tid);
-                self.cleanup_signal.store(true, Relaxed);
-                return self.response_with(reason);
+            match self.close_committed_brackets(&tid) {
+                Ok(()) => {}
+                // Still decided and still holding its locks and heads.
+                Err(CloseRefusal::Pending(reason)) => return self.response_with(reason),
+                Err(CloseRefusal::RolledBack(reason)) => {
+                    self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
+                    self.record_decision(&tid, TxnOutcome::Aborted);
+                    self.wipe_out_transaction(&tid);
+                    self.cleanup_signal.store(true, Relaxed);
+                    return self.response_with(reason);
+                }
             }
         }
 

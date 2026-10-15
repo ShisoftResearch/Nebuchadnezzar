@@ -952,6 +952,41 @@ pub fn expire_transaction_leases(
 /// Exact rather than estimated, which is what lets any single part decide
 /// the whole transaction: a COMMIT is honoured only when every member it
 /// names is present.
+#[cfg(test)]
+lazy_static! {
+    static ref INJECTED_COMMIT_REFUSALS: Mutex<Vec<(usize, crate::server::transactions::TxnId)>> =
+        Mutex::new(Vec::new());
+}
+
+/// Test hook: the next COMMIT decision of `txn` in the store at `base_addr`
+/// is refused after its COMMIT records are placed and before they are
+/// synced, as a full store or a failed sync would refuse it.
+#[cfg(test)]
+pub(crate) fn refuse_next_commit_for_test(
+    base_addr: usize,
+    txn: crate::server::transactions::TxnId,
+) {
+    INJECTED_COMMIT_REFUSALS.lock().push((base_addr, txn));
+}
+
+#[cfg(test)]
+fn take_injected_commit_refusal(
+    base_addr: usize,
+    txn: &crate::server::transactions::TxnId,
+) -> bool {
+    let mut refusals = INJECTED_COMMIT_REFUSALS.lock();
+    match refusals
+        .iter()
+        .position(|(base, refused)| *base == base_addr && refused == txn)
+    {
+        Some(index) => {
+            refusals.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn transaction_manifest(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
@@ -5262,6 +5297,10 @@ impl Chunks {
                     .get(chunk_id as usize)
                     .ok_or(WriteError::CannotAllocateSpace)?;
                 chunk.close_transaction_bracket(txn, &manifest)?;
+            }
+            #[cfg(test)]
+            if take_injected_commit_refusal(self.base_addr, txn) {
+                return Err(WriteError::CannotAllocateSpace);
             }
             for segment in &segments {
                 segment.force_wal_sync().map_err(WriteError::from_wal_io)?;

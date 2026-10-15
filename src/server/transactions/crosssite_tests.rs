@@ -828,3 +828,97 @@ async fn a_resolved_sites_own_commit_record_outlives_the_peer_evidence() {
     );
     cluster.shutdown().await;
 }
+
+/// A COMMIT refused on one site must not tear the transaction.
+///
+/// The coordinator sends the decision to every site at once. Site A closes
+/// its bracket; site B cannot (a full store or a failed sync). B must not
+/// roll back: A already committed. B keeps the transaction decided and
+/// finishes it later, through its lease sweeper, and the commit survives a
+/// restart of B.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_refused_on_one_site_does_not_tear_the_transaction() {
+    let (mut cluster, client) = Cluster::start("crosssite_refused").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 10_000, 0).await;
+    drop(client);
+
+    crate::ram::chunk::refuse_next_commit_for_test(cluster.site(B).chunks().base_addr, tid.clone());
+    let result = txn.commit(tid.clone()).await;
+    warn!(
+        "CROSSSITE commit with a refusal on site B returned {:?}",
+        result
+    );
+    assert_eq!(
+        cluster.site(A).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "test setup: site A must commit"
+    );
+    assert_ne!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "test setup: site B must have refused its COMMIT"
+    );
+    assert_all_or_nothing(&cluster, &ids, &scores, "refused COMMIT on B, right after");
+
+    // B's sweeper finishes the decided transaction.
+    let site = cluster.site(B).database_runtime().data_site().unwrap();
+    site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
+        .await;
+    assert_eq!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "site B must finish the commit it was told to make"
+    );
+    cluster.restart(B).await;
+    assert_all_or_nothing(
+        &cluster,
+        &ids,
+        &scores,
+        "refused COMMIT on B, after B restart",
+    );
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "the transaction must be committed on both sites");
+    cluster.shutdown().await;
+}
+
+/// A site whose COMMIT was refused still holds the decision, and must say so.
+///
+/// The coordinator reaches B only, and B's COMMIT is refused. A is in doubt
+/// and asks B. B was told to commit, so it must answer `Committed`: an
+/// `InDoubt` answer makes A presume abort while B later finishes the commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_with_a_refused_commit_still_answers_committed() {
+    let (cluster, client) = Cluster::start("crosssite_refused_answer").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 11_000, 0).await;
+    drop(client);
+
+    crate::ram::chunk::refuse_next_commit_for_test(cluster.site(B).chunks().base_addr, tid.clone());
+    let limit =
+        super::manager::stop_end_fanout_after_server(tid.clone(), cluster.site(B).server_id);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    assert_ne!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "test setup: site B must have refused its COMMIT"
+    );
+    warn!(
+        "CROSSSITE site B with a refused COMMIT answers {:?}",
+        outcome_on(&cluster, B, &tid)
+    );
+
+    resolve_live(&cluster, &tid).await;
+    let site = cluster.site(B).database_runtime().data_site().unwrap();
+    site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
+        .await;
+    for index in [A, B] {
+        assert_eq!(
+            cluster.site(index).chunks().durable_txn_status(&tid),
+            DurableTxnStatus::Committed,
+            "site {} must hold a durable COMMIT",
+            index
+        );
+    }
+    assert_all_or_nothing(&cluster, &ids, &scores, "refused COMMIT on B, A asked B");
+    cluster.shutdown().await;
+}
