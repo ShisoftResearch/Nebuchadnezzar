@@ -833,3 +833,36 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
         server.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_transaction_stays_pinned_when_a_peer_reports_unknown() {
+    let (servers, _client, _addresses, _temp) = start_txn_cluster("recovery_unknown_pin").await;
+    let txn = super::test_hlc(9846, 1);
+    let runtime = servers[0].current_database();
+    runtime.chunks().stop_background();
+    let segment = runtime.chunks().list[0].segments().pop().unwrap();
+    segment.protection.retain_transaction(&txn);
+    runtime.chunks().recovered_brackets.lock().in_doubt.push(
+        crate::ram::recovery::InDoubtBracket {
+            txn: txn.clone(),
+            chunks: vec![0],
+            cells: vec![],
+        },
+    );
+    assert_eq!(
+        servers[1].database_runtime().data_site().unwrap().txn_outcome(&txn),
+        super::TxnOutcome::Unknown,
+    );
+
+    crate::server::resolve_in_doubt_after_recovery(&runtime).await;
+
+    assert_eq!(runtime.chunks().pinned_segments(), 1);
+    assert_eq!(runtime.chunks().pinned_bytes(), crate::ram::segs::SEGMENT_SIZE);
+    let unresolved = runtime.chunks().take_in_doubt_brackets();
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].txn, txn);
+    runtime.chunks().release_transaction_pins(&txn);
+    for server in servers {
+        server.shutdown().await;
+    }
+}
