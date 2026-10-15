@@ -1245,6 +1245,15 @@ impl DataManager {
         }
     }
 
+    /// Test hook: record as many later, unrelated decisions as the decision
+    /// memory holds, the way that many finished transactions would.
+    #[cfg(test)]
+    pub(crate) fn fill_decision_memory_with_later_decisions(&self) {
+        for _ in 0..DECISION_MEMORY {
+            self.record_decision(&self.hlc.now(), TxnOutcome::Aborted);
+        }
+    }
+
     /// What this site can say about a transaction, for a peer resolving it.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(outcome) = self.decided.lock().get(tid) {

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod corruption_tests;
+#[cfg(test)]
+mod crosssite_tests;
 pub mod data_site;
 pub mod manager;
 #[cfg(test)]
