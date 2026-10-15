@@ -3494,7 +3494,7 @@ mod tests {
         assert_eq!(after.hash_entries_derived, 120, "{after}");
         assert_eq!(after.hash_index_ids_scanned, 120, "{after}");
         assert_eq!(after.entries_derived, 240, "{after}");
-        assert!(after.index_keys_scanned >= 240, "{after}");
+        assert_eq!(after.index_keys_scanned, 240, "{after}");
         server.shutdown().await;
     }
 
