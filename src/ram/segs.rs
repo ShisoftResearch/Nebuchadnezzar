@@ -3544,7 +3544,16 @@ impl Iterator for SegmentEntryIter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_WRITER_RESERVE_CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 pub struct SegmentAllocator {
+    // Reserve checks and address claims are one operation. The guard never
+    // covers segment initialization, file I/O, or cleaner work.
+    allocation_lock: parking_lot::Mutex<()>,
     base: usize,
     offset: AtomicUsize,
     limit: usize,
@@ -3599,6 +3608,7 @@ impl SegmentAllocator {
         };
 
         Self {
+            allocation_lock: parking_lot::Mutex::new(()),
             base,
             offset: AtomicUsize::new(addr),
             limit,
@@ -3612,8 +3622,8 @@ impl SegmentAllocator {
     }
 
     /// Segments still grantable: the free list plus untouched bump space.
-    /// Approximate under concurrency, which is fine -- it feeds a headroom
-    /// heuristic, not an invariant.
+    /// Approximate under concurrency unless `allocation_lock` is held. The
+    /// writer reserve check holds that lock through the address claim.
     pub fn available_segments(&self) -> usize {
         let bump_left = self.limit.saturating_sub(self.offset.load(Relaxed)) >> SEGMENT_BITS_SHIFT;
         self.free_count.load(Relaxed) + bump_left
@@ -3685,6 +3695,7 @@ impl SegmentAllocator {
     where
         F: Fn(usize) -> bool,
     {
+        let _allocation = self.allocation_lock.lock();
         let bumped_to = self.offset.load(Relaxed);
         let mut reclaimed = 0usize;
         let mut addr = self.base;
@@ -3753,7 +3764,13 @@ impl SegmentAllocator {
             );
             return None;
         }
-        self.alloc_seg_with_class(file_manager, segment_class)
+        #[cfg(test)]
+        TEST_WRITER_RESERVE_CHECKED.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        self.alloc_seg_with_reserve(file_manager, segment_class, reserve)
     }
 
     fn take_free(&self) -> Option<usize> {
@@ -3764,42 +3781,52 @@ impl SegmentAllocator {
         addr
     }
 
+    /// Claim an address while preserving the caller's reserve. A snapshot
+    /// check before this claim lets two writers both spend the last writer
+    /// slot, leaving the cleaner no destination despite reclaimable sources.
+    fn take_address(&self, reserve: usize) -> Option<usize> {
+        let _allocation = self.allocation_lock.lock();
+        if self.available_segments() <= reserve {
+            return None;
+        }
+        self.take_free().or_else(|| {
+            let addr = self.offset.load(Relaxed);
+            let next = addr + SEGMENT_SIZE;
+            if next > self.limit {
+                return None;
+            }
+            self.offset.store(next, Release);
+            Some(addr)
+        })
+    }
+
     pub fn alloc_seg_with_class(
         &self,
         file_manager: &Arc<SegmentFileManager>,
         segment_class: SegmentClass,
     ) -> Option<Segment> {
-        self.take_free()
-            .or_else(|| loop {
-                debug!("Allocate segment by bump pointer");
-                let addr = self.offset.load(Relaxed);
-                let new_addr = addr + SEGMENT_SIZE;
-                if new_addr > self.limit {
-                    // Check the right boundary
-                    return None;
-                } else {
-                    if self
-                        .offset
-                        .compare_exchange(addr, new_addr, AcqRel, Relaxed)
-                        .is_ok()
-                    {
-                        return Some(addr);
-                    }
-                }
-            })
-            .map(|addr| {
-                let id = self.id_by_addr(addr);
-                let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
-                Segment::new_with_class(
-                    id as u64,
-                    seq_id as u64,
-                    self.chunk_id,
-                    addr,
-                    true,
-                    file_manager.clone(),
-                    segment_class,
-                )
-            })
+        self.alloc_seg_with_reserve(file_manager, segment_class, 0)
+    }
+
+    fn alloc_seg_with_reserve(
+        &self,
+        file_manager: &Arc<SegmentFileManager>,
+        segment_class: SegmentClass,
+        reserve: usize,
+    ) -> Option<Segment> {
+        self.take_address(reserve).map(|addr| {
+            let id = self.id_by_addr(addr);
+            let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
+            Segment::new_with_class(
+                id as u64,
+                seq_id as u64,
+                self.chunk_id,
+                addr,
+                true,
+                file_manager.clone(),
+                segment_class,
+            )
+        })
     }
 
     /// Allocate a segment with a specific seq_id (for recovery purposes)
@@ -3819,37 +3846,19 @@ impl SegmentAllocator {
         hot: bool,
         segment_class: SegmentClass,
     ) -> Option<Segment> {
-        // First allocate the address
-        self.take_free()
-            .or_else(|| loop {
-                debug!("Allocate segment by bump pointer (recovery)");
-                let addr = self.offset.load(Relaxed);
-                let new_addr = addr + SEGMENT_SIZE;
-                if new_addr > self.limit {
-                    return None;
-                } else {
-                    if self
-                        .offset
-                        .compare_exchange(addr, new_addr, AcqRel, Relaxed)
-                        .is_ok()
-                    {
-                        return Some(addr);
-                    }
-                }
-            })
-            .map(|addr| {
-                let id = self.id_by_addr(addr);
-                // Use the provided seq_id instead of fetching a new one
-                Segment::new_with_class(
-                    id as u64,
-                    seq_id,
-                    self.chunk_id,
-                    addr,
-                    hot,
-                    file_manager.clone(),
-                    segment_class,
-                )
-            })
+        self.take_address(0).map(|addr| {
+            let id = self.id_by_addr(addr);
+            // Use the provided seq_id instead of fetching a new one
+            Segment::new_with_class(
+                id as u64,
+                seq_id,
+                self.chunk_id,
+                addr,
+                hot,
+                file_manager.clone(),
+                segment_class,
+            )
+        })
     }
 
     /// Allocate a segment at a specific ID for recovery purposes
@@ -3883,6 +3892,7 @@ impl SegmentAllocator {
         }
 
         // Update offset if needed (to track allocated space)
+        let allocation = self.allocation_lock.lock();
         let required_end = addr + SEGMENT_SIZE;
         loop {
             let current_offset = self.offset.load(Ordering::Relaxed);
@@ -3903,6 +3913,8 @@ impl SegmentAllocator {
                 break;
             }
         }
+
+        drop(allocation);
 
         Some(Segment::new_with_class(
             seg_id,
@@ -3930,6 +3942,7 @@ impl SegmentAllocator {
     }
 
     pub fn free(&self, seg_addr: usize) {
+        let _allocation = self.allocation_lock.lock();
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);
         debug!("Segment {} freed", seg_addr);
@@ -4939,6 +4952,61 @@ mod skipped_slot_tests {
             SegmentAllocator::new(0, SEGMENT_SIZE * segments),
             Arc::new(SegmentFileManager::new(None, None)),
         )
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_bump_compaction_reserve() {
+        concurrent_writers_preserve_compaction_reserve(false);
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_recycled_compaction_reserve() {
+        concurrent_writers_preserve_compaction_reserve(true);
+    }
+
+    fn concurrent_writers_preserve_compaction_reserve(recycled: bool) {
+        let (allocator, fm) = allocator_of(8);
+        let allocator = Arc::new(allocator);
+        for _ in 0..6 {
+            allocator.alloc_seg(&fm).unwrap();
+        }
+        if recycled {
+            let first = allocator.alloc_seg(&fm).unwrap();
+            let second = allocator.alloc_seg(&fm).unwrap();
+            allocator.free(first.addr);
+            allocator.free(second.addr);
+        }
+        assert_eq!(allocator.available_segments(), 2);
+        assert_eq!(allocator.compaction_reserve(), 1);
+        let checked = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let allocator = allocator.clone();
+                let fm = fm.clone();
+                let checked = checked.clone();
+                std::thread::spawn(move || {
+                    TEST_WRITER_RESERVE_CHECKED.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            checked.wait();
+                        }));
+                    });
+                    allocator.alloc_seg_for_writer(&fm, SegmentClass::Regular)
+                })
+            })
+            .collect();
+        let granted = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .count();
+        assert_eq!(
+            granted, 1,
+            "writers spent the cleaner's reserved destination"
+        );
+        assert_eq!(allocator.available_segments(), 1);
+        assert!(
+            allocator.alloc_seg(&fm).is_some(),
+            "the cleaner must still allocate"
+        );
     }
 
     /// Allocating AT an id drags the bump pointer over every lower slot,
