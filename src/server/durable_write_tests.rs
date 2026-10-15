@@ -180,7 +180,7 @@ async fn cut_with_batch(durable: bool, batch: u64) -> usize {
                 .unwrap();
             let destination = wal.join(relative);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            std::fs::copy(source, &destination).unwrap();
+            std::fs::copy(&source, &destination).unwrap();
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&destination)
