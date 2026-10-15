@@ -1893,6 +1893,15 @@ mod tests {
         group: &str,
         dir: &TempDir,
     ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        server_with_indexed_schema_size(addr, group, dir, 64 * 1024 * 1024).await
+    }
+
+    async fn server_with_indexed_schema_size(
+        addr: &str,
+        group: &str,
+        dir: &TempDir,
+        chunk_size: usize,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
         let backup = dir.path().join("backup");
         let wal = dir.path().join("wal");
         let raft = dir.path().join("raft");
@@ -1901,8 +1910,8 @@ mod tests {
         }
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
-                db_size: 64 * 1024 * 1024,
+                chunk_size,
+                db_size: chunk_size,
                 tiered_config: None,
                 backup_storage: Some(backup.to_str().unwrap().to_string()),
                 wal_storage: Some(wal.to_str().unwrap().to_string()),
@@ -3312,10 +3321,11 @@ mod tests {
     // to this pass so concurrent tests cannot activate the hook.
     async fn movement_fixture() -> (Arc<NebServer>, Arc<AsyncClient>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let (server, client) = server_with_indexed_schema(
+        let (server, client) = server_with_indexed_schema_size(
             &crate::utils::test_port::unique_localhost_addr(),
             "scrub_movement",
             &dir,
+            256 * 1024 * 1024,
         )
         .await;
         server.cleaner().pause();
