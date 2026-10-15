@@ -69,6 +69,7 @@ use crate::index::EntryKey;
 use crate::index::IndexerClients;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
+#[cfg(test)]
 use crate::ram::entry::EntryContent;
 use crate::ram::schema::IndexType;
 use crate::ram::types::Id;
@@ -521,6 +522,7 @@ async fn reconcile_cell_entries(
             let mut derived_report = ScrubReport::default();
             for &id in ids {
                 let Ok(header) = chunk.head_cell(id) else {
+                    derived_report.prune_incomplete += 1;
                     derived_report.cells_unreadable += 1;
                     continue;
                 };
@@ -564,6 +566,7 @@ fn derive_into(
     let Ok(cell) = chunk.read_cell(id.bits()) else {
         // The snapshot included this ID. A failed read prevents a complete
         // verdict, so the caller must retry or resolve the read failure.
+        report.prune_incomplete += 1;
         report.cells_unreadable += 1;
         return;
     };
@@ -1398,15 +1401,19 @@ async fn scrub_hash_index_inner(
     // segments whose members live in a different chunk.
     for prune in [true, false] {
         let mut workers = tokio::task::JoinSet::new();
+        // Snapshot IDs, not addresses. Movement preserves each ID and cell
+        // guards resolve its current address when a worker visits it.
+        // Later writes cannot extend this finite walk.
         let mut pending = chunks
             .list
             .iter()
             .enumerate()
             .flat_map(|(chunk_index, chunk)| {
                 chunk
-                    .segments()
-                    .into_iter()
-                    .map(move |segment| (chunk_index, segment))
+                    .live_cell_ids()
+                    .chunks(1024)
+                    .map(|ids| (chunk_index, ids.to_vec()))
+                    .collect::<Vec<_>>()
             });
         #[cfg(test)]
         let mut pending = {
@@ -1418,20 +1425,20 @@ async fn scrub_hash_index_inner(
         };
         loop {
             while workers.len() < concurrency().min(4) {
-                let Some((chunk_index, segment)) = pending.next() else {
+                let Some((chunk_index, ids)) = pending.next() else {
                     break;
                 };
                 let chunks = chunks.clone();
                 let indexers = indexers.clone();
                 workers.spawn(async move {
-                    scrub_hash_segment(
+                    scrub_hash_cells(
                         &chunks,
                         &indexers,
                         mode,
                         can_prune,
                         prune,
                         chunk_index,
-                        &segment,
+                        &ids,
                     )
                     .await
                 });
@@ -1458,16 +1465,16 @@ async fn scrub_hash_index_inner(
     total
 }
 
-/// Bound parallel work to 4 storage segments. Guards remain inside the
+/// Bound parallel work to 4 batches of 1024 IDs. Guards remain inside the
 /// synchronous derive phase; each worker releases them before an RPC.
-async fn scrub_hash_segment(
+async fn scrub_hash_cells(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
     can_prune: bool,
     prune: bool,
     chunk_index: usize,
-    segment: &lightning::aarc::Arc<crate::ram::segs::Segment>,
+    ids: &[u64],
 ) -> ScrubReport {
     let mut total = ScrubReport::default();
     let chunk = &chunks.list[chunk_index];
@@ -1477,9 +1484,14 @@ async fn scrub_hash_segment(
     let mut owed: Vec<(Id, Id)> = Vec::new();
     let mut stale: Vec<(Id, Id, Id)> = Vec::new();
     let mut derived = ScrubReport::default();
-    for entry in chunk.live_entries(&segment) {
-        let EntryContent::Cell(header) = entry.content else {
-            continue;
+    for &bits in ids {
+        let header = match chunk.head_cell(bits) {
+            Ok(header) => header,
+            Err(_) => {
+                derived.hash_prune_incomplete += 1;
+                derived.hash_cells_unreadable += 1;
+                continue;
+            }
         };
         let id = header.id();
         if header.schema == *HASH_INDEX_SCHEMA_ID {
@@ -1492,12 +1504,9 @@ async fn scrub_hash_segment(
             // same job, because its keys live inside page images.
             let cell = match read_local_cell(chunk, id) {
                 LocalCell::Found(cell, _) => cell,
-                // `Absent` cannot happen: `live_entries` just said this
-                // cell is here. An unreadable cell, or one whose schema
-                // this restart never registered, holds no verdict either
-                // way, and no opinion is never a delete.
-                LocalCell::Absent => continue,
-                LocalCell::Unreadable => {
+                // A snapshot ID that cannot be read gives no verdict.
+                LocalCell::Absent | LocalCell::Unreadable => {
+                    derived.hash_prune_incomplete += 1;
                     derived.hash_cells_unreadable += 1;
                     continue;
                 }
@@ -1543,8 +1552,8 @@ async fn scrub_hash_segment(
         }
         let (cell, written_under) = match read_local_cell(chunk, id) {
             LocalCell::Found(cell, schema) => (cell, schema),
-            LocalCell::Absent => continue,
-            LocalCell::Unreadable => {
+            LocalCell::Absent | LocalCell::Unreadable => {
+                derived.hash_prune_incomplete += 1;
                 derived.hash_cells_unreadable += 1;
                 continue;
             }
@@ -3325,11 +3334,13 @@ mod tests {
         );
         client.new_schema_with_id(schema).await.unwrap().unwrap();
         for i in 0..120 {
-            client
-                .write_cell(hash_product_cell(i, i))
-                .await
-                .unwrap()
-                .unwrap();
+            crate::index::builder::IndexBuilder::with_request_index_scope(|| {
+                server
+                    .chunks()
+                    .write_cell(&mut hash_product_cell(i, i))
+                    .unwrap();
+            })
+            .await;
             if i % 30 == 29 {
                 for chunk in &server.chunks().list {
                     chunk.rotate_heads_for_scrub_test();
@@ -3359,7 +3370,19 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let mut selected = chunk.segments();
+            selected.retain(|segment| {
+                segment.segment_class() == crate::ram::segs::SegmentClass::Regular
+            });
             selected.sort_by_key(|segment| segment.seq_id);
+            for segment in &selected {
+                let products = chunk.live_entries(segment).filter(|entry| matches!(
+                    &entry.content, EntryContent::Cell(header) if header.schema == SchemaVid(HASH_SCHEMA_ID)
+                )).count();
+                println!(
+                    "movement source: segment={} seq={} products={products}",
+                    segment.id, segment.seq_id
+                );
+            }
             if partial {
                 // At least 2 source segments are required by the combine cleaner.
                 selected.truncate(2);
