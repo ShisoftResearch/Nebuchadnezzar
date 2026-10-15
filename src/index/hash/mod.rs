@@ -1,5 +1,5 @@
 use crate::ram::cell::{Cell, ReadError, WriteError, MAX_CELL_SIZE};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Bucket-size accounting for the hashed index.
 pub static HASH_BUCKET_LEN_SUM: AtomicU64 = AtomicU64::new(0);
@@ -112,6 +112,9 @@ fn spilled_cell_id(index_id: &Id, version: u64) -> Id {
 struct Bucket {
     pending: Mutex<HashSet<Id>>,
     apply: TokioMutex<()>,
+    blocking_removals: AtomicUsize,
+    #[cfg(test)]
+    removal_handoffs: AtomicUsize,
 }
 
 pub struct HashIndexer {
@@ -549,17 +552,42 @@ impl HashIndexer {
     /// same predecessor. An empty segment costs one small cell and one read on
     /// the walk, which is cheaper than getting that race wrong.
     pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
-        let client = self.neb_client.clone();
-        let cell_id = *cell_id;
-        let index_id = *index_id;
-        let runtime = tokio::runtime::Handle::current();
-        // Local RPC calls take synchronous cell locks and can wait for WAL sync.
-        // Keep those waits off runtime workers without serializing the bucket.
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(Self::remove_index_inner(&client, &cell_id, &index_id))
-        })
-        .await
-        .map_err(|_| WriteError::NetworkingError)?
+        let bucket = self.bucket(index_id);
+        let mut inline = bucket
+            .apply
+            .try_lock()
+            .ok()
+            .filter(|_| bucket.blocking_removals.load(Ordering::Acquire) == 0);
+        let result = if let Some(_guard) = inline.take() {
+            Self::remove_index_inner(&self.neb_client, cell_id, index_id).await
+        } else {
+            // Count queued jobs too. A cancelled future must not clear this count
+            // while its blocking worker still uses the bucket.
+            struct RemovalJob(Arc<Bucket>);
+            impl Drop for RemovalJob {
+                fn drop(&mut self) {
+                    self.0.blocking_removals.fetch_sub(1, Ordering::Release);
+                }
+            }
+            bucket.blocking_removals.fetch_add(1, Ordering::AcqRel);
+            #[cfg(test)]
+            bucket.removal_handoffs.fetch_add(1, Ordering::Relaxed);
+            let job = RemovalJob(bucket.clone());
+            let client = self.neb_client.clone();
+            let cell_id = *cell_id;
+            let index_id = *index_id;
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let _job = job;
+                runtime.block_on(Self::remove_index_inner(&client, &cell_id, &index_id))
+            })
+            .await
+            .map_err(|_| WriteError::NetworkingError)?
+        };
+        drop(inline);
+        drop(bucket);
+        self.release_bucket(index_id);
+        result
     }
 
     async fn remove_index_inner(
@@ -1108,6 +1136,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncontended_removal_makes_no_blocking_handoffs() {
+        let (server, client) = create_test_server("remove_inline").await;
+        let indexer = HashIndexer::new(&client);
+        let index_id = Id::rand();
+        let member = Id::rand();
+        indexer.add_index(&member, &index_id).await.unwrap();
+        let bucket = indexer.bucket(&index_id);
+        indexer.remove_index(&member, &index_id).await.unwrap();
+        assert_eq!(bucket.removal_handoffs.load(Ordering::Relaxed), 0);
+        let stored = client.read_cell(index_id).await.unwrap().unwrap();
+        assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn removal_does_not_serialize_on_the_bucket_applier() {
         let (server, client) = create_test_server("remove_no_applier_queue").await;
         let indexer = HashIndexer::new(&client);
@@ -1119,9 +1162,13 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             indexer.remove_index(&member, &index_id),
-        ).await;
+        )
+        .await;
         drop(apply);
-        assert!(result.is_ok(), "removal unnecessarily waited for the bucket applier");
+        assert!(
+            result.is_ok(),
+            "removal unnecessarily waited for the bucket applier"
+        );
         result.unwrap().unwrap();
         let stored = client.read_cell(index_id).await.unwrap().unwrap();
         assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
@@ -1129,7 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_waits_for_the_bucket_applier_without_stalling_the_runtime() {
+    async fn contended_removal_waits_for_the_cell_word_without_stalling_the_runtime() {
         use std::time::Duration;
 
         let (server, client) = create_test_server("remove_applier_progress").await;
@@ -1161,7 +1208,7 @@ mod tests {
         drop(apply);
         assert!(
             waiting.is_err(),
-            "removal must await the applier and let the runtime timer run"
+            "removal must await the cell word and let the runtime timer run"
         );
         removal.await.unwrap();
         let stored = client.read_cell(index_id).await.unwrap().unwrap();
