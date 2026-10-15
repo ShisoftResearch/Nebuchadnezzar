@@ -3803,7 +3803,29 @@ impl Chunk {
         }
     }
 
+    // Writers reserve a head before taking a cell word. A delete must use
+    // the same order, or it can hold the word needed by that head's owner.
+    fn reserve_tombstone_for_remove(&self, hash: u64) -> Result<PendingEntry, WriteError> {
+        // Preserve the absent-cell result even when the store has no capacity.
+        let guard = CellGuard::for_read(hash, self).map_err(|error| match error {
+            ReadError::CellDoesNotExisted | ReadError::CellIdIsUnitId => {
+                WriteError::CellDoesNotExisted
+            }
+            other => WriteError::ReadError(other),
+        })?;
+        #[cfg(test)]
+        TEST_DELETE_BEFORE_RESERVE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        drop(guard);
+        // Preserve best-effort collection for transaction apply callers.
+        self.acquire_tombstone(false)
+    }
+
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
+        let pending_entry = self.reserve_tombstone_for_remove(hash)?;
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3813,7 +3835,9 @@ impl Chunk {
         };
         let cell_location = guard.get_ptr();
 
-        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
+        let removed_len =
+            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        drop(pending_entry);
 
         if let Some(indexer) = &self.index_builder {
             match SharedCell::from_chunk_raw(hash, guard, self) {
@@ -3846,6 +3870,7 @@ impl Chunk {
     /// Keeping the entries is not a leak: the cell still exists, on the recipient,
     /// and the entry still names it correctly. Removing them is what was wrong.
     fn remove_cell_keeping_indices(&self, hash: u64) -> Result<(), WriteError> {
+        let pending_entry = self.reserve_tombstone_for_remove(hash)?;
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
             Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
@@ -3853,7 +3878,9 @@ impl Chunk {
             Err(e) => return Err(WriteError::ReadError(e)),
         };
         let cell_location = guard.get_ptr();
-        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
+        let removed_len =
+            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        drop(pending_entry);
         guard.remove_cell();
         self.slot_bytes.sub(hash, removed_len);
         Ok(())
@@ -3875,6 +3902,7 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
+        let pending_entry = self.reserve_tombstone_for_remove(hash)?;
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3887,10 +3915,12 @@ impl Chunk {
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
-                    // The cleaner can probe this cell. Do not wait for its GC lock
-                    // while the cell-index guard is held, even at the allocator wall.
-                    let removed_len =
-                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old, false)?;
+                    let removed_len = self.put_tombstone_by_cell_loc_inner(
+                        cell_location,
+                        retire_old,
+                        &pending_entry,
+                    )?;
+                    drop(pending_entry);
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
                     self.slot_bytes.sub(hash, removed_len);
@@ -4262,14 +4292,7 @@ impl Chunk {
         return res;
     }
 
-    #[inline]
-    fn put_tombstone(
-        &self,
-        cell_header: &CellHeader,
-        cell_seg: &AArc<Segment>,
-        record_deleted_version: bool,
-        full_gc: bool,
-    ) -> Result<(), WriteError> {
+    fn acquire_tombstone(&self, full_gc: bool) -> Result<PendingEntry, WriteError> {
         // Bounded, and never retried when retrying cannot possibly work.
         //
         // This used to loop forever on ANY acquire error. Two ways that
@@ -4314,13 +4337,23 @@ impl Chunk {
         }
         let Some(pending_entry) = acquired else {
             error!(
-                "Chunk {} could not place a tombstone for {:?} after {} attempts: {:?}. The \
+                "Chunk {} could not place a tombstone after {} attempts: {:?}. The \
                  delete is REFUSED rather than retried forever, so the caller learns it did \
                  not happen.",
-                self.id, cell_header.id, TOMBSTONE_ACQUIRE_ATTEMPTS, last_error
+                self.id, TOMBSTONE_ACQUIRE_ATTEMPTS, last_error
             );
             return Err(last_error);
         };
+        Ok(pending_entry)
+    }
+
+    fn put_tombstone(
+        &self,
+        cell_header: &CellHeader,
+        cell_seg: &AArc<Segment>,
+        record_deleted_version: bool,
+        pending_entry: &PendingEntry,
+    ) -> Result<(), WriteError> {
         Tombstone::put(
             pending_entry.addr,
             cell_seg.seq_id,
@@ -4339,14 +4372,15 @@ impl Chunk {
     /// Returns the removed entry's content length, so the logical remove
     /// paths can settle the slot counter without a second decode.
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
-        self.put_tombstone_by_cell_loc_inner(cell_location, true, true)
+        let pending_entry = self.acquire_tombstone(true)?;
+        self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)
     }
 
     fn put_tombstone_by_cell_loc_inner(
         &self,
         cell_location: usize,
         retire_old: bool,
-        full_gc: bool,
+        pending_entry: &PendingEntry,
     ) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
@@ -4363,7 +4397,7 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg, retire_old, full_gc)?;
+        self.put_tombstone(&header, &cell_seg, retire_old, pending_entry)?;
         if retire_old {
             self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
         }
@@ -6523,6 +6557,7 @@ impl<'a> Deref for CellGuard<'a> {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_DELETE_BEFORE_RESERVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_ROTATION_ALLOCATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -7910,6 +7945,95 @@ mod tests {
         );
         finish_tx.send(()).unwrap();
         pinning.join().expect("pinning thread");
+    }
+
+    #[test]
+    fn delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(0);
+    }
+
+    #[test]
+    fn migration_delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(1);
+    }
+
+    #[test]
+    fn conditional_delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(2);
+    }
+
+    fn delete_head_lock_order(path: usize) {
+        let schema = Schema::new(
+            "delete_head_order",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed_array("data", Type::U8),
+            ]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        chunks.stop_background();
+        let id = Id::allocated(1, 0, 123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        chunks.write_cell(&mut cell).unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let chunk = &writer_chunks.list[0];
+            let pending = chunk.try_acquire(64, true).unwrap();
+            owned_tx.send(()).unwrap();
+            // Model an updater holding the only head before taking its word.
+            // Release on timeout so the reverted control fails an assertion.
+            let started = std::time::Instant::now();
+            let obtained = loop {
+                if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                    drop(guard);
+                    break true;
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(1) {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            drop(pending);
+            obtained
+        });
+        TEST_DELETE_BEFORE_RESERVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                owned_rx.recv().unwrap();
+            }))
+        });
+        let chunk = &chunks.list[0];
+        let result = match path {
+            0 => chunk.remove_cell(id.bits()),
+            1 => chunk.remove_cell_keeping_indices(id.bits()),
+            _ => chunk.remove_cell_by(id.bits(), |_| true),
+        };
+        let obtained = writer.join().unwrap();
+        result.expect("the delete must finish after the head becomes available");
+        assert!(
+            obtained,
+            "delete held the cell word while waiting for the head owner"
+        );
+        assert!(matches!(
+            chunks.read_cell(&id),
+            Err(ReadError::CellDoesNotExisted)
+        ));
     }
 
     /// A best-effort allocation must return while another cleaner owns the
