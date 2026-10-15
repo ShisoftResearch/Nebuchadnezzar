@@ -480,6 +480,11 @@ fn test_cold_segment_promotion() {
 
     info!("Wrote {} cells", written_ids.len());
 
+    // A queued seal protects its segment from eviction until the archive finishes.
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
+
     // Force eviction to make sure we have cold segments
     for chunk in &chunks.list {
         if let Some(ref manager) = chunk.tiered_manager {
