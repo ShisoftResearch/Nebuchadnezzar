@@ -3586,6 +3586,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+        // Drain page writes so the controlled combine is the only movement.
+        // Captured receipts remain pending across the checkpoint and combine.
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        crate::index::ranged::tree::service::local_tree_service("scrub_movement", "scrub_movement")
+            .unwrap()
+            .flush_all_trees()
+            .await;
         let chunks = server.chunks();
         let indexers = &server.indexer().unwrap().clients;
         let mut hook = |prune: bool| {
