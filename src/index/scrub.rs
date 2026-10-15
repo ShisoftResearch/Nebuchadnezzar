@@ -3420,6 +3420,10 @@ mod tests {
             }
         }
         crate::index::builder::IndexBuilder::await_all_indices().await;
+        assert!(
+            crate::index::ranged::tree::btree::storage::wait_until_updated().await,
+            "movement fixture did not drain page writeback"
+        );
         (server, client, dir)
     }
 
@@ -3525,6 +3529,12 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Repair setup also changes pages. Finish those writes before the
+        // controlled combine checks versions and requires idle source segments.
+        assert!(
+            crate::index::ranged::tree::btree::storage::wait_until_updated().await,
+            "movement setup did not drain page writeback"
+        );
         let mut hook = |prune: bool| {
             if prune == move_prune {
                 move_scrub_cells(chunks, partial);
