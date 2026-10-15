@@ -37,6 +37,19 @@ fn counters() -> [u64; 4] {
         ALLOCATION_EXHAUSTED.load(Ordering::Relaxed),
     ]
 }
+fn extended_counters() -> [u64; 8] {
+    [
+        neb::ram::cleaner::CAS_FULL_PASSES.load(Ordering::Relaxed),
+        neb::ram::cleaner::CAS_RECLAIMED_BYTES.load(Ordering::Relaxed),
+        neb::ram::segs::ARCHIVE_REFUSALS.load(Ordering::Relaxed),
+        neb::ram::segs::SEAL_RETRIES.load(Ordering::Relaxed),
+        neb::ram::durability::NAMESPACE_SYNCS.load(Ordering::Relaxed),
+        neb::ram::segs::FORCED_WAL_SYNCS.load(Ordering::Relaxed),
+        neb::client::TRANSACTION_RETRIES.load(Ordering::Relaxed),
+        neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed),
+    ]
+}
+
 const SCHEMA: u32 = 7402;
 const SEED_VERSION: u64 = 2;
 fn cell(id: u64, value: u64) -> OwnedCell {
@@ -53,6 +66,7 @@ async fn phase(
     measured: bool,
 ) {
     let before = counters();
+    let extended_before = extended_counters();
     if measured {
         println!("IWP phase_begin {kind}_{writers}{} page_images={} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={}",
             if hot { "_hot" } else { "" }, before[0], before[1], before[2], before[3]);
@@ -124,6 +138,14 @@ async fn phase(
     times.sort_unstable();
     if measured {
         let after = counters();
+        let extended_after = extended_counters();
+        let delta: Vec<_> = extended_after
+            .iter()
+            .zip(extended_before)
+            .map(|(after, before)| after - before)
+            .collect();
+        println!("IWP_COUNTERS {kind}_{writers}{} cas_full_passes={} cas_reclaimed_bytes={} archive_refusals={} seal_retries={} namespace_syncs={} forced_wal_syncs={} transaction_retries={} rotations={}",
+            if hot { "_hot" } else { "" }, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7]);
         println!("IWP {kind}_{writers}{} ops={} secs={secs:.6} ops_per_sec={:.3} p50_us={:.3} p95_us={:.3} p99_us={:.3} page_images_per_sec={:.3} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={} cas_conflicts={}",
         if hot { "_hot" } else { "" }, times.len(), times.len() as f64 / secs,
         times[times.len()/2] as f64 / 1000.0, times[times.len()*95/100] as f64 / 1000.0,
@@ -274,6 +296,41 @@ async fn run() {
         only.as_ref()
             .is_none_or(|list| list.split(',').any(|item| item == row))
     };
+    if wanted("read_rotation") && only.is_some() {
+        phase(client.clone(), "insert", 16, count, false, false).await;
+        assert!(neb::index::ranged::tree::btree::storage::wait_until_updated().await);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read_finished = finished.clone();
+        let reader = client.clone();
+        let reads = tokio::spawn(async move {
+            let mut samples = Vec::new();
+            let mut sequence = 0;
+            while !read_finished.load(Ordering::Acquire) {
+                let started = Instant::now();
+                reader
+                    .read_cell(Id::from_parts(3, 16_000_000 + sequence % count))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                samples.push(started.elapsed().as_nanos() as u64);
+                sequence += 1;
+                tokio::task::yield_now().await;
+            }
+            samples
+        });
+        let rotations = neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed);
+        phase(client.clone(), "update", 16, count, false, true).await;
+        finished.store(true, Ordering::Release);
+        let mut reads = reads.await.unwrap();
+        reads.sort_unstable();
+        assert!(!reads.is_empty());
+        println!(
+            "IWP read_rotation reads={} p99_us={:.3} rotations={}",
+            reads.len(),
+            reads[reads.len() * 99 / 100] as f64 / 1000.0,
+            neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed) - rotations
+        );
+    }
     for writers in [1, 16] {
         let insert = wanted(&format!("insert_{writers}"));
         let update = wanted(&format!("update_{writers}"));
@@ -310,6 +367,11 @@ async fn run() {
         assert!(neb::index::ranged::tree::btree::storage::wait_until_updated().await);
         phase(client, "update", 16, count, true, true).await;
     }
+    println!(
+        "IWP retention pinned_segments={} pinned_bytes={}",
+        server.chunks().pinned_segments(),
+        server.chunks().pinned_bytes()
+    );
     server.shutdown().await;
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         if let Some(line) = status.lines().find(|line| line.starts_with("VmHWM:")) {

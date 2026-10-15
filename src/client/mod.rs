@@ -34,6 +34,8 @@ use crate::server::{database_meta_plane_id, shared_meta_plane_id};
 
 use self::transaction::*;
 
+pub static TRANSACTION_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static TRANSACTION_MAX_RETRY: u32 = 1000;
 
 pub mod embedding;
@@ -1351,6 +1353,7 @@ impl AsyncClient {
         while retried < TRANSACTION_MAX_RETRY {
             // Exponential backoff before retry (skip on first attempt)
             if retried > 0 {
+                TRANSACTION_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let backoff_ms = 2u64.pow(retried.min(10)) * 5; // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms, cap at 5120ms
                 debug!(
                     "Client retrying transaction after {}ms backoff (attempt {}/{})",

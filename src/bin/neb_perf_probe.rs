@@ -100,6 +100,17 @@ fn rate(name: &str, ops: u64, started: Instant) {
     println!("METRIC {name}_ops_per_sec {:.0}", ops as f64 / secs);
 }
 
+fn batch_counters() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        neb::ram::durability::NAMESPACE_SYNCS.load(Relaxed),
+        neb::ram::segs::FORCED_WAL_SYNCS.load(Relaxed),
+        neb::ram::segs::ARCHIVE_REFUSALS.load(Relaxed),
+        neb::ram::segs::SEAL_RETRIES.load(Relaxed),
+        neb::client::TRANSACTION_RETRIES.load(Relaxed),
+    ]
+}
+
 async fn populate(base: &str, cells: u64) {
     let addr = format!("127.0.0.1:{}", 47900 + std::process::id() % 100);
     let server = NebServer::new_from_opts(&options(base, false), &addr, "perf_probe", async |_| {})
@@ -129,7 +140,10 @@ async fn populate(base: &str, cells: u64) {
 
     // Batched: BATCH cells per transaction, on a disjoint id range, so the
     // bracketed write path and its recovery are exercised too.
-    let batched = cells / 10;
+    let batched = std::env::var("NEB_PROBE_BATCHED_CELLS")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("batched cell count"))
+        .unwrap_or(cells / 10);
     let base_index = cells;
     for (name, phase) in [
         ("batched_insert", 0u8),
@@ -137,6 +151,7 @@ async fn populate(base: &str, cells: u64) {
         ("batched_delete", 2),
     ] {
         let started = Instant::now();
+        let counters_before = batch_counters();
         let mut done = 0u64;
         let mut at = 0u64;
         while at < batched {
@@ -162,7 +177,25 @@ async fn populate(base: &str, cells: u64) {
             }
         }
         rate(name, done, started);
+        let counters_after = batch_counters();
+        for (index, key) in [
+            "namespace_syncs",
+            "forced_wal_syncs",
+            "archive_refusals",
+            "seal_retries",
+            "transaction_retries",
+        ]
+        .iter()
+        .enumerate()
+        {
+            println!(
+                "METRIC {name}_{key} {}",
+                counters_after[index] - counters_before[index]
+            );
+        }
     }
+    println!("METRIC pinned_segments {}", chunks.pinned_segments());
+    println!("METRIC pinned_bytes {}", chunks.pinned_bytes());
 
     let bytes_before: usize = chunks
         .list
