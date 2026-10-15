@@ -3517,10 +3517,7 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
                 continue;
             }
             if answered == roster.len() {
-                discard_in_doubt(&bracket, "every peer returned a final abort");
-                database_runtime
-                    .chunks
-                    .release_transaction_pins(&bracket.txn);
+                discard_in_doubt(&database_runtime.chunks, &bracket, "every peer returned a final abort");
                 continue;
             }
             still_waiting.push(bracket);
