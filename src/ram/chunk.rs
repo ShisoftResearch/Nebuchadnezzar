@@ -2593,11 +2593,26 @@ impl Chunk {
                         && self
                             .segs
                             .get(&(id as usize))
-                            .map(|seg| !seg.bracket_is_open() && seg.can_still_append())
+                            .map(|seg| {
+                                !seg.bracket_is_open()
+                                    && seg.can_still_append()
+                                    && (growing
+                                        || seg.bound().saturating_sub(
+                                            seg.append_header.load(Ordering::Acquire),
+                                        )
+                                            >= size as usize)
+                            })
                             .unwrap_or(false)
                 })
             };
-            if growing && near_wall && any_live_head() {
+            // A full rotation target does not imply a full pool. Other
+            // writers can own heads with room. Use the same bounded queue
+            // as pool growth instead of refusing while they finish.
+            if near_wall && any_live_head() {
+                #[cfg(test)]
+                TEST_BEFORE_HEAD_QUEUE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() { hook(); }
+                });
                 if self.current_txn_holds_head_here(segment_class) {
                     error!(
                         "chunk {} is at capacity and the live head(s) this write would queue on \
@@ -6273,6 +6288,7 @@ impl<'a> Deref for CellGuard<'a> {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_WORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_CAS_HEAD_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -8084,15 +8100,20 @@ mod tests {
 
     #[test]
     fn allocation_uses_space_in_later_heads_before_rotating() {
-        allocation_at_full_capacity(false);
+        allocation_at_full_capacity(false, false);
     }
 
     #[test]
     fn allocation_rescans_a_head_replaced_before_capacity_refusal() {
-        allocation_at_full_capacity(true);
+        allocation_at_full_capacity(true, false);
     }
 
-    fn allocation_at_full_capacity(replace_head: bool) {
+    #[test]
+    fn allocation_queues_for_an_owned_head_with_space() {
+        allocation_at_full_capacity(false, true);
+    }
+
+    fn allocation_at_full_capacity(replace_head: bool, own_available: bool) {
         let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
         chunks.stop_background();
         let chunk = &chunks.list[0];
@@ -8127,7 +8148,20 @@ mod tests {
                 chunk.head_pool[first].store(available, Ordering::Release);
             })));
         }
-        let pending = chunk.try_acquire(64, true).expect("later head still has room");
+        let available_seg = chunk.segs.get(&(available as usize)).unwrap();
+        if own_available {
+            assert!(available_seg.try_own());
+            let seg = available_seg.clone();
+            TEST_BEFORE_HEAD_QUEUE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                seg.release_own();
+            })));
+        }
+        let result = chunk.try_acquire(64, true);
+        if own_available {
+            if result.is_err() { available_seg.release_own(); }
+            TEST_BEFORE_HEAD_QUEUE.with(|hook| *hook.borrow_mut() = None);
+        }
+        let pending = result.expect("later head still has room");
         assert_eq!(pending.seg.id, available);
         drop(pending);
         drop(pins);
