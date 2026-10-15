@@ -78,7 +78,7 @@ impl Protection {
         self.activity.load(Ordering::Acquire) & !RETIRED == 0
     }
 
-    /// A sync can race maintenance. Wait without holding a cell or file lock here.
+    /// A sync can race maintenance. Wait before taking the file lock.
     pub fn sync_job(&self, timeout: std::time::Duration) -> std::io::Result<Job<'_>> {
         let deadline = std::time::Instant::now() + timeout;
         loop {

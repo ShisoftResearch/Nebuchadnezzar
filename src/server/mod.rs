@@ -3367,26 +3367,14 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
 
 /// Cooperative termination, recovery side.
 ///
-/// A store that restarts mid-transaction finds brackets with no COMMIT. Until
-/// now it discarded them, which is presume-abort: correct only if no other
-/// participant was told to commit, and it cannot see that from here.
+/// Recovery asks every group member because the participant set was held in memory.
+/// One committed outcome decides the transaction. The resolver syncs the decision,
+/// installs the cells, and syncs plain entries before it releases transaction pins.
+/// It discards a bracket only when every other member reports an aborted outcome.
+/// Unknown or unreachable peers leave the bracket pinned for later resolution.
 ///
-/// So it asks. It has lost the participant set the coordinator sent at
-/// prepare -- that lived in memory -- so it asks EVERY member of the group.
-/// One `Committed` decides the transaction; the record is written before the
-/// cells are installed, so a crash in the middle of resolving replays it
-/// rather than losing it again.
-///
-/// Runs BEFORE the cleaner resumes, and that ordering is load-bearing: an
-/// in-doubt bracket's cells are not in the index, so a compaction pass would
-/// read them as dead and reclaim the evidence out from under the question.
-///
-/// WHAT IT CANNOT DO: resolve a transaction when no peer is reachable, which
-/// is exactly a whole-cluster restart. Every peer answers `Unknown` -- either
-/// down, or itself restarting with no live record -- and the transaction is
-/// presumed abort. That is the limit of cooperative termination without a
-/// durable coordinator decision, and it is the same answer this code gave
-/// unconditionally before.
+/// This runs before the cleaner resumes. The pins protect unresolved entries,
+/// which are absent from the cell index, from reclamation.
 async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
     let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
     if in_doubt.is_empty() {
