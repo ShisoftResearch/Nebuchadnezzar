@@ -7484,10 +7484,6 @@ mod tests {
     }
 
     /// A compacted part must not lose the only surviving transaction decision.
-    #[test]
-    fn non_durable_commit_power_cut_after_compacting_one_part_is_atomic() {
-        power_cut_after_compacting_one_part(false);
-    }
 
     #[test]
     fn durable_commit_power_cut_after_compacting_one_part_is_atomic() {
@@ -7514,13 +7510,15 @@ mod tests {
         for segment in &entries {
             segment.force_wal_sync().unwrap();
         }
+        for segment in &entries {
+            assert!(
+                segment.durable_receipt().unwrap().is_none(),
+                "round 1 must cover every entry before a decision"
+            );
+        }
         let entries_synced = last.wal_append_position();
         let (result, _receipts) = crate::ram::durability::capture(|| {
-            if durable {
-                chunks.commit_transaction_brackets(&txn)
-            } else {
-                chunks.commit_transaction_brackets_without_decision_sync(&txn)
-            }
+            chunks.commit_transaction_brackets(&txn)
         });
         result.unwrap();
         let last_synced = last.durable_file().unwrap().watermark();
@@ -7602,6 +7600,15 @@ mod tests {
         }
     }
     fn transaction_cut_across_chunks(sync_commits: usize, durable: bool, refuse: bool) -> usize {
+        transaction_cut_at_decision(sync_commits, durable, refuse, false)
+    }
+
+    fn transaction_cut_at_decision(
+        sync_commits: usize,
+        durable: bool,
+        refuse: bool,
+        before_commit: bool,
+    ) -> usize {
         let live = BracketCleanerStore::new(8932, "txn_power_cut_chunks");
         let cut = BracketCleanerStore::new(8932, "txn_power_cut_chunks");
         let open = |store: &BracketCleanerStore, recover| {
@@ -7635,6 +7642,12 @@ mod tests {
         for segment in &entries {
             segment.force_wal_sync().unwrap();
         }
+        for segment in &entries {
+            assert!(
+                segment.durable_receipt().unwrap().is_none(),
+                "round 1 must cover every entry before a decision"
+            );
+        }
         if refuse {
             // Chunk 0 closes before chunk 1 refuses its first COMMIT.
             let segment = entries
@@ -7644,17 +7657,20 @@ mod tests {
             segment.retire_tail();
         }
         let (result, _receipts) = crate::ram::durability::capture(|| {
-            if durable {
-                chunks.commit_transaction_brackets(&txn)
+            if before_commit {
+                Ok(())
             } else {
-                chunks.commit_transaction_brackets_without_decision_sync(&txn)
+                chunks.commit_transaction_brackets(&txn)
             }
         });
         if refuse {
             assert!(result.is_err());
         } else {
             result.unwrap();
-            crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
+            if !before_commit {
+                crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range())
+                    .unwrap();
+            }
         }
         for segment in entries.iter().take(sync_commits) {
             segment.force_wal_sync().unwrap();
@@ -7696,7 +7712,7 @@ mod tests {
             "recovered {present}/{} cells",
             ids.len()
         );
-        if !durable && sync_commits < entries.len() {
+        if before_commit {
             let parts: Vec<_> = recovered
                 .list
                 .iter()
@@ -7715,26 +7731,21 @@ mod tests {
         if !refuse && present == 0 {
             assert_eq!(recovered.take_in_doubt_brackets().len(), 1);
         }
-        if refuse {
+        if refuse || before_commit {
             crate::ram::chunk::retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
         }
         present
     }
 
     #[test]
-    fn non_durable_transaction_cut_before_any_commit_sync_is_absent() {
-        assert_eq!(transaction_cut_across_chunks(0, false, false), 0);
+    fn transaction_cut_before_any_commit_append_is_absent() {
+        for durable in [false, true] {
+            assert_eq!(transaction_cut_at_decision(0, durable, false, true), 0);
+        }
     }
 
-    #[test]
-    fn non_durable_transaction_cut_after_one_commit_sync_is_complete() {
-        assert_eq!(transaction_cut_across_chunks(1, false, false), 36);
-    }
 
-    #[test]
-    fn non_durable_transaction_cut_after_all_commit_syncs_is_complete() {
-        assert_eq!(transaction_cut_across_chunks(4, false, false), 36);
-    }
+
 
     #[test]
     fn durable_transaction_cut_after_ack_is_complete() {

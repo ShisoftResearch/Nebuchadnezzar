@@ -525,6 +525,221 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn power_cut_participants_resolve_with_both_sync_rounds() {
+    power_cut_participants_resolve(true).await;
+}
+
+async fn power_cut_participants_resolve(durable: bool) {
+    let _ = env_logger::try_init();
+    let group = if durable {
+        "cut_restart_durable"
+    } else {
+        "cut_restart_no_decision_sync"
+    };
+    let temp: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let addresses: Vec<String> = (0..2)
+        .map(|_| crate::utils::test_port::unique_localhost_addr())
+        .collect();
+    let opts_for = |dir: &tempfile::TempDir| ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 256 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+        // Required once recovery is on: schemas live in raft storage, and
+        // recovering cells without them restores data nothing can read.
+        raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell, Service::Transaction],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let schema = Schema::new_with_id(
+        SCHEMA_ID,
+        &String::from("termination_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+
+    let mut servers = Vec::new();
+    for (address, dir) in addresses.iter().zip(temp.iter()) {
+        servers.push(
+            NebServer::new_cluster_from_opts(
+                &opts_for(dir),
+                address,
+                &addresses,
+                group,
+                async |_| {},
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let client = Arc::new(
+        AsyncClient::new(&servers[0].rpc, &servers[0].membership, &addresses, group)
+            .await
+            .unwrap(),
+    );
+    client.reload_slot_owners().await;
+    for server in &servers {
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+    }
+    let ids = two_ids_on_distinct_servers(&client, &servers).await;
+
+    let txn = super::new_async_client_for_database(&addresses[0], group, group)
+        .await
+        .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        txn.write(tid.clone(), cell_of(*id, 500 + n as u64))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let before_prepare =
+        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+    assert!(
+        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+            >= before_prepare + 2,
+        "round 1 must sync both participants before any decision"
+    );
+    for server in &servers {
+        for chunk in &server.chunks().list {
+            for segment in chunk.segments() {
+                if segment.protection.transaction_pending() {
+                    assert!(
+                        segment.durable_receipt().unwrap().is_none(),
+                        "prepared entries need durable prefixes"
+                    );
+                }
+            }
+        }
+    }
+
+    let told = client.locate_server_id(&ids[1]).unwrap();
+    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), told);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    if !durable {
+        // Preserve one decision prefix that a power cut is allowed to retain.
+        for chunk in &servers[1].chunks().list {
+            for segment in chunk.segments() {
+                if segment.protection.transaction_pending() {
+                    segment.force_wal_sync().unwrap();
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        servers[0].chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Prepared,
+        "the server that was not told must be in doubt before it restarts"
+    );
+    assert_eq!(
+        servers[1].chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "the server that was told must hold a durable COMMIT"
+    );
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        if !from.exists() {
+            return;
+        }
+        std::fs::create_dir_all(to).unwrap();
+        for item in std::fs::read_dir(from).unwrap() {
+            let item = item.unwrap();
+            let target = to.join(item.file_name());
+            if item.file_type().unwrap().is_dir() {
+                copy_tree(&item.path(), &target);
+            } else {
+                std::fs::copy(item.path(), target).unwrap();
+            }
+        }
+    }
+    let cut: Vec<_> = (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    // Copy before shutdown. Later shutdown syncs cannot enter either crash image.
+    for ((server, live), image) in servers.iter().zip(&temp).zip(&cut) {
+        copy_tree(live.path(), image.path());
+        for chunk in &server.chunks().list {
+            for segment in chunk.segments() {
+                let Some(path) =
+                    chunk
+                        .file_manager
+                        .wal_path(segment.chunk_id, segment.id, segment.seq_id)
+                else {
+                    continue;
+                };
+                let path = std::path::Path::new(&path);
+                if !path.exists() {
+                    continue;
+                }
+                let destination = image.path().join(path.strip_prefix(live.path()).unwrap());
+                let synced = segment
+                    .durable_file()
+                    .map(|file| file.watermark())
+                    .unwrap_or(crate::ram::wal_format::FILE_HEADER_SIZE as u64);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(destination)
+                    .unwrap()
+                    .set_len(synced)
+                    .unwrap();
+            }
+        }
+    }
+    // The in-doubt participant loses its volatile tail. The peer remains available.
+    let restarting = servers.remove(0);
+    restarting.shutdown().await;
+    drop(restarting);
+    let peer = servers.remove(0);
+    // Preserve metadata. Replace only this fixture's data with the pre-shutdown cut.
+    for name in ["wal", "backup"] {
+        let target = temp[0].path().join(name);
+        if target.exists() {
+            std::fs::remove_dir_all(&target).unwrap();
+        }
+        copy_tree(&cut[0].path().join(name), &target);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let restarted = NebServer::new_cluster_from_opts(
+        &opts_for(&temp[0]),
+        &addresses[0],
+        &addresses,
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        restarted.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "a restarted participant must ask the group and commit what a peer \
+         was told to commit, rather than discarding its half"
+    );
+
+    // The fixture schema is local; install it again to decode the recovered cells.
+    restarted
+        .meta()
+        .schemas
+        .debug_only_new_schema(schema.clone());
+    for (server, id) in [(&restarted, ids[0]), (&peer, ids[1])] {
+        assert!(
+            server.chunks().read_cell(&id).is_ok(),
+            "both participants must recover their cell"
+        );
+    }
+    restarted.shutdown().await;
+    peer.shutdown().await;
+}
+
 /// A silent peer must not be counted as a vote to abort.
 ///
 /// The participant is in doubt and the peer that knows the answer is DOWN.
