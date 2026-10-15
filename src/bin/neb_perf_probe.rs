@@ -164,11 +164,25 @@ async fn populate(base: &str, cells: u64) {
         rate(name, done, started);
     }
 
+    let bytes_before: usize = chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.total_space.load(std::sync::atomic::Ordering::Acquire))
+        .sum();
     let started = Instant::now();
     for chunk in &chunks.list {
         neb::ram::cleaner::Cleaner::clean(chunk, true, true);
     }
-    println!("METRIC cleaner_secs {:.3}", started.elapsed().as_secs_f64());
+    println!("METRIC cleaner_secs {:.6}", started.elapsed().as_secs_f64());
+    let bytes_after: usize = chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.total_space.load(std::sync::atomic::Ordering::Acquire))
+        .sum();
+    println!(
+        "METRIC cleaner_reclaimed_bytes {}",
+        bytes_before.saturating_sub(bytes_after)
+    );
     let started = Instant::now();
     server.shutdown().await;
     println!(
