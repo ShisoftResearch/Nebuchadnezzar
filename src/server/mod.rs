@@ -3396,12 +3396,21 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     let Some(txn_manager) = database_runtime.txn_manager().cloned() else {
         warn!(
             "{} transaction(s) are in doubt after recovery but this database runs no transaction \
-             service, so there is nothing to ask with; all are presumed abort",
+             service, so there is nothing to ask with; all remain pinned",
             in_doubt.len()
         );
         for bracket in &in_doubt {
-            discard_in_doubt(bracket, "no transaction service on this database");
+            warn!(
+                "transaction {:?} remains pinned without a transaction service",
+                bracket.txn
+            );
         }
+        database_runtime
+            .chunks
+            .recovered_brackets
+            .lock()
+            .in_doubt
+            .extend(in_doubt);
         return;
     };
 
@@ -3444,13 +3453,22 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     if roster.is_empty() {
         warn!(
             "{} transaction(s) are in doubt after recovery and this group reports no other \
-             member after {:?}; all are presumed abort",
+             member after {:?}; all remain pinned",
             in_doubt.len(),
             settle
         );
         for bracket in &in_doubt {
-            discard_in_doubt(bracket, "no peer in the group to ask");
+            warn!(
+                "transaction {:?} remains pinned without a peer",
+                bracket.txn
+            );
         }
+        database_runtime
+            .chunks
+            .recovered_brackets
+            .lock()
+            .in_doubt
+            .extend(in_doubt);
         return;
     }
     info!(
@@ -3478,7 +3496,9 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
                 };
                 match site.txn_status(bracket.txn.clone()).await {
                     Ok(response) => {
-                        answered += 1;
+                        if response.payload == transactions::TxnOutcome::Aborted {
+                            answered += 1;
+                        }
                         if response.payload == transactions::TxnOutcome::Committed {
                             committed = true;
                             break;
@@ -3491,11 +3511,16 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
                 }
             }
             if committed {
-                apply_resolved_commit(database_runtime, &bracket);
+                if !apply_resolved_commit(database_runtime, &bracket) {
+                    still_waiting.push(bracket);
+                }
                 continue;
             }
             if answered == roster.len() {
-                discard_in_doubt(&bracket, "every peer answered and none had committed it");
+                discard_in_doubt(&bracket, "every peer returned a final abort");
+                database_runtime
+                    .chunks
+                    .release_transaction_pins(&bracket.txn);
                 continue;
             }
             still_waiting.push(bracket);
@@ -3508,14 +3533,17 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     }
     for bracket in &unresolved {
         error!(
-            "transaction {:?} stayed in doubt: not every peer answered within {:?}. Presuming \
-             abort, which is the only thing this node can do alone -- if a peer did commit it, \
-             this store has lost its half.",
+            "transaction {:?} remains in doubt and pinned after {:?}",
             bracket.txn,
             resolve_answer_timeout()
         );
-        discard_in_doubt(bracket, "peers did not answer in time");
     }
+    database_runtime
+        .chunks
+        .recovered_brackets
+        .lock()
+        .in_doubt
+        .extend(unresolved);
 }
 
 /// How long to let the membership roster grow before believing it is final.
@@ -3536,7 +3564,8 @@ fn resolve_answer_timeout() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
-fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
+fn discard_in_doubt(chunks: &crate::ram::chunk::Chunks, bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
+    chunks.release_transaction_pins(&bracket.txn);
     info!(
         "transaction {:?} was in doubt after recovery and is discarded ({}); {} bracketed \
          cell(s) dropped",
@@ -3564,7 +3593,7 @@ fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
 fn apply_resolved_commit(
     database_runtime: &Arc<DatabaseRuntime>,
     bracket: &crate::ram::recovery::InDoubtBracket,
-) {
+) -> bool {
     let mut placed = 0usize;
     for chunk_id in &bracket.chunks {
         let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
@@ -3587,33 +3616,46 @@ fn apply_resolved_commit(
             bracket.txn,
             bracket.chunks.len()
         );
-        return;
+        return false;
     }
     if placed < bracket.chunks.len() {
-        warn!(
-            "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely on \
-             those records surviving compaction",
-            bracket.txn,
-            placed,
-            bracket.chunks.len()
-        );
+        return false;
     }
     for cell in &bracket.cells {
         if let Err(error) =
             crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell)
         {
-            error!("cannot install resolved transaction {:?}: {}", bracket.txn, error);
-            return;
+            error!(
+                "cannot install resolved transaction {:?}: {}",
+                bracket.txn, error
+            );
+            return false;
         }
     }
+    if let Err(error) = crate::ram::recovery::rewrite_resolved_entries(
+        &database_runtime.chunks.list,
+        &bracket.cells,
+    ) {
+        error!(
+            "cannot rewrite resolved transaction {:?}: {error:?}",
+            bracket.txn
+        );
+        return false;
+    }
+    database_runtime
+        .chunks
+        .release_transaction_pins(&bracket.txn);
     warn!(
         "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \
          cell(s) are installed and its COMMIT is durable here",
         bracket.txn,
         bracket.cells.len()
     );
-    crate::ram::recovery::BRACKETS_APPLIED
-        .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    crate::ram::recovery::BRACKETS_APPLIED.fetch_add(
+        bracket.cells.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
 }
 
 /// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000

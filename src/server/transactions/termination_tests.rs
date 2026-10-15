@@ -736,6 +736,11 @@ async fn power_cut_participants_resolve(durable: bool) {
             "both participants must recover their cell"
         );
     }
+    assert_eq!(
+        restarted.chunks().pinned_segments(),
+        0,
+        "peer-resolved commit must release its segment pins"
+    );
     restarted.shutdown().await;
     peer.shutdown().await;
 }

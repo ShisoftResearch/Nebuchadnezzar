@@ -3365,3 +3365,17 @@ async fn database_catalog_initialization_preserves_storage_errors() {
     );
     assert_eq!(attempts, 1);
 }
+
+#[test]
+fn a_final_peer_discard_releases_segment_pins() {
+    let chunks = crate::ram::chunk::Chunks::new_dummy(1, 4 * crate::ram::segs::SEGMENT_SIZE);
+    chunks.stop_background();
+    let txn = crate::server::transactions::test_hlc(9845, 1);
+    let segment = chunks.list[0].segments().pop().unwrap();
+    segment.protection.retain_transaction(&txn);
+    assert_eq!(chunks.pinned_segments(), 1);
+    let bracket = crate::ram::recovery::InDoubtBracket { txn, chunks: vec![0], cells: vec![] };
+    super::discard_in_doubt(&chunks, &bracket, "all peers returned a final abort");
+    assert_eq!(chunks.pinned_segments(), 0);
+    assert_eq!(chunks.pinned_bytes(), 0);
+}
