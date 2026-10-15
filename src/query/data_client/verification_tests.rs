@@ -400,3 +400,202 @@ async fn verify_hash_schema_replacement() {
     );
     server.shutdown().await;
 }
+
+// Model the proposed owner counter with the strongest atomic order. The real
+// verifier stays enabled so these tests preserve D9 while exposing raw hits.
+struct CandidateInflightCounter(std::sync::atomic::AtomicUsize);
+
+impl CandidateInflightCounter {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn begin(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn complete(&self) {
+        let previous = self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(previous > 0);
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idxinflight_buffered_hit_outlives_successful_update() {
+    let (server, client, _dir) = fixture("idxinflight_buffered", IndexType::Ranged).await;
+    let id = Id::from_parts(3, 401);
+    client.write_cell(cell(id, 0)).await.unwrap().unwrap();
+    let data_client = server.indexed_data_client();
+    let key_range = range(0).to_key_range(SchemaUid(SCHEMA), hash_str(FIELD), Ordering::Forward);
+    let captured = data_client
+        .index_clients
+        .range_seek(key_range.clone(), 8, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured.current_block(), &vec![id]);
+
+    let counter = CandidateInflightCounter::new();
+    counter.begin();
+    let (published, tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().update_cell(&mut cell(id, 1)));
+    published.unwrap();
+    assert!(!tasks.is_empty());
+    assert_eq!(counter.count(), 1);
+    for task in tasks {
+        task.await.unwrap();
+    }
+    counter.complete();
+    assert_eq!(counter.count(), 0);
+    assert_eq!(
+        client.read_cell(id).await.unwrap().unwrap()[hash_str(FIELD)],
+        OwnedValue::U64(1)
+    );
+    assert!(data_client
+        .index_clients
+        .range_seek(key_range.clone(), 8, None)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(captured.current_block(), &vec![id]);
+
+    let checked = data_client
+        .read_cells_from_ids_checked(
+            captured.current_block(),
+            &vec![],
+            &Expr::nothing(),
+            &Expr::nothing(),
+            &vec![
+                crate::index::verification::IndexCheck::Schema(SchemaUid(SCHEMA)),
+                crate::index::verification::IndexCheck::Ranged(key_range),
+            ],
+        )
+        .await;
+    println!(
+        "IDXINFLIGHT_BUFFERED price=1 raw={:?} counter={} checked={:?}",
+        captured.current_block(),
+        counter.count(),
+        checked.iter().map(|cell| cell.id()).collect::<Vec<_>>()
+    );
+    server.shutdown().await;
+    assert!(
+        checked.is_empty(),
+        "a zero counter cannot validate a buffered hit"
+    );
+}
+
+async fn reordered_successful_updates(index: IndexType) {
+    let ranged = matches!(index, IndexType::Ranged);
+    let name = if ranged {
+        "idxinflight_reordered_ranged"
+    } else {
+        "idxinflight_reordered_hash"
+    };
+    let (server, client, _dir) = fixture(name, index).await;
+    let id = Id::from_parts(3, 402);
+    client.write_cell(cell(id, 0)).await.unwrap().unwrap();
+    let counter = CandidateInflightCounter::new();
+
+    counter.begin();
+    let (first, first_tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().update_cell(&mut cell(id, 1)));
+    first.unwrap();
+    assert!(!first_tasks.is_empty());
+    counter.begin();
+    let (second, second_tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().update_cell(&mut cell(id, 2)));
+    second.unwrap();
+    assert!(!second_tasks.is_empty());
+    assert_eq!(counter.count(), 2);
+
+    for task in second_tasks {
+        task.await.unwrap();
+    }
+    counter.complete();
+    assert_eq!(counter.count(), 1, "the first update still owns its marker");
+    for task in first_tasks {
+        task.await.unwrap();
+    }
+    counter.complete();
+    assert_eq!(counter.count(), 0);
+    assert_eq!(
+        client.read_cell(id).await.unwrap().unwrap()[hash_str(FIELD)],
+        OwnedValue::U64(2)
+    );
+
+    let data_client = server.indexed_data_client();
+    let raw = if ranged {
+        let mut cursor = data_client
+            .index_clients
+            .range_seek(
+                range(1).to_key_range(SchemaUid(SCHEMA), hash_str(FIELD), Ordering::Forward),
+                8,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ids = vec![];
+        while let Some(id) = cursor.next().await.unwrap() {
+            ids.push(id);
+        }
+        ids
+    } else {
+        let bucket = IndexedDataClient::hashed_index_id(
+            SchemaUid(SCHEMA),
+            hash_str(FIELD),
+            &OwnedValue::U64(1),
+        );
+        data_client
+            .index_clients
+            .hashed_client
+            .indexer
+            .candidates(bucket)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        raw,
+        vec![id],
+        "successful reordered tasks left a stale entry"
+    );
+    let checked = collect(
+        data_client
+            .query_ids(SchemaUid(SCHEMA), selection(1), QueryOrdering::Asc)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let final_ids = collect(
+        data_client
+            .query_ids(SchemaUid(SCHEMA), selection(2), QueryOrdering::Asc)
+            .await
+            .unwrap(),
+    )
+    .await;
+    println!(
+        "IDXINFLIGHT_REORDERED index={name} price=2 raw={raw:?} counter={} checked={checked:?} final={final_ids:?}",
+        counter.count()
+    );
+    server.shutdown().await;
+    assert!(
+        checked.is_empty(),
+        "successful tasks and zero count do not prove a hit"
+    );
+    assert_eq!(final_ids, vec![id]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idxinflight_reordered_ranged_tasks_need_verification() {
+    reordered_successful_updates(IndexType::Ranged).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idxinflight_reordered_hash_tasks_need_verification() {
+    reordered_successful_updates(IndexType::Hashed).await;
+}
