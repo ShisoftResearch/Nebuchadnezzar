@@ -2895,9 +2895,12 @@ impl Chunk {
     #[cfg(test)]
     pub(crate) fn rotate_heads_for_scrub_test(&self) {
         for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
+            let lookup = crate::ram::qsbr::QsbrSection::new();
             let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
             if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
-                self.finish_rotated_head(old);
+                let sequence = self.segs.get(&(old as usize)).unwrap().seq_id;
+                drop(lookup);
+                self.finish_rotated_head(old, sequence);
             }
         }
     }
@@ -6238,6 +6241,36 @@ mod tests {
     use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
+
+    #[test]
+    fn compose_scrub_rotation_archives_the_selected_generation() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.get_head_seg_id();
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        crate::ram::entry::stamp_reservation_padding(segment.addr, 8);
+        segment
+            .append_header
+            .store(segment.addr + 8, Ordering::Release);
+
+        chunk.rotate_heads_for_scrub_test();
+
+        assert_eq!(chunk.head_seg_ids_for_test(), (None, None));
+        assert!(segment.is_sealed());
+        assert!(std::path::Path::new(
+            &chunk
+                .file_manager
+                .backup_path(chunk.id, segment.id, segment.seq_id)
+                .unwrap()
+        )
+        .exists());
+    }
 
     #[test]
     fn rotated_seal_protects_its_generation_until_archive_finishes() {
