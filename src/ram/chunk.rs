@@ -2493,8 +2493,12 @@ impl Chunk {
                     head.end_pending_journal();
                     head.decr_references();
                     head.release_own();
-                    rotate_target = Some((slot, head_seg_id, head.seq_id));
-                    break;
+                    if rotate_target.is_none() {
+                        rotate_target = Some((slot, head_seg_id, head.seq_id));
+                    }
+                    // A later head can still fit this entry. Rotation needs a
+                    // new segment; do not refuse at capacity before trying it.
+                    continue;
                 } else {
                     // This head is sealing; it will never accept another
                     // write. Next slot.
@@ -2636,6 +2640,16 @@ impl Chunk {
             }
             if at_wall {
                 if tried_gc {
+                    #[cfg(test)]
+                    TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() { hook(); }
+                    });
+                    // Another writer can replace the selected full head while
+                    // this writer checks capacity or runs GC. Rescan its new
+                    // head before refusing the allocation.
+                    if head_slot.load(Ordering::Acquire) != head_seg_id {
+                        continue;
+                    }
                     debug!(
                         "chunk-allocation-failure: chunk={}, live_bytes={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
                         self.id,
@@ -6259,6 +6273,7 @@ impl<'a> Deref for CellGuard<'a> {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_WORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_CAS_HEAD_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -8065,6 +8080,87 @@ mod tests {
             header: CellHeader::new(SchemaVid(schema_id), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
+    }
+
+    #[test]
+    fn allocation_uses_space_in_later_heads_before_rotating() {
+        allocation_at_full_capacity(false);
+    }
+
+    #[test]
+    fn allocation_rescans_a_head_replaced_before_capacity_refusal() {
+        allocation_at_full_capacity(true);
+    }
+
+    fn allocation_at_full_capacity(replace_head: bool) {
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let last = (head_affinity() + chunk.head_pool.len() - 1) % chunk.head_pool.len();
+        let mut available = 0;
+        for (i, slot) in chunk.head_pool.iter().enumerate() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            let seg = chunk.segs.get(&(id as usize)).unwrap();
+            if !replace_head && i == last { available = id; } else { seg.retire_tail(); }
+        }
+        // No address for another head. Keep non-head segments pinned so this
+        // tests use of existing head space, not cleaner scheduling.
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            chunk.put_segment(seg);
+            pins.push(SegmentReferenceGuard::new(chunk.segs.get(&(id as usize)).unwrap()).unwrap());
+            if replace_head && available == 0 { available = id; }
+        }
+        if replace_head {
+            let chunks = chunks.clone();
+            TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let chunk = &chunks.list[0];
+                let first = head_affinity() % chunk.head_pool.len();
+                chunk.head_pool[first].store(available, Ordering::Release);
+            })));
+        }
+        let pending = chunk.try_acquire(64, true).expect("later head still has room");
+        assert_eq!(pending.seg.id, available);
+        drop(pending);
+        drop(pins);
+    }
+
+    #[test]
+    fn delayed_seal_job_does_not_seal_a_reused_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = Chunks::new(1, 4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas: LocalSchemasCache::new_local("") }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()), None);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.head_pool[0].load(Ordering::Acquire);
+        let old = chunk.segs.get(&(id as usize)).unwrap();
+        assert!(chunk.seal_queue.enqueue(chunk.id, id, old.seq_id));
+        chunk.head_pool[0].store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        chunk.remove_segment(id);
+        assert_eq!(drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)), 1);
+        let replacement = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        assert_eq!(replacement.id, id);
+        assert_ne!(replacement.seq_id, old.seq_id);
+        chunk.put_segment(replacement);
+        chunk.head_pool[0].store(id, Ordering::Release);
+        let current = chunk.segs.get(&(id as usize)).unwrap();
+        for (chunk_id, seg_id, seq_id) in chunk.seal_queue.drain() {
+            chunks.list[chunk_id].finish_rotated_head(seg_id, seq_id);
+        }
+        assert!(!current.is_sealed(), "a queued job for the retired incarnation sealed the current append head");
+        assert!(current.begin_pending_journal(), "the new head's journal gate must remain open");
+        current.end_pending_journal();
     }
 
     // Prepare the observed CAS word -> head / upsert head -> word cycle.
