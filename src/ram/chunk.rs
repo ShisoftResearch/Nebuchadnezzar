@@ -2727,6 +2727,10 @@ impl Chunk {
             };
 
             let t_alloc_seg = std::time::Instant::now();
+            #[cfg(test)]
+            TEST_BEFORE_ROTATION_ALLOCATE.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() { hook(); }
+            });
             let new_seg_opt = match self
                 .allocator
                 .alloc_seg_for_writer(&self.file_manager, segment_class)
@@ -2758,9 +2762,9 @@ impl Chunk {
                 // Space was there when we checked, and is gone now -- another
                 // writer took the last segment between the check and here.
                 drop(restore);
-                // A failed GROWTH still is not a failed write while live
-                // heads exist: put the slot back and queue on one of them.
-                if growing && any_live_head() {
+                // Another writer can consume the last free segment. Restore
+                // the slot and retry usable heads, including owned heads.
+                if any_live_head() {
                     backoff.spin();
                     continue;
                 }
@@ -4609,7 +4613,9 @@ impl Chunk {
         // The expected version is checked after allocation, under that word.
         cell.header.version = version;
         let write_plan = cell.plan_write(self)?;
-        let pending_entry = write_plan.allocate(self, false)?;
+        // No cell word is held here, so a concurrent cleaner can finish
+        // before we decide whether the chunk has space.
+        let pending_entry = write_plan.allocate(self, true)?;
         let mut guard = self.lock_cell_for_write(hash, true).map_err(WriteError::ReadError)?;
         if guard.cell_version().map_err(WriteError::ReadError)? != version {
             return Err(WriteError::CellVersionMismatch);
@@ -6288,6 +6294,7 @@ impl<'a> Deref for CellGuard<'a> {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_BEFORE_ROTATION_ALLOCATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_WORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -8069,6 +8076,10 @@ mod tests {
     }
 
     fn setup_test_chunks() -> (Arc<Chunks>, Schema) {
+        setup_test_chunks_with_size(TEST_CHUNK_SIZE)
+    }
+
+    fn setup_test_chunks_with_size(size: usize) -> (Arc<Chunks>, Schema) {
         let fields = Field::new_schema(vec![
             Field::new_unindexed("id", Type::I32),
             Field::new_unindexed_array("data", Type::U8),
@@ -8078,7 +8089,7 @@ mod tests {
         schemas.debug_only_new_schema(schema.clone());
         let chunks = Chunks::new(
             1,
-            TEST_CHUNK_SIZE,
+            size,
             Arc::new(ServerMeta { schemas }),
             None,
             None,
@@ -8099,21 +8110,82 @@ mod tests {
     }
 
     #[test]
+    fn cas_allocation_waits_for_inflight_cleaner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 42);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let version = chunks.write_cell(&mut cell).unwrap().version;
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            chunk.put_segment(seg);
+            pins.push((id, SegmentReferenceGuard::new(chunk.segs.get(&(id as usize)).unwrap()).unwrap()));
+        }
+        let gc = chunk.gc_lock.lock();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_CAS_HEAD_WAIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                })));
+                result_tx.send(chunks.list[0].compare_version_and_update_cell(
+                    id.bits(), version, &mut cell,
+                )).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(200));
+        // Finish the simulated cleaner pass by retiring an unowned segment.
+        // No active head or transaction-owned segment is compacted.
+        let (victim, pin) = pins.pop().unwrap();
+        drop(pin);
+        chunk.remove_segment(victim);
+        drop(gc);
+        let result = early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(result.is_ok(), "CAS refused while a cleaner could release space: {:?}", result);
+        assert!(chunks.head_cell(&id).unwrap().version > version);
+        drop(pins);
+    }
+
+    #[test]
     fn allocation_uses_space_in_later_heads_before_rotating() {
-        allocation_at_full_capacity(false, false);
+        allocation_at_full_capacity(false, false, false);
     }
 
     #[test]
     fn allocation_rescans_a_head_replaced_before_capacity_refusal() {
-        allocation_at_full_capacity(true, false);
+        allocation_at_full_capacity(true, false, false);
     }
 
     #[test]
     fn allocation_queues_for_an_owned_head_with_space() {
-        allocation_at_full_capacity(false, true);
+        allocation_at_full_capacity(false, true, false);
     }
 
-    fn allocation_at_full_capacity(replace_head: bool, own_available: bool) {
+    #[test]
+    fn allocation_rechecks_heads_after_losing_rotation_capacity() {
+        allocation_at_full_capacity(false, true, true);
+    }
+
+    fn allocation_at_full_capacity(replace_head: bool, own_available: bool, lose_rotation: bool) {
         let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
         chunks.stop_background();
         let chunk = &chunks.list[0];
@@ -8133,7 +8205,7 @@ mod tests {
         // No address for another head. Keep non-head segments pinned so this
         // tests use of existing head space, not cleaner scheduling.
         let mut pins = Vec::new();
-        while chunk.allocator.writer_headroom() > 0 {
+        while chunk.allocator.writer_headroom() > if lose_rotation { 2 } else { 0 } {
             let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
             let id = seg.id;
             chunk.put_segment(seg);
@@ -8154,6 +8226,16 @@ mod tests {
             let seg = available_seg.clone();
             TEST_BEFORE_HEAD_QUEUE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
                 seg.release_own();
+            })));
+        }
+        if lose_rotation {
+            let chunks = chunks.clone();
+            TEST_BEFORE_ROTATION_ALLOCATE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let chunk = &chunks.list[0];
+                while chunk.allocator.writer_headroom() > 0 {
+                    let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                    chunk.put_segment(seg);
+                }
             })));
         }
         let result = chunk.try_acquire(64, true);
