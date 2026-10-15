@@ -560,7 +560,13 @@ async fn compose_durable_receipts_preserve_verified_reads() {
     rpc.write_cell_durable(initial).await.unwrap();
     let mut changed = cell(1, 2);
     changed.header.schema = SchemaVid(8903);
-    let (result, tokens) = rpc.update_cell_captured(changed).await;
+    let (result, tokens) = rpc
+        .compare_version_and_update_cell_captured(
+            changed.header.id,
+            rpc.head_cell(changed.header.id).await.unwrap().version,
+            changed,
+        )
+        .await;
     result.unwrap();
     assert!(!tokens.is_empty());
     let checks = |value| {

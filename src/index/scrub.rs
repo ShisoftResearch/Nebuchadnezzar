@@ -3566,7 +3566,18 @@ mod tests {
         let capture = crate::client::CapturedWriteBatch::new();
         for i in 0..120 {
             client
-                .update_cell_captured(&capture, hash_product_cell(i, i))
+                .compare_version_and_update_cell_captured(
+                    &capture,
+                    hash_product_id(i),
+                    client
+                        .read_cell(hash_product_id(i))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .header
+                        .version,
+                    hash_product_cell(i, i),
+                )
                 .await
                 .unwrap()
                 .unwrap();
