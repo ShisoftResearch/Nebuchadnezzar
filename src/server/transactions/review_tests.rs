@@ -91,6 +91,7 @@ async fn old_segment_eviction_is_refused_while_a_transaction_is_applied() {
     assert_eq!(runtime.chunks().address_of(&id), previous);
     assert_eq!(runtime.chunks().head_cell(&id).unwrap().version, version);
     assert_eq!(source.references_count(), 0);
+    chunk.release_append_heads_for_test();
     crate::ram::tiered::eviction::evict_segment(&source, chunk).unwrap();
     assert!(source.is_cold());
     assert_eq!(

@@ -399,6 +399,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
         chunks.remove_cell(id).unwrap();
     }
 
+    chunk.wait_for_segment_jobs_for_test();
     let candidate_segments = chunk.segs_for_combine_cleaner();
     let candidate_ids: BTreeSet<_> = candidate_segments.iter().map(|(seg, _)| seg.id).collect();
 
@@ -483,6 +484,7 @@ fn blob_schema_combine_preserves_blob_segment_class() {
         "setup should keep one live blob cell per source segment"
     );
 
+    chunk.wait_for_segment_jobs_for_test();
     let selected_segments: Vec<_> = chunk
         .segments()
         .into_iter()

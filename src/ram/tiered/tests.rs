@@ -324,6 +324,10 @@ fn test_eviction_on_memory_overflow() {
         }
     }
 
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
+
     // Final eviction check to ensure memory limit is respected
     info!("Final eviction check");
     for chunk in &chunks.list {
@@ -858,6 +862,7 @@ fn test_blob_segments_evict_before_regular_segments() {
         wait_for_rotated_archive(&chunk.segs.get(&(id as usize)).unwrap());
     }
 
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -964,6 +969,7 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         &chunk.segs.get(&(cold_target_segment_id as usize)).unwrap(),
     );
 
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -1195,6 +1201,9 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
         "single database should reach the exact hot-segment threshold before eviction is triggered for the next allocation"
     );
 
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
     let cold_before_crossing = total_cold_segments(&chunks);
     let evicted_after_threshold = manager
         .evict_for_allocation()
@@ -2026,6 +2035,11 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         "equal-sized databases should exceed the shared lower watermark before eviction"
     );
 
+    for (chunks, _, _, _) in &databases {
+        for chunk in &chunks.list {
+            chunk.wait_for_segment_jobs_for_test();
+        }
+    }
     let mut evicted_total = 0;
     for _ in 0..4 {
         let hot_now: usize = databases

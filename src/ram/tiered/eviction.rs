@@ -25,12 +25,6 @@ use std::io;
 /// - Archive happens before cell locking to maintain consistent lock ordering
 pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     debug!("evict_segment called for segment {}", segment.id);
-    if segment.protection.in_progress() || segment.is_head_owned() {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "segment is in progress",
-        ));
-    }
 
     // Step 3: Obtain exclusive references (skip if not available)
     let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
@@ -45,6 +39,13 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             "Segment has active references",
         ));
     };
+
+    if segment.protection.in_progress() || segment.is_head_owned() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "segment is in progress",
+        ));
+    }
 
     // Step 1: Try to acquire segment lock (skip if already locked)
     if !segment.lock_hot_to_cold() {

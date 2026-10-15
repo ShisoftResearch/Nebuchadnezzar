@@ -2730,9 +2730,10 @@ image, not an empty segment; archiving it would persist the damage.",
         })?;
         #[cfg(feature = "abort_profile")]
         let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
+        let needs_transaction_proof = force && self.protection.transaction_pending();
         let (file, written, end, durability, epoch) = {
             let mut state = self.file_state.lock();
-            if force && state.wal.is_some() && state.durability.is_none() {
+            if needs_transaction_proof && state.wal.is_some() && state.durability.is_none() {
                 self.init_durability(&mut state)?;
             }
             if let Some(error) = state.durability.as_ref().and_then(|d| d.failure()) {
