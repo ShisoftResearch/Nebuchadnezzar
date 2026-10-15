@@ -3,12 +3,14 @@ use crate::ram::segs::Segment;
 use rayon::prelude::*;
 use std::env;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 /// Bytes removed from the chunk space charge by the combine cleaner.
+pub static CAS_FULL_PASSES: AtomicU64 = AtomicU64::new(0);
+pub static CAS_RECLAIMED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static CLEANER_RECLAIMED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -259,6 +261,10 @@ impl Cleaner {
             );
             return false;
         }
+        let cas_pass = full && crate::ram::chunk::CAS_ALLOCATING.with(|active| active.get());
+        if cas_pass {
+            CAS_FULL_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg(test)]
         TEST_GC_PROBE.with(|slot| {
             let probe = slot.borrow_mut().take();
@@ -323,6 +329,9 @@ impl Cleaner {
         }
 
         let combined_cleaned_space = combiner_cleaned_space;
+        if cas_pass {
+            CAS_RECLAIMED_BYTES.fetch_add(combiner_cleaned_space as u64, Ordering::Relaxed);
+        }
         CLEANER_RECLAIMED_BYTES.fetch_add(combiner_cleaned_space as u64, Ordering::Relaxed);
         chunk
             .total_space
@@ -387,6 +396,14 @@ pub struct SegmentCandidate {
 
 impl SegmentCandidate {
     pub(crate) fn for_cleaner(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
+        // Avoid excluding prepare/decision syncs for an ineligible segment.
+        if segment.protection.in_progress()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            return None;
+        }
         if !segment.protection.claim_cleaner() {
             return None;
         }

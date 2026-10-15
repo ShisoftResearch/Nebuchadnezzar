@@ -27,6 +27,17 @@ use std::{io, slice};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveOutcome {
+    Archived,
+    AlreadyArchived,
+    Refused,
+    Unconfigured,
+}
+
+pub static ARCHIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+pub static SEAL_RETRIES: AtomicU64 = AtomicU64::new(0);
+
 /// Durability write accounting, for attributing disk write volume.
 ///
 /// Inferring these from segment counts and directory growth proved unreliable
@@ -1942,22 +1953,25 @@ impl Segment {
     // Backup files are opened on demand and closed immediately after use
     pub fn archive(&self) -> Result<bool, io::Error> {
         self.archive_inner(false)
+            .map(|outcome| outcome == ArchiveOutcome::Archived)
     }
 
-    pub(crate) fn archive_rotated(&self) -> Result<bool, io::Error> {
+    pub(crate) fn archive_rotated(&self) -> Result<ArchiveOutcome, io::Error> {
         self.archive_inner(true)
     }
 
-    fn archive_inner(&self, seal_job: bool) -> Result<bool, io::Error> {
+    fn archive_inner(&self, seal_job: bool) -> Result<ArchiveOutcome, io::Error> {
         let Some(_maintenance) = self.protection.maintenance() else {
-            return Ok(false);
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
         };
         if self.protection.head.load(Acquire)
             || (!seal_job && self.protection.seal_pending.load(Acquire))
             || self.is_head_owned()
             || self.protection.transaction_pending()
         {
-            return Ok(false);
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
         }
         // Let in-flight journal writes land before this takes `file_state`.
         //
@@ -2004,7 +2018,8 @@ impl Segment {
                 self.seq_id,
                 self.pending_journal_count()
             );
-            return Ok(false);
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
         }
         let mut state = self.file_state.lock();
         let backup_path_opt = state
@@ -2153,7 +2168,7 @@ impl Segment {
                      blocks. The existing backup is authoritative.",
                     self.id, self.chunk_id, self.seq_id, via
                 );
-                return Ok(false);
+                return Ok(ArchiveOutcome::Unconfigured);
             }
 
             // A segment holding appended bytes must yield at least one entry.
@@ -2447,7 +2462,7 @@ image, not an empty segment; archiving it would persist the damage.",
                         debug!("Deleted WAL file for archived segment {}", self.id);
                     }
 
-                    return Ok(true);
+                    return Ok(ArchiveOutcome::Archived);
                 }
             }
         } else {
@@ -2455,9 +2470,9 @@ image, not an empty segment; archiving it would persist the damage.",
                 "Segment {} has no backup storage configured, cannot archive",
                 self.id
             );
-            return Ok(false);
+            return Ok(ArchiveOutcome::AlreadyArchived);
         }
-        return Ok(false);
+        return Ok(ArchiveOutcome::AlreadyArchived);
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
@@ -2722,12 +2737,9 @@ image, not an empty segment; archiving it would persist the damage.",
     where
         F: FnOnce(&File) -> io::Result<()>,
     {
-        let _job = self.protection.job().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "segment is being cleaned or retired",
-            )
-        })?;
+        let _job = self
+            .protection
+            .sync_job(std::time::Duration::from_secs(10))?;
         #[cfg(feature = "abort_profile")]
         let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
         let needs_transaction_proof = force && self.protection.transaction_pending();

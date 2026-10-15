@@ -426,6 +426,6 @@ fn cleaner_keeps_queued_seal_segment() {
     assert!(super::SegmentCandidate::for_cleaner(&segment).is_none());
     chunk.remove_segment(id);
     assert!(chunk.segs.get(&(id as usize)).is_some());
-    chunk.finish_rotated_head(id);
+    chunk.finish_rotated_head(id, segment.seq_id);
     assert!(super::SegmentCandidate::for_cleaner(&segment).is_some());
 }

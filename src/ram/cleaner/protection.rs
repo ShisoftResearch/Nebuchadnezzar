@@ -26,6 +26,9 @@ impl Protection {
     }
 
     pub fn decide_transaction(&self, txn: &TxnId, receipts: Arc<Vec<Receipt>>) {
+        for receipt in receipts.iter() {
+            receipt.file.request_sync(receipt.offset, receipt.epoch);
+        }
         self.transactions.lock().insert(txn.clone(), Some(receipts));
     }
 
@@ -60,7 +63,7 @@ impl Protection {
     }
 
     pub fn maintenance(&self) -> Option<Maintenance<'_>> {
-        self.claim_cleaner().then_some(Maintenance(self))
+        self.claim_cleaner().then(|| Maintenance(self))
     }
 
     pub fn release_cleaner(&self) {
@@ -73,6 +76,29 @@ impl Protection {
 
     pub fn jobs_drained(&self) -> bool {
         self.activity.load(Ordering::Acquire) & !RETIRED == 0
+    }
+
+    /// A sync can race maintenance. Wait without holding a cell or file lock here.
+    pub fn sync_job(&self, timeout: std::time::Duration) -> std::io::Result<Job<'_>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(job) = self.job() {
+                return Ok(job);
+            }
+            if self.activity.load(Ordering::Acquire) & RETIRED != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "segment retired",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "segment maintenance did not finish",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Jobs share a count. The cleaner excludes their start until it releases.
@@ -99,5 +125,89 @@ pub(crate) struct Maintenance<'a>(&'a Protection);
 impl Drop for Maintenance<'_> {
     fn drop(&mut self) {
         self.0.release_cleaner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decided_uncovered_pin_requests_sync_without_an_ack_waiter() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let mut descriptor = std::fs::File::create(directory.path().join("wal")).unwrap();
+        descriptor.write_all(&[7; 16]).unwrap();
+        let descriptor = Arc::new(descriptor);
+        let file = crate::ram::durability::DurableFile::new(0, 1, 1);
+        file.open(&descriptor, 0, directory.path().to_str().unwrap())
+            .unwrap();
+        file.observe(16);
+        let protection = Protection::default();
+        let txn = crate::server::transactions::test_hlc(9843, 1);
+        protection.retain_transaction(&txn);
+        protection.decide_transaction(
+            &txn,
+            Arc::new(vec![Receipt {
+                file: file.clone(),
+                offset: 16,
+                epoch: 0,
+                descriptor: Some(descriptor),
+            }]),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while protection.transaction_pending() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !protection.transaction_pending(),
+            "a decided pin needs a sync trigger"
+        );
+        assert!(file.covers_receipt(16, 0));
+    }
+
+    #[test]
+    fn refused_maintenance_keeps_the_existing_claim() {
+        let protection = Protection::default();
+        let claim = protection.maintenance().unwrap();
+        assert!(protection.maintenance().is_none());
+        assert!(protection.job().is_none());
+        drop(claim);
+        assert!(protection.job().is_some());
+    }
+
+    #[test]
+    fn sync_waits_for_maintenance_and_has_a_deadline() {
+        let protection = Protection::default();
+        let claim = protection.maintenance().unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let protection = &protection;
+            scope.spawn(move || {
+                sent.send(
+                    protection
+                        .sync_job(std::time::Duration::from_secs(2))
+                        .map(|_| ()),
+                )
+                .unwrap();
+            });
+            assert!(received
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(claim);
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        });
+        let _claim = protection.maintenance().unwrap();
+        assert_eq!(
+            protection
+                .sync_job(std::time::Duration::from_millis(1))
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 }

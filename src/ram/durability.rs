@@ -86,6 +86,7 @@ struct Progress {
     namespaced: bool,
     failed: Option<DurabilityError>,
     running: bool,
+    requested: Option<(u64, u64)>,
     released: u64,
     waiters: Vec<Waiter>,
     #[cfg(test)]
@@ -138,6 +139,7 @@ impl DurableFile {
                 namespaced: false,
                 failed: None,
                 running: false,
+                requested: None,
                 released: 0,
                 waiters: Vec::new(),
                 #[cfg(test)]
@@ -334,6 +336,29 @@ impl DurableFile {
         p.waiters = pending;
     }
 
+    /// Queue a decided prefix even when no acknowledgement waiter remains.
+    pub(crate) fn request_sync(self: &Arc<Self>, offset: u64, epoch: u64) {
+        let mut progress = self.progress.lock();
+        if progress.failed.is_some()
+            || progress.epoch != epoch
+            || (progress.namespaced && progress.durable >= offset)
+        {
+            return;
+        }
+        let Some(descriptor) = progress.file.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let requested = progress
+            .requested
+            .map_or(offset, |(old, _)| old.max(offset));
+        progress.requested = Some((requested, epoch));
+        if !progress.running {
+            progress.running = true;
+            let file = self.clone();
+            POOL.spawn(move || file.run(descriptor));
+        }
+    }
+
     pub async fn wait(
         self: &Arc<Self>,
         offset: u64,
@@ -399,7 +424,12 @@ impl DurableFile {
             let (end, epoch, bytes) = {
                 let mut p = self.progress.lock();
                 p.waiters.retain(|w| !w.sender.is_canceled());
-                if p.failed.is_some() || p.waiters.is_empty() {
+                if p.requested.is_some_and(|(offset, epoch)| {
+                    epoch != p.epoch || (p.namespaced && p.durable >= offset)
+                }) {
+                    p.requested = None;
+                }
+                if p.failed.is_some() || (p.waiters.is_empty() && p.requested.is_none()) {
                     p.running = false;
                     return;
                 }
@@ -408,7 +438,12 @@ impl DurableFile {
                 let end = self.end();
                 #[cfg(test)]
                 let end = if std::env::var_os("NEB_TEST_SPLIT_PREFIXES").is_some() {
-                    p.waiters.iter().map(|w| w.offset).min().unwrap()
+                    p.waiters
+                        .iter()
+                        .map(|w| w.offset)
+                        .chain(p.requested.map(|(offset, _)| offset))
+                        .min()
+                        .unwrap()
                 } else {
                     end
                 };
