@@ -318,6 +318,10 @@ impl SegmentFileManager {
             }
         }
 
+        #[cfg(test)]
+        if crate::ram::segs::power_loss_model::wal_sync_fails(&Some(wal_path.clone())) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         backup_file.sync_all()?;
         Ok(true)
     }

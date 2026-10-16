@@ -514,7 +514,7 @@ async fn abort_profile(base: &str, txns: u64, tasks: u64, abort: bool, operation
                 .write_cell(&mut cell(80_000_000 + t, 0))
                 .expect("seed");
         }
-        server.chunks().sync_all();
+        server.chunks().sync_all().expect("sync the store");
     }
     println!(
         "PROFILE operation={operation} decision={}",

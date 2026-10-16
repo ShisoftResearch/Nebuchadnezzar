@@ -2093,7 +2093,10 @@ impl NebServer {
         // same silent loss the shutdown path had for dynamically-loaded
         // databases. Writes are closed first so nothing lands after its
         // segment is archived.
-        runtime.chunks().sync_all();
+        if let Err(error) = runtime.chunks().sync_all() {
+            // The unsynced tail stays in the WAL files for the next start.
+            error!("unload continues after a failed WAL sync: {error}");
+        }
         runtime.chunks().close_writes();
         runtime.chunks().archive_all();
         // Stop the store's background work EXPLICITLY rather than letting the
@@ -2429,7 +2432,10 @@ impl NebServer {
         // Step 1.5: Ensure all WAL data is synced to disk
         // This is critical after LSM flush to ensure root cells and new pages are persisted
         info!("Syncing WAL for all chunks...");
-        self.chunks().sync_all();
+        if let Err(error) = self.chunks().sync_all() {
+            // The unsynced tail stays in the WAL files for the next start.
+            error!("shutdown continues after a failed WAL sync: {error}");
+        }
         info!("WAL sync completed");
 
         // Step 1.6: Archive all dirty segments to backup storage
@@ -2538,7 +2544,9 @@ impl NebServer {
             }
         }
         for (_, runtime) in &secondary_runtimes {
-            runtime.chunks().sync_all();
+            if let Err(error) = runtime.chunks().sync_all() {
+                error!("shutdown continues after a failed WAL sync: {error}");
+            }
             runtime.chunks().close_writes();
             runtime.chunks().archive_all();
         }

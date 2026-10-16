@@ -1289,7 +1289,7 @@ async fn an_open_bracket_with_its_own_synced_status_cell_commits_at_the_start() 
         "test setup: B must have refused its COMMIT"
     );
     // The group sync takes the appended status cell to disk.
-    cluster.site(B).chunks().sync_all();
+    cluster.site(B).chunks().sync_all().unwrap();
     let a_id = cluster.site(A).server_id;
     super::data_site::silent_peers_for_test().lock().insert(a_id);
     cluster.power_loss_restart(B).await;

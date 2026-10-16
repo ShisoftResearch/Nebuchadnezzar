@@ -115,6 +115,27 @@ pub(crate) mod power_loss_model {
         GROUP_SYNC_PAUSED.load(Ordering::Acquire)
     }
 
+    static FAILED_SYNC_DIRS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Fail every explicit WAL sync of a file under `prefix` with EIO, as a
+    /// disk that refuses the sync.
+    pub(crate) fn fail_wal_syncs_under(prefix: &Path, failing: bool) {
+        let mut dirs = FAILED_SYNC_DIRS.lock();
+        dirs.retain(|existing| existing != prefix);
+        if failing {
+            dirs.push(prefix.to_path_buf());
+        }
+    }
+
+    pub(crate) fn wal_sync_fails(path: &Option<String>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        let dirs = FAILED_SYNC_DIRS.lock();
+        !dirs.is_empty() && dirs.iter().any(|dir| Path::new(path).starts_with(dir))
+    }
+
     /// `len` is the file length that the sync covered.
     pub(crate) fn record_synced_len(path: &Option<String>, len: u64) {
         if !ENABLED.load(Ordering::Acquire) {
@@ -2452,6 +2473,10 @@ image, not an empty segment; archiving it would persist the damage.",
                         }
                     }
 
+                    #[cfg(test)]
+                    if power_loss_model::wal_sync_fails(&Some(tmp_backup_file.clone())) {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
                     file.sync_all()?;
                     drop(file);
 
@@ -2899,6 +2924,9 @@ image, not an empty segment; archiving it would persist the damage.",
                 return Ok(());
             }
             let Some(file) = &state.wal else {
+                if drain {
+                    return Self::sync_unopened_wal(&state, self.chunk_id, self.id, self.seq_id);
+                }
                 return Ok(());
             };
             let file = file.clone();
@@ -2929,7 +2957,9 @@ image, not an empty segment; archiving it would persist the damage.",
         // preceded it; later appends keep their own dirty bytes or force their own sync.
         let sync_started = std::time::Instant::now();
         #[cfg(test)]
-        let result = if durability.as_ref().is_some_and(|d| d.test_fail_sync()) {
+        let result = if durability.as_ref().is_some_and(|d| d.test_fail_sync())
+            || power_loss_model::wal_sync_fails(&model_path)
+        {
             Err(io::Error::from_raw_os_error(libc::EIO))
         } else {
             sync(&file)
@@ -2962,6 +2992,36 @@ image, not an empty segment; archiving it would persist the damage.",
         } else if !force {
             BACKGROUND_WAL_SYNCS.fetch_add(1, Relaxed);
         }
+        Ok(())
+    }
+
+    /// Sync the WAL file of a segment that has not opened it: a segment that
+    /// recovery left with its WAL, as a head or after a failed archive. A
+    /// process crash can leave its bytes in the page cache only, and a start
+    /// answers `Committed` from them once `sync_all` returns (review finding
+    /// 6, TLA+ F1).
+    fn sync_unopened_wal(
+        state: &SegmentFileState,
+        chunk_id: usize,
+        id: u64,
+        seq_id: u64,
+    ) -> io::Result<()> {
+        let Some(path) = state.manager.wal_path(chunk_id, id, seq_id) else {
+            return Ok(());
+        };
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        if power_loss_model::wal_sync_fails(&Some(path.clone())) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        file.sync_all()?;
+        #[cfg(test)]
+        power_loss_model::record_synced(&Some(path), &file);
+        DRAIN_WAL_SYNCS.fetch_add(1, Relaxed);
         Ok(())
     }
 

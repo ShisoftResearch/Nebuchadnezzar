@@ -4676,7 +4676,7 @@ mod tests {
                     );
                     // This variant checks reuse after durability, not the
                     // new deferred-release window (covered separately).
-                    chunks.sync_all();
+                    chunks.sync_all().unwrap();
                 }
                 "expire" => {
                     let expired = crate::ram::chunk::expire_transaction_leases(
@@ -4715,7 +4715,7 @@ mod tests {
                     "an ordinary write must never land behind an open BEGIN"
                 ),
             }
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema.clone());
@@ -4888,7 +4888,7 @@ mod tests {
                 other => panic!("unknown variant {other}"),
             }
             drop(crate::ram::chunk::take_transactional_segments());
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema.clone());
@@ -5008,6 +5008,144 @@ mod tests {
         assert!(
             started.is_err(),
             "a start with a status cell that does not decode must stop"
+        );
+    }
+
+    /// Review finding 6: `sync_all` reports a segment it could not sync. The
+    /// start calls it before it registers recovered status cells as synced,
+    /// and stops on that error.
+    #[test]
+    fn sync_all_reports_a_segment_it_cannot_sync() {
+        let store = BracketCleanerStore::new(8942, "sync_all_fails");
+        let wal_dir = store.wal_dir.path().to_path_buf();
+        let chunks = store.open(false);
+        // The group syncer must not cover the write first.
+        crate::ram::segs::power_loss_model::pause_group_sync(true);
+        chunks
+            .write_cell(&mut store.cell(&Id::allocated(0, 0, 1), 128))
+            .unwrap();
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal_dir, true);
+        let synced = chunks.sync_all();
+        crate::ram::segs::power_loss_model::pause_group_sync(false);
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal_dir, false);
+        chunks.stop_background();
+        assert!(synced.is_err(), "a failed segment sync must be reported");
+    }
+
+    /// Review finding 6: a start whose syncs fail stops. A start turns a
+    /// recovered WAL into a synced backup, or syncs the WAL it keeps; when
+    /// both fail, the recovered records are not on disk.
+    #[test]
+    fn a_start_whose_sync_fails_does_not_come_up() {
+        let store = BracketCleanerStore::new(8944, "start_sync_fails");
+        let wal_dir = store.wal_dir.path().to_path_buf();
+        {
+            let chunks = store.open(false);
+            chunks
+                .write_cell(&mut store.cell(&Id::allocated(0, 0, 1), 128))
+                .unwrap();
+            chunks.sync_all().unwrap();
+            chunks.stop_background();
+        }
+        let backup_dir = store.backup_dir.path().to_path_buf();
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal_dir, true);
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup_dir, true);
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.open(true)));
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal_dir, false);
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup_dir, false);
+        if let Ok(chunks) = &started {
+            chunks.stop_background();
+        }
+        assert!(started.is_err(), "a start whose syncs fail must stop");
+    }
+
+    /// Review finding 6: a process crash leaves a COMMIT and a status cell in
+    /// the page cache only. The start must sync them before it registers the
+    /// status cell as synced (TLA+ F1): a power loss after the start must not
+    /// take a status cell that already answered `Committed`.
+    #[test]
+    fn a_recovered_status_cell_is_on_disk_before_it_is_registered_synced() {
+        recovered_status_cell_on_disk(false);
+    }
+
+    /// As above, and the start cannot turn the WAL into a backup: the start
+    /// must sync the WAL it keeps.
+    #[test]
+    fn a_recovered_status_cell_is_on_disk_when_the_start_cannot_archive() {
+        recovered_status_cell_on_disk(true);
+    }
+
+    fn recovered_status_cell_on_disk(archive_fails: bool) {
+        crate::ram::segs::power_loss_model::enable();
+        let store = BracketCleanerStore::new(8941, "status_cell_page_cache");
+        let wal_dir = store.wal_dir.path().to_path_buf();
+        let txn = crate::server::transactions::test_hlc(8941, 1);
+        // From here only explicit syncs reach the disk.
+        crate::ram::segs::power_loss_model::pause_group_sync(true);
+        crate::ram::durability::pause_receipt_syncs_under(&wal_dir, true);
+        {
+            let chunks = store.open(false);
+            {
+                let _scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+                    txn.clone(),
+                    vec![1, 2],
+                );
+                chunks
+                    .write_cell(&mut store.cell(&Id::allocated(0, 0, 1), 128))
+                    .unwrap();
+                let chunk = &chunks.list[0];
+                let id = chunk.free_status_id(&txn).unwrap();
+                let mut cell = crate::ram::txn_status::status_cell(&txn, &id, &[1, 2]);
+                chunk.write_status_cell(&mut cell).unwrap();
+            }
+            drop(crate::ram::chunk::take_transactional_segments());
+            chunks.commit_transaction_brackets(&txn, false).unwrap();
+            // A process crash: no sync.
+            chunks.stop_background();
+        }
+        {
+            let before = BracketCleanerStore::new(8941, "status_cell_page_cache");
+            crate::ram::segs::power_loss_model::copy_store_as_after_power_loss(
+                store.wal_dir.path(),
+                store.backup_dir.path(),
+                before.wal_dir.path(),
+                before.backup_dir.path(),
+            )
+            .unwrap();
+            let cut = before.open(true);
+            let durable = cut.find_status_cell(&txn).is_some();
+            cut.stop_background();
+            assert!(
+                !durable,
+                "test setup: the status cell must be in the page cache only before the start"
+            );
+        }
+        let backup_dir = store.backup_dir.path().to_path_buf();
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup_dir, archive_fails);
+        let recovered = store.open(true);
+        crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup_dir, false);
+        let entry = recovered
+            .txn_status()
+            .get(&txn)
+            .expect("test setup: recovery registers the status cell");
+        assert!(entry.self_synced);
+        recovered.stop_background();
+        let image = BracketCleanerStore::new(8941, "status_cell_page_cache");
+        crate::ram::segs::power_loss_model::copy_store_as_after_power_loss(
+            store.wal_dir.path(),
+            store.backup_dir.path(),
+            image.wal_dir.path(),
+            image.backup_dir.path(),
+        )
+        .unwrap();
+        crate::ram::segs::power_loss_model::pause_group_sync(false);
+        crate::ram::durability::pause_receipt_syncs_under(&wal_dir, false);
+        let after = image.open(true);
+        let kept = after.find_status_cell(&txn).is_some();
+        after.stop_background();
+        assert!(
+            kept,
+            "a status cell registered as synced must survive a power loss after the start"
         );
     }
 
@@ -5184,7 +5322,7 @@ mod tests {
             for id in [&small, &sized, &spill].into_iter().chain(fillers.iter()) {
                 assert!(chunks.read_cell(id).is_ok(), "{id:?} before restart");
             }
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let chunks = store.open(true);
         for id in [&small, &sized, &spill].into_iter().chain(fillers.iter()) {
@@ -5281,7 +5419,7 @@ mod tests {
             crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
             Ok(1)
         );
-        chunks.sync_all();
+        chunks.sync_all().unwrap();
         let point1 = store.snapshot();
         // Reuse: make the rewound head the only live head in the pool, so the
         // next ordinary write lands in it whatever this thread's affinity.
@@ -5314,7 +5452,7 @@ mod tests {
             )
         });
         chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
-        chunks.sync_all();
+        chunks.sync_all().unwrap();
         let point2 = store.snapshot();
         drop(chunks);
 
@@ -5362,7 +5500,7 @@ mod tests {
                 Ok(1)
             );
         }
-        chunks.sync_all();
+        chunks.sync_all().unwrap();
         assert!(segment_ids.len() <= 2);
         assert!(chunks.list[0].seg_count() <= 2);
         for n in 0..200u64 {
@@ -5384,7 +5522,7 @@ mod tests {
             chunks.write_cell(&mut store.cell(&aborted, 128)).unwrap();
         }
         let segment = segment_of(&chunks, &aborted);
-        chunks.sync_all();
+        chunks.sync_all().unwrap();
         // Model loss of the unsynced padding with the durable pre-abort WAL.
         let lost_padding = store.snapshot();
         let pause = crate::ram::segs::PauseRewindSync::new(&segment);
@@ -5437,7 +5575,7 @@ mod tests {
         }
         chunks.write_cell(&mut store.cell(&after, 128)).unwrap();
         assert_eq!(segment_of(&chunks, &after).id, segment.id);
-        chunks.sync_all();
+        chunks.sync_all().unwrap();
         drop(pause);
         let reused = store.snapshot();
         for (snapshot, has_after) in [
@@ -5513,7 +5651,7 @@ mod tests {
             let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
             chunks.write_cell(&mut store.cell(&in_flight, 128)).unwrap();
             open_seg = segment_of(&chunks, &in_flight).seq_id;
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
             // Crash: no decision ever arrives.
         }
         {
@@ -5525,7 +5663,7 @@ mod tests {
                 open_seg,
                 "a recovered segment holding an open BEGIN must never take a write"
             );
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let chunks = store.open(true);
         assert!(chunks.read_cell(&in_flight).is_err());
@@ -5548,10 +5686,10 @@ mod tests {
         {
             let chunks = store.open(false);
             chunks.write_cell(&mut store.cell(&victim, 128)).unwrap();
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
             let _scope = crate::ram::chunk::TransactionScope::enter(txn.clone());
             chunks.remove_cell(&victim).unwrap();
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
             // Crash: no decision ever arrives.
         }
         {
@@ -5574,7 +5712,7 @@ mod tests {
                 crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
             eprintln!("dropped_open_delete: collected {collected}");
             assert!(chunks.read_cell(&victim).is_ok());
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let chunks = store.open(true);
         assert!(
@@ -5659,7 +5797,7 @@ mod tests {
                 second_written = result.is_ok();
                 drop(in_flight);
             }
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
             // Crash: nobody decides.
         }
         let chunks = store.open(true);
@@ -5713,7 +5851,7 @@ mod tests {
                 crate::ram::chunk::rewind_transaction_writes(&txn, &chunks.address_range()),
                 Ok(1)
             );
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
             // The head is back in the pool; an ordinary write follows (which
             // head it picks is the pool's affinity, not this test's business).
             assert!(!part.is_head_owned() && !part.bracket_is_open());
@@ -5737,7 +5875,7 @@ mod tests {
                 );
             }
             assert!(chunks.read_cell(&after).is_ok());
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
         }
         let chunks = store.open(true);
         for id in &gone {
@@ -5800,7 +5938,7 @@ mod tests {
             };
             chunks.write_cell(&mut durable).unwrap();
             chunks.write_cell(&mut torn).unwrap();
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
 
             let chunk = &chunks.list[0];
             let segment = chunk
@@ -5888,7 +6026,7 @@ mod tests {
             };
             chunks.write_cell(&mut durable).unwrap();
             chunks.write_cell(&mut scribbled).unwrap();
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
 
             let chunk = &chunks.list[0];
             let segment = chunk
@@ -5976,7 +6114,7 @@ mod tests {
 
             chunks.write_cell(&mut first_cell).unwrap();
             chunks.write_cell(&mut second_cell).unwrap();
-            chunks.sync_all();
+            chunks.sync_all().unwrap();
 
             let chunk = &chunks.list[0];
             let blob_segment = chunk

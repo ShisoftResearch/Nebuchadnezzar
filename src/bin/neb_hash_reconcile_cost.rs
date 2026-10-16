@@ -280,7 +280,7 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
         );
         if std::env::var("NEB_HRC_STOP").as_deref() == Ok("kill") {
             // Preserve the fixture's cell count without flushing ranged trees.
-            server.chunks().sync_all();
+            server.chunks().sync_all().expect("sync the store");
             println!("KILL_READY cells={cells}");
             use std::io::Write;
             std::io::stdout().flush().unwrap();

@@ -3620,7 +3620,7 @@ mod tests {
         }
         // Both outcomes release the transaction's protection of the source.
         assert_eq!(source.references_count(), 0);
-        runtime.chunks().sync_all();
+        runtime.chunks().sync_all().unwrap();
         server.shutdown().await;
         let recovered = NebServer::new_from_opts(
             &opts,

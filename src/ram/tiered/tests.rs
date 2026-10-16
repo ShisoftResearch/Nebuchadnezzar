@@ -1612,7 +1612,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
         .await;
 
-    analytics.chunks().sync_all();
+    analytics.chunks().sync_all().unwrap();
     analytics.chunks().archive_all();
     assert!(server.unload_database_runtime("analytics").await);
     wait_for_shared_counter_alignment(&manager, &[&server.chunks()], 750).await;

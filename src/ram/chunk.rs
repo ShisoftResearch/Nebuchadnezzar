@@ -977,6 +977,20 @@ pub fn expire_transaction_leases(
     expired
 }
 
+/// `Chunks::sync_all` could not sync every segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncAllFailed {
+    pub segments: usize,
+}
+
+impl std::fmt::Display for SyncAllFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} segment(s) could not be synced", self.segments)
+    }
+}
+
+impl std::error::Error for SyncAllFailed {}
+
 /// The manifest of a transaction's brackets: every chunk it wrote and the
 /// seq id of the segment holding that chunk's bracket.
 ///
@@ -5666,7 +5680,15 @@ impl Chunks {
                     // be page cache that a power loss still drops, and a
                     // `Committed` answer must come from synced records only
                     // (TLA+ F1).
-                    chunks_arc.sync_all();
+                    if let Err(error) = chunks_arc.sync_all() {
+                        error!(
+                            "the recovered store cannot be synced: {}. REFUSING TO START: a \
+                             recovered status cell would answer `Committed` from a record \
+                             that is not on disk.",
+                            error
+                        );
+                        panic!("cannot sync the recovered store, refusing to start: {error}");
+                    }
                     chunks_arc.remember_recovered_brackets(brackets);
                 }
                 Err(e) => {
@@ -5903,7 +5925,10 @@ impl Chunks {
     }
 
     /// Sync all buffered WAL data to disk across all chunks.
-    pub fn sync_all(&self) {
+    /// Returns how many segments could not be synced: their most recent
+    /// writes are not durable, and a caller that promises durability must
+    /// stop (review finding 6).
+    pub fn sync_all(&self) -> Result<(), SyncAllFailed> {
         info!("Syncing WAL for all chunks...");
         let mut failures = 0usize;
         for chunk in &self.list {
@@ -5925,8 +5950,10 @@ impl Chunks {
                 "sync_all left {} segment(s) unsynced; their most recent writes are NOT durable",
                 failures
             );
+            Err(SyncAllFailed { segments: failures })
         } else {
             info!("All WAL data synced to disk.");
+            Ok(())
         }
     }
 
