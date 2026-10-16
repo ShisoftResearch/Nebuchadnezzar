@@ -5206,17 +5206,6 @@ pub struct Chunks {
     /// Committed transactions a peer, or this store's next recovery, may
     /// still need the evidence of. See `crate::ram::evidence`.
     evidence: crate::ram::evidence::DecisionEvidence,
-    /// The participant fences this site promised (D29).
-    fences: crate::ram::fence::FenceLog,
-    /// In-doubt transactions that wait for their participants' answers. The
-    /// background resolver and the operator tool take one from here under
-    /// this lock, so only one of them resolves it.
-    unresolved: Mutex<
-        std::collections::BTreeMap<
-            crate::server::transactions::TxnId,
-            crate::ram::recovery::InDoubtBracket,
-        >,
-    >,
     /// Set when the owning server goes away, so the background sweeper exits
     /// without waiting for the store itself to be dropped. The store can
     /// outlive its server -- an RPC service still holds it -- and a thread that
@@ -5342,32 +5331,6 @@ impl Chunks {
     /// Whether this store committed `txn` and keeps the evidence of it.
     pub fn holds_commit_evidence(&self, txn: &crate::server::transactions::TxnId) -> bool {
         self.evidence.holds_commit(txn)
-    }
-
-    /// The participant fences of this store.
-    pub fn fences(&self) -> &crate::ram::fence::FenceLog {
-        &self.fences
-    }
-
-    /// Keep an in-doubt transaction that waits for its participants.
-    pub fn park_unresolved(&self, bracket: crate::ram::recovery::InDoubtBracket) {
-        self.unresolved.lock().insert(bracket.txn.clone(), bracket);
-    }
-
-    pub fn take_unresolved(
-        &self,
-        txn: &crate::server::transactions::TxnId,
-    ) -> Option<crate::ram::recovery::InDoubtBracket> {
-        self.unresolved.lock().remove(txn)
-    }
-
-    /// The parked transactions and their participant sets.
-    pub fn unresolved_transactions(&self) -> Vec<(crate::server::transactions::TxnId, Vec<u64>)> {
-        self.unresolved
-            .lock()
-            .iter()
-            .map(|(txn, bracket)| (txn.clone(), bracket.participants.clone()))
-            .collect()
     }
 
     /// Take the transactions recovery could not decide, for resolution.
@@ -5574,8 +5537,6 @@ impl Chunks {
             ),
             recovered_brackets: Mutex::new(crate::ram::recovery::RecoveredBrackets::empty()),
             evidence: crate::ram::evidence::DecisionEvidence::new(),
-            fences: crate::ram::fence::FenceLog::new(wal_storage.as_deref()),
-            unresolved: Mutex::new(std::collections::BTreeMap::new()),
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,
@@ -5717,25 +5678,6 @@ impl Chunks {
                 }
             }
         }
-
-        // The fences of the last run that still matter: those of the
-        // transactions in doubt now. A log this build cannot read stops the
-        // start, like any store file that does not decode.
-        let previous = chunks_arc
-            .fences
-            .load(enable_recovery)
-            .unwrap_or_else(|error| panic!("cannot read the fence log, refusing to start: {error}"));
-        let in_doubt: std::collections::BTreeSet<_> = chunks_arc
-            .recovered_brackets
-            .lock()
-            .in_doubt
-            .iter()
-            .map(|bracket| bracket.txn.clone())
-            .collect();
-        chunks_arc
-            .fences
-            .reset(previous.intersection(&in_doubt).cloned().collect())
-            .unwrap_or_else(|error| panic!("cannot write the fence log, refusing to start: {error}"));
 
         chunks_arc
     }

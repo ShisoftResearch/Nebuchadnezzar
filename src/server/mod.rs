@@ -3365,22 +3365,14 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
     res
 }
 
-/// Cooperative termination, recovery side: the participant fence (D29).
+/// Cooperative termination, recovery side.
 ///
-/// A store that restarts mid-transaction finds brackets with no COMMIT. Only
-/// facts on disk count now. Each BEGIN names the participant set:
-///
-/// * A bracket of this site alone is aborted: no other site can hold a
-///   COMMIT of it, and this one holds none.
-/// * Any other bracket runs the participant fence with the other
-///   participants (`DataManager::decide_in_doubt`): one `Committed` means
-///   commit; abort only when every participant is fenced, aborted, or never
-///   held it; anything else means wait, with no time limit. This start
-///   waits for `resolve_startup_wait`, then a background task keeps asking,
-///   so a participant that is down does not stop the start.
-///
-/// A commit writes a synced carrier, installs the cells, and rewrites them as
-/// synced plain entries before the transaction stops resolving.
+/// Recovery asks every group member. One committed outcome decides the
+/// transaction: the resolver writes a synced carrier, installs the cells,
+/// and rewrites them as synced plain entries before the transaction stops
+/// resolving. It discards a bracket only when every other member reports an
+/// aborted outcome. Unknown or unreachable peers leave the bracket pinned for
+/// later resolution.
 ///
 /// This runs before the cleaner resumes. Recovery holds every part of an
 /// in-doubt bracket in `Protection` (`BracketLedger::settle`): its cells are
@@ -3389,191 +3381,184 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
 /// until it is settled (D28).
 async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
     let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
-    let chunks = &database_runtime.chunks;
     let me = database_runtime.rpc.server_id;
-    let site = match (database_runtime.txn_manager(), database_runtime.data_site()) {
-        (Some(_), Some(site)) => site,
-        _ => {
-            // No peer can ask this database anything, so nothing waits to
-            // settle.
-            for (txn, segments) in chunks.evidence().release_all() {
-                chunks.settle_transaction(&txn, &segments);
-            }
-            if in_doubt.is_empty() {
-                return;
-            }
-            warn!(
-                "{} transaction(s) are in doubt after recovery but this database runs no \
-                 transaction service, so there is nothing to ask with; all remain pinned",
-                in_doubt.len()
-            );
-            for bracket in in_doubt {
-                chunks.park_unresolved(bracket);
-            }
+    let Some(txn_manager) = database_runtime.txn_manager().cloned() else {
+        // No peer can ask this database anything, so nothing waits to settle.
+        let chunks = &database_runtime.chunks;
+        for (txn, segments) in chunks.evidence().release_all() {
+            chunks.settle_transaction(&txn, &segments);
+        }
+        if in_doubt.is_empty() {
             return;
         }
+        warn!(
+            "{} transaction(s) are in doubt after recovery but this database runs no transaction \
+             service, so there is nothing to ask with; all remain pinned",
+            in_doubt.len()
+        );
+        for bracket in &in_doubt {
+            warn!(
+                "transaction {:?} remains pinned without a transaction service",
+                bracket.txn
+            );
+        }
+        database_runtime
+            .chunks
+            .recovered_brackets
+            .lock()
+            .in_doubt
+            .extend(in_doubt);
+        return;
     };
     if in_doubt.is_empty() {
         return;
     }
-    let mut waiting = Vec::new();
-    for bracket in in_doubt {
-        if bracket.participants.iter().all(|participant| *participant == me) {
-            discard_in_doubt(
-                chunks,
-                &bracket,
-                "a transaction of this site alone, with no COMMIT here",
-            );
-        } else {
-            waiting.push(bracket);
-        }
-    }
-    if waiting.is_empty() {
-        return;
-    }
-    info!(
-        "running the participant fence for {} transaction(s) left in doubt by recovery",
-        waiting.len()
-    );
-    let deadline = std::time::Instant::now() + resolve_startup_wait();
+
+    // WAIT for the membership to know its peers before believing it has none.
+    //
+    // Not defensive padding -- this is the bug the first version had. A node
+    // that restarts resolves before its membership view is populated, reads a
+    // roster of just itself, concludes "no peer reports it committed", and
+    // discards a committed transaction's half. It reproduced roughly one run
+    // in four, logging `asking 0 peer(s)`.
+    //
+    // A successful read is NOT enough on its own: membership answers happily
+    // while it is still learning, so the roster has to be given time to grow.
+    // The cost falls only on a store that crashed mid-transaction, which is
+    // the case that can afford it.
+    let settle = resolve_membership_settle();
+    let settle_deadline = std::time::Instant::now() + settle;
+    let mut roster: Vec<u64> = Vec::new();
     loop {
-        waiting = resolve_round(database_runtime, &site, waiting).await;
-        if waiting.is_empty() || std::time::Instant::now() >= deadline {
+        match database_runtime.consh.membership().all_members(false).await {
+            Ok((members, _)) => {
+                let seen: Vec<u64> = members
+                    .into_iter()
+                    .map(|member| member.id)
+                    .filter(|id| *id != me)
+                    .collect();
+                if seen.len() > roster.len() {
+                    roster = seen;
+                }
+            }
+            Err(error) => debug!("membership not readable yet while resolving: {:?}", error),
+        }
+        // One peer is enough to ask; a bigger roster only matters for
+        // deciding that abort is safe, and the answer loop below re-checks.
+        if !roster.is_empty() || std::time::Instant::now() >= settle_deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    if waiting.is_empty() {
+    if roster.is_empty() {
+        warn!(
+            "{} transaction(s) are in doubt after recovery and this group reports no other \
+             member after {:?}; all remain pinned",
+            in_doubt.len(),
+            settle
+        );
+        for bracket in &in_doubt {
+            warn!(
+                "transaction {:?} remains pinned without a peer",
+                bracket.txn
+            );
+        }
+        database_runtime
+            .chunks
+            .recovered_brackets
+            .lock()
+            .in_doubt
+            .extend(in_doubt);
         return;
     }
-    for bracket in &waiting {
-        error!(
-            "transaction {:?} stays in doubt: its participants {:?} do not decide it within \
-             {:?}. It is NOT presumed abort: its parts stay pinned, and a background task keeps \
-             asking. If a participant is lost for good, resolve it with \
-             `force_resolve_in_doubt`.",
-            bracket.txn,
-            bracket.participants,
-            resolve_startup_wait()
-        );
-    }
-    for bracket in waiting {
-        chunks.park_unresolved(bracket);
-    }
-    let runtime = database_runtime.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if runtime.chunks.is_background_stopped() {
-                return;
-            }
-            let parked = runtime.chunks.unresolved_transactions();
-            if parked.is_empty() {
-                // Resolved here or by the operator tool.
-                return;
-            }
-            for (txn, participants) in parked {
-                let peers: Vec<u64> = participants
-                    .iter()
-                    .copied()
-                    .filter(|peer| *peer != runtime.rpc.server_id)
-                    .collect();
-                let commit = match site.decide_in_doubt(&txn, &peers).await {
-                    transactions::data_site::InDoubtDecision::Commit => true,
-                    transactions::data_site::InDoubtDecision::Abort => false,
-                    transactions::data_site::InDoubtDecision::Wait => continue,
+    info!(
+        "asking {} peer(s) about {} transaction(s) left in doubt by recovery",
+        roster.len(),
+        in_doubt.len()
+    );
+
+    // ABORT ONLY WHEN EVERY PEER HAS ACTUALLY ANSWERED.
+    //
+    // A peer that cannot be reached has not said "not committed" -- it has
+    // said nothing, and treating silence as a vote is what tears a
+    // transaction. So an unanswered roster member means retry, up to a
+    // deadline, and the give-up is loud and names the transaction.
+    let answer_deadline = std::time::Instant::now() + resolve_answer_timeout();
+    let mut unresolved: Vec<crate::ram::recovery::InDoubtBracket> = in_doubt;
+    loop {
+        let mut still_waiting = Vec::new();
+        for bracket in unresolved {
+            let mut committed = false;
+            let mut answered = 0usize;
+            for peer in &roster {
+                let Ok(site) = txn_manager.data_site_for(*peer).await else {
+                    continue;
                 };
-                // Taken only now, so the operator tool finds the bracket
-                // while the question is out.
-                if let Some(bracket) = runtime.chunks.take_unresolved(&txn) {
-                    finish_in_doubt_bracket(&runtime, bracket, commit);
+                match site.txn_status(bracket.txn.clone()).await {
+                    Ok(response) => {
+                        if response.payload == transactions::TxnOutcome::Aborted {
+                            answered += 1;
+                        }
+                        if response.payload == transactions::TxnOutcome::Committed {
+                            committed = true;
+                            break;
+                        }
+                    }
+                    Err(error) => debug!(
+                        "peer {} did not answer about {:?}: {:?}",
+                        peer, bracket.txn, error
+                    ),
                 }
             }
-        }
-    });
-}
-
-/// Run the participant fence once for each bracket, and resolve the ones it
-/// decides. Returns the brackets that still wait.
-async fn resolve_round(
-    database_runtime: &Arc<DatabaseRuntime>,
-    site: &Arc<transactions::data_site::DataManager>,
-    brackets: Vec<crate::ram::recovery::InDoubtBracket>,
-) -> Vec<crate::ram::recovery::InDoubtBracket> {
-    let me = database_runtime.rpc.server_id;
-    let mut waiting = Vec::new();
-    for bracket in brackets {
-        let peers: Vec<u64> = bracket
-            .participants
-            .iter()
-            .copied()
-            .filter(|peer| *peer != me)
-            .collect();
-        match site.decide_in_doubt(&bracket.txn, &peers).await {
-            transactions::data_site::InDoubtDecision::Commit => {
-                if let Some(unresolved) =
-                    finish_in_doubt_bracket_or_keep(database_runtime, bracket, true)
-                {
-                    waiting.push(unresolved);
+            if committed {
+                if !apply_resolved_commit(database_runtime, &bracket) {
+                    still_waiting.push(bracket);
                 }
+                continue;
             }
-            transactions::data_site::InDoubtDecision::Abort => {
-                finish_in_doubt_bracket_or_keep(database_runtime, bracket, false);
+            if answered == roster.len() {
+                discard_in_doubt(&database_runtime.chunks, &bracket, "every peer returned a final abort");
+                continue;
             }
-            transactions::data_site::InDoubtDecision::Wait => waiting.push(bracket),
+            still_waiting.push(bracket);
         }
+        unresolved = still_waiting;
+        if unresolved.is_empty() || std::time::Instant::now() >= answer_deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    waiting
-}
-
-/// Resolve one in-doubt bracket: commit it or discard it. Returns the
-/// bracket if it stays in doubt, because the commit could not be made
-/// durable.
-fn finish_in_doubt_bracket_or_keep(
-    database_runtime: &Arc<DatabaseRuntime>,
-    bracket: crate::ram::recovery::InDoubtBracket,
-    commit: bool,
-) -> Option<crate::ram::recovery::InDoubtBracket> {
-    if commit {
-        if !apply_resolved_commit(database_runtime, &bracket) {
-            return Some(bracket);
-        }
-    } else {
-        discard_in_doubt(
-            &database_runtime.chunks,
-            &bracket,
-            "every participant is fenced, aborted, or never held it",
+    for bracket in &unresolved {
+        error!(
+            "transaction {:?} remains in doubt and pinned after {:?}",
+            bracket.txn,
+            resolve_answer_timeout()
         );
     }
-    database_runtime.chunks.fences().forget(&bracket.txn);
-    None
+    database_runtime
+        .chunks
+        .recovered_brackets
+        .lock()
+        .in_doubt
+        .extend(unresolved);
 }
 
-/// `finish_in_doubt_bracket_or_keep`, for the operator tool and the
-/// background task. A bracket that stays in doubt is parked again. Returns
-/// whether it was resolved.
-pub(crate) fn finish_in_doubt_bracket(
-    database_runtime: &Arc<DatabaseRuntime>,
-    bracket: crate::ram::recovery::InDoubtBracket,
-    commit: bool,
-) -> bool {
-    match finish_in_doubt_bracket_or_keep(database_runtime, bracket, commit) {
-        None => true,
-        Some(bracket) => {
-            database_runtime.chunks.park_unresolved(bracket);
-            false
-        }
-    }
-}
-
-/// How long a start waits for the participants of its in-doubt
-/// transactions before it leaves them to the background task.
-fn resolve_startup_wait() -> std::time::Duration {
-    std::env::var("NEB_RESOLVE_STARTUP_WAIT_SECS")
+/// How long to let the membership roster grow before believing it is final.
+fn resolve_membership_settle() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_SETTLE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(10))
+}
+
+/// How long to keep asking peers that have not answered.
+fn resolve_answer_timeout() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_ANSWER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
 /// Drop an in-doubt bracket: its cells were never installed, and its parts

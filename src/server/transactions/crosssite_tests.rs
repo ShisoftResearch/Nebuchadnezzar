@@ -314,17 +314,7 @@ async fn torn_transaction(
     client: &Arc<AsyncClient>,
     base_score: u64,
 ) -> (TxnId, Vec<Id>, Vec<u64>) {
-    torn_transaction_seq(cluster, client, base_score, 1).await
-}
-
-/// `torn_transaction` on the cells of `seq`.
-async fn torn_transaction_seq(
-    cluster: &Cluster,
-    client: &Arc<AsyncClient>,
-    base_score: u64,
-    seq: u64,
-) -> (TxnId, Vec<Id>, Vec<u64>) {
-    let (txn, tid, ids, scores) = prepared_transaction(cluster, client, base_score, seq).await;
+    let (txn, tid, ids, scores) = prepared_transaction(cluster, client, base_score, 1).await;
     let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
@@ -599,7 +589,7 @@ async fn resolve_live(cluster: &Cluster, tid: &TxnId) {
         .data_site()
         .expect("site A runs a data site");
     for _ in 0..40 {
-        site.sweep_idle_transactions(Duration::ZERO)
+        site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
             .await;
         if crate::ram::chunk::transaction_lease_count(
             tid,
@@ -956,7 +946,7 @@ async fn a_commit_refused_on_one_site_does_not_tear_the_transaction() {
 
     // B's sweeper finishes the decided transaction.
     let site = cluster.site(B).database_runtime().data_site().unwrap();
-    site.sweep_idle_transactions(Duration::ZERO)
+    site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
         .await;
     assert_eq!(
         cluster.site(B).chunks().durable_txn_status(&tid),
@@ -1002,7 +992,7 @@ async fn a_peer_with_a_refused_commit_still_answers_committed() {
 
     resolve_live(&cluster, &tid).await;
     let site = cluster.site(B).database_runtime().data_site().unwrap();
-    site.sweep_idle_transactions(Duration::ZERO)
+    site.sweep_idle_transactions(Duration::ZERO, Duration::from_secs(300))
         .await;
     for index in [A, B] {
         assert_eq!(
@@ -1143,7 +1133,7 @@ async fn a_member_without_a_data_site_does_not_stall_the_release() {
 /// cannot drop them as dead. At the next restart A resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_resolution_keeps_the_in_doubt_parts_through_the_cleaner_and_a_restart() {
-    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "3");
+    std::env::set_var("NEB_TERMINATION_ANSWER_SECS", "3");
     let (mut cluster, client) = Cluster::start("crosssite_t3_failed").await;
     let (tid, ids, scores) = torn_transaction(&cluster, &client, 14_000).await;
     drop(client);
@@ -1473,270 +1463,5 @@ async fn a_down_participant_pins_only_its_own_transactions() {
         held_for(&cluster, B, &tid),
         "only the unsettled transaction pins segments"
     );
-    cluster.shutdown().await;
-}
-
-fn data_site(cluster: &Cluster, index: usize) -> Arc<super::data_site::DataManager> {
-    cluster
-        .site(index)
-        .database_runtime()
-        .data_site()
-        .expect("the site runs a data site")
-}
-
-/// Whether site `index` still has `tid` in doubt: live with leases, or
-/// parked after a restart.
-fn in_doubt_on(cluster: &Cluster, index: usize, tid: &TxnId) -> bool {
-    let chunks = cluster.site(index).chunks();
-    crate::ram::chunk::transaction_lease_count(tid, &chunks.address_range()) > 0
-        || chunks
-            .unresolved_transactions()
-            .iter()
-            .any(|(txn, _)| txn == tid)
-}
-
-async fn wait_until(what: &str, seconds: u64, mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
-    while !condition() {
-        assert!(std::time::Instant::now() < deadline, "{} did not happen", what);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// F1 (C3): a participant that is down makes the others wait. They never
-/// presume abort, live or after a restart, and the transaction commits
-/// everywhere once the participant is back.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_down_participant_keeps_the_others_waiting_without_a_tear() {
-    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
-    let (mut cluster, client) = Cluster::start("crosssite_f1_down").await;
-    let (tid, ids, scores) = torn_transaction(&cluster, &client, 21_000).await;
-    drop(client);
-    cluster.stop(B).await;
-
-    for _ in 0..5 {
-        data_site(&cluster, A)
-            .sweep_idle_transactions(Duration::ZERO)
-            .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(in_doubt_on(&cluster, A, &tid), "A must wait, live");
-    assert_eq!(
-        cluster.site(A).chunks().durable_txn_status(&tid),
-        DurableTxnStatus::Prepared
-    );
-    cluster.restart(A).await;
-    assert!(in_doubt_on(&cluster, A, &tid), "A must wait after its restart");
-    assert!(
-        !compact_records(cluster.site(A), &tid, EntryType::BEGIN),
-        "the cleaner must not take the parts A waits with"
-    );
-
-    cluster.start_site(B).await;
-    wait_until("A's resolution", 60, || {
-        score_on(cluster.site(A), &ids[0]) == Some(scores[0])
-    })
-    .await;
-    assert_all_or_nothing(&cluster, &ids, &scores, "participant down, then back");
-    cluster.shutdown().await;
-}
-
-/// F2 (C9): a late `end` after the fence is refused. A's lease runs out
-/// before the client commits: A fences B and aborts. The coordinator's
-/// `end` then reaches B, which refuses it. Nothing commits anywhere.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_late_end_after_the_fence_is_refused() {
-    let (cluster, client) = Cluster::start("crosssite_f2_late_end").await;
-    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 22_000, 1).await;
-    drop(client);
-
-    data_site(&cluster, A)
-        .sweep_idle_transactions(Duration::ZERO)
-        .await;
-    assert!(!in_doubt_on(&cluster, A, &tid), "A must abort once B is fenced");
-    let result = txn.commit(tid.clone()).await;
-    warn!("CROSSSITE late end after the fence returned {:?}", result);
-    assert!(
-        !matches!(
-            result,
-            Ok(Ok(EndResult::Success)) | Ok(Ok(EndResult::DecidedPending))
-        ),
-        "the client must not hear that the transaction committed: {:?}",
-        result
-    );
-    data_site(&cluster, B)
-        .sweep_idle_transactions(Duration::ZERO)
-        .await;
-    for index in [A, B] {
-        assert_ne!(
-            cluster.site(index).chunks().durable_txn_status(&tid),
-            DurableTxnStatus::Committed,
-            "site {} must not commit after the fence",
-            index
-        );
-    }
-    let (a, b) = halves(&cluster, &ids, &scores);
-    assert!(!a && !b, "nothing may commit: A {}, B {}", a, b);
-    cluster.shutdown().await;
-}
-
-/// F3 (C2): no site was told, and the whole cluster loses power. Every
-/// participant restarts in doubt, fences the others, and aborts. Nobody
-/// waits for a coordinator.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_whole_cluster_power_loss_with_no_decision_aborts_everywhere() {
-    crate::ram::segs::power_loss_model::enable();
-    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "5");
-    let (mut cluster, client) = Cluster::start("crosssite_f3_power").await;
-    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 23_000, 1).await;
-    drop(client);
-    let limit = super::manager::stop_end_fanout_before_commit_point(tid.clone());
-    let _ = txn.commit(tid.clone()).await;
-    drop(limit);
-
-    cluster.power_cut_all(&[A, B]).await;
-    wait_until("the abort on both sites", 60, || {
-        !in_doubt_on(&cluster, A, &tid) && !in_doubt_on(&cluster, B, &tid)
-    })
-    .await;
-    for index in [A, B] {
-        assert_ne!(
-            cluster.site(index).chunks().durable_txn_status(&tid),
-            DurableTxnStatus::Committed
-        );
-    }
-    let (a, b) = halves(&cluster, &ids, &scores);
-    assert!(!a && !b, "nothing may commit: A {}, B {}", a, b);
-    cluster.shutdown().await;
-}
-
-/// The fences recorded in the WAL tree under `root`, as a power loss leaves
-/// them.
-fn fences_after_power_loss(cluster: &Cluster, index: usize) -> std::collections::BTreeSet<TxnId> {
-    let live = cluster.temp[index].path().to_path_buf();
-    let image = tempfile::TempDir::new().unwrap();
-    crate::ram::segs::power_loss_model::copy_store_as_after_power_loss(
-        &live.join("wal"),
-        &live.join("backup"),
-        &image.path().join("wal"),
-        &image.path().join("backup"),
-    )
-    .unwrap();
-    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        for item in std::fs::read_dir(dir).ok()? {
-            let path = item.ok()?.path();
-            if path.is_dir() {
-                if let Some(found) = find(&path) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|n| n.to_str())
-                == Some(crate::ram::fence::FENCE_LOG_FILE)
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
-    let Some(path) = find(&image.path().join("wal")) else {
-        return std::collections::BTreeSet::new();
-    };
-    let log = crate::ram::fence::FenceLog::new(path.parent().unwrap().to_str());
-    log.load(true).unwrap()
-}
-
-/// F4: the fence is durable before the fenced site answers `Fenced`. A
-/// power loss of the fenced site right after the answer keeps it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fence_is_durable_before_the_site_answers() {
-    crate::ram::segs::power_loss_model::enable();
-    let (cluster, client) = Cluster::start("crosssite_f4_durable_fence").await;
-    let (_txn, tid, _ids, _scores) = prepared_transaction(&cluster, &client, 24_000, 1).await;
-    drop(client);
-    // Only explicit syncs reach the disk from here.
-    crate::ram::segs::power_loss_model::pause_group_sync(true);
-    assert_eq!(
-        data_site(&cluster, B).fence_here(&tid),
-        FenceAnswer::Fenced
-    );
-    let durable = fences_after_power_loss(&cluster, B);
-    crate::ram::segs::power_loss_model::pause_group_sync(false);
-    assert!(
-        durable.contains(&tid),
-        "the fence must be on disk when B answers `Fenced`: {:?}",
-        durable
-    );
-    cluster.shutdown().await;
-}
-
-/// F5: restarts during the fence. B is fenced, then A restarts (the
-/// initiator, before it aborted), then B restarts with its fence. Every
-/// site ends aborted; a late `end` commits nothing.
-#[tokio::test(flavor = "multi_thread")]
-async fn restarts_during_the_fence_abort_everywhere() {
-    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "5");
-    let (mut cluster, client) = Cluster::start("crosssite_f5_restart_fence").await;
-    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 25_000, 1).await;
-    drop(client);
-    assert_eq!(
-        data_site(&cluster, B).fence_here(&tid),
-        FenceAnswer::Fenced
-    );
-    cluster.restart(A).await;
-    cluster.restart(B).await;
-    let result = txn.commit(tid.clone()).await;
-    warn!("CROSSSITE late end after restarts returned {:?}", result);
-    wait_until("the abort on both sites", 60, || {
-        !in_doubt_on(&cluster, A, &tid) && !in_doubt_on(&cluster, B, &tid)
-    })
-    .await;
-    let (a, b) = halves(&cluster, &ids, &scores);
-    assert!(!a && !b, "nothing may commit: A {}, B {}", a, b);
-    for index in [A, B] {
-        assert_ne!(
-            cluster.site(index).chunks().durable_txn_status(&tid),
-            DurableTxnStatus::Committed
-        );
-    }
-    cluster.shutdown().await;
-}
-
-/// F6: the operator tool. B committed and is lost for good. A waits for it;
-/// the operator resolves A's half, live and after a restart.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_force_resolve_tool_decides_for_a_lost_participant() {
-    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
-    let (mut cluster, client) = Cluster::start("crosssite_f6_force").await;
-    let (live, live_ids, live_scores) = torn_transaction_seq(&cluster, &client, 26_000, 1).await;
-    let (parked, parked_ids, _) = torn_transaction_seq(&cluster, &client, 27_000, 2).await;
-    drop(client);
-    cluster.stop(B).await;
-
-    let address = cluster.addresses[A].clone();
-    let group = cluster.group.clone();
-    assert_eq!(
-        super::force_resolve_in_doubt(&address, &group, &group, live.clone(), ForcedOutcome::Commit)
-            .await
-            .unwrap(),
-        ForceResolveResult::Resolved
-    );
-    assert_eq!(score_on(cluster.site(A), &live_ids[0]), Some(live_scores[0]));
-    assert!(!in_doubt_on(&cluster, A, &live));
-    assert_eq!(
-        super::force_resolve_in_doubt(&address, &group, &group, live.clone(), ForcedOutcome::Commit)
-            .await
-            .unwrap(),
-        ForceResolveResult::NotInDoubt
-    );
-
-    cluster.restart(A).await;
-    assert!(in_doubt_on(&cluster, A, &parked), "test setup: A must wait for B");
-    assert_eq!(
-        super::force_resolve_in_doubt(&address, &group, &group, parked.clone(), ForcedOutcome::Abort)
-            .await
-            .unwrap(),
-        ForceResolveResult::Resolved
-    );
-    assert!(!in_doubt_on(&cluster, A, &parked));
-    assert_eq!(score_on(cluster.site(A), &parked_ids[0]), None);
     cluster.shutdown().await;
 }
