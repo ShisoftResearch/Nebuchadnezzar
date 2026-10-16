@@ -917,8 +917,11 @@ async fn a_resolved_commit_survives_a_power_loss_after_the_peer_released() {
     drop(client);
 
     wait_status_synced(&cluster, B, &tid).await;
-    // From here only explicit syncs reach the disk.
+    // From here only explicit syncs reach A's disk: the group syncer and
+    // the queued COMMIT syncs (S1) are held back.
+    let a_dir = cluster.temp[A].path().to_path_buf();
     crate::ram::segs::power_loss_model::pause_group_sync(true);
+    crate::ram::durability::pause_receipt_syncs_under(&a_dir, true);
     cluster.restart(A).await;
     let (a, b) = halves(&cluster, &ids, &scores);
     assert!(a && b, "test setup: the restart must resolve COMMIT");
@@ -929,6 +932,7 @@ async fn a_resolved_commit_survives_a_power_loss_after_the_peer_released() {
 
     cluster.power_loss_restart(A).await;
     crate::ram::segs::power_loss_model::pause_group_sync(false);
+    crate::ram::durability::pause_receipt_syncs_under(&a_dir, false);
 
     assert_all_or_nothing(&cluster, &ids, &scores, "resolved site, power loss");
     let (a, b) = halves(&cluster, &ids, &scores);
@@ -1770,7 +1774,8 @@ async fn restarts_during_the_fence_abort_everywhere() {
 }
 
 /// The operator tool: B committed and is lost for good. A waits for it; the
-/// operator resolves A's half, live and after a restart.
+/// operator resolves A's half, live (B stopped) and after a restart (B
+/// silent to the fence).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_force_resolve_tool_decides_for_a_lost_participant() {
     std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
@@ -1797,6 +1802,11 @@ async fn the_force_resolve_tool_decides_for_a_lost_participant() {
         ForceResolveResult::NotInDoubt
     );
 
+    // B stays lost to the fence; the harness cannot have two of its three
+    // raft members down at once (`bifrost/src/raft/mod.rs:2987`).
+    cluster.start_site(B).await;
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(b_id);
     cluster.restart(A).await;
     assert!(in_doubt_on(&cluster, A, &parked), "test setup: A must wait for B");
     assert_eq!(
@@ -1807,6 +1817,7 @@ async fn the_force_resolve_tool_decides_for_a_lost_participant() {
     );
     assert!(!in_doubt_on(&cluster, A, &parked));
     assert_eq!(score_on(cluster.site(A), &parked_ids[0]), None);
+    super::data_site::silent_peers_for_test().lock().remove(&b_id);
     cluster.shutdown().await;
 }
 

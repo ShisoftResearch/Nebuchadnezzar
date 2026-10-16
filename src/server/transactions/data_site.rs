@@ -1575,6 +1575,27 @@ impl DataManager {
         participants.iter().any(|peer| *peer != me)
     }
 
+    /// Whether this site's COMMIT and status cell of `txn` are synced: no
+    /// segment of its bracket holds the transaction in progress any more
+    /// (D20). Remembered in the registry once true.
+    fn status_entry_synced(&self, txn: &TxnId, entry: &crate::ram::txn_status::StatusEntry) -> bool {
+        if entry.self_synced {
+            return true;
+        }
+        let chunks = self.chunks();
+        let pending = entry.segments.iter().any(|(chunk_id, segment_id)| {
+            chunks
+                .list
+                .get(*chunk_id)
+                .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
+                .is_some_and(|segment| segment.protection.holds_transaction(txn))
+        });
+        if !pending {
+            chunks.txn_status().mark_self_synced(txn);
+        }
+        !pending
+    }
+
     /// One release round for the status cells of this site (TLA+ F4).
     ///
     /// 1. A status cell whose own COMMIT is now synced (no segment of the
@@ -1594,18 +1615,8 @@ impl DataManager {
         let me = self.database_runtime.rpc.server_id;
         let mut notices: HashMap<u64, Vec<TxnId>> = HashMap::new();
         for (txn, entry) in registry.entries() {
-            if !entry.self_synced {
-                let pending = entry.segments.iter().any(|(chunk_id, segment_id)| {
-                    chunks
-                        .list
-                        .get(*chunk_id)
-                        .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
-                        .is_some_and(|segment| segment.protection.holds_transaction(&txn))
-                });
-                if pending {
-                    continue;
-                }
-                registry.mark_self_synced(&txn);
+            if !self.status_entry_synced(&txn, &entry) {
+                continue;
             }
             #[cfg(test)]
             if SYNCED_NOTICES_SKIPPED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
@@ -1718,7 +1729,7 @@ impl DataManager {
     /// a peer that acted on it would tear the transaction.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(entry) = self.chunks().txn_status().get(tid) {
-            return if entry.self_synced {
+            return if self.status_entry_synced(tid, &entry) {
                 TxnOutcome::Committed
             } else {
                 TxnOutcome::Committing
