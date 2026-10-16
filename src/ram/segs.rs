@@ -59,6 +59,110 @@ static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
+/// A test model of a power loss.
+///
+/// When enabled, every successful sync of a WAL file records the bytes it
+/// made durable. [`power_loss_model::copy_store_as_after_power_loss`] then
+/// builds a copy of a store in which each WAL file holds only those bytes:
+/// writes and truncations that no sync covered are gone, as after a power
+/// loss. Backup files are copied as they are: they are installed by rename
+/// after their own sync. The model does not cover directory entries.
+///
+/// Process-global. The test runner gives each test its own process.
+#[cfg(test)]
+pub(crate) mod power_loss_model {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static GROUP_SYNC_PAUSED: AtomicBool = AtomicBool::new(false);
+    static DURABLE: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Vec<u8>>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Start to record durable WAL bytes. Enable it before the first store
+    /// starts, or the WAL files written before have no durable image.
+    pub(crate) fn enable() {
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    /// Stop the group syncer, as a power loss inside its interval does.
+    /// Explicit syncs still run.
+    pub(crate) fn pause_group_sync(paused: bool) {
+        GROUP_SYNC_PAUSED.store(paused, Ordering::Release);
+    }
+
+    pub(super) fn group_sync_paused() -> bool {
+        GROUP_SYNC_PAUSED.load(Ordering::Acquire)
+    }
+
+    /// `len` is the file length that the sync covered.
+    pub(crate) fn record_synced_len(path: &Option<String>, len: u64) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(mut bytes) = std::fs::read(path) else {
+            return;
+        };
+        bytes.truncate(len as usize);
+        DURABLE.lock().insert(path.clone(), bytes);
+    }
+
+    pub(crate) fn record_synced(path: &Option<String>, file: &std::fs::File) {
+        if let Ok(metadata) = file.metadata() {
+            record_synced_len(path, metadata.len());
+        }
+    }
+
+    fn copy_tree(from: &Path, to: &Path, wal: bool) -> std::io::Result<()> {
+        if !from.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target, wal)?;
+                continue;
+            }
+            if !wal {
+                std::fs::copy(entry.path(), &target)?;
+                continue;
+            }
+            let key = entry.path().to_string_lossy().to_string();
+            let durable = DURABLE.lock().get(&key).cloned();
+            let bytes = match durable {
+                Some(bytes) => bytes,
+                // Never synced through a segment: only the header, which the
+                // file manager syncs when it creates the file, is durable.
+                None => {
+                    let mut bytes = std::fs::read(entry.path())?;
+                    bytes.truncate(crate::ram::wal_format::FILE_HEADER_SIZE);
+                    bytes
+                }
+            };
+            std::fs::write(&target, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Copy a store's WAL and backup directories as a power loss at this
+    /// instant would leave them.
+    pub(crate) fn copy_store_as_after_power_loss(
+        wal_from: &Path,
+        backup_from: &Path,
+        wal_to: &Path,
+        backup_to: &Path,
+    ) -> std::io::Result<()> {
+        copy_tree(backup_from, backup_to, false)?;
+        copy_tree(wal_from, wal_to, true)
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct PauseRewindSync(usize);
 
@@ -119,7 +223,7 @@ fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     // Bytes journaled during this sync must enqueue another pass.
     seg.wal_sync_queued.store(false, Ordering::Release);
     #[cfg(test)]
-    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) {
+    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
         seg.wal_sync_queued.store(true, Ordering::Release);
         WAL_DIRTY.lock().push(seg.clone());
         return;
@@ -2533,6 +2637,11 @@ image, not an empty segment; archiving it would persist the damage.",
                         return Err(error);
                     }
                     self.wal_bytes_synced.fetch_max(written, Release);
+                    #[cfg(test)]
+                    power_loss_model::record_synced_len(
+                        &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                        original_len + framed.len() as u64,
+                    );
                     trace!(
                         "WAL synced inline for segment {} ({} bytes)",
                         self.id,
@@ -2556,10 +2665,20 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     /// Remove decision records from a refused transaction's private tail.
+    ///
+    /// Synced. An unsynced truncation can be undone by a power loss, and
+    /// the COMMIT it removed then decides the transaction at recovery,
+    /// while the site already rolled it back and reported it failed.
     pub(crate) fn truncate_wal_to(&self, position: u64) -> io::Result<()> {
         let mut state = self.file_state.lock();
         if let Some(file) = &state.wal {
             file.set_len(position)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            crate::ram::segs::power_loss_model::record_synced(
+                &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                file,
+            );
         }
         state.wal_len = position;
         Ok(())
@@ -2599,11 +2718,21 @@ image, not an empty segment; archiving it would persist the damage.",
             let written = self.wal_bytes_written.load(Relaxed);
             (file, written)
         };
+        #[cfg(test)]
+        let (model_path, model_len) = {
+            let state = self.file_state.lock();
+            (
+                state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                state.wal_len,
+            )
+        };
         // The descriptor keeps this WAL inode alive if an archive unlinks its name.
         // Appends remain ordered under file_state. This sync covers the records that
         // preceded it; later appends keep their own dirty bytes or force their own sync.
         sync(&file)?;
         self.wal_bytes_synced.fetch_max(written, Release);
+        #[cfg(test)]
+        power_loss_model::record_synced_len(&model_path, model_len);
         FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
         Ok(())
     }

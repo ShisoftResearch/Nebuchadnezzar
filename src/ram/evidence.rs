@@ -1,27 +1,41 @@
-//! Decision evidence for transactions that span sites.
+//! Unsettled multi-site transactions, and the cleaner invariant that keeps
+//! them whole.
 //!
-//! A participant that is in doubt asks its peers what became of a
-//! transaction. A peer that committed must answer `Committed` for as long as
-//! any participant can still ask. Two things used to end that answer early:
+//! THE INVARIANT (D20, extended by D28): the cleaner never compacts a segment
+//! that is in progress. A segment is in progress while it holds any part --
+//! BEGIN, data entries or COMMIT -- of a multi-site transaction that is not
+//! SETTLED at every participant. Settled means every other participant
+//! answered a release round and does not hold the transaction open: it holds
+//! the outcome durably (its COMMIT synced, or its abort final), so no site
+//! can ask about the transaction again. Until then compaction could remove
+//! the evidence a site needs to decide, and tear the transaction. After it,
+//! compaction turns the entries into plain cells, as for any transaction.
 //!
-//! * The live answer came from a bounded memory of recent decisions, so later
-//!   transactions evicted it.
-//! * After a restart the answer came from the COMMIT records that recovery
-//!   found, and the cleaner drops COMMIT records when it compacts a segment.
+//! A transaction of one site cannot tear across sites. It is never pinned,
+//! and its COMMIT is not retained after recovery.
 //!
-//! This module keeps the answer until no participant can ask. A retained
-//! transaction PINS every segment that holds one of its COMMIT records, and
-//! the cleaner does not compact a pinned segment. The pin goes when every
-//! site that could ask reports that it does not hold the transaction open.
+//! Three kinds of entry hold pins:
 //!
-//! A second kind of pin protects a site's own evidence. A site that resolved
-//! an in-doubt transaction after a restart writes its COMMIT into a new
-//! segment, because a recovered segment never becomes a write head again. The
-//! transaction's BEGIN stays in the old segment. If the cleaner compacted the
-//! new segment first, the next restart would find the BEGIN without a COMMIT
-//! and put the transaction in doubt again. Such a transaction is "fragile":
-//! its COMMIT segments stay pinned until no segment with an open part of it
-//! remains.
+//! * RETAINED: a multi-site transaction this site committed. Every
+//!   participant keeps one, not only the commit point: the segments that hold
+//!   its parts stay pinned, and the commit point answers `Committed` from it
+//!   when its bounded decision memory has evicted the answer. It goes in a
+//!   release round, when every other participant reports that it does not
+//!   hold the transaction open (see `DataManager::release_decision_evidence`).
+//!   The participants come from prepare, and after a restart from the BEGIN
+//!   records (`crate::ram::bracket::encode_begin`).
+//! * FRAGILE: a transaction committed through a COMMIT that is not in the
+//!   segment of an open part. A site that resolved an in-doubt transaction
+//!   after a restart writes such a COMMIT into a new segment, because a
+//!   recovered segment never becomes a write head again; a close that fell
+//!   back to a standalone COMMIT does the same. If the cleaner compacted the
+//!   COMMIT segment first, the next restart would find the BEGIN without a
+//!   COMMIT and put the transaction in doubt again, after the commit point
+//!   forgot it. So the COMMIT segments stay pinned until no segment with an
+//!   open part remains, also after the transaction is settled.
+//! * RESOLVING: a transaction in doubt after a restart. Its cells are not in
+//!   the index, so the cleaner would drop them as dead. The open parts stay
+//!   pinned until resolution ends.
 
 use crate::ram::chunk::Chunk;
 use crate::server::transactions::TxnId;
@@ -31,38 +45,43 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// A segment as a commit manifest names it: chunk id and segment seq id.
 pub type SegmentRef = (usize, u64);
 
-/// What a store keeps about committed transactions that other sites, or its
-/// own next recovery, may still need.
+/// The unsettled multi-site transactions of one store.
 pub struct DecisionEvidence {
     state: Mutex<EvidenceState>,
 }
 
 #[derive(Default)]
 struct EvidenceState {
-    /// Committed here. A peer may still be in doubt about it.
     retained: BTreeMap<TxnId, Retained>,
-    /// Committed here through a COMMIT in another segment than an open part.
     fragile: BTreeMap<TxnId, Fragile>,
-    /// In doubt here after recovery, and not resolved yet.
-    resolving: BTreeSet<TxnId>,
+    resolving: BTreeMap<TxnId, Resolving>,
 }
 
 struct Retained {
-    /// The sites that can ask. `None` after a restart: the participant set
-    /// lived in memory, so every member of the group can ask.
-    participants: Option<BTreeSet<u64>>,
-    commits: Vec<SegmentRef>,
+    /// The whole participant set, this site included.
+    participants: BTreeSet<u64>,
+    /// Pinned: the segments that hold a part of the transaction here.
+    segments: Vec<SegmentRef>,
 }
 
 struct Fragile {
+    /// Pinned: the segments with a COMMIT that closes no part in its own
+    /// segment.
     commits: Vec<SegmentRef>,
+    /// The segments with the parts those COMMITs decide.
+    open: Vec<SegmentRef>,
+}
+
+struct Resolving {
+    participants: Vec<u64>,
+    /// Pinned until resolution ends.
     open: Vec<SegmentRef>,
 }
 
 /// A retained transaction and the sites that must report it closed.
 pub struct ReleaseCandidate {
     pub txn: TxnId,
-    pub participants: Option<BTreeSet<u64>>,
+    pub peers: BTreeSet<u64>,
 }
 
 /// A committed transaction as recovery found it.
@@ -73,12 +92,23 @@ pub struct RecoveredCommit {
     /// Segments that hold a part of the transaction whose BEGIN no COMMIT
     /// in the same segment closes. Not empty means fragile.
     pub open: Vec<SegmentRef>,
+    /// The participant set its BEGIN records name. Empty when no BEGIN of
+    /// it remains: then the transaction was settled and compacted, and only
+    /// a fragile COMMIT can be left.
+    pub participants: Vec<u64>,
+}
+
+/// A transaction in doubt after recovery, as the evidence keeps it.
+pub struct RecoveredInDoubt {
+    pub txn: TxnId,
+    pub participants: Vec<u64>,
+    pub open: Vec<SegmentRef>,
 }
 
 fn pin_all(chunks: &[Chunk], segments: &[SegmentRef]) {
     for (chunk_id, seq) in segments {
         if let Some(chunk) = chunks.get(*chunk_id) {
-            chunk.pin_evidence_segment(*seq);
+            chunk.pin_in_progress_segment(*seq);
         }
     }
 }
@@ -86,7 +116,7 @@ fn pin_all(chunks: &[Chunk], segments: &[SegmentRef]) {
 fn unpin_all(chunks: &[Chunk], segments: &[SegmentRef]) {
     for (chunk_id, seq) in segments {
         if let Some(chunk) = chunks.get(*chunk_id) {
-            chunk.unpin_evidence_segment(*seq);
+            chunk.unpin_in_progress_segment(*seq);
         }
     }
 }
@@ -104,42 +134,42 @@ impl DecisionEvidence {
         }
     }
 
-    /// Keep the answer for a transaction this store committed.
+    /// Keep a multi-site transaction this store committed until it is
+    /// settled. `segments` are the segments that hold its parts here. A
+    /// transaction of one site is not kept.
     ///
-    /// The caller must hold the transaction's write heads, so that no
-    /// segment in `commits` can be compacted before the pin is in place.
+    /// The caller must make sure that the cleaner cannot take a segment in
+    /// `segments` before the pin is in place: it holds the transaction's
+    /// write heads, or the segments are pinned already.
     pub fn retain_commit(
         &self,
         chunks: &[Chunk],
         txn: TxnId,
-        participants: Option<BTreeSet<u64>>,
-        commits: Vec<SegmentRef>,
+        participants: BTreeSet<u64>,
+        segments: Vec<SegmentRef>,
     ) {
-        let commits = dedup(commits);
+        if participants.len() < 2 {
+            return;
+        }
+        let segments = dedup(segments);
         let mut state = self.state.lock();
         match state.retained.get_mut(&txn) {
             Some(existing) => {
-                existing.participants = match (existing.participants.take(), participants) {
-                    (Some(mut known), Some(more)) => {
-                        known.extend(more);
-                        Some(known)
-                    }
-                    _ => None,
-                };
-                let added: Vec<SegmentRef> = commits
+                existing.participants.extend(participants);
+                let added: Vec<SegmentRef> = segments
                     .into_iter()
-                    .filter(|segment| !existing.commits.contains(segment))
+                    .filter(|segment| !existing.segments.contains(segment))
                     .collect();
                 pin_all(chunks, &added);
-                existing.commits.extend(added);
+                existing.segments.extend(added);
             }
             None => {
-                pin_all(chunks, &commits);
+                pin_all(chunks, &segments);
                 state.retained.insert(
                     txn,
                     Retained {
                         participants,
-                        commits,
+                        segments,
                     },
                 );
             }
@@ -170,7 +200,7 @@ impl DecisionEvidence {
         &self,
         chunks: &[Chunk],
         committed: Vec<RecoveredCommit>,
-        in_doubt: impl IntoIterator<Item = TxnId>,
+        in_doubt: Vec<RecoveredInDoubt>,
     ) {
         for commit in committed {
             if !commit.open.is_empty() {
@@ -178,50 +208,87 @@ impl DecisionEvidence {
                     chunks,
                     commit.txn.clone(),
                     commit.commits.clone(),
-                    commit.open,
+                    commit.open.clone(),
                 );
             }
-            self.retain_commit(chunks, commit.txn, None, commit.commits);
+            let segments: Vec<SegmentRef> =
+                commit.commits.into_iter().chain(commit.open).collect();
+            self.retain_commit(
+                chunks,
+                commit.txn,
+                commit.participants.into_iter().collect(),
+                segments,
+            );
         }
-        self.state.lock().resolving.extend(in_doubt);
+        let mut state = self.state.lock();
+        for bracket in in_doubt {
+            let open = dedup(bracket.open);
+            pin_all(chunks, &open);
+            if let Some(existing) = state.resolving.insert(
+                bracket.txn,
+                Resolving {
+                    participants: bracket.participants,
+                    open,
+                },
+            ) {
+                unpin_all(chunks, &existing.open);
+            }
+        }
     }
 
-    /// Whether this store committed `txn` and still keeps the evidence.
+    /// Whether this store committed `txn` and still keeps it.
     pub fn holds_commit(&self, txn: &TxnId) -> bool {
         let state = self.state.lock();
         state.retained.contains_key(txn) || state.fragile.contains_key(txn)
     }
 
-    /// Recovery resolution decided `txn`; this store no longer asks about it.
-    pub fn end_resolving(&self, txn: &TxnId) {
-        self.state.lock().resolving.remove(txn);
+    /// Recovery resolution decided `txn`; this store no longer asks about
+    /// it. The open parts stay pinned if a commit retained them.
+    pub fn end_resolving(&self, chunks: &[Chunk], txn: &TxnId) {
+        if let Some(resolving) = self.state.lock().resolving.remove(txn) {
+            unpin_all(chunks, &resolving.open);
+        }
     }
 
     /// The transactions this store is resolving after recovery.
     pub fn resolving(&self) -> Vec<TxnId> {
-        self.state.lock().resolving.iter().cloned().collect()
+        self.state.lock().resolving.keys().cloned().collect()
     }
 
-    /// The retained transactions, for one release round.
-    pub fn release_candidates(&self) -> Vec<ReleaseCandidate> {
+    /// The participant set of a transaction this store is resolving.
+    pub fn resolving_participants(&self, txn: &TxnId) -> Option<Vec<u64>> {
+        self.state
+            .lock()
+            .resolving
+            .get(txn)
+            .map(|resolving| resolving.participants.clone())
+    }
+
+    /// The retained transactions, for one release round of site `me`.
+    pub fn release_candidates(&self, me: u64) -> Vec<ReleaseCandidate> {
         self.state
             .lock()
             .retained
             .iter()
             .map(|(txn, retained)| ReleaseCandidate {
                 txn: txn.clone(),
-                participants: retained.participants.clone(),
+                peers: retained
+                    .participants
+                    .iter()
+                    .copied()
+                    .filter(|peer| *peer != me)
+                    .collect(),
             })
             .collect()
     }
 
-    /// Stop retaining `txns`: no site can ask about them any more.
+    /// `txns` are settled: unpin their segments.
     pub fn release(&self, chunks: &[Chunk], txns: &[TxnId]) -> usize {
         let mut state = self.state.lock();
         let mut released = 0;
         for txn in txns {
             if let Some(retained) = state.retained.remove(txn) {
-                unpin_all(chunks, &retained.commits);
+                unpin_all(chunks, &retained.segments);
                 released += 1;
             }
         }
@@ -233,9 +300,8 @@ impl DecisionEvidence {
     pub fn release_all_retained(&self, chunks: &[Chunk]) {
         let mut state = self.state.lock();
         for (_, retained) in std::mem::take(&mut state.retained) {
-            unpin_all(chunks, &retained.commits);
+            unpin_all(chunks, &retained.segments);
         }
-        state.resolving.clear();
     }
 
     /// Release the fragile transactions whose open parts are all gone.
@@ -272,10 +338,14 @@ impl DecisionEvidence {
         settled.len()
     }
 
-    /// `(retained, fragile)` transaction counts.
-    pub fn counts(&self) -> (usize, usize) {
+    /// `(retained, fragile, resolving)` transaction counts.
+    pub fn counts(&self) -> (usize, usize, usize) {
         let state = self.state.lock();
-        (state.retained.len(), state.fragile.len())
+        (
+            state.retained.len(),
+            state.fragile.len(),
+            state.resolving.len(),
+        )
     }
 }
 

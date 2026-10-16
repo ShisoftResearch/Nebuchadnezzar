@@ -41,9 +41,7 @@ async fn start_txn_cluster(
 ) {
     let _ = env_logger::try_init();
     let temp: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
-    let addresses: Vec<String> = (0..2)
-        .map(|_| crate::utils::test_port::unique_localhost_addr())
-        .collect();
+    let addresses = commit_point_last_addresses();
     let mut servers = Vec::with_capacity(addresses.len());
     for (address, dir) in addresses.iter().zip(temp.iter()) {
         let opts = ServerOptions {
@@ -87,6 +85,20 @@ async fn start_txn_cluster(
         server.meta().schemas.debug_only_new_schema(schema.clone());
     }
     (servers, client, addresses, temp)
+}
+
+/// Two addresses, ordered so that the SECOND server has the lower server id
+/// and so is the commit point of a transaction over both
+/// (`super::commit_point`). Server ids are hashes of the addresses. The
+/// first server runs the coordinator and is the site that is left in doubt.
+fn commit_point_last_addresses() -> Vec<String> {
+    let mut addresses: Vec<String> = (0..2)
+        .map(|_| crate::utils::test_port::unique_localhost_addr())
+        .collect();
+    if bifrost_hasher::hash_str(&addresses[0]) < bifrost_hasher::hash_str(&addresses[1]) {
+        addresses.swap(0, 1);
+    }
+    addresses
 }
 
 /// Two ids on DIFFERENT servers, by moving a slot rather than hoping the hash
@@ -198,7 +210,7 @@ async fn a_coordinator_dying_mid_decision_tears_the_transaction() {
     txn.prepare(tid.clone()).await.unwrap().unwrap();
 
     // Then the coordinator tells exactly one participant and stops.
-    let limit = super::manager::stop_end_fanout_after(tid.clone(), 1);
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -299,7 +311,7 @@ async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
     }
     txn.prepare(tid.clone()).await.unwrap().unwrap();
 
-    let limit = super::manager::stop_end_fanout_after(tid.clone(), 1);
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -321,7 +333,7 @@ async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO)
             .await;
     }
 
@@ -361,7 +373,7 @@ async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
 
     // Nobody is told: the coordinator decides and dies before the first
     // participant hears it.
-    let limit = super::manager::stop_end_fanout_after(tid.clone(), 0);
+    let limit = super::manager::stop_end_fanout_before_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -379,7 +391,7 @@ async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO)
             .await;
     }
 
@@ -412,9 +424,7 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     let _ = env_logger::try_init();
     let group = "tear_restart";
     let temp: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
-    let addresses: Vec<String> = (0..2)
-        .map(|_| crate::utils::test_port::unique_localhost_addr())
-        .collect();
+    let addresses = commit_point_last_addresses();
     let opts_for = |dir: &tempfile::TempDir| ServerOptions {
         chunk_size: 64 * 1024 * 1024,
         db_size: 256 * 1024 * 1024,
@@ -476,10 +486,9 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     }
     txn.prepare(tid.clone()).await.unwrap().unwrap();
 
-    // Tell the SECOND server only. The first is left in doubt, and it is the
-    // one that restarts.
-    let told = client.locate_server_id(&ids[1]).unwrap();
-    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), told);
+    // Tell the commit point (the SECOND server) only. The first is left in
+    // doubt, and it is the one that restarts.
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -525,18 +534,15 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     }
 }
 
-/// A silent peer must not be counted as a vote to abort.
+/// A silent commit point must not be counted as a vote to abort.
 ///
-/// The participant is in doubt and the peer that knows the answer is DOWN.
-/// Concluding abort here is the tear: the peer holds a durable COMMIT and
-/// will still hold it when it comes back. So the heads stay held and the
-/// question stays open -- but not forever, because a held head is a writer
-/// slot gone from its chunk with no refill path.
-///
-/// Both halves are asserted: it holds while inside the grace window, and it
-/// gives up once past it.
+/// The participant is in doubt and the commit point, which knows the answer,
+/// is DOWN. Concluding abort here is the tear: the commit point holds a
+/// durable COMMIT and will still hold it when it comes back. So the heads
+/// stay held and the question stays open, with no time limit: only the
+/// commit point can decide (D26).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
+async fn a_silent_commit_point_holds_the_transaction_open() {
     let (servers, client, addresses, _temp) = start_txn_cluster("tear_silent").await;
     let ids = two_ids_on_distinct_servers(&client, &servers).await;
 
@@ -552,8 +558,7 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
     }
     txn.prepare(tid.clone()).await.unwrap().unwrap();
 
-    let told = client.locate_server_id(&ids[1]).unwrap();
-    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), told);
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -576,13 +581,13 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
     knows.shutdown().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Inside the grace window: hold, do not decide.
+    // Hold, do not decide.
     let site = in_doubt
         .database_runtime()
         .data_site()
         .expect("the in-doubt server runs a data site");
     let hold = site
-        .terminate_in_doubt_transactions(Duration::ZERO, Duration::from_secs(300))
+        .terminate_in_doubt_transactions(Duration::ZERO)
         .await;
     assert!(
         hold.contains(&tid),
@@ -599,14 +604,21 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
         "holding is not deciding"
     );
 
-    // Past it: give up, so a permanently silent peer cannot cost a writer
-    // slot for the life of the process.
-    let hold = site
-        .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
-        .await;
-    assert!(
-        !hold.contains(&tid),
-        "past the grace window the transaction must be released to the sweeper"
+    // Again, and through the whole sweep: still held, still not decided.
+    // There is no grace window after which the site gives up.
+    for _ in 0..3 {
+        site.sweep_idle_transactions(Duration::ZERO).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        crate::ram::chunk::transaction_lease_count(&tid, &in_doubt.chunks().address_range()),
+        leases_before,
+        "a site that is not the commit point never presumes abort"
+    );
+    assert_eq!(
+        in_doubt.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Prepared,
+        "the in-doubt bracket must still be there"
     );
 
     for server in servers {

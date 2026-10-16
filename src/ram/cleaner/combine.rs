@@ -187,17 +187,17 @@ impl CombinedCleaner {
                 if chunk.is_active_head(seg.id) {
                     return None;
                 }
-                // Compaction drops COMMIT records. A pinned segment holds one
-                // that a site still needs to decide a transaction.
-                if chunk.is_evidence_pinned(seg.seq_id) {
-                    return None;
-                }
                 // Check references first to avoid locking if busy (fast path)
                 if !seg.no_references() {
                     return None;
                 }
-
-                SegmentCandidate::new(&seg)
+                let candidate = SegmentCandidate::new(&seg)?;
+                // The invariant is checked after the claim, so a pin placed
+                // before the claim cannot be missed.
+                if !chunk.cleaner_may_take(seg) {
+                    return None;
+                }
+                Some(candidate)
             })
             .collect_vec();
 

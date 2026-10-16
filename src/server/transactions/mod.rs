@@ -264,6 +264,68 @@ pub async fn new_async_client_for_database(
     ))
 }
 
+/// The commit point of a transaction: the lowest server id among its
+/// participants (the servers that hold a bracket for it).
+///
+/// The coordinator sends `end` to the commit point first, and to the other
+/// participants only after the commit point made its COMMIT durable. So the
+/// commit point alone can decide: it may presume abort, and every other
+/// participant asks it and waits for its answer. Every site computes the same
+/// value from the same participant set, which it has from prepare and, after
+/// a restart, from its BEGIN records. An empty set (a bracket written outside
+/// a coordinated transaction) makes `me` the commit point.
+pub fn commit_point(participants: &[u64], me: u64) -> u64 {
+    participants.iter().copied().min().unwrap_or(me)
+}
+
+/// The outcome an operator forces on an in-doubt transaction.
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum ForcedOutcome {
+    Commit,
+    Abort,
+}
+
+/// The result of `force_resolve` on one site.
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub enum ForceResolveResult {
+    /// The transaction was in doubt here and now has the forced outcome.
+    Resolved,
+    /// This site is the commit point of the transaction. It decides
+    /// itself, so the tool refuses.
+    CommitPoint,
+    /// The transaction is not in doubt here: unknown, or already decided.
+    NotInDoubt,
+    /// The outcome could not be applied; the transaction stays in doubt.
+    Failed(String),
+}
+
+/// Operator tool: force the outcome of one in-doubt transaction on the site
+/// at `address`, for a commit point that is lost for good.
+///
+/// Call it once for each surviving participant. It refuses on the commit
+/// point itself.
+///
+/// WARNING: if the commit point comes back with its data and a different
+/// decision, the transaction is torn. Use it only for a commit point whose
+/// data is gone.
+pub async fn force_resolve_in_doubt(
+    address: &String,
+    group_name: &str,
+    database_name: &str,
+    tid: TxnId,
+    outcome: ForcedOutcome,
+) -> io::Result<ForceResolveResult> {
+    let client = DEFAULT_CLIENT_POOL.get(address).await?;
+    let site = data_site::AsyncServiceClient::new_with_service_id(
+        data_site::generate_scoped_service_id(group_name, database_name),
+        &client,
+    );
+    site.force_resolve(tid, outcome)
+        .await
+        .map(|response| response.payload)
+        .map_err(|error| io::Error::other(format!("force_resolve RPC failed: {:?}", error)))
+}
+
 /// Shared test-support constructor for transaction ids. Placed at module top
 /// level (not inside a `#[cfg(test)] mod`) so child test modules can reach it
 /// via `super::test_hlc` / `crate::server::transactions::test_hlc`. The old

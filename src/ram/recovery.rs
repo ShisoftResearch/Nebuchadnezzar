@@ -447,6 +447,8 @@ pub struct BracketLedger {
     /// the same segment.
     open_parts:
         Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::evidence::SegmentRef>>>,
+    /// The participant set each BEGIN names, per transaction.
+    participants: Mutex<HashMap<crate::server::transactions::TxnId, Vec<u64>>>,
     /// Every plain (unbracketed) tombstone the scan met, newest version per
     /// `(chunk, hash)`. Segment order is NOT write order across segments (a
     /// chunk writes into several heads at once), so the scan cannot decide
@@ -501,6 +503,7 @@ impl BracketLedger {
             commits: Mutex::new(HashMap::new()),
             commit_segments: Mutex::new(HashMap::new()),
             open_parts: Mutex::new(HashMap::new()),
+            participants: Mutex::new(HashMap::new()),
             plain_deletes: Mutex::new(Vec::new()),
             ties: Mutex::new(HashMap::new()),
             late_losers: Mutex::new(Vec::new()),
@@ -545,6 +548,15 @@ impl BracketLedger {
             .push(at);
     }
 
+    /// Every part of a transaction names the same set; the first one seen
+    /// is kept.
+    fn note_participants(&self, txn: &crate::server::transactions::TxnId, participants: Vec<u64>) {
+        self.participants
+            .lock()
+            .entry(txn.clone())
+            .or_insert(participants);
+    }
+
     fn note_open_part(
         &self,
         txn: &crate::server::transactions::TxnId,
@@ -573,6 +585,7 @@ impl BracketLedger {
         let commits = std::mem::take(&mut *self.commits.lock());
         let mut commit_segments = std::mem::take(&mut *self.commit_segments.lock());
         let mut open_parts = std::mem::take(&mut *self.open_parts.lock());
+        let mut participants = std::mem::take(&mut *self.participants.lock());
         let mut pending = std::mem::take(&mut *self.pending.lock());
         // Floors count physical tombstones, including undecided brackets.
         // Their versions constrain a future create without deciding the bracket.
@@ -588,6 +601,7 @@ impl BracketLedger {
                 txn: txn.clone(),
                 commits: commit_segments.remove(&txn).unwrap_or_default(),
                 open: open_parts.remove(&txn).unwrap_or_default(),
+                participants: participants.remove(&txn).unwrap_or_default(),
             });
             let missing: Vec<_> = manifest
                 .iter()
@@ -669,11 +683,13 @@ impl BracketLedger {
                 chunks.sort_unstable();
                 chunks.dedup();
                 let open = open_parts.remove(&txn).unwrap_or_default();
+                let participants = participants.remove(&txn).unwrap_or_default();
                 InDoubtBracket {
                     txn,
                     cells,
                     chunks,
                     open,
+                    participants,
                 }
             })
             .collect();
@@ -699,6 +715,11 @@ pub struct InDoubtBracket {
     pub cells: Vec<PendingBracketCell>,
     /// The segments that hold its parts. No COMMIT in them closes a part.
     pub open: Vec<crate::ram::evidence::SegmentRef>,
+    /// The servers that hold a bracket for it, from its BEGIN records. The
+    /// lowest id is the commit point: see
+    /// `crate::server::transactions::commit_point`. Empty for a BEGIN written
+    /// outside a coordinated transaction, which this site decides alone.
+    pub participants: Vec<u64>,
 }
 
 /// What recovery learned about transactions, for cooperative termination.
@@ -1373,6 +1394,50 @@ fn current_segment_entry_content_length(
 /// The scan runs against the deterministic virtual address range for the segment
 /// before a Segment object is installed. That lets recovery discover the final
 /// segment class and statistics in the same pass that rebuilds the cell index.
+/// An undecodable bracket record, as the error that stops recovery.
+fn bracket_format_io_error(
+    seg_id: u64,
+    offset: usize,
+    error: crate::ram::bracket::BracketFormatError,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        BracketRecordError {
+            seg_id,
+            offset,
+            error,
+        },
+    )
+}
+
+/// A bracket record that recovery cannot read. Unlike other scan errors, it
+/// stops the start instead of quarantining the segment: it means the store
+/// holds another record format, and every segment would be quarantined.
+#[derive(Debug)]
+pub struct BracketRecordError {
+    pub seg_id: u64,
+    pub offset: usize,
+    pub error: crate::ram::bracket::BracketFormatError,
+}
+
+impl std::fmt::Display for BracketRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "segment {} has an unreadable bracket record at offset {}: {}",
+            self.seg_id, self.offset, self.error
+        )
+    }
+}
+
+impl std::error::Error for BracketRecordError {}
+
+fn is_bracket_record_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<BracketRecordError>())
+}
+
 fn scan_segment_from_data(
     chunk: &Chunk,
     seg_id: u64,
@@ -1623,14 +1688,17 @@ fn scan_segment_from_data(
                     );
                 }
                 match crate::ram::bracket::decode_begin(content) {
-                    Some(txn) => {
-                        open_bracket = Some((cursor + entry_size, txn));
+                    Ok(begin) => {
+                        ledger.note_participants(&begin.txn, begin.participants);
+                        open_bracket = Some((cursor + entry_size, begin.txn));
                     }
-                    None => warn!(
-                        "Recovered segment {} has an undecodable BEGIN at offset {}; the entries \
-                         after it are read as ordinary",
-                        seg_id, offset
-                    ),
+                    // The frame or the image checked out, so the record is
+                    // what was written: another format, or damage. Reading
+                    // the entries behind it as ordinary would apply writes
+                    // that were never committed. Stop the start instead.
+                    Err(error) => {
+                        return Err(bracket_format_io_error(seg_id, offset, error));
+                    }
                 }
                 append_header = cursor + entry_size;
                 cursor += entry_size;
@@ -2300,6 +2368,18 @@ pub fn recover_chunks(
                                             );
                                         }
                                     }
+                                }
+                                if is_bracket_record_error(&error) {
+                                    error!(
+                                        "segment {} (chunk {}, seq {}) from '{}': {}. Recovery \
+                                         stops.",
+                                        file_info.seg_id,
+                                        chunk_id,
+                                        file_info.seq_id,
+                                        file_info.path.display(),
+                                        error
+                                    );
+                                    return Err(error);
                                 }
                                 match recovered_from_wal {
                                     Some(loaded) => loaded,
@@ -3547,7 +3627,7 @@ mod tests {
         }
 
         let txn = crate::server::transactions::test_hlc(4242, 7);
-        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn));
+        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn, &[]));
         let manifest = vec![crate::ram::bracket::ManifestEntry {
             chunk_id: 0,
             seq_id: 0,
@@ -3653,7 +3733,7 @@ mod tests {
         chunk.meta.schemas.debug_only_new_schema(schema.clone());
 
         let txn = crate::server::transactions::test_hlc(909, 3);
-        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn));
+        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn, &[]));
         let id = Id::allocated(30, 0, 1);
         let mut cell = OwnedCell {
             header: CellHeader::new(schema.vid, &id),
