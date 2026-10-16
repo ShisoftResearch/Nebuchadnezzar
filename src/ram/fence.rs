@@ -23,9 +23,15 @@
 //! synced, so the site never answered `Fenced` for it. Another version, or
 //! another magic, is a typed error that stops the start (§10.1).
 //!
-//! A fence matters only while its transaction is undecided at this site. At
-//! each start the log is rewritten with the fences of the transactions that
-//! are still in doubt, so it does not grow without limit.
+//! A fence must outlive the transaction at this site (TLA+ F3, F6): a site
+//! with no bracket of the transaction answers `Unknown` and must still refuse
+//! a `prepare` that a coordinator sends later, and a site that aborted after
+//! a fence must refuse a duplicate `prepare` after a compaction and a
+//! restart. So a fence is never dropped while the process runs. At each start
+//! the log is rewritten with the fences of the transactions still in doubt
+//! and every fence younger than `fence_retention` (24 h by default; a
+//! coordinator gives a transaction up long before), so the log does not grow
+//! without limit.
 
 use crate::server::transactions::TxnId;
 use crc_fast::{CrcAlgorithm, Digest};
@@ -243,20 +249,33 @@ impl FenceLog {
         self.state.lock().fenced.contains(txn)
     }
 
-    /// `txn` is decided here: its fence no longer matters. The record stays
-    /// in the file until the next start rewrites it.
-    pub fn forget(&self, txn: &TxnId) {
-        if self.count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        if self.state.lock().fenced.remove(txn) {
-            self.count.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.count.load(Ordering::Acquire)
     }
+}
+
+/// How long a start keeps the fence of a transaction that is not in doubt.
+pub fn fence_retention() -> std::time::Duration {
+    std::env::var("NEB_FENCE_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60))
+}
+
+/// The fences a start keeps: those of the transactions in doubt, and those
+/// younger than `fence_retention` by the transaction's clock.
+pub fn fences_to_keep(
+    previous: &BTreeSet<TxnId>,
+    in_doubt: &BTreeSet<TxnId>,
+    now_ms: u64,
+) -> BTreeSet<TxnId> {
+    let horizon = now_ms.saturating_sub(fence_retention().as_millis() as u64);
+    previous
+        .iter()
+        .filter(|txn| in_doubt.contains(*txn) || txn.wall_ms() >= horizon)
+        .cloned()
+        .collect()
 }
 
 /// Test hook for a reverted control: record fences without the sync.

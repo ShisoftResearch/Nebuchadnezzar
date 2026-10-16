@@ -17,79 +17,27 @@ pub(crate) struct Protection {
     /// Set before rotation unpublishes the head; cleared after the seal job.
     pub seal_pending: AtomicBool,
     activity: AtomicUsize,
-    transactions: Mutex<HashMap<TxnId, TransactionPin>>,
-}
-
-/// Why a transaction keeps a segment in progress.
-///
-/// A transaction owns the segments that hold its parts from its first lease
-/// until it is over. For a transaction of one site it is over when its
-/// COMMIT receipts are synced, or when it aborts. For a transaction of
-/// several sites (D28) it is over only when it is SETTLED: every other
-/// participant answered a release round and does not hold it open (see
-/// `crate::ram::evidence`). Before that, compaction could remove what a
-/// participant needs to decide, and tear the transaction.
-struct TransactionPin {
-    /// `None` until the decision: the transaction is in flight.
-    receipts: Option<Arc<Vec<Receipt>>>,
-    /// Set for a decided multi-site transaction until it is settled.
-    awaiting_settle: bool,
+    transactions: Mutex<HashMap<TxnId, Option<Arc<Vec<Receipt>>>>>,
 }
 
 impl Protection {
     pub fn retain_transaction(&self, txn: &TxnId) {
-        self.transactions.lock().insert(
-            txn.clone(),
-            TransactionPin {
-                receipts: None,
-                awaiting_settle: false,
-            },
-        );
+        self.transactions.lock().insert(txn.clone(), None);
     }
 
-    /// The decision of a transaction of one site: the pin goes when the
-    /// receipts are synced.
     pub fn decide_transaction(&self, txn: &TxnId, receipts: Arc<Vec<Receipt>>) {
-        self.decide(txn, receipts, false);
-    }
-
-    /// The decision of a multi-site transaction: the pin goes when the
-    /// receipts are synced AND [`Self::settle_transaction`] was called.
-    pub fn decide_multi_site_transaction(&self, txn: &TxnId, receipts: Arc<Vec<Receipt>>) {
-        self.decide(txn, receipts, true);
-    }
-
-    fn decide(&self, txn: &TxnId, receipts: Arc<Vec<Receipt>>, awaiting_settle: bool) {
         for receipt in receipts.iter() {
             receipt.file.request_sync(receipt.offset, receipt.epoch);
         }
-        self.transactions.lock().insert(
-            txn.clone(),
-            TransactionPin {
-                receipts: Some(receipts),
-                awaiting_settle,
-            },
-        );
-    }
-
-    /// A multi-site transaction that recovery found committed: its records
-    /// are durable, and it stays until it is settled.
-    pub fn hold_until_settled(&self, txn: &TxnId) {
-        self.decide(txn, Arc::new(Vec::new()), true);
-    }
-
-    /// Every participant settled the transaction.
-    pub fn settle_transaction(&self, txn: &TxnId) {
-        if let Some(pin) = self.transactions.lock().get_mut(txn) {
-            pin.awaiting_settle = false;
-        }
+        self.transactions.lock().insert(txn.clone(), Some(receipts));
     }
 
     pub fn abort_transaction(&self, txn: &TxnId) {
         self.transactions.lock().remove(txn);
     }
 
-    /// Whether `txn` keeps this segment in progress.
+    /// Whether `txn` still keeps this segment in progress: in flight, or
+    /// decided with receipts that a sync has not covered yet.
     pub fn holds_transaction(&self, txn: &TxnId) -> bool {
         self.transaction_pending();
         self.transactions.lock().contains_key(txn)
@@ -97,13 +45,12 @@ impl Protection {
 
     pub fn transaction_pending(&self) -> bool {
         let mut transactions = self.transactions.lock();
-        transactions.retain(|_, pin| {
-            pin.awaiting_settle
-                || pin.receipts.as_ref().map_or(true, |receipts| {
-                    !receipts
-                        .iter()
-                        .all(|receipt| receipt.file.covers_receipt(receipt.offset, receipt.epoch))
-                })
+        transactions.retain(|_, decision| {
+            decision.as_ref().map_or(true, |receipts| {
+                !receipts
+                    .iter()
+                    .all(|receipt| receipt.file.covers_receipt(receipt.offset, receipt.epoch))
+            })
         });
         !transactions.is_empty()
     }
@@ -224,28 +171,6 @@ mod tests {
             "a decided pin needs a sync trigger"
         );
         assert!(file.covers_receipt(16, 0));
-    }
-
-    /// D28: a decided multi-site transaction stays in progress after its
-    /// receipts are covered, until it is settled. A single-site one does not.
-    #[test]
-    fn a_multi_site_decision_stays_in_progress_until_settled() {
-        let protection = Protection::default();
-        let single = crate::server::transactions::test_hlc(1, 1);
-        let multi = crate::server::transactions::test_hlc(2, 1);
-        protection.retain_transaction(&single);
-        protection.decide_transaction(&single, Arc::new(Vec::new()));
-        assert!(!protection.transaction_pending());
-        protection.retain_transaction(&multi);
-        protection.decide_multi_site_transaction(&multi, Arc::new(Vec::new()));
-        assert!(protection.transaction_pending());
-        assert!(protection.holds_transaction(&multi));
-        protection.settle_transaction(&multi);
-        assert!(!protection.transaction_pending());
-        protection.hold_until_settled(&multi);
-        assert!(protection.transaction_pending());
-        protection.settle_transaction(&multi);
-        assert!(!protection.transaction_pending());
     }
 
     #[test]

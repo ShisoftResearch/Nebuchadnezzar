@@ -456,6 +456,20 @@ impl DurableFile {
                     gate.wait();
                 }
             }
+            #[cfg(test)]
+            loop {
+                let directory = self.progress.lock().directory.clone();
+                let paused = directory.is_some_and(|directory| {
+                    PAUSED_RECEIPT_SYNCS
+                        .lock()
+                        .iter()
+                        .any(|prefix| directory.starts_with(prefix))
+                });
+                if !paused {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             let started = Instant::now();
             GROUP_SYNCS.fetch_add(1, Relaxed);
             GROUP_BYTES.fetch_add(bytes, Relaxed);
@@ -468,6 +482,24 @@ impl DurableFile {
             #[cfg(not(test))]
             let result = file.sync_data();
             let result = result.and_then(|()| self.publish_namespace());
+            #[cfg(test)]
+            if result.is_ok() {
+                let directory = self.progress.lock().directory.clone();
+                if let Some(directory) = directory {
+                    crate::ram::segs::power_loss_model::record_synced_len(
+                        &Some(
+                            directory
+                                .join(format!(
+                                    "{}-{}-{}.nlog",
+                                    self.chunk, self.segment, self.sequence
+                                ))
+                                .to_string_lossy()
+                                .to_string(),
+                        ),
+                        end,
+                    );
+                }
+            }
             let finished = Instant::now();
             SYNC_NS.fetch_add(nanos(finished.duration_since(started)), Relaxed);
             self.publish(end, epoch, &result, Some((started, finished)));
@@ -672,3 +704,18 @@ impl std::fmt::Display for DurabilityError {
     }
 }
 impl std::error::Error for DurabilityError {}
+
+/// Test hook: hold the receipt syncs of every WAL file under a directory
+/// prefix, as a site whose group sync has not run yet.
+#[cfg(test)]
+static PAUSED_RECEIPT_SYNCS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn pause_receipt_syncs_under(prefix: &std::path::Path, paused: bool) {
+    let mut held = PAUSED_RECEIPT_SYNCS.lock();
+    held.retain(|existing| existing != prefix);
+    if paused {
+        held.push(prefix.to_path_buf());
+    }
+}

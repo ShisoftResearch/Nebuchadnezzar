@@ -134,6 +134,9 @@ pub enum TxnState {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone)]
 pub enum TxnOutcome {
     Committed,
+    /// The site was told to commit, and its COMMIT is not synced yet (TLA+
+    /// F1): ask again. Never a reason to abort.
+    Committing,
     Aborted,
     /// This peer is in doubt too: it prepared and is waiting for a decision
     /// it never received.
@@ -246,6 +249,10 @@ pub enum TMError {
     AssertionError,
     InvalidTransactionState(TxnState),
     Other,
+    /// `end` was sent and the coordinator cannot tell whether the transaction
+    /// committed: a site did not answer (D33). The transaction is still
+    /// all-or-nothing; the caller must read the outcome again.
+    OutcomeUnknown,
 }
 
 pub async fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {

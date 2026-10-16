@@ -1418,6 +1418,11 @@ impl AsyncClient {
                         reason, abort_result
                     );
                 }
+                Err(TxnError::OutcomeUnknown) => {
+                    // `end` was sent (D33): the transaction can be committed.
+                    // No abort and no retry; the caller reads the data again.
+                    return Err(TxnError::OutcomeUnknown);
+                }
                 Err(e) => {
                     // abort will always be an error to achieve early break
                     let abort_result = txn.abort().await;

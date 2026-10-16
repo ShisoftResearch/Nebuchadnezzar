@@ -3379,14 +3379,15 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
 ///   waits for `resolve_startup_wait`, then a background task keeps asking,
 ///   so a participant that is down does not stop the start.
 ///
-/// A commit writes a synced carrier, installs the cells, and rewrites them as
-/// synced plain entries before the transaction stops resolving.
+/// A commit writes an ordinary synced bracket with copies of the cells and
+/// the status cell before the transaction stops resolving
+/// (`apply_resolved_commit`).
 ///
 /// This runs before the cleaner resumes. Recovery holds every part of an
 /// in-doubt bracket in `Protection` (`BracketLedger::settle`): its cells are
 /// absent from the cell index, so a compaction would read them as dead. A
-/// discard releases them; a resolved commit of several sites keeps them
-/// until it is settled (D28).
+/// discard releases them; a resolved commit releases them once its new
+/// bracket is synced (D20).
 async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
     let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
     let chunks = &database_runtime.chunks;
@@ -3394,11 +3395,7 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     let site = match (database_runtime.txn_manager(), database_runtime.data_site()) {
         (Some(_), Some(site)) => site,
         _ => {
-            // No peer can ask this database anything, so nothing waits to
-            // settle.
-            for (txn, segments) in chunks.evidence().release_all() {
-                chunks.settle_transaction(&txn, &segments);
-            }
+            // No peer can ask this database anything.
             if in_doubt.is_empty() {
                 return;
             }
@@ -3545,7 +3542,6 @@ fn finish_in_doubt_bracket_or_keep(
             "every participant is fenced, aborted, or never held it",
         );
     }
-    database_runtime.chunks.fences().forget(&bracket.txn);
     None
 }
 
@@ -3591,28 +3587,24 @@ fn discard_in_doubt(
         bracket.cells.len()
     );
     chunks.release_transaction_pins(&bracket.txn);
-    chunks.evidence().end_resolving(&bracket.txn);
+    chunks.txn_status().end_resolving(&bracket.txn);
     crate::ram::recovery::BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Make a commit that the commit point reported durable HERE, then install
-/// its cells.
+/// Make a commit that a participant reported HERE, then install its cells.
 ///
-/// In order, and each step durable before the next:
+/// The site writes ONE ORDINARY BRACKET for the transaction (D31): copies of
+/// its cells, and, for a multi-site transaction, its status cell, closed by a
+/// COMMIT and synced before it answers anything. Then:
 ///
-/// 1. One synced BEGIN+COMMIT carrier per CHUNK THAT HOLDS A PART
-///    (`Chunk::write_resolved_commit`). A crash from here on recovers the
-///    transaction as committed.
-/// 2. The cells are installed.
-/// 3. The cells are rewritten as synced plain entries
-///    (`recovery::rewrite_resolved_entries`). From here the data does not
-///    depend on the carrier or the old BEGINs.
-/// 4. The transaction stops resolving: this site reports it closed, and
-///    the commit point can settle it.
+/// * the data no longer depends on the old open parts: a later start finds
+///   the copies committed, and an old open part is decided by the status cell
+///   or, after the release, by the copies being the newest versions;
+/// * the status cell answers `Committed` for this site until every
+///   participant reported its COMMIT synced (TLA+ F4), like any commit.
 ///
-/// The parts stay held in `Protection` through all of it. A transaction of
-/// one site is released at the end; one of several sites is held until it
-/// is settled (D28).
+/// The old open parts stay held in `Protection` (D20) until the new bracket
+/// is synced; then they are released.
 ///
 /// Returns whether the transaction is decided here.
 fn apply_resolved_commit(
@@ -3620,27 +3612,11 @@ fn apply_resolved_commit(
     bracket: &crate::ram::recovery::InDoubtBracket,
 ) -> bool {
     let chunks = &database_runtime.chunks;
-    let mut placed = 0usize;
-    for chunk_id in &bracket.chunks {
-        let Some(chunk) = chunks.list.get(*chunk_id) else {
-            continue;
-        };
-        match chunk.write_resolved_commit(&bracket.txn, &bracket.participants) {
-            Ok(()) => placed += 1,
-            Err(error) => warn!(
-                "chunk {} holds part of resolved transaction {:?} but could not take its COMMIT: \
-                 {:?}",
-                chunk_id, bracket.txn, error
-            ),
-        }
-    }
-    if placed == 0 || placed < bracket.chunks.len() {
+    #[cfg(test)]
+    if crate::ram::chunk::resolved_commits_refused_for_test() {
         error!(
-            "transaction {:?} was resolved COMMITTED by its commit point but only {} of its {} \
-             chunk(s) could hold a COMMIT; it stays in doubt and pinned, and resolution retries",
-            bracket.txn,
-            placed,
-            bracket.chunks.len()
+            "TEST: the resolution of {:?} cannot write its bracket",
+            bracket.txn
         );
         return false;
     }
@@ -3653,27 +3629,82 @@ fn apply_resolved_commit(
             return false;
         }
     }
-    if let Err(error) = crate::ram::recovery::rewrite_resolved_entries(&chunks.list, &bracket.cells)
-    {
-        error!(
-            "cannot rewrite resolved transaction {:?}: {error:?}",
-            bracket.txn
+    let me = database_runtime.rpc.server_id;
+    let multi_site = bracket.participants.iter().any(|peer| *peer != me);
+    let store = chunks.address_range();
+    let mut status = None;
+    let written = {
+        let _scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+            bracket.txn.clone(),
+            bracket.participants.clone(),
         );
+        let copied = crate::ram::recovery::copy_resolved_entries(&chunks.list, &bracket.cells);
+        copied.and_then(|()| {
+            if !multi_site {
+                return Ok(());
+            }
+            // The status cell goes into a chunk the copies already lease.
+            let chunk_id = crate::ram::chunk::transaction_leased_segments(&bracket.txn, &store)
+                .iter()
+                .map(|segment| segment.chunk_id)
+                .min()
+                .or_else(|| bracket.chunks.first().copied())
+                .unwrap_or(0);
+            let chunk = &chunks.list[chunk_id];
+            let id = chunk
+                .free_status_id(&bracket.txn)
+                .ok_or(crate::ram::cell::WriteError::CannotAllocateSpace)?;
+            let mut cell =
+                crate::ram::txn_status::status_cell(&bracket.txn, &id, &bracket.participants);
+            chunk.write_status_cell(&mut cell)?;
+            status = Some((chunk_id, id));
+            Ok(())
+        })
+    };
+    drop(crate::ram::chunk::take_transactional_segments());
+    let closed = written.map_err(|error| format!("{error:?}")).and_then(|()| {
+        chunks
+            .commit_transaction_brackets(&bracket.txn, true)
+            .map(|_| ())
+            .map_err(|refusal| format!("{refusal:?}"))
+    });
+    if let Err(error) = closed {
+        error!(
+            "cannot write the resolution of {:?}: {}; it stays in doubt and pinned, and \
+             resolution retries",
+            bracket.txn, error
+        );
+        // The open bracket of this attempt is retired; it has no COMMIT, so
+        // recovery discards it.
+        let _ = crate::ram::chunk::retire_transaction_leases(&bracket.txn, &store);
         return false;
     }
-    let participants: std::collections::BTreeSet<u64> =
-        bracket.participants.iter().copied().collect();
-    if participants.len() > 1 {
-        let held = chunks.hold_transaction_until_settled(&bracket.txn);
-        chunks
-            .evidence()
-            .retain_commit(bracket.txn.clone(), participants, held);
-    } else {
-        chunks.release_transaction_pins(&bracket.txn);
+    if let Err(error) = crate::ram::chunk::release_transaction_leases(&bracket.txn, &store) {
+        error!(
+            "resolved transaction {:?} committed but its heads could not be released: {}",
+            bracket.txn, error
+        );
     }
-    chunks.evidence().end_resolving(&bracket.txn);
+    if let Some((chunk, id)) = status {
+        chunks.txn_status().register(
+            bracket.txn.clone(),
+            crate::ram::txn_status::StatusEntry {
+                id,
+                chunk,
+                participants: bracket.participants.clone(),
+                self_synced: true,
+                synced_peers: std::collections::BTreeSet::new(),
+                segments: Vec::new(),
+                announced: false,
+                since: std::time::Instant::now(),
+            },
+        );
+    }
+    // The new bracket is synced: the old open parts may go.
+    chunks.release_transaction_pins(&bracket.txn);
+    chunks.txn_status().end_resolving(&bracket.txn);
     warn!(
-        "transaction {:?} was in doubt after recovery and its commit point reports it \
+        "transaction {:?} was in doubt after recovery and a participant reports it \
          COMMITTED; its {} cell(s) are installed and durable here",
         bracket.txn,
         bracket.cells.len()

@@ -85,6 +85,9 @@ pub enum TxnError {
     PrepareError(TMPrepareResult),
     CommitError(EndResult),
     AbortError(AbortResult),
+    /// The commit request reached the coordinator, and the outcome is not
+    /// known (D33): read the data again before any retry.
+    OutcomeUnknown,
 }
 
 #[derive(Clone)]
@@ -205,9 +208,27 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
+    /// Commit. The COMMIT is appended at every participant and its sync is
+    /// queued (D19 option 1): the result survives a process crash, and a
+    /// power loss may drop the whole transaction, never part of it.
     pub async fn commit(&self) -> Result<(), TxnError> {
+        self.commit_with(false).await
+    }
+
+    /// Commit with the COMMIT synced at every participant before the result
+    /// (D7): the result survives a power loss.
+    pub async fn commit_durable(&self) -> Result<(), TxnError> {
+        self.commit_with(true).await
+    }
+
+    async fn commit_with(&self, durable: bool) -> Result<(), TxnError> {
         self.state.set(TxnState::Committed);
-        match self.client.commit(self.tid.to_owned()).await {
+        let result = if durable {
+            self.client.commit_durable(self.tid.to_owned()).await
+        } else {
+            self.client.commit(self.tid.to_owned()).await
+        };
+        match result {
             Ok(Ok(EndResult::Success)) => return Ok(()),
             Ok(Ok(EndResult::SomeLocksNotReleased {
                 released,
@@ -247,8 +268,10 @@ impl Transaction {
                 Ok(())
             }
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
+            Ok(Err(TMError::OutcomeUnknown)) => Err(TxnError::OutcomeUnknown),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
-            Err(e) => Err(TxnError::RPCError(e)),
+            // The request may have been taken and `end` sent (D33).
+            Err(_) => Err(TxnError::OutcomeUnknown),
         }
     }
     pub async fn abort(&self) -> Result<(), TxnError> {

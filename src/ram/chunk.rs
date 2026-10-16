@@ -1072,7 +1072,7 @@ pub(crate) fn refuse_resolved_commits_for_test(refuse: bool) {
 }
 
 #[cfg(test)]
-fn resolved_commits_refused_for_test() -> bool {
+pub(crate) fn resolved_commits_refused_for_test() -> bool {
     REFUSED_RESOLVED_COMMITS.load(Ordering::Acquire)
 }
 
@@ -2116,63 +2116,63 @@ impl Chunk {
         journaled.map(|()| true)
     }
 
-    /// Write a COMMIT for a transaction this chunk holds no lease for, as a
-    /// BEGIN+COMMIT carrier.
-    ///
-    /// The resolution path after a restart. The lease-based close cannot be
-    /// used there -- recovery reset the write heads, so nothing is leased and
-    /// the transaction's own segments may be full or sealed -- but it does
-    /// not need to be: recovery collects COMMIT records store-wide and
-    /// settles pending cells against them, so ONE record anywhere in the
-    /// store decides the transaction everywhere in it. The carrier's BEGIN
-    /// names `participants`, like every BEGIN.
-    ///
-    /// Synced before it returns: this is the record that turns a transaction
-    /// the commit point resolved into one this store will still agree is
-    /// committed after the next crash, until the entries have plain copies.
-    /// The caller installs the cells and reports the transaction closed only
-    /// after this, so a power loss inside the group-sync window cannot drop
-    /// the record after the commit point released its evidence.
-    ///
-    /// The carrier's segment is retained for the transaction (`Protection`)
-    /// until the caller releases or settles it.
-    pub fn write_resolved_commit(
+    /// Write the status cell of a multi-site transaction into this chunk
+    /// (`crate::ram::txn_status`). The caller runs inside the transaction's
+    /// `TransactionScope`, so the cell lands in the transaction's bracket,
+    /// before its COMMIT. An upsert: a resolution that retries after a failed
+    /// attempt writes the cell again into its new bracket.
+    pub(crate) fn write_status_cell(
+        &self,
+        cell: &mut OwnedCell,
+    ) -> Result<CellHeader, WriteError> {
+        self.upsert_cell(cell)
+    }
+
+    /// Tombstone a status cell of this chunk: every participant's COMMIT is
+    /// synced, so nobody can ask about the transaction any more (TLA+ F4).
+    pub(crate) fn remove_status_cell(&self, id: &Id) -> Result<(), WriteError> {
+        self.remove_cell(id.bits())
+    }
+
+    /// The status cell of `txn` in this chunk, if one exists: its id and the
+    /// participants it names.
+    pub(crate) fn find_status_cell(
         &self,
         txn: &crate::server::transactions::TxnId,
-        participants: &[u64],
-    ) -> Result<(), WriteError> {
-        #[cfg(test)]
-        if resolved_commits_refused_for_test() {
-            return Err(WriteError::CannotAllocateSpace);
+    ) -> Option<(Id, Vec<u64>)> {
+        for probe in 0..crate::ram::txn_status::STATUS_PROBES {
+            let id = crate::ram::txn_status::status_id(txn, self.id, probe);
+            let Ok(cell) = self.read_cell(id.bits()) else {
+                continue;
+            };
+            if let Some((found, participants)) =
+                crate::ram::txn_status::decode_status_cell(&cell.to_owned())
+            {
+                if &found == txn {
+                    return Some((id, participants));
+                }
+            }
         }
-        // Recovery recognizes a complete bracket, not a standalone COMMIT.
-        // Keep this carrier pinned until all resolved entries have plain copies.
-        let begin = crate::ram::bracket::encode_begin(txn, participants);
-        let commit = crate::ram::bracket::encode_commit(txn, &[]);
-        let size = (2 * crate::ram::entry::ENTRY_HEAD_SIZE + begin.len() + commit.len()) as u32;
-        let pending = self.try_acquire(size, false)?;
-        pending.seg.protection.retain_transaction(txn);
-        let mut cursor = pending.addr;
-        for (kind, content) in [
-            (crate::ram::entry::EntryType::BEGIN, begin),
-            (crate::ram::entry::EntryType::COMMIT, commit),
-        ] {
-            crate::ram::entry::Entry::encode_to(
-                cursor,
-                kind,
-                content.len() as u32,
-                |addr| unsafe {
-                    std::ptr::copy_nonoverlapping(content.as_ptr(), addr as *mut u8, content.len());
-                },
-            );
-            cursor += crate::ram::entry::ENTRY_HEAD_SIZE + content.len();
+        None
+    }
+
+    /// The first probe id for `txn` in this chunk that is free or already
+    /// holds the status cell of `txn`.
+    pub(crate) fn free_status_id(&self, txn: &crate::server::transactions::TxnId) -> Option<Id> {
+        for probe in 0..crate::ram::txn_status::STATUS_PROBES {
+            let id = crate::ram::txn_status::status_id(txn, self.id, probe);
+            match self.read_cell(id.bits()) {
+                Err(_) => return Some(id),
+                Ok(cell) => {
+                    if crate::ram::txn_status::decode_status_cell(&cell.to_owned())
+                        .is_some_and(|(found, _)| &found == txn)
+                    {
+                        return Some(id);
+                    }
+                }
+            }
         }
-        pending.append()?;
-        pending
-            .seg
-            .force_wal_sync()
-            .map_err(WriteError::from_wal_io)?;
-        Ok(())
+        None
     }
 
     /// This chunk's lease key: unique across every store in the process.
@@ -5203,9 +5203,9 @@ pub struct Chunks {
     /// can ask its peers about them. Empty on a fresh store and after
     /// resolution.
     pub recovered_brackets: Mutex<crate::ram::recovery::RecoveredBrackets>,
-    /// Committed transactions a peer, or this store's next recovery, may
-    /// still need the evidence of. See `crate::ram::evidence`.
-    evidence: crate::ram::evidence::DecisionEvidence,
+    /// The status cells of this store and the transactions it resolves. See
+    /// `crate::ram::txn_status`.
+    txn_status: crate::ram::txn_status::TxnStatusRegistry,
     /// The participant fences this site promised (D29).
     fences: crate::ram::fence::FenceLog,
     /// In-doubt transactions that wait for their participants' answers. The
@@ -5261,87 +5261,56 @@ impl Chunks {
 
     /// Keep what recovery learned about transactions, for termination.
     ///
-    /// Every committed transaction with more than one participant stays in
-    /// progress, with no cap, until it is settled: a restarted store does
-    /// not know which of them a participant is still in doubt about. Its
-    /// segments are held in `Protection` before the cleaner can run, and the
-    /// commit point answers from the evidence. A transaction of one site is
-    /// not kept. The in-doubt transactions are held by recovery already
+    /// The status cells that recovery found are registered (D31): this site
+    /// committed their transactions, and keeps answering `Committed` for them
+    /// until every participant's COMMIT is synced. Recovery ends with a sync of
+    /// every WAL file, so each of them is synced here (TLA+ F1). The in-doubt
+    /// transactions are held in `Protection` by recovery already
     /// (`BracketLedger::settle`).
     pub fn remember_recovered_brackets(
         &self,
         mut brackets: crate::ram::recovery::RecoveredBrackets,
     ) {
-        for commit in std::mem::take(&mut brackets.committed) {
-            let participants: std::collections::BTreeSet<u64> =
-                commit.participants.into_iter().collect();
-            if participants.len() < 2 {
-                continue;
-            }
-            for (chunk_id, segment_id) in &commit.segments {
-                if let Some(segment) = self
-                    .list
-                    .get(*chunk_id)
-                    .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
-                {
-                    segment.protection.hold_until_settled(&commit.txn);
-                }
-            }
-            self.evidence
-                .retain_commit(commit.txn, participants, commit.segments);
+        brackets.committed.clear();
+        for found in std::mem::take(&mut brackets.status_cells) {
+            self.txn_status.register(
+                found.txn,
+                crate::ram::txn_status::StatusEntry {
+                    id: found.id,
+                    chunk: found.chunk,
+                    participants: found.participants,
+                    self_synced: true,
+                    synced_peers: std::collections::BTreeSet::new(),
+                    segments: Vec::new(),
+                    announced: false,
+                    since: std::time::Instant::now(),
+                },
+            );
         }
         for bracket in &brackets.in_doubt {
-            self.evidence
+            self.txn_status
                 .begin_resolving(bracket.txn.clone(), bracket.participants.clone());
         }
         *self.recovered_brackets.lock() = brackets;
     }
 
-    /// Hold a resolved multi-site transaction in every segment that holds it
-    /// now, until it is settled. Returns those segments.
-    pub(crate) fn hold_transaction_until_settled(
+    /// The status cells and in-doubt transactions of this store.
+    pub fn txn_status(&self) -> &crate::ram::txn_status::TxnStatusRegistry {
+        &self.txn_status
+    }
+
+    /// The status cell of `txn` in this store, by probing every chunk: its
+    /// chunk, its id and the participants it names.
+    pub fn find_status_cell(
         &self,
         txn: &crate::server::transactions::TxnId,
-    ) -> Vec<crate::ram::evidence::SegmentRef> {
-        let mut held = Vec::new();
+    ) -> Option<(usize, Id, Vec<u64>)> {
         for chunk in &self.list {
-            for segment in chunk.segments() {
-                if segment.protection.holds_transaction(txn) {
-                    segment.protection.hold_until_settled(txn);
-                    held.push((chunk.id, segment.id));
-                }
+            if let Some((id, participants)) = chunk.find_status_cell(txn) {
+                return Some((chunk.id, id, participants));
             }
         }
-        held
-    }
-
-    /// `txn` is settled at every participant: its segments are no longer in
-    /// progress for it.
-    pub(crate) fn settle_transaction(
-        &self,
-        txn: &crate::server::transactions::TxnId,
-        segments: &[crate::ram::evidence::SegmentRef],
-    ) {
-        for (chunk_id, segment_id) in segments {
-            if let Some(segment) = self
-                .list
-                .get(*chunk_id)
-                .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
-            {
-                segment.protection.settle_transaction(txn);
-            }
-        }
-        self.cleaner_wake.request();
-    }
-
-    /// Committed transactions whose evidence this store still keeps.
-    pub fn evidence(&self) -> &crate::ram::evidence::DecisionEvidence {
-        &self.evidence
-    }
-
-    /// Whether this store committed `txn` and keeps the evidence of it.
-    pub fn holds_commit_evidence(&self, txn: &crate::server::transactions::TxnId) -> bool {
-        self.evidence.holds_commit(txn)
+        None
     }
 
     /// The participant fences of this store.
@@ -5452,6 +5421,11 @@ impl Chunks {
     ) -> Arc<Chunks> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
+
+        // The hidden schema of transaction status cells, before recovery
+        // reads them (`crate::ram::txn_status`).
+        meta.schemas
+            .register_internal_schema(crate::ram::txn_status::txn_status_schema());
 
         // Calculate exact chunk size
         let chunk_size = size.next_power_of_two();
@@ -5573,7 +5547,7 @@ impl Chunks {
                     .collect(),
             ),
             recovered_brackets: Mutex::new(crate::ram::recovery::RecoveredBrackets::empty()),
-            evidence: crate::ram::evidence::DecisionEvidence::new(),
+            txn_status: crate::ram::txn_status::TxnStatusRegistry::new(),
             fences: crate::ram::fence::FenceLog::new(wal_storage.as_deref()),
             unresolved: Mutex::new(std::collections::BTreeMap::new()),
             base_addr: global_base_addr,
@@ -5684,6 +5658,11 @@ impl Chunks {
                         brackets.committed.len(),
                         brackets.in_doubt.len()
                     );
+                    // Before the store answers anything: what recovery read may
+                    // be page cache that a power loss still drops, and a
+                    // `Committed` answer must come from synced records only
+                    // (TLA+ F1).
+                    chunks_arc.sync_all();
                     chunks_arc.remember_recovered_brackets(brackets);
                 }
                 Err(e) => {
@@ -5719,8 +5698,9 @@ impl Chunks {
         }
 
         // The fences of the last run that still matter: those of the
-        // transactions in doubt now. A log this build cannot read stops the
-        // start, like any store file that does not decode.
+        // transactions in doubt now, and every recent one, also of a
+        // transaction with no bracket here (TLA+ F3). A log this build cannot
+        // read stops the start, like any store file that does not decode.
         let previous = chunks_arc
             .fences
             .load(enable_recovery)
@@ -5732,9 +5712,13 @@ impl Chunks {
             .iter()
             .map(|bracket| bracket.txn.clone())
             .collect();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
         chunks_arc
             .fences
-            .reset(previous.intersection(&in_doubt).cloned().collect())
+            .reset(crate::ram::fence::fences_to_keep(&previous, &in_doubt, now_ms))
             .unwrap_or_else(|error| panic!("cannot write the fence log, refusing to start: {error}"));
 
         chunks_arc
@@ -5755,8 +5739,9 @@ impl Chunks {
     /// COMMIT then proves every entry of the transaction was already durable,
     /// so one COMMIT anywhere decides the whole transaction at recovery.
     ///
-    /// `Ok` means every open part of the transaction carries its own COMMIT
-    /// and every one of those records is fsynced; nothing less. Any failure
+    /// `Ok(true)` means every open part of the transaction carries its own
+    /// COMMIT and every one of those records is fsynced. `Ok(false)` means
+    /// the records are appended and their sync is queued. Any failure
     /// refuses the commit; [`CommitRefusal`] says what a power loss can bring
     /// back. If no COMMIT was synced, the failure path retracts the records
     /// this attempt placed from each private WAL tail, and syncs the
@@ -5772,17 +5757,21 @@ impl Chunks {
     /// of a transaction that did write; `DataManager` keeps that knowledge in
     /// the transaction object it serializes every decision through.
     ///
-    /// `multi_site`: the transaction has other participants. Its segments
-    /// then stay in progress after the COMMIT is synced, until the release
-    /// round settles it (D28, see `crate::ram::evidence`).
+    /// `durable` (D7): the COMMIT records are synced before this returns.
+    /// Otherwise (D19 option 1, the default) they are appended and their
+    /// sync is queued: the receipts request it from the group syncer, and
+    /// the segments stay in progress (D20) until it lands. A process crash
+    /// keeps the appended records; a power loss may drop them at every
+    /// participant, and the participant fence then aborts or commits the
+    /// transaction as a whole.
     pub fn commit_transaction_brackets(
         &self,
         txn: &crate::server::transactions::TxnId,
-        multi_site: bool,
-    ) -> Result<(), CommitRefusal> {
+        durable: bool,
+    ) -> Result<bool, CommitRefusal> {
         let manifest = transaction_manifest(txn, &self.address_range());
         if manifest.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let chunk_ids: Vec<u16> = {
             let mut ids: Vec<u16> = manifest.iter().map(|member| member.chunk_id).collect();
@@ -5806,7 +5795,8 @@ impl Chunks {
             .collect();
         // Set once a segment that holds a COMMIT of this transaction is
         // synced. From then on recovery commits the transaction.
-        let mut durable = false;
+        let mut synced_commit = false;
+        let mut forced = false;
         let mut proof = None;
         let decision: Result<(), WriteError> = 'decision: {
             for chunk_id in chunk_ids {
@@ -5839,9 +5829,13 @@ impl Chunks {
                     Err(error) => break 'decision Err(WriteError::from_wal_io(error)),
                 }
             }
-            for segment in &segments {
+            // Queued (the default): the receipts below request the sync.
+            // Forced: also when a part cannot be proven by a receipt.
+            let force = durable || !all_parts_proven;
+            forced = force;
+            for segment in segments.iter().filter(|_| force) {
                 #[cfg(test)]
-                if durable && take_injected_sync_failure(self.base_addr, txn) {
+                if synced_commit && take_injected_sync_failure(self.base_addr, txn) {
                     break 'decision Err(WriteError::from_wal_io(io::Error::other(
                         "injected WAL sync failure",
                     )));
@@ -5850,7 +5844,7 @@ impl Chunks {
                     break 'decision Err(WriteError::from_wal_io(error));
                 }
                 if segment.bracket_is_committed() {
-                    durable = true;
+                    synced_commit = true;
                 }
             }
             proof = Some((Arc::new(receipts), all_parts_proven));
@@ -5860,18 +5854,12 @@ impl Chunks {
             let (receipts, all_parts_proven) = proof.expect("a decision that succeeded has a proof");
             if all_parts_proven {
                 for segment in &segments {
-                    if multi_site {
-                        segment
-                            .protection
-                            .decide_multi_site_transaction(txn, receipts.clone());
-                    } else {
-                        segment.protection.decide_transaction(txn, receipts.clone());
-                    }
+                    segment.protection.decide_transaction(txn, receipts.clone());
                 }
             }
-            return Ok(());
+            return Ok(forced);
         };
-        if durable {
+        if synced_commit {
             // Retracting now would make the client hear "failed" about a
             // transaction that recovery commits. The heads stay leased, so
             // the segments stay in progress until a retry closes them.
@@ -6372,10 +6360,28 @@ impl Chunks {
     /// migration plan covering many slots costs one sweep rather than one per
     /// slot.
     pub fn cell_ids_in_slots(&self, slots: &std::collections::HashSet<u16>) -> Vec<Id> {
+        // A status cell belongs to this site and is never migrated.
         self.list
             .iter()
             .flat_map(|chunk| chunk.cell_ids_in_slots(slots))
+            .filter(|id| !self.is_status_cell(id.bits()))
             .collect()
+    }
+
+    /// Whether the live cell `id` is a status cell (D31). Status cells have
+    /// the reserved origin `STATUS_ORIGIN`; for such an id the registry
+    /// answers, and the header answers for a status cell that is not
+    /// registered yet (written, its close still running). Other ids cost one
+    /// shift and compare.
+    pub fn is_status_cell(&self, id: u64) -> bool {
+        let id = Id::from_bits(id);
+        if id.is_hashed() || id.origin() != crate::ram::txn_status::STATUS_ORIGIN {
+            return false;
+        }
+        self.txn_status.is_status_id(id.bits())
+            || self.head_cell(&id).is_ok_and(|header| {
+                header.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID
+            })
     }
 
     pub fn count(&self) -> usize {
@@ -6390,10 +6396,14 @@ impl Chunks {
     /// Live cell ids of one chunk, ascending. See [`Chunk::live_cell_ids`] for
     /// what this costs; an out-of-range index is an empty chunk.
     pub fn live_cell_ids_of_chunk(&self, chunk: usize) -> Vec<u64> {
-        self.list
+        let mut ids = self
+            .list
             .get(chunk)
             .map(Chunk::live_cell_ids)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Status cells are hidden: a scan, a count or a dump never sees them.
+        ids.retain(|id| !self.is_status_cell(*id));
+        ids
     }
 
     pub fn clear_cell_index(&self) -> usize {
@@ -7334,7 +7344,7 @@ mod tests {
         // The first store decides. It must close and release ITS head and
         // nothing else.
         first
-            .commit_transaction_brackets(&txn, false)
+            .commit_transaction_brackets(&txn, true)
             .expect("first store commits");
         assert_eq!(
             release_transaction_leases(&txn, &first.address_range()),
@@ -7361,7 +7371,7 @@ mod tests {
         );
 
         second
-            .commit_transaction_brackets(&txn, false)
+            .commit_transaction_brackets(&txn, true)
             .expect("second store commits");
         assert_eq!(
             release_transaction_leases(&txn, &second.address_range()),
@@ -7412,7 +7422,7 @@ mod tests {
         drop(scope);
 
         // Decided: every bracket closed, so the heads may go back.
-        chunks.commit_transaction_brackets(&txn, false).expect("commit");
+        chunks.commit_transaction_brackets(&txn, true).expect("commit");
         assert_eq!(
             release_transaction_leases(&txn, &chunks.address_range()),
             Ok(1)
@@ -7455,7 +7465,7 @@ mod tests {
                     Ok(1)
                 );
             } else {
-                chunks.commit_transaction_brackets(&txn, false).expect("commit");
+                chunks.commit_transaction_brackets(&txn, true).expect("commit");
                 assert_eq!(
                     release_transaction_leases(&txn, &chunks.address_range()),
                     Ok(1)
@@ -7657,7 +7667,7 @@ mod tests {
         assert!(seg.is_head_owned());
 
         // Closing the bracket is what makes the release legal.
-        chunks.commit_transaction_brackets(&txn, false).expect("commit");
+        chunks.commit_transaction_brackets(&txn, true).expect("commit");
         assert!(seg.bracket_is_committed());
         assert_eq!(
             release_transaction_leases(&txn, &chunks.address_range()),
@@ -7877,7 +7887,7 @@ mod tests {
             .is_none());
         drop(scope);
 
-        chunks.commit_transaction_brackets(&txn, false).expect("commit");
+        chunks.commit_transaction_brackets(&txn, true).expect("commit");
         for seg in [&first_seg, &second_seg] {
             let types = entry_types_in(seg);
             assert_eq!(types.first(), Some(&crate::ram::entry::EntryType::BEGIN));

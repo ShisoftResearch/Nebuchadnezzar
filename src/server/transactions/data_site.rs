@@ -15,7 +15,7 @@ use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -300,7 +300,33 @@ struct Transaction {
     /// on; only termination may commit it, after a participant reports it
     /// committed.
     fenced: bool,
+    /// The coordinator asked for a durable commit (D7): the COMMIT is synced
+    /// before `end` answers, also on a retry of a refused close.
+    durable_commit: bool,
 }
+
+/// Test hook: a site does not send `synced` notices, as one whose notices
+/// were lost. The slow sweep must release its status cells.
+#[cfg(test)]
+pub(crate) static SYNCED_NOTICES_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: the participant fence treats these server ids as down, as if
+/// they did not answer. The cluster harness cannot stop two of its three
+/// raft members at once (`bifrost/src/raft/mod.rs:2987`), so a test that
+/// restarts one participant while another is down marks that one silent.
+#[cfg(test)]
+pub(crate) fn silent_peers_for_test() -> &'static Mutex<std::collections::BTreeSet<u64>> {
+    static SILENT: std::sync::OnceLock<Mutex<std::collections::BTreeSet<u64>>> =
+        std::sync::OnceLock::new();
+    SILENT.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Test hook for TLA+ F2 (C15): the prepare round does not sync the
+/// entries before the yes vote.
+#[cfg(test)]
+pub(crate) static PREPARE_SYNC_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// What the participant fence decided about an in-doubt transaction.
 pub(crate) enum InDoubtDecision {
@@ -378,9 +404,9 @@ pub struct DataManager {
     decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
 }
 
-/// How often a site asks the participants of the multi-site transactions it
-/// still keeps whether they hold them open. The fallback for a lost
-/// `settled` notice; see `release_decision_evidence`.
+/// How often a site asks the participants that did not report their COMMIT
+/// synced; the fallback for a lost `synced` notice. See
+/// `status_release_round`.
 fn settle_sweep_interval() -> std::time::Duration {
     std::env::var("NEB_SETTLE_SWEEP_SECS")
         .ok()
@@ -425,7 +451,9 @@ service! {
     rpc abort(clock: Hlc, tid: TxnId) -> DataSiteResponse<AbortResult>;
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
-    rpc end(clock: Hlc, tid: TxnId) -> DataSiteResponse<EndResult>;
+    // `durable` (D7): the COMMIT is synced before the reply. Otherwise
+    // (default, D19 option 1) it is appended and its sync is queued.
+    rpc end(clock: Hlc, tid: TxnId, durable: bool) -> DataSiteResponse<EndResult>;
 
     // Cooperative termination: what does this site know about T's fate?
     //
@@ -434,15 +462,10 @@ service! {
     // that went away.
     rpc txn_status(tid: TxnId) -> DataSiteResponse<TxnOutcome>;
 
-    // The transactions this site holds open: it can still ask a peer about
-    // each of them. A peer keeps the evidence of a commit until no site that
-    // can ask reports it here.
-    rpc open_transactions() -> DataSiteResponse<Vec<TxnId>>;
-
-    // Every participant of each of `tids` holds the outcome durably, as the
-    // coordinator saw from their `end` results: release what this site keeps
-    // for them (D28). Batched by the coordinator's flusher.
-    rpc settled(tids: Vec<TxnId>) -> DataSiteResponse<()>;
+    // Participant `from` synced its COMMIT of each of `tids` (TLA+ F4).
+    // Batched; a site tombstones its status cell of a transaction when every
+    // participant reported.
+    rpc synced(from: u64, tids: Vec<TxnId>) -> DataSiteResponse<()>;
 
     // The participant fence (D29): refuse the coordinator's `end` and any
     // `prepare` of `tid` from now on, recorded durably before the answer.
@@ -488,18 +511,21 @@ impl DataManager {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
-        // The slow fallback of the `settled` notice: a coordinator that died
-        // before its flush, a close that finished late, a resolved site.
-        // Separate from the lease sweep, so a peer that is slow to answer
-        // does not delay it.
+        // The status-cell release (TLA+ F4): each second, find the status
+        // cells whose COMMIT got synced, announce them, and tombstone the
+        // ones every participant reported; each sweep interval, ask the
+        // participants that did not report. Separate from the lease sweep,
+        // so a peer that is slow to answer does not delay it.
         let manager_clone = manager.clone();
         tokio::spawn(async move {
+            let mut last_sweep = std::time::Instant::now();
             loop {
-                let interval = settle_sweep_interval();
-                tokio::time::sleep(interval).await;
-                manager_clone
-                    .release_decision_evidence_older_than(interval)
-                    .await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sweep = last_sweep.elapsed() >= settle_sweep_interval();
+                if sweep {
+                    last_sweep = std::time::Instant::now();
+                }
+                manager_clone.status_release_round(sweep).await;
             }
         });
 
@@ -543,6 +569,7 @@ impl DataManager {
                 decided_commit: false,
                 commit_durable: false,
                 fenced: false,
+                durable_commit: false,
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -809,7 +836,6 @@ impl DataManager {
         }
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
-        self.chunks().fences().forget(tid);
     }
 
     /// Restore the cell index, pad the spans, then release the leased heads.
@@ -1027,7 +1053,7 @@ impl DataManager {
     ///   decided and the client is told `Success`. If the retraction could
     ///   not be synced, a COMMIT can come back after a power loss, so it stays
     ///   decided and the client is told the refusal.
-    fn close_committed_brackets(&self, tid: &TxnId) -> CloseOutcome {
+    fn close_committed_brackets(&self, tid: &TxnId, durable: bool) -> CloseOutcome {
         let Some(txn_lock) = self.find_transaction(tid) else {
             return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
         };
@@ -1045,24 +1071,41 @@ impl DataManager {
             );
             return CloseOutcome::Fenced;
         }
+        // A durable `end` (D7) makes every later retry durable too.
+        txn.durable_commit |= durable;
+        let durable = txn.durable_commit;
         let store = self.chunks().address_range();
-        let segments: Vec<crate::ram::evidence::SegmentRef> =
-            crate::ram::chunk::transaction_leased_segments(tid, &store)
-                .iter()
-                .map(|segment| (segment.chunk_id, segment.id))
-                .collect();
         let multi_site = self.has_other_participants(&txn.participants);
+        let mut status = None;
         if multi_site {
             // Before the first record, as `decided_commit` promises: from
             // here no abort path can run. The coordinator sent `end` to every
             // site at once, so another site may already be committed.
             txn.decided_commit = true;
             txn.commit_durable = true;
+            // The status cell, inside the bracket, before the COMMIT, under
+            // the same sync (D31).
+            match self.write_status_cell(tid, &txn.participants, &store) {
+                Ok(placed) => status = Some(placed),
+                Err(error) => {
+                    error!(
+                        "cannot write the status cell of {:?}: {:?}; the transaction is \
+                         decided and its close is retried",
+                        tid, error
+                    );
+                    return CloseOutcome::Pending(EndResult::StoreFull(error));
+                }
+            }
         }
-        if let Err(refusal) = self
-            .chunks()
-            .commit_transaction_brackets(tid, multi_site)
-        {
+        let segments: Vec<crate::ram::txn_status::SegmentRef> =
+            crate::ram::chunk::transaction_leased_segments(tid, &store)
+                .iter()
+                .map(|segment| (segment.chunk_id, segment.id))
+                .collect();
+        let closed = self.chunks().commit_transaction_brackets(tid, durable);
+        let synced = match closed {
+            Ok(synced) => synced,
+            Err(refusal) => {
             let reason = match refusal.error() {
                 WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
                     EndResult::StoreFull(refusal.error().clone())
@@ -1119,13 +1162,27 @@ impl DataManager {
                     CloseOutcome::RolledBack(reason)
                 }
             };
-        }
+            }
+        };
         txn.decided_commit = true;
         txn.commit_durable = true;
-        // Before the leases go. The segments themselves stay in progress in
-        // `Protection` (decided above as multi-site) until the transaction
-        // is settled.
-        self.retain_commit_evidence(tid, &txn.participants, segments);
+        if let Some((chunk, id)) = status {
+            // Answered `Committing` until this site's COMMIT is synced, then
+            // `Committed` until every participant's is (TLA+ F1, F4).
+            self.chunks().txn_status().register(
+                tid.clone(),
+                crate::ram::txn_status::StatusEntry {
+                    id,
+                    chunk,
+                    participants: txn.participants.clone(),
+                    self_synced: synced,
+                    synced_peers: std::collections::BTreeSet::new(),
+                    segments,
+                    announced: false,
+                    since: std::time::Instant::now(),
+                },
+            );
+        }
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -1194,7 +1251,7 @@ impl DataManager {
             if decided_commit {
                 // This site was TOLD to commit and could not finish closing
                 // its brackets. There is nothing to ask anyone: finish it.
-                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
                     .await
                     .payload;
                 if !matches!(ended, EndResult::Success) {
@@ -1247,7 +1304,7 @@ impl DataManager {
                         );
                         continue;
                     }
-                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
                         .await
                         .payload;
                     if !matches!(ended, EndResult::Success) {
@@ -1293,8 +1350,8 @@ impl DataManager {
     /// 3. Abort only if every participant answered `Fenced`, `Aborted` or
     ///    `Unknown`: then no site holds a COMMIT and no site can ever get one
     ///    from the coordinator. `Unknown` is a real answer because a site
-    ///    that committed keeps its answer while the transaction is unsettled
-    ///    (D28). `Committing` or silence means wait.
+    ///    that committed keeps its status cell until every participant's
+    ///    COMMIT is synced (D31, TLA+ F4). `Committing` or silence means wait.
     ///
     /// Works for a live transaction and for a bracket in doubt after a
     /// restart; both fence this site durably first.
@@ -1304,6 +1361,10 @@ impl DataManager {
         };
         let mut sites = Vec::with_capacity(peers.len());
         for peer in peers {
+            #[cfg(test)]
+            if silent_peers_for_test().lock().contains(peer) {
+                return InDoubtDecision::Wait;
+            }
             match txn_manager.data_site_for(*peer).await {
                 Ok(site) => sites.push((*peer, site)),
                 Err(error) => {
@@ -1319,8 +1380,11 @@ impl DataManager {
             match site.txn_status(tid.clone()).await {
                 Ok(response) => {
                     self.update_clock(response.clock);
-                    if response.payload == TxnOutcome::Committed {
-                        return InDoubtDecision::Commit;
+                    match response.payload {
+                        TxnOutcome::Committed => return InDoubtDecision::Commit,
+                        // Decided, not synced yet (F1): ask again later.
+                        TxnOutcome::Committing => return InDoubtDecision::Wait,
+                        _ => {}
                     }
                 }
                 Err(error) => {
@@ -1369,7 +1433,7 @@ impl DataManager {
             Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
             _ => {}
         }
-        if self.chunks().holds_commit_evidence(tid) {
+        if self.chunks().txn_status().get(tid).is_some() {
             return FenceAnswer::Committing;
         }
         if let Some(txn_lock) = self.find_transaction(tid) {
@@ -1394,7 +1458,7 @@ impl DataManager {
             error!("cannot record the fence of {:?}: {}", tid, error);
             return FenceAnswer::Committing;
         }
-        if self.chunks().evidence().resolving_participants(tid).is_some() {
+        if self.chunks().txn_status().resolving_participants(tid).is_some() {
             // In doubt after a restart: its parts are here, undecided.
             FenceAnswer::Fenced
         } else {
@@ -1432,7 +1496,7 @@ impl DataManager {
                     if let Some(txn_lock) = self.find_transaction(tid) {
                         txn_lock.lock().fenced = false;
                     }
-                    match <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                    match <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
                         .await
                         .payload
                     {
@@ -1468,22 +1532,42 @@ impl DataManager {
         }
     }
 
-    /// Keep a multi-site transaction this site committed until it is
-    /// settled at every participant. Every participant keeps one: the
-    /// release round then settles its segments in `Protection`, and on the
-    /// commit point the answer `Committed` outlives the bounded decision
-    /// memory. A transaction of one site needs none.
-    fn retain_commit_evidence(
+    /// Write the status cell of `tid` into its bracket, in the lowest chunk
+    /// it already leases here, so no bracket part is added. A retry finds the
+    /// cell it wrote before. Returns the chunk and the id.
+    fn write_status_cell(
         &self,
         tid: &TxnId,
         participants: &[u64],
-        segments: Vec<crate::ram::evidence::SegmentRef>,
-    ) {
-        self.chunks().evidence().retain_commit(
-            tid.clone(),
-            participants.iter().copied().collect(),
-            segments,
-        );
+        store: &std::ops::Range<usize>,
+    ) -> Result<(usize, Id), WriteError> {
+        let chunks = self.chunks();
+        let chunk_id = crate::ram::chunk::transaction_leased_segments(tid, store)
+            .iter()
+            .map(|segment| segment.chunk_id)
+            .min()
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        let chunk = chunks
+            .list
+            .get(chunk_id)
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        if let Some((id, _)) = chunk.find_status_cell(tid) {
+            return Ok((chunk_id, id));
+        }
+        let id = chunk
+            .free_status_id(tid)
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        let mut cell = crate::ram::txn_status::status_cell(tid, &id, participants);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+                tid.clone(),
+                participants.to_vec(),
+            );
+            chunk.write_status_cell(&mut cell)?;
+        }
+        // Synced with the COMMIT records, not on its own.
+        drop(crate::ram::chunk::take_transactional_segments());
+        Ok((chunk_id, id))
     }
 
     fn has_other_participants(&self, participants: &[u64]) -> bool {
@@ -1491,99 +1575,111 @@ impl DataManager {
         participants.iter().any(|peer| *peer != me)
     }
 
-    /// The transactions this site can still ask a peer about: every live
-    /// transaction object, and every bracket recovery left in doubt that is
-    /// not resolved yet.
-    pub(crate) fn open_transaction_ids(&self) -> Vec<TxnId> {
-        let mut open: Vec<TxnId> = self.txns_sorted.lock().iter().cloned().collect();
-        open.extend(self.chunks().evidence().resolving());
-        open
-    }
-
-    /// One release round for the commit evidence this site retains.
+    /// One release round for the status cells of this site (TLA+ F4).
     ///
-    /// A transaction is released when every other participant answered and
-    /// none holds it open. A site that holds a transaction open prepared it
-    /// before this site committed it, so a site that does not hold it open
-    /// now has decided it and never asks again. SILENCE IS NOT AN ANSWER: a
-    /// participant that cannot be reached keeps every transaction it could
-    /// ask about retained. Only participants are asked: a member that holds
-    /// no part of the transaction cannot ask about it.
-    pub(crate) async fn release_decision_evidence(&self) -> usize {
-        self.release_decision_evidence_older_than(Duration::ZERO)
-            .await
-    }
-
-    /// `release_decision_evidence` for the transactions kept longer than
-    /// `min_age`. The slow sweep uses it: a younger one normally goes with
-    /// the coordinator's `settled` notice.
-    pub(crate) async fn release_decision_evidence_older_than(&self, min_age: Duration) -> usize {
+    /// 1. A status cell whose own COMMIT is now synced (no segment of the
+    ///    transaction is in progress for it any more) becomes `self_synced`.
+    /// 2. A newly synced one is announced to the other participants with one
+    ///    batched `synced` RPC per peer.
+    /// 3. A status cell is tombstoned when this site and every other
+    ///    participant reported their COMMIT synced: from then on nobody can
+    ///    be in doubt about the transaction.
+    /// 4. With `sweep`, a status cell older than the sweep interval asks the
+    ///    participants that did not report: `Committed` (synced, F1) or
+    ///    `Unknown`/`Aborted` (nothing open there) counts as reported;
+    ///    `Committing`, `InDoubt` or silence does not.
+    pub(crate) async fn status_release_round(&self, sweep: bool) -> usize {
         let chunks = self.chunks().clone();
-        let candidates = chunks
-            .evidence()
-            .release_candidates(self.database_runtime.rpc.server_id, min_age);
-        if candidates.is_empty() {
-            return 0;
-        }
-        let Some(txn_manager) = self.database_runtime.txn_manager().cloned() else {
-            return 0;
-        };
-        let ask: BTreeSet<u64> = candidates
-            .iter()
-            .flat_map(|candidate| candidate.peers.iter().copied())
-            .collect();
-        let mut open_at: HashMap<u64, HashSet<TxnId>> = HashMap::new();
-        for peer in ask {
-            let site = match txn_manager.data_site_for(peer).await {
-                Ok(site) => site,
-                Err(error) => {
-                    debug!(
-                        "cannot reach site {} for an evidence release round: {}",
-                        peer, error
-                    );
+        let registry = chunks.txn_status();
+        let me = self.database_runtime.rpc.server_id;
+        let mut notices: HashMap<u64, Vec<TxnId>> = HashMap::new();
+        for (txn, entry) in registry.entries() {
+            if !entry.self_synced {
+                let pending = entry.segments.iter().any(|(chunk_id, segment_id)| {
+                    chunks
+                        .list
+                        .get(*chunk_id)
+                        .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
+                        .is_some_and(|segment| segment.protection.holds_transaction(&txn))
+                });
+                if pending {
                     continue;
                 }
-            };
-            match site.open_transactions().await {
-                Ok(response) => {
-                    self.update_clock(response.clock);
-                    open_at.insert(peer, response.payload.into_iter().collect());
+                registry.mark_self_synced(&txn);
+            }
+            #[cfg(test)]
+            if SYNCED_NOTICES_SKIPPED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            if !entry.announced {
+                for peer in entry.participants.iter().filter(|peer| **peer != me) {
+                    notices.entry(*peer).or_default().push(txn.clone());
                 }
-                Err(error) => debug!(
-                    "site {} did not report its open transactions: {:?}",
-                    peer, error
-                ),
+                registry.mark_announced(&txn);
             }
         }
-        let releasable: Vec<TxnId> = candidates
-            .into_iter()
-            .filter(|candidate| {
-                candidate.peers.iter().all(|peer| {
-                    open_at
-                        .get(peer)
-                        .map_or(false, |open| !open.contains(&candidate.txn))
-                })
-            })
-            .map(|candidate| candidate.txn)
-            .collect();
-        let released = self.release_settled(&releasable);
-        if released > 0 {
-            debug!(
-                "released the commit evidence of {} transaction(s)",
-                released
-            );
+        if let Some(txn_manager) = self.database_runtime.txn_manager().cloned() {
+            for (peer, tids) in notices {
+                match txn_manager.data_site_for(peer).await {
+                    Ok(site) => {
+                        if let Err(error) = site.synced(me, tids).await {
+                            debug!("site {} did not take the synced notice: {:?}", peer, error);
+                        }
+                    }
+                    Err(error) => debug!("cannot reach site {} for a synced notice: {}", peer, error),
+                }
+            }
+            if sweep {
+                let min_age = settle_sweep_interval();
+                for (txn, entry) in registry.entries() {
+                    if !entry.self_synced || entry.since.elapsed() < min_age {
+                        continue;
+                    }
+                    for peer in entry
+                        .participants
+                        .iter()
+                        .filter(|peer| **peer != me && !entry.synced_peers.contains(*peer))
+                    {
+                        let Ok(site) = txn_manager.data_site_for(*peer).await else {
+                            continue;
+                        };
+                        if let Ok(response) = site.txn_status(txn.clone()).await {
+                            self.update_clock(response.clock);
+                            if matches!(
+                                response.payload,
+                                TxnOutcome::Committed | TxnOutcome::Unknown | TxnOutcome::Aborted
+                            ) {
+                                registry.note_peer_synced(&txn, *peer);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        released
-    }
-
-    /// `tids` are settled at every participant: stop keeping them, and let
-    /// the cleaner take their segments.
-    pub(crate) fn release_settled(&self, tids: &[TxnId]) -> usize {
-        let chunks = self.chunks();
-        let settled = chunks.evidence().release(tids);
-        let released = settled.len();
-        for (txn, segments) in settled {
-            chunks.settle_transaction(&txn, &segments);
+        let mut released = 0;
+        for (txn, entry) in registry.entries() {
+            let all_synced = entry.self_synced
+                && entry
+                    .participants
+                    .iter()
+                    .filter(|peer| **peer != me)
+                    .all(|peer| entry.synced_peers.contains(peer));
+            if !all_synced {
+                continue;
+            }
+            let Some(chunk) = chunks.list.get(entry.chunk) else {
+                continue;
+            };
+            match chunk.remove_status_cell(&entry.id) {
+                Ok(()) => {
+                    registry.remove(&txn);
+                    released += 1;
+                }
+                Err(error) => debug!(
+                    "cannot tombstone the status cell of {:?} yet: {:?}",
+                    txn, error
+                ),
+            }
         }
         released
     }
@@ -1614,30 +1710,40 @@ impl DataManager {
     }
 
     /// What this site can say about a transaction, for a peer resolving it.
+    ///
+    /// `Committed` comes only from a SYNCED record (TLA+ F1): a status cell
+    /// whose COMMIT is synced, or a finished commit. An unsynced COMMIT, or a
+    /// decided close that is refused or still running, answers `Committing`:
+    /// the asker waits. A power loss here could still drop such a record, and
+    /// a peer that acted on it would tear the transaction.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
+        if let Some(entry) = self.chunks().txn_status().get(tid) {
+            return if entry.self_synced {
+                TxnOutcome::Committed
+            } else {
+                TxnOutcome::Committing
+            };
+        }
+        let live = self.find_transaction(tid).map(|txn| {
+            let txn = txn.lock();
+            (txn.state, txn.decided_commit)
+        });
+        match live {
+            Some((_, true)) => return TxnOutcome::Committing,
+            Some((TxnState::Aborted, false)) => return TxnOutcome::Aborted,
+            Some(_) => return TxnOutcome::InDoubt,
+            None => {}
+        }
+        if self.chunks().txn_status().resolving_participants(tid).is_some() {
+            return TxnOutcome::InDoubt;
+        }
+        // A finished multi-site commit is answered from its status cell
+        // above until every participant is synced; a single-site one is never
+        // asked about.
         if let Some(outcome) = self.decided.lock().get(tid) {
             return *outcome;
         }
-        // The live record is bounded and a RESTART empties it. The evidence
-        // keeps every unsettled multi-site commit, so a site that durably
-        // committed never answers "never heard of it" to a peer that is
-        // still in doubt.
-        if self.chunks().holds_commit_evidence(tid) {
-            return TxnOutcome::Committed;
-        }
-        // Still live here. Anything short of a durable decision is in doubt
-        // -- including `TxnState::Committed`, which only means the entries
-        // are durable.
-        match self.find_transaction(tid).map(|txn| {
-            let txn = txn.lock();
-            (txn.state, txn.decided_commit, txn.commit_durable)
-        }) {
-            Some((_, true, true)) => TxnOutcome::Committed,
-            Some((_, true, false)) => TxnOutcome::InDoubt,
-            Some((TxnState::Aborted, false, _)) => TxnOutcome::Aborted,
-            Some(_) => TxnOutcome::InDoubt,
-            None => TxnOutcome::Unknown,
-        }
+        TxnOutcome::Unknown
     }
 
     async fn cell_meta_cleanup(&self) {
@@ -2209,6 +2315,12 @@ impl DataManager {
         // four-cell transaction spread over four chunks came back 3/4.
         let mut sync_failure = None;
         let entry_segments = crate::ram::chunk::take_transactional_segments();
+        #[cfg(test)]
+        let entry_segments = if PREPARE_SYNC_SKIPPED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+            Vec::new()
+        } else {
+            entry_segments
+        };
         for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -2745,7 +2857,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort, AbortResult::Success(None));
-        let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -2873,7 +2985,7 @@ mod tests {
         assert!(seg.try_own(), "the head must be back in the pool");
         seg.release_own();
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -2961,7 +3073,7 @@ mod tests {
         );
         assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
         assert_no_open_bracket(&runtime);
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3023,7 +3135,7 @@ mod tests {
             DMCommitResult::Success
         );
         assert_eq!(
-            <DataManager as Service>::end(&manager, older, older)
+            <DataManager as Service>::end(&manager, older, older, false)
                 .await
                 .payload,
             EndResult::Success
@@ -3234,7 +3346,7 @@ mod tests {
             "rollback did not restore the index entry set"
         );
         assert_eq!(
-            <DataManager as Service>::end(&manager, tid.clone(), tid)
+            <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
             EndResult::Success
@@ -3446,7 +3558,7 @@ mod tests {
             }
         }
         assert_eq!(
-            <DataManager as Service>::end(&manager, tid, tid)
+            <DataManager as Service>::end(&manager, tid, tid, false)
                 .await
                 .payload,
             EndResult::Success
@@ -3605,7 +3717,7 @@ mod tests {
         for tid in &holders {
             abort_and_end_local(&manager, tid).await;
         }
-        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone())
+        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3658,7 +3770,7 @@ mod tests {
         );
         assert_no_open_bracket(&runtime);
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3714,7 +3826,7 @@ mod tests {
         assert_no_open_bracket(&runtime);
 
         // The owner wakes up with a commit decision. It must be refused.
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_ne!(
@@ -3758,7 +3870,7 @@ mod tests {
         );
         assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 1);
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3928,7 +4040,7 @@ mod tests {
             "the delete must be refused or applied, not fail with something else: {applied:?}"
         );
         if applied == DMCommitResult::Success {
-            let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
                 .await
                 .payload;
             thaw_wal_dir(&frozen);
@@ -4100,7 +4212,7 @@ mod tests {
             DMCommitResult::Success
         );
         let frozen = refuse_wal_appends(&runtime, wal.path());
-        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid, false)
             .await
             .payload;
         thaw_wal_dir(&frozen);
@@ -4240,7 +4352,7 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
             }
         }
-        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid, false)
             .await
             .payload;
         assert!(
@@ -4440,7 +4552,7 @@ mod tests {
             .await,
             DMCommitResult::Success
         );
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -4938,7 +5050,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5009,7 +5121,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5099,7 +5211,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5186,7 +5298,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5317,7 +5429,7 @@ mod tests {
         let results = join_all(tids.iter().cloned().map(|tid| {
             let manager = manager.clone();
             async move {
-                <DataManager as Service>::end(&manager, tid.clone(), tid)
+                <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                     .await
                     .payload
             }
@@ -5353,7 +5465,7 @@ mod tests {
             .state = TxnState::Committed;
 
         let end_result =
-            <DataManager as Service>::end(&default_manager, shared_tid.clone(), shared_tid.clone())
+            <DataManager as Service>::end(&default_manager, shared_tid.clone(), shared_tid.clone(), false)
                 .await
                 .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5373,7 +5485,7 @@ mod tests {
             &analytics_manager,
             shared_tid.clone(),
             shared_tid.clone(),
-        )
+         false,)
         .await
         .payload;
         assert_eq!(analytics_end, EndResult::Success);
@@ -5403,12 +5515,12 @@ mod tests {
 
         let (left, right) = tokio::join!(
             async move {
-                <DataManager as Service>::end(&left_manager, left_clock, left_tid)
+                <DataManager as Service>::end(&left_manager, left_clock, left_tid, false)
                     .await
                     .payload
             },
             async move {
-                <DataManager as Service>::end(&right_manager, right_clock, right_tid)
+                <DataManager as Service>::end(&right_manager, right_clock, right_tid, false)
                     .await
                     .payload
             }
@@ -5756,7 +5868,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5860,7 +5972,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
         assert_eq!(end_t2, EndResult::Success);
@@ -5869,7 +5981,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t1, AbortResult::Success(None));
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -5963,7 +6075,7 @@ mod tests {
             txn.coordinator_id = Some(23);
         }
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -6089,12 +6201,12 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
         assert_eq!(end_t2, EndResult::Success);
 
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -6142,7 +6254,7 @@ mod tests {
         .await;
         assert_eq!(commit_t1, DMCommitResult::Success);
 
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -7062,13 +7174,11 @@ impl Service for DataManager {
         async move { self.response_with(outcome).await }.boxed()
     }
 
-    fn open_transactions(&self) -> BoxFuture<'_, DataSiteResponse<Vec<TxnId>>> {
-        let open = self.open_transaction_ids();
-        async move { self.response_with(open).await }.boxed()
-    }
-
-    fn settled(&self, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
-        self.release_settled(&tids);
+    fn synced(&self, from: u64, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
+        let registry = self.chunks().txn_status();
+        for tid in &tids {
+            registry.note_peer_synced(tid, from);
+        }
         self.response_with(())
     }
 
@@ -7089,7 +7199,12 @@ impl Service for DataManager {
         .boxed()
     }
 
-    fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+    fn end(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        durable: bool,
+    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
@@ -7119,7 +7234,7 @@ impl Service for DataManager {
         };
 
         if txn_state == TxnState::Committed {
-            match self.close_committed_brackets(&tid) {
+            match self.close_committed_brackets(&tid, durable) {
                 CloseOutcome::Closed => {}
                 // Still decided and still holding its locks and heads.
                 CloseOutcome::Pending(report) => return self.response_with(report),
