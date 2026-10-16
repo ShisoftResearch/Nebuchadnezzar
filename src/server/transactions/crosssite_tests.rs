@@ -2104,6 +2104,65 @@ async fn a_write_to_an_in_doubt_cell_after_a_restart_waits_for_the_resolution() 
     cluster.shutdown().await;
 }
 
+/// Review R4: the other half of finding 1. B's `fence_here` stops between
+/// its fence record and its object lookup, and a whole `prepare` of B runs
+/// in that gap. The `prepare` must see the fence; else B prepares, answers
+/// the fence `Unknown`, and commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepare_inside_the_fence_gap_is_refused() {
+    let (cluster, client) = Cluster::start("crosssite_r4_fence_gap").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    drop(client);
+    let ids = vec![
+        Id::from_parts(HERE as u64, 42),
+        Id::from_parts(THERE as u64, 42),
+    ];
+    let scores = vec![37_000, 37_001];
+    let txn = coordinator(&cluster).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (id, score) in ids.iter().zip(scores.iter()) {
+        txn.write(tid.clone(), cell_of(*id, *score))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let hook = super::data_site::install_fence_gap_hook(tid.clone());
+    let site = data_site(&cluster, B);
+    let fencer = {
+        let tid = tid.clone();
+        std::thread::spawn(move || site.fence_here(&tid))
+    };
+    wait_until("B's fence in the gap", 10, || {
+        hook.entered.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let prepared = txn.prepare(tid.clone()).await;
+    hook.released.store(true, std::sync::atomic::Ordering::SeqCst);
+    let b_answer = fencer.join().unwrap();
+    let a_answer = data_site(&cluster, A).fence_here(&tid);
+    warn!(
+        "CROSSSITE R4: B answered {:?}, A answered {:?}, the prepare returned {:?}",
+        b_answer, a_answer, prepared
+    );
+    let committed = if matches!(prepared, Ok(Ok(TMPrepareResult::Success))) {
+        matches!(
+            txn.commit(tid.clone()).await,
+            Ok(Ok(EndResult::Success)) | Ok(Ok(EndResult::DecidedPending))
+        )
+    } else {
+        false
+    };
+    assert_ne!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "B answered the fence, so it must not commit the transaction"
+    );
+    assert!(!committed, "the client must not hear that the transaction committed");
+    assert_all_or_nothing(&cluster, &ids, &scores, "prepare inside the fence gap");
+    cluster.shutdown().await;
+}
+
 /// C16 (F6): A aborts after the fence; the cleaner runs on A; A restarts;
 /// a duplicate `prepare` arrives. A refuses it: the fence survives the
 /// compaction and the start.

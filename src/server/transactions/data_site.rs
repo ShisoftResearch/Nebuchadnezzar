@@ -116,6 +116,46 @@ fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDela
     PREPARE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Test hook (review R4): `fence_here` of this transaction stops between
+/// the fence record and the object lookup until the test releases it.
+#[cfg(test)]
+pub(crate) struct FenceGapHook {
+    pub(crate) tid: TxnId,
+    pub(crate) entered: AtomicBool,
+    pub(crate) released: AtomicBool,
+}
+
+#[cfg(test)]
+static FENCE_GAP_HOOK: Mutex<Option<Arc<FenceGapHook>>> = parking_lot::const_mutex(None);
+
+#[cfg(test)]
+pub(crate) fn install_fence_gap_hook(tid: TxnId) -> Arc<FenceGapHook> {
+    let hook = Arc::new(FenceGapHook {
+        tid,
+        entered: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    });
+    *FENCE_GAP_HOOK.lock() = Some(hook.clone());
+    hook
+}
+
+#[cfg(test)]
+fn wait_in_fence_gap(tid: &TxnId) {
+    let hook = {
+        let mut slot = FENCE_GAP_HOOK.lock();
+        match slot.as_ref() {
+            Some(hook) if &hook.tid == tid => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(hook) = hook {
+        hook.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !hook.released.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
 /// Test hook (review finding 1): a `prepare` of this cell waits before it
 /// takes the transaction object, where the fence check ran before the fix,
 /// as a thread that the scheduler stops there.
@@ -1481,6 +1521,8 @@ impl DataManager {
             error!("cannot record the fence of {:?}: {}", tid, error);
             return FenceAnswer::Committing;
         }
+        #[cfg(test)]
+        wait_in_fence_gap(tid);
         if let Some(txn_lock) = self.find_transaction(tid) {
             let mut txn = txn_lock.lock();
             if txn.decided_commit {
