@@ -48,6 +48,8 @@ struct Retained {
     /// The segments whose `Protection` holds the transaction until it is
     /// settled.
     segments: Vec<SegmentRef>,
+    /// When this site started to keep it.
+    since: std::time::Instant,
 }
 
 /// A retained transaction and the sites that must report it closed.
@@ -89,6 +91,7 @@ impl DecisionEvidence {
         let retained = state.retained.entry(txn).or_insert_with(|| Retained {
             participants: BTreeSet::new(),
             segments: Vec::new(),
+            since: std::time::Instant::now(),
         });
         retained.participants.extend(participants);
         retained.segments.append(&mut segments);
@@ -123,12 +126,18 @@ impl DecisionEvidence {
         self.state.lock().resolving.get(txn).cloned()
     }
 
-    /// The retained transactions, for one release round of site `me`.
-    pub fn release_candidates(&self, me: u64) -> Vec<ReleaseCandidate> {
+    /// The transactions kept longer than `min_age`, for one release round
+    /// of site `me`.
+    pub fn release_candidates(
+        &self,
+        me: u64,
+        min_age: std::time::Duration,
+    ) -> Vec<ReleaseCandidate> {
         self.state
             .lock()
             .retained
             .iter()
+            .filter(|(_, retained)| retained.since.elapsed() >= min_age)
             .map(|(txn, retained)| ReleaseCandidate {
                 txn: txn.clone(),
                 peers: retained

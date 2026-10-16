@@ -382,6 +382,17 @@ fn termination_answer_grace() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
+/// How often a site asks the participants of the multi-site transactions it
+/// still keeps whether they hold them open. The fallback for a lost
+/// `settled` notice; see `release_decision_evidence`.
+fn settle_sweep_interval() -> std::time::Duration {
+    std::env::var("NEB_SETTLE_SWEEP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
 /// What `close_committed_brackets` did.
 enum CloseOutcome {
     /// Every bracket is closed: the transaction is committed here.
@@ -428,6 +439,11 @@ service! {
     // each of them. A peer keeps the evidence of a commit until no site that
     // can ask reports it here.
     rpc open_transactions() -> DataSiteResponse<Vec<TxnId>>;
+
+    // Every participant of each of `tids` holds the outcome durably, as the
+    // coordinator saw from their `end` results: release what this site keeps
+    // for them (D28). Batched by the coordinator's flusher.
+    rpc settled(tids: Vec<TxnId>) -> DataSiteResponse<()>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -466,13 +482,18 @@ impl DataManager {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
-        // Separate from the sweep, so a peer that is slow to answer does not
-        // delay it.
+        // The slow fallback of the `settled` notice: a coordinator that died
+        // before its flush, a close that finished late, a resolved site.
+        // Separate from the lease sweep, so a peer that is slow to answer
+        // does not delay it.
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                manager_clone.release_decision_evidence().await;
+                let interval = settle_sweep_interval();
+                tokio::time::sleep(interval).await;
+                manager_clone
+                    .release_decision_evidence_older_than(interval)
+                    .await;
             }
         });
 
@@ -1016,6 +1037,13 @@ impl DataManager {
                 .map(|segment| (segment.chunk_id, segment.id))
                 .collect();
         let multi_site = self.has_other_participants(&txn.participants);
+        if multi_site {
+            // Before the first record, as `decided_commit` promises: from
+            // here no abort path can run. The coordinator sent `end` to every
+            // site at once, so another site may already be committed.
+            txn.decided_commit = true;
+            txn.commit_durable = true;
+        }
         if let Err(refusal) = self
             .chunks()
             .commit_transaction_brackets(tid, multi_site)
@@ -1370,10 +1398,18 @@ impl DataManager {
     /// ask about retained. Only participants are asked: a member that holds
     /// no part of the transaction cannot ask about it.
     pub(crate) async fn release_decision_evidence(&self) -> usize {
+        self.release_decision_evidence_older_than(Duration::ZERO)
+            .await
+    }
+
+    /// `release_decision_evidence` for the transactions kept longer than
+    /// `min_age`. The slow sweep uses it: a younger one normally goes with
+    /// the coordinator's `settled` notice.
+    pub(crate) async fn release_decision_evidence_older_than(&self, min_age: Duration) -> usize {
         let chunks = self.chunks().clone();
         let candidates = chunks
             .evidence()
-            .release_candidates(self.database_runtime.rpc.server_id);
+            .release_candidates(self.database_runtime.rpc.server_id, min_age);
         if candidates.is_empty() {
             return 0;
         }
@@ -1418,16 +1454,24 @@ impl DataManager {
             })
             .map(|candidate| candidate.txn)
             .collect();
-        let settled = chunks.evidence().release(&releasable);
-        let released = settled.len();
-        for (txn, segments) in settled {
-            chunks.settle_transaction(&txn, &segments);
-        }
+        let released = self.release_settled(&releasable);
         if released > 0 {
             debug!(
                 "released the commit evidence of {} transaction(s)",
                 released
             );
+        }
+        released
+    }
+
+    /// `tids` are settled at every participant: stop keeping them, and let
+    /// the cleaner take their segments.
+    pub(crate) fn release_settled(&self, tids: &[TxnId]) -> usize {
+        let chunks = self.chunks();
+        let settled = chunks.evidence().release(tids);
+        let released = settled.len();
+        for (txn, segments) in settled {
+            chunks.settle_transaction(&txn, &segments);
         }
         released
     }
@@ -6902,6 +6946,11 @@ impl Service for DataManager {
     fn open_transactions(&self) -> BoxFuture<'_, DataSiteResponse<Vec<TxnId>>> {
         let open = self.open_transaction_ids();
         async move { self.response_with(open).await }.boxed()
+    }
+
+    fn settled(&self, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
+        self.release_settled(&tids);
+        self.response_with(())
     }
 
     fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {

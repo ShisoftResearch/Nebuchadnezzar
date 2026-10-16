@@ -198,6 +198,10 @@ pub enum EndResult {
         failures: Vec<LockReleaseFailure>,
     },
     Success,
+    /// A multi-site transaction is decided COMMIT, but every site refused
+    /// to close its brackets for now. Each site keeps it decided and
+    /// finishes the close later. The client must not retry it.
+    DecidedPending,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -541,6 +541,9 @@ async fn power_cut_participants_resolve_with_both_sync_rounds() {
 
 async fn power_cut_participants_resolve(durable: bool) {
     let _ = env_logger::try_init();
+    // The resolved site has no coordinator to send it `settled`; its slow
+    // release sweep releases the transaction.
+    std::env::set_var("NEB_SETTLE_SWEEP_SECS", "1");
     let group = if durable {
         "cut_restart_durable"
     } else {
