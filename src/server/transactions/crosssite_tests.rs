@@ -1141,6 +1141,14 @@ async fn a_status_cell_is_hidden_from_scans_and_counts() {
         );
     }
     drop(scan);
+    // Review finding 4: the `count` RPC agrees with the hidden live count.
+    let counted = client.count().await.unwrap();
+    let live = client.live_cell_count().await.unwrap();
+    assert_eq!(
+        counted, live,
+        "the `count` RPC must not count status cells: count {} live {}",
+        counted, live
+    );
     cluster.shutdown().await;
 }
 

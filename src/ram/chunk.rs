@@ -6415,8 +6415,11 @@ impl Chunks {
             })
     }
 
+    /// Cells in the index of every chunk, without the status cells this
+    /// store holds: they are hidden, as in a scan (review finding 4).
     pub fn count(&self) -> usize {
-        self.list.iter().map(|c| c.count()).sum()
+        let indexed: usize = self.list.iter().map(|c| c.count()).sum();
+        indexed.saturating_sub(self.txn_status.counts().0)
     }
 
     /// How many chunks this store has. A cell scan visits them one at a time.
