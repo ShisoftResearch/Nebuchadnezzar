@@ -632,7 +632,16 @@ async fn migrate_slot_prepared(
         // benign orphan as before, just rarer, and a retried migration
         // upserts over it.
         if let Ok(recipient) = client.client_by_server_id(to).await {
-            if let Ok(Ok(orphaned)) = recipient.cell_ids_in_slots(&vec![slot]).await {
+            let scanned = recipient.cell_ids_in_slots(&vec![slot]).await;
+            if let Ok(Err(in_doubt)) = &scanned {
+                // The recipient holds an in-doubt bracket for a slot it does
+                // not own; its landed copies stay (review N2).
+                warn!(
+                    "slot {slot} transfer aborted; recipient {to} refused its orphan scan: \
+                     {in_doubt}; the cells that landed there stay"
+                );
+            }
+            if let Ok(Ok(orphaned)) = scanned {
                 if !orphaned.is_empty() {
                     match recipient.drop_migrated_cells(&orphaned).await {
                         Ok(results) => {
@@ -1210,7 +1219,17 @@ pub async fn reshard_slots(
         match recipient
             .cell_ids_in_slots(&orphaned_slots)
             .await
-            .map(|scanned| scanned.unwrap_or_default())
+            .map(|scanned| {
+                scanned.unwrap_or_else(|in_doubt| {
+                    // Review N2: the refusal covers the whole slot set.
+                    warn!(
+                        "{} slots did not commit to {to}; recipient {to} refused their orphan \
+                         scan: {in_doubt}; the cells that landed there stay",
+                        orphaned_slots.len()
+                    );
+                    Vec::new()
+                })
+            })
         {
             Ok(orphaned) if !orphaned.is_empty() => {
                 match recipient.drop_migrated_cells(&orphaned).await {
