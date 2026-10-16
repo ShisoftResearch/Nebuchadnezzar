@@ -4371,6 +4371,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forced_sync_after_a_retraction_is_not_covered_by_the_old_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let retract_to = seg.wal_append_position();
+        let (result, receipts) =
+            crate::ram::durability::capture(|| seg.write_wal(seg.addr + 8, 64, false));
+        result.unwrap();
+        crate::ram::durability::wait(receipts).await.unwrap();
+        let high = seg.durable_file().unwrap().watermark();
+        assert!(high > retract_to, "test setup: the watermark covers the long frame");
+        seg.truncate_wal_to(retract_to).unwrap();
+        seg.write_wal(seg.addr + 8, 8, false).unwrap();
+        assert!(
+            seg.wal_append_position() <= high,
+            "test setup: the new bytes end below the old watermark"
+        );
+        let mut synced = false;
+        seg.sync_wal_with(true, |file| {
+            synced = true;
+            file.sync_all()
+        })
+        .unwrap();
+        assert!(
+            synced,
+            "bytes appended after a retraction must get their own sync, not the old watermark"
+        );
+    }
+
+    #[tokio::test]
     async fn durable_ack_background_reuses_a_covering_foreground_watermark() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(SegmentFileManager::new(
