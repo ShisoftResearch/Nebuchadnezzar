@@ -2739,7 +2739,7 @@ mod tests {
         let seg = segment_holding(&runtime, &cell);
         assert!(seg.bracket_is_open());
         let begin_at = runtime.chunks().address_of(&cell)
-            - (crate::ram::entry::ENTRY_HEAD_SIZE + crate::ram::bracket::TXN_ID_SIZE);
+            - (crate::ram::entry::ENTRY_HEAD_SIZE + crate::ram::bracket::encode_begin(&tid, &[]).len());
         assert_eq!(
             entry_type_at(begin_at).0,
             crate::ram::entry::EntryType::BEGIN
