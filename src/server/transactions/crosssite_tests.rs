@@ -2203,15 +2203,22 @@ async fn a_read_only_transaction_does_not_see_an_in_doubt_transaction_half_appli
     );
     super::data_site::silent_peers_for_test().lock().remove(&b_id);
     wait_until("A's resolution", 60, || !in_doubt_on(&cluster, A, &tid)).await;
-    if let (Some(x_seen), Some(y_seen)) = (x_seen, y_seen) {
-        assert_eq!(
-            x_seen == Some(scores[0]),
-            y_seen == Some(scores[1]),
-            "R saw T half applied: X {:?}, Y {:?}",
-            x_seen,
-            y_seen
-        );
-    }
+    assert_eq!(
+        y_seen,
+        Some(Some(scores[1])),
+        "test setup: R must read T's Y at B"
+    );
+    assert_eq!(
+        x_seen, None,
+        "R saw T half applied: T's Y and X {:?} from before T",
+        x_seen
+    );
+    // After the resolution a new read-only transaction sees all of T.
+    let after = reader.begin().await.unwrap().unwrap();
+    let x_after = score_of(&reader.read(after.clone(), ids[0]).await);
+    let y_after = score_of(&reader.read(after.clone(), ids[1]).await);
+    assert_eq!(x_after, Some(Some(scores[0])), "R2 must read T's X after the resolution");
+    assert_eq!(y_after, Some(Some(scores[1])));
     cluster.shutdown().await;
 }
 
@@ -2323,6 +2330,71 @@ async fn a_refused_reshard_leaves_every_slot_stable_on_its_donor() {
         "the failure must name the slot in doubt: {:?}",
         reshard.failed
     );
+    cluster.shutdown().await;
+}
+
+/// Review N3: the production branch of `decide_in_doubt` for a peer that
+/// cannot be reached, with no test hook. Three sites (the seed, A, B),
+/// sorted by id as L < M < H. Only L is told; M learns the commit from L;
+/// then L is stopped. H must commit from M while L is down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_peer_does_not_block_a_commit_another_peer_proves() {
+    const HERE_SEED: u16 = 95;
+    let (mut cluster, client) = Cluster::start("crosssite_n3_stopped_peer").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    place_slot(&cluster, &client, HERE_SEED, SEED).await;
+    drop(client);
+    let sites = [A, B, SEED];
+    let ids: Vec<Id> = [HERE, THERE, HERE_SEED]
+        .iter()
+        .map(|slot| Id::from_parts(*slot as u64, 7))
+        .collect();
+    let scores: Vec<u64> = (0..3).map(|n| 42_000 + n).collect();
+    let txn = coordinator(&cluster).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (id, score) in ids.iter().zip(scores.iter()) {
+        txn.write(tid.clone(), cell_of(*id, *score))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+    let mut by_id = sites.to_vec();
+    by_id.sort_by_key(|index| cluster.site(*index).server_id);
+    let (low, mid, high) = (by_id[0], by_id[1], by_id[2]);
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    drop(txn);
+    wait_status_synced(&cluster, low, &tid).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while in_doubt_on(&cluster, mid, &tid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test setup: M must learn the commit from L"
+        );
+        data_site(&cluster, mid)
+            .sweep_idle_transactions(Duration::ZERO)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    wait_status_synced(&cluster, mid, &tid).await;
+    cluster.stop(low).await;
+    for _ in 0..5 {
+        data_site(&cluster, high)
+            .sweep_idle_transactions(Duration::ZERO)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let waiting = in_doubt_on(&cluster, high, &tid);
+    warn!(
+        "CROSSSITE N3: H in doubt {} while L (index {}) is stopped and M committed",
+        waiting, low
+    );
+    assert!(!waiting, "H must commit from M's `Committed` while L is stopped");
+    let n = sites.iter().position(|site| *site == high).unwrap();
+    assert_eq!(score_on(cluster.site(high), &ids[n]), Some(scores[n]));
     cluster.shutdown().await;
 }
 
