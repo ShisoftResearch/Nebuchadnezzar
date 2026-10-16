@@ -2644,6 +2644,18 @@ impl Chunk {
                         // head owner can wait for that word (cycle C1 in
                         // docs/tla/HeadWordLock.tla). Give that caller the
                         // head-queue deadline here too, so it releases the word.
+                        // A caller that waits without the deadline must hold no
+                        // word, or C1 comes back.
+                        #[cfg(debug_assertions)]
+                        if full_gc {
+                            HELD_CELL_GUARDS.with(|held| {
+                                debug_assert_eq!(
+                                    held.get(),
+                                    0,
+                                    "a full-GC allocation waits for a head while it holds a cell word"
+                                )
+                            });
+                        }
                         if !full_gc
                             && queueing_since
                                 .get_or_insert_with(std::time::Instant::now)
@@ -9374,6 +9386,100 @@ mod tests {
             obtained.iter().all(|got| *got),
             "a head owner never got the word the word-first update held: {obtained:?}"
         );
+    }
+
+    /// Contention soak for the C1 deadline: many writers on few heads, with
+    /// word-first updates, head-first updates and CAS on shared cells. In a
+    /// roomy chunk no write may hit the head-queue deadline or refuse.
+    /// The pool is 2 when this process creates its first chunk here (the
+    /// isolated runner gives each test its own process).
+    /// `NEB_SOAK_SECS` sets the duration (default 60).
+    #[test]
+    #[ignore = "soak, about 60 s"]
+    fn head_contention_soak_has_no_head_queue_timeouts() {
+        use std::time::{Duration, Instant};
+        std::env::set_var("NEB_HEAD_POOL", "2");
+        let secs: u64 = std::env::var("NEB_SOAK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        // A chunk large enough that the cleaner keeps up with the churn:
+        // this soak is about heads, not about capacity.
+        let segments: usize = std::env::var("NEB_SOAK_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let (chunks, schema) = setup_test_chunks_with_size(segments * SEGMENT_SIZE);
+        let pool = chunks.list[0].head_pool.len();
+        const WRITERS: u64 = 64;
+        const SHARED: u64 = 16;
+        for i in 0..WRITERS + SHARED {
+            let id = Id::allocated(0, 0, 99800 + i);
+            chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        }
+        let timeouts = HEAD_QUEUE_TIMEOUTS.load(Ordering::Relaxed);
+        let refusals = ALLOCATION_EXHAUSTED.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let workers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let chunks = chunks.clone();
+                std::thread::spawn(move || {
+                    let own = Id::allocated(0, 0, 99800 + w);
+                    let (mut ops, mut lost, mut no_space) = (0u64, 0u64, 0u64);
+                    let mut step = w;
+                    while Instant::now() < deadline {
+                        step += 1;
+                        let shared = Id::allocated(0, 0, 99800 + WRITERS + step % SHARED);
+                        let result = match step % 4 {
+                            0 | 1 => chunks
+                                .update_cell(&mut payload_cell(schema.vid.get(), &own, 64))
+                                .map(|_| ()),
+                            2 => chunks
+                                .update_cell_by(&shared, |_| {
+                                    Some(payload_cell(schema.vid.get(), &shared, 64))
+                                })
+                                .map(|_| ()),
+                            _ => {
+                                let version = chunks.head_cell(&shared).unwrap().version;
+                                chunks.list[0]
+                                    .compare_version_and_set_field(
+                                        shared.bits(),
+                                        version,
+                                        hash_str("id"),
+                                        OwnedValue::I32(step as i32),
+                                    )
+                                    .map(|_| ())
+                            }
+                        };
+                        match result {
+                            Ok(()) => ops += 1,
+                            Err(WriteError::CellVersionMismatch) => lost += 1,
+                            Err(WriteError::CannotAllocateSpace) => no_space += 1,
+                            Err(other) => panic!("unexpected write error: {other:?}"),
+                        }
+                    }
+                    (ops, lost, no_space)
+                })
+            })
+            .collect();
+        let (mut ops, mut lost, mut no_space) = (0, 0, 0);
+        for worker in workers {
+            let (o, l, n) = worker.join().unwrap();
+            ops += o;
+            lost += l;
+            no_space += n;
+        }
+        let timeouts = HEAD_QUEUE_TIMEOUTS.load(Ordering::Relaxed) - timeouts;
+        let refusals = ALLOCATION_EXHAUSTED.load(Ordering::Relaxed) - refusals;
+        eprintln!(
+            "head contention soak: pool={pool} segments={segments} secs={secs} writers={WRITERS} ops={ops} \
+             lost_cas={lost} no_space={no_space} head_queue_timeouts={timeouts} \
+             allocation_refusals={refusals}"
+        );
+        assert!(ops > 0);
+        assert_eq!(timeouts, 0, "a write hit the head-queue deadline in a roomy chunk");
+        assert_eq!(no_space, 0, "a write was refused in a roomy chunk");
+        assert_eq!(refusals, 0);
     }
 
     /// D40: with a head free, a CAS checks, writes and publishes under one
