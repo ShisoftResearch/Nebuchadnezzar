@@ -56,6 +56,8 @@ pub struct WriteToChunkResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum WriteError {
+    /// The write can be visible, but its durability could not be certified.
+    Durability(crate::ram::durability::DurabilityError),
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
     /// The WAL append failed. The write was not published.
@@ -137,6 +139,12 @@ pub enum WriteError {
 
 impl WriteError {
     pub(crate) fn from_wal_io(error: std::io::Error) -> Self {
+        if let Some(error) = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::ram::durability::DurabilityError>())
+        {
+            return Self::Durability(error.clone());
+        }
         if error.raw_os_error() == Some(libc::ENOSPC) {
             Self::CannotAllocateSpace
         } else {

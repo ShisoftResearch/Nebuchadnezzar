@@ -259,11 +259,6 @@ pub static TERMINATION_COMMITTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How many refused closes a decided transaction gets on a site that is
-/// not its commit point before the close falls back to a standalone COMMIT.
-/// The sweeper retries once per tick (1 s).
-const PENDING_CLOSE_FALLBACK_AFTER: u32 = 8;
-
 fn txn_lease_timeout() -> std::time::Duration {
     std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
         .ok()
@@ -431,15 +426,7 @@ dispatch_rpc_service_functions!(DataManager);
 
 service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
-/// The segments a commit manifest names.
-fn manifest_segments(
-    manifest: &[crate::ram::bracket::ManifestEntry],
-) -> Vec<crate::ram::evidence::SegmentRef> {
-    manifest
-        .iter()
-        .map(|member| (member.chunk_id as usize, member.seq_id))
-        .collect()
-}
+
 
 impl DataManager {
     pub fn new(
@@ -1027,10 +1014,17 @@ impl DataManager {
         let store = self.chunks().address_range();
         // The segments that will hold this site's COMMITs. Read while the
         // leases are held: they name the heads the brackets live in.
-        let manifest = crate::ram::chunk::transaction_manifest(tid, &store);
+        let segments: Vec<crate::ram::evidence::SegmentRef> =
+            crate::ram::chunk::transaction_leased_segments(tid, &store)
+                .iter()
+                .map(|segment| (segment.chunk_id, segment.id))
+                .collect();
         let at_commit_point = self.is_commit_point(&txn.participants);
-        let mut closed_without_leases = false;
-        if let Err(refusal) = self.chunks().commit_transaction_brackets(tid) {
+        let multi_site = self.has_other_participants(&txn.participants);
+        if let Err(refusal) = self
+            .chunks()
+            .commit_transaction_brackets(tid, multi_site)
+        {
             let reason = match refusal.error() {
                 WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
                     EndResult::StoreFull(refusal.error().clone())
@@ -1043,23 +1037,18 @@ impl DataManager {
                 txn.decided_commit = true;
                 txn.commit_durable = true;
                 let attempts = self.note_pending_close(tid);
-                if attempts < PENDING_CLOSE_FALLBACK_AFTER
-                    || !self.close_with_standalone_commit(tid, &txn.participants.clone(), &manifest)
-                {
-                    error!(
-                        "refused COMMIT for {:?} (attempt {}): {:?}; the commit point decided \
-                         it, so this site keeps it decided and finishes it later",
-                        tid, attempts, reason
-                    );
-                    return CloseOutcome::Pending(reason);
-                }
-                closed_without_leases = true;
+                error!(
+                    "refused COMMIT for {:?} (attempt {}): {:?}; the commit point decided it, \
+                     so this site keeps it decided and finishes it later",
+                    tid, attempts, reason
+                );
+                return CloseOutcome::Pending(reason);
             } else {
                 match refusal {
                     crate::ram::chunk::CommitRefusal::Durable(_) => {
                         txn.decided_commit = true;
                         txn.commit_durable = true;
-                        self.retain_commit_evidence(tid, &txn.participants, manifest_segments(&manifest));
+                        self.retain_commit_evidence(tid, &txn.participants, segments.clone());
                         self.record_decision(tid, TxnOutcome::Committed);
                         self.note_pending_close(tid);
                         error!(
@@ -1107,8 +1096,10 @@ impl DataManager {
         }
         txn.decided_commit = true;
         txn.commit_durable = true;
-        // Before the leases go: until then no COMMIT segment can be compacted.
-        self.retain_commit_evidence(tid, &txn.participants, manifest_segments(&manifest));
+        // Before the leases go. The segments themselves stay in progress in
+        // `Protection` (decided above as multi-site) until the transaction
+        // is settled.
+        self.retain_commit_evidence(tid, &txn.participants, segments);
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -1119,18 +1110,14 @@ impl DataManager {
             }
         }
         txn.history.clear();
-        // A standalone COMMIT left the brackets in the heads open, so the
-        // heads cannot be released; the final wipe retires them.
-        if !closed_without_leases {
-            if let Err(error) = crate::ram::chunk::release_transaction_leases(tid, &store) {
-                // Every bracket carries its COMMIT, so this is unreachable; if
-                // it is reached, the final wipe retires the head rather than
-                // hand it over open.
-                error!(
-                    "transaction {:?} committed but its heads could not be released: {}",
-                    tid, error
-                );
-            }
+        if let Err(error) = crate::ram::chunk::release_transaction_leases(tid, &store) {
+            // Every bracket carries its COMMIT, so this is unreachable; if it
+            // is reached, the final wipe retires the head rather than hand it
+            // over open.
+            error!(
+                "transaction {:?} committed but its heads could not be released: {}",
+                tid, error
+            );
         }
         drop(txn);
         self.pending_close.lock().remove(tid);
@@ -1143,65 +1130,6 @@ impl DataManager {
         let attempts = pending.entry(tid.clone()).or_insert(0);
         *attempts += 1;
         *attempts
-    }
-
-    /// The fallback for a close that stays refused on a site that is not
-    /// the commit point: one COMMIT per chunk, written outside the leased
-    /// heads, through the resolved-commit path (synced). Recovery commits the
-    /// open parts from such a record (see `recovery::scan_segment_from_data`),
-    /// and the record segments stay pinned until the open parts are
-    /// compacted (fragile, see `crate::ram::evidence`). Then the locks and
-    /// heads can go. Returns whether a record was placed.
-    ///
-    /// The caller holds the transaction lock.
-    fn close_with_standalone_commit(
-        &self,
-        tid: &TxnId,
-        participants: &[u64],
-        manifest: &[crate::ram::bracket::ManifestEntry],
-    ) -> bool {
-        let chunks = self.chunks();
-        let mut chunk_ids: Vec<usize> = manifest
-            .iter()
-            .map(|member| member.chunk_id as usize)
-            .collect();
-        chunk_ids.sort_unstable();
-        chunk_ids.dedup();
-        let mut placed = Vec::new();
-        for chunk_id in chunk_ids {
-            let Some(chunk) = chunks.list.get(chunk_id) else {
-                continue;
-            };
-            match chunk.write_resolved_commit(tid) {
-                Ok(seq_id) => placed.push((chunk_id, seq_id)),
-                Err(error) => warn!(
-                    "chunk {} could not take a standalone COMMIT for {:?}: {:?}",
-                    chunk_id, tid, error
-                ),
-            }
-        }
-        if placed.is_empty() {
-            return false;
-        }
-        let open = manifest_segments(manifest);
-        chunks
-            .evidence()
-            .retain_fragile(&chunks.list, tid.clone(), placed.clone(), open.clone());
-        self.retain_commit_evidence(
-            tid,
-            participants,
-            open.into_iter().chain(placed.iter().copied()).collect(),
-        );
-        // `write_resolved_commit` left one pin for this caller on each segment.
-        for (chunk_id, seq_id) in placed {
-            chunks.list[chunk_id].unpin_in_progress_segment(seq_id);
-        }
-        warn!(
-            "transaction {:?} could not close its brackets and was closed with a standalone \
-             COMMIT; its locks and heads are released",
-            tid
-        );
-        true
     }
 
     /// Cooperative termination, participant side.
@@ -1387,23 +1315,26 @@ impl DataManager {
     }
 
     /// Keep a multi-site transaction this site committed until it is
-    /// settled at every participant: its segments stay pinned (the cleaner
-    /// invariant, see `crate::ram::evidence`), and, on the commit point, the
-    /// answer `Committed` outlives the bounded decision memory. Every
-    /// participant keeps one. A transaction of one site needs none.
+    /// settled at every participant. Every participant keeps one: the
+    /// release round then settles its segments in `Protection`, and on the
+    /// commit point the answer `Committed` outlives the bounded decision
+    /// memory. A transaction of one site needs none.
     fn retain_commit_evidence(
         &self,
         tid: &TxnId,
         participants: &[u64],
         segments: Vec<crate::ram::evidence::SegmentRef>,
     ) {
-        let chunks = self.chunks();
-        chunks.evidence().retain_commit(
-            &chunks.list,
+        self.chunks().evidence().retain_commit(
             tid.clone(),
             participants.iter().copied().collect(),
             segments,
         );
+    }
+
+    fn has_other_participants(&self, participants: &[u64]) -> bool {
+        let me = self.database_runtime.rpc.server_id;
+        participants.iter().any(|peer| *peer != me)
     }
 
     /// The transactions this site can still ask a peer about: every live
@@ -1426,7 +1357,6 @@ impl DataManager {
     /// no part of the transaction cannot ask about it.
     pub(crate) async fn release_decision_evidence(&self) -> usize {
         let chunks = self.chunks().clone();
-        chunks.evidence().release_settled_fragile(&chunks.list);
         let candidates = chunks
             .evidence()
             .release_candidates(self.database_runtime.rpc.server_id);
@@ -1474,7 +1404,11 @@ impl DataManager {
             })
             .map(|candidate| candidate.txn)
             .collect();
-        let released = chunks.evidence().release(&chunks.list, &releasable);
+        let settled = chunks.evidence().release(&releasable);
+        let released = settled.len();
+        for (txn, segments) in settled {
+            chunks.settle_transaction(&txn, &segments);
+        }
         if released > 0 {
             debug!(
                 "released the commit evidence of {} transaction(s)",
@@ -1515,6 +1449,8 @@ impl DataManager {
     }
 
     /// What this site can say about a transaction, with no side effect.
+    /// For tests: a peer gets `answer_as_commit_point`.
+    #[cfg(test)]
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(outcome) = self.decided.lock().get(tid) {
             return *outcome;

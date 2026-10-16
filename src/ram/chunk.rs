@@ -59,6 +59,8 @@ pub static WAL_JOURNAL_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// harness judging durability has to be able to tell the two apart, so the
 /// refusal is counted where it happens.
 pub static ALLOCATION_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// Bytes marked dead, including versions replaced by the cleaner.
+pub static DEAD_BYTES_PRODUCED: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
 /// Within rotation: allocating the fresh segment (including its WAL file
@@ -722,7 +724,8 @@ fn end_lease(
             // the revocation (claims are taken under the lock that revoked
             // it). Let that entry land first, so the padding covers it.
             #[cfg(feature = "abort_profile")]
-            let drain_timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
+            let drain_timer =
+                crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Drain);
             let drained = seg.drain_pending_journals(std::time::Duration::from_secs(5));
             #[cfg(feature = "abort_profile")]
             drop(drain_timer);
@@ -743,6 +746,7 @@ fn end_lease(
             match outcome {
                 Ok(()) => {
                     seg.mark_bracket_disowned();
+                    seg.protection.abort_transaction(txn);
                     TXN_SPANS_REWOUND.fetch_add(1, Ordering::Relaxed);
                     // The group-commit timer makes the padding durable.
                     if lease.pre_cursor < end {
@@ -985,8 +989,6 @@ lazy_static! {
         Mutex::new(Vec::new());
     static ref INJECTED_SYNC_FAILURES: Mutex<Vec<(usize, crate::server::transactions::TxnId)>> =
         Mutex::new(Vec::new());
-    static ref REFUSED_RESOLVED_COMMITS: Mutex<Vec<std::ops::Range<usize>>> =
-        Mutex::new(Vec::new());
 }
 
 /// Test hook: the next COMMIT decision of `txn` in the store at `base_addr`
@@ -1058,24 +1060,20 @@ fn take_injected_sync_failure(base_addr: usize, txn: &crate::server::transaction
     }
 }
 
-/// Test hook: every chunk in `store` refuses a resolved COMMIT until the
+#[cfg(test)]
+static REFUSED_RESOLVED_COMMITS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: every chunk in the process refuses a resolved COMMIT until the
 /// hook is cleared, as a full store refuses it.
 #[cfg(test)]
-pub(crate) fn refuse_resolved_commits_for_test(store: std::ops::Range<usize>, refuse: bool) {
-    let mut refused = REFUSED_RESOLVED_COMMITS.lock();
-    refused.retain(|range| *range != store);
-    if refuse {
-        refused.push(store);
-    }
+pub(crate) fn refuse_resolved_commits_for_test(refuse: bool) {
+    REFUSED_RESOLVED_COMMITS.store(refuse, Ordering::Release);
 }
 
 #[cfg(test)]
-fn resolved_commits_refused_for_test(chunk: &Chunk) -> bool {
-    let base = chunk.allocator.base_addr();
-    REFUSED_RESOLVED_COMMITS
-        .lock()
-        .iter()
-        .any(|range| range.contains(&base))
+fn resolved_commits_refused_for_test() -> bool {
+    REFUSED_RESOLVED_COMMITS.load(Ordering::Acquire)
 }
 
 /// Why [`Chunks::commit_transaction_brackets`] did not close every bracket.
@@ -1235,7 +1233,8 @@ pub fn is_in_transaction() -> bool {
 /// to answer "no" for backpressure -- past `SEAL_QUEUE_LIMIT` the rotating
 /// writer archives inline, throttling writers to what archiving sustains.
 pub struct SealQueue {
-    pending: parking_lot::Mutex<Vec<(usize, u64)>>,
+    // The sequence distinguishes generations that reuse the same physical slot.
+    pending: parking_lot::Mutex<Vec<(usize, u64, u64)>>,
 }
 
 /// Beyond this backlog, rotation archives inline. Small on purpose: the queue
@@ -1250,15 +1249,24 @@ impl SealQueue {
         }
     }
     /// True if accepted; false means the caller must do the work inline.
-    fn enqueue(&self, chunk_id: usize, seg_id: u64) -> bool {
+    fn enqueue(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> bool {
         let mut pending = self.pending.lock();
         if pending.len() >= SEAL_QUEUE_LIMIT {
             return false;
         }
-        pending.push((chunk_id, seg_id));
+        pending.push((chunk_id, seg_id, seq_id));
         true
     }
-    pub fn drain(&self) -> Vec<(usize, u64)> {
+    /// A refusal already owns a segment. Retain it even under queue backpressure.
+    fn retry(&self, chunk_id: usize, seg_id: u64, seq_id: u64) {
+        let mut pending = self.pending.lock();
+        let job = (chunk_id, seg_id, seq_id);
+        if !pending.contains(&job) {
+            pending.push(job);
+            crate::ram::segs::SEAL_RETRIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn drain(&self) -> Vec<(usize, u64, u64)> {
         std::mem::take(&mut *self.pending.lock())
     }
     pub fn len(&self) -> usize {
@@ -1404,10 +1412,6 @@ pub struct Chunk {
     /// the alternative is silent corruption with no durable copy left.
     pub retired_segments: Mutex<Vec<RetiredSegment>>,
     pub(crate) retired_segment_files: AtomicUsize,
-    /// Segments, by seq id, that are in progress because they hold a part of
-    /// an unsettled multi-site transaction: see `crate::ram::evidence`. The
-    /// cleaner does not compact them. The value counts the pins.
-    in_progress_pins: Mutex<std::collections::HashMap<u64, u32>>,
     /// Set once shutdown has begun archiving; no entry may be acquired after.
     ///
     /// Shutdown archives every dirty segment and only then stops the RPC
@@ -1686,10 +1690,13 @@ impl Chunk {
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
             retired_segment_files: AtomicUsize::new(0),
-            in_progress_pins: Mutex::new(std::collections::HashMap::new()),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
+        bootstrap_segment
+            .protection
+            .head
+            .store(true, Ordering::Release);
         chunk.put_segment(bootstrap_segment);
         return chunk;
     }
@@ -1752,41 +1759,6 @@ impl Chunk {
             }
         }
         repaired
-    }
-
-    pub fn pin_in_progress_segment(&self, seq_id: u64) {
-        *self.in_progress_pins.lock().entry(seq_id).or_insert(0) += 1;
-    }
-
-    pub fn unpin_in_progress_segment(&self, seq_id: u64) {
-        let mut pins = self.in_progress_pins.lock();
-        if let Some(count) = pins.get_mut(&seq_id) {
-            *count -= 1;
-            if *count == 0 {
-                pins.remove(&seq_id);
-            }
-        }
-    }
-
-    /// Whether a segment holds a part of an unsettled multi-site
-    /// transaction.
-    pub fn is_in_progress_pinned(&self, seq_id: u64) -> bool {
-        self.in_progress_pins.lock().contains_key(&seq_id)
-    }
-
-    pub fn in_progress_pinned_segments(&self) -> usize {
-        self.in_progress_pins.lock().len()
-    }
-
-    /// THE cleaner invariant, in one place: whether the cleaner may compact
-    /// or remove `segment`. It may not while the segment is in progress: a
-    /// write head (D20), or a segment that holds a part of an unsettled
-    /// multi-site transaction (D28, see `crate::ram::evidence`).
-    ///
-    /// The combiner checks it AFTER it claims a segment, and removal checks
-    /// it again, so a pin placed before the claim is always seen.
-    pub fn cleaner_may_take(&self, segment: &Segment) -> bool {
-        !self.is_active_head(segment.id) && !self.is_in_progress_pinned(segment.seq_id)
     }
 
     pub fn is_active_head(&self, seg_id: u64) -> bool {
@@ -1994,6 +1966,7 @@ impl Chunk {
             // Idle time for expiry counts from the first head held.
             leases.opened_at = std::time::Instant::now();
         }
+        head.protection.retain_transaction(&txn);
         leases
             .per_chunk
             .entry(self.lease_key())
@@ -2143,69 +2116,63 @@ impl Chunk {
         journaled.map(|()| true)
     }
 
-    /// Write a COMMIT for a transaction this chunk holds no lease for.
+    /// Write a COMMIT for a transaction this chunk holds no lease for, as a
+    /// BEGIN+COMMIT carrier.
     ///
     /// The resolution path after a restart. The lease-based close cannot be
     /// used there -- recovery reset the write heads, so nothing is leased and
     /// the transaction's own segments may be full or sealed -- but it does
     /// not need to be: recovery collects COMMIT records store-wide and
     /// settles pending cells against them, so ONE record anywhere in the
-    /// store decides the transaction everywhere in it.
+    /// store decides the transaction everywhere in it. The carrier's BEGIN
+    /// names `participants`, like every BEGIN.
     ///
-    /// Synced rather than deferred: this is the record that turns a
-    /// transaction the commit point resolved into one this store will still
-    /// agree is committed after the next crash. Leaving it in a buffer would
-    /// make the resolution itself something a crash could undo: the site then
-    /// reports the transaction closed, the commit point releases its
-    /// evidence, and a power loss inside the group-sync window drops the
-    /// record.
+    /// Synced before it returns: this is the record that turns a transaction
+    /// the commit point resolved into one this store will still agree is
+    /// committed after the next crash, until the entries have plain copies.
+    /// The caller installs the cells and reports the transaction closed only
+    /// after this, so a power loss inside the group-sync window cannot drop
+    /// the record after the commit point released its evidence.
     ///
-    /// Returns the seq id of the segment that holds the record. That segment
-    /// carries one evidence pin for the caller, placed before the record is
-    /// appended, so the cleaner cannot take the segment before the caller
-    /// retains it. The caller releases that pin with
-    /// [`Chunk::unpin_in_progress_segment`] once it has its own.
+    /// The carrier's segment is retained for the transaction (`Protection`)
+    /// until the caller releases or settles it.
     pub fn write_resolved_commit(
         &self,
         txn: &crate::server::transactions::TxnId,
-    ) -> Result<u64, WriteError> {
+        participants: &[u64],
+    ) -> Result<(), WriteError> {
         #[cfg(test)]
-        if resolved_commits_refused_for_test(self) {
+        if resolved_commits_refused_for_test() {
             return Err(WriteError::CannotAllocateSpace);
         }
-        // Empty manifest, deliberately. A manifest lets a reader check that
-        // every part of a bracket is present, and every member it could name
-        // here is one this store already has; naming none says "decide on the
-        // record alone", which is what a missing member already falls back to.
-        let content = crate::ram::bracket::encode_commit(txn, &[]);
-        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        // Recovery recognizes a complete bracket, not a standalone COMMIT.
+        // Keep this carrier pinned until all resolved entries have plain copies.
+        let begin = crate::ram::bracket::encode_begin(txn, participants);
+        let commit = crate::ram::bracket::encode_commit(txn, &[]);
+        let size = (2 * crate::ram::entry::ENTRY_HEAD_SIZE + begin.len() + commit.len()) as u32;
         let pending = self.try_acquire(size, false)?;
-        let segment = self
-            .locate_segment(pending.addr)
-            .ok_or(WriteError::CannotAllocateSpace)?;
-        let seq_id = segment.seq_id;
-        self.pin_in_progress_segment(seq_id);
-        crate::ram::entry::stamp_reservation_padding(pending.addr, size);
-        crate::ram::entry::Entry::encode_to(
-            pending.addr,
-            crate::ram::entry::EntryType::COMMIT,
-            content.len() as u32,
-            |content_addr| unsafe {
-                std::ptr::copy_nonoverlapping(
-                    content.as_ptr(),
-                    content_addr as *mut u8,
-                    content.len(),
-                );
-            },
-        );
-        let written = pending
-            .append()
-            .and_then(|()| segment.force_wal_sync().map_err(WriteError::from_wal_io));
-        if let Err(error) = written {
-            self.unpin_in_progress_segment(seq_id);
-            return Err(error);
+        pending.seg.protection.retain_transaction(txn);
+        let mut cursor = pending.addr;
+        for (kind, content) in [
+            (crate::ram::entry::EntryType::BEGIN, begin),
+            (crate::ram::entry::EntryType::COMMIT, commit),
+        ] {
+            crate::ram::entry::Entry::encode_to(
+                cursor,
+                kind,
+                content.len() as u32,
+                |addr| unsafe {
+                    std::ptr::copy_nonoverlapping(content.as_ptr(), addr as *mut u8, content.len());
+                },
+            );
+            cursor += crate::ram::entry::ENTRY_HEAD_SIZE + content.len();
         }
-        Ok(seq_id)
+        pending.append()?;
+        pending
+            .seg
+            .force_wal_sync()
+            .map_err(WriteError::from_wal_io)?;
+        Ok(())
     }
 
     /// This chunk's lease key: unique across every store in the process.
@@ -2577,6 +2544,12 @@ impl Chunk {
         // the guard has already pinned its own segment by reference, and a
         // pinned segment is never freed; the section's lookup-to-pin job is
         // done before allocation starts.
+        #[cfg(test)]
+        TEST_CAS_HEAD_WAIT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let _outside_section = crate::ram::qsbr::segment_qsbr().suspend();
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
@@ -2600,7 +2573,7 @@ impl Chunk {
             // writer can OWN takes the entry; a full one becomes the
             // rotation target; an EMPTY slot is the fallback target so the
             // pool grows exactly when contention demands it.
-            let mut rotate_target: Option<(&AtomicU64, u64)> = None;
+            let mut rotate_target: Option<(&AtomicU64, u64, u64)> = None;
             let mut empty_slot: Option<&AtomicU64> = None;
             for i in 0..slots.len() {
                 let slot = &slots[(start + i) % slots.len()];
@@ -2705,8 +2678,12 @@ impl Chunk {
                     head.end_pending_journal();
                     head.decr_references();
                     head.release_own();
-                    rotate_target = Some((slot, head_seg_id));
-                    break;
+                    if rotate_target.is_none() {
+                        rotate_target = Some((slot, head_seg_id, head.seq_id));
+                    }
+                    // A later head can still fit this entry. Rotation needs a
+                    // new segment; do not refuse at capacity before trying it.
+                    continue;
                 } else {
                     // This head is sealing; it will never accept another
                     // write. Next slot.
@@ -2720,10 +2697,10 @@ impl Chunk {
             // rotates; failing that, an EMPTY slot gets its first segment;
             // failing THAT, every slot is owned or allocating -- spin
             // briefly and rescan.
-            let (head_slot, head_seg_id) = match rotate_target {
+            let (head_slot, head_seg_id, head_seq_id) = match rotate_target {
                 Some(target) => target,
                 None => match empty_slot {
-                    Some(slot) => (slot, HEAD_SEG_ID_EMPTY),
+                    Some(slot) => (slot, HEAD_SEG_ID_EMPTY, 0),
                     None => {
                         if self.current_txn_holds_head_here(segment_class) {
                             error!(
@@ -2801,11 +2778,27 @@ impl Chunk {
                         && self
                             .segs
                             .get(&(id as usize))
-                            .map(|seg| !seg.bracket_is_open() && seg.can_still_append())
+                            .map(|seg| {
+                                !seg.bracket_is_open()
+                                    && seg.can_still_append()
+                                    && (growing
+                                        || seg.bound().saturating_sub(
+                                            seg.append_header.load(Ordering::Acquire),
+                                        ) >= size as usize)
+                            })
                             .unwrap_or(false)
                 })
             };
-            if growing && near_wall && any_live_head() {
+            // A full rotation target does not imply a full pool. Other
+            // writers can own heads with room. Use the same bounded queue
+            // as pool growth instead of refusing while they finish.
+            if near_wall && any_live_head() {
+                #[cfg(test)]
+                TEST_BEFORE_HEAD_QUEUE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
                 if self.current_txn_holds_head_here(segment_class) {
                     error!(
                         "chunk {} is at capacity and the live head(s) this write would queue on \
@@ -2848,6 +2841,23 @@ impl Chunk {
             }
             if at_wall {
                 if tried_gc {
+                    #[cfg(test)]
+                    TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook();
+                        }
+                    });
+                    // Another writer can replace the selected full head while
+                    // this writer checks capacity or runs GC. Rescan its new
+                    // head before refusing the allocation.
+                    if head_slot.load(Ordering::Acquire) != head_seg_id {
+                        continue;
+                    }
+                    if self.wait_for_capacity_progress(full_gc, segment_class, &mut queueing_since)
+                    {
+                        tried_gc = false;
+                        continue;
+                    }
                     debug!(
                         "chunk-allocation-failure: chunk={}, live_bytes={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
                         self.id,
@@ -2910,6 +2920,12 @@ impl Chunk {
             };
 
             let t_alloc_seg = std::time::Instant::now();
+            #[cfg(test)]
+            TEST_BEFORE_ROTATION_ALLOCATE.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
             let new_seg_opt = match self
                 .allocator
                 .alloc_seg_for_writer(&self.file_manager, segment_class)
@@ -2941,10 +2957,14 @@ impl Chunk {
                 // Space was there when we checked, and is gone now -- another
                 // writer took the last segment between the check and here.
                 drop(restore);
-                // A failed GROWTH still is not a failed write while live
-                // heads exist: put the slot back and queue on one of them.
-                if growing && any_live_head() {
+                // Another writer can consume the last free segment. Restore
+                // the slot and retry usable heads, including owned heads.
+                if any_live_head() {
                     backoff.spin();
+                    continue;
+                }
+                if self.wait_for_capacity_progress(full_gc, segment_class, &mut queueing_since) {
+                    tried_gc = false;
                     continue;
                 }
                 self.log_allocation_exhausted(segment_class);
@@ -2973,6 +2993,11 @@ impl Chunk {
             // Publish new head segment id FIRST
             // This creates a window where the head_seg_id points to a segment not yet in self.segs.
             // Readers of head_seg_id must handle this by retrying.
+            new_seg.protection.head.store(true, Ordering::Release);
+            if let Some(old) = self.segs.get(&(head_seg_id as usize)) {
+                old.protection.seal_pending.store(true, Ordering::Release);
+                old.protection.head.store(false, Ordering::Release);
+            }
             restore.publish(new_seg_id);
 
             self.put_segment(new_seg);
@@ -2999,88 +3024,100 @@ impl Chunk {
                 // behind.
                 let sealed_in_background = std::env::var("NEB_SYNC_SEAL_ARCHIVE").as_deref()
                     != Ok("1")
-                    && self.seal_queue.enqueue(self.id, head_seg_id);
+                    && self.seal_queue.enqueue(self.id, head_seg_id, head_seq_id);
                 if !sealed_in_background {
-                    self.finish_rotated_head(head_seg_id);
+                    self.finish_rotated_head(head_seg_id, head_seq_id);
                 }
             }
         }
+    }
+
+    /// A GC snapshot can exclude segments that the sealer or reclaimer still
+    /// owns. They are not proof that the store is full. Only callers permitted
+    /// to wait for GC may wait here: a best-effort caller can hold a cell word
+    /// or a reference needed by that work. Transaction leases cannot wait on
+    /// their own heads either. Use the existing head-queue deadline.
+    fn wait_for_capacity_progress(
+        &self,
+        full_gc: bool,
+        segment_class: SegmentClass,
+        waiting_since: &mut Option<std::time::Instant>,
+    ) -> bool {
+        if !full_gc || self.current_txn_holds_head_here(segment_class) {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        HELD_CELL_GUARDS.with(|held| {
+            debug_assert_eq!(held.get(), 0, "capacity progress caller holds a cell word");
+        });
+        let pending = self.retired_segment_files.load(Ordering::Acquire) != 0
+            || self.gc_lock.is_locked()
+            || self.segments().iter().any(|segment| {
+                segment.protection.seal_pending.load(Ordering::Acquire)
+                    && !segment.protection.transaction_pending()
+            });
+        if !pending
+            || waiting_since
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed()
+                >= HEAD_QUEUE_DEADLINE
+        {
+            return false;
+        }
+        // Release CPU time so the work that makes capacity available can run.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
     }
 
     /// Drain, sync, archive and seal a segment that has just stopped being the
     /// head. Runs inline from rotation (under backpressure or the
     /// NEB_SYNC_SEAL_ARCHIVE toggle) or on the background sealer; the sequence
     /// is identical either way.
-    pub(crate) fn finish_rotated_head(&self, head_seg_id: u64) {
+    pub(crate) fn finish_rotated_head(&self, head_seg_id: u64, head_seq_id: u64) {
+        let lookup = crate::ram::qsbr::QsbrSection::new();
         if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-            // Let the writers that acquired from this segment finish
-            // before it stops being writable.
-            //
-            // Rotation only publishes a new head; entries acquired from
-            // the old one moments earlier are still in flight, and each
-            // holds a reference until its `PendingEntry` drops (which is
-            // where the WAL write happens). Closing its WAL and
-            // archiving underneath them is what made the twin: the late
-            // write found no WAL and re-created one beside a backup that
-            // did not contain it. Sealing turned that silent corruption
-            // into a refused write -- 3,958 failed batches in one import
-            // -- which is the same race being reported instead of
-            // hidden. Draining first is the actual fix.
-            //
-            // Bounded, because a reference can also be a long-lived read
-            // guard and rotation runs on the write path. If it does not
-            // drain, the archive is simply skipped: the segment stays
-            // dirty and unsealed, so late writes still land in its WAL
-            // and eviction, shutdown or recovery archive it later.
-            let t_drain = std::time::Instant::now();
-            let drain = Backoff::new();
-            let mut drained = old_head.no_references();
-            for _ in 0..512 {
-                if drained {
-                    break;
-                }
-                // We are waiting on other threads to finish their
-                // writes; the head slot already points at the new
-                // segment, so nothing is blocked behind this. Yield
-                // periodically rather than burning a core on a wait
-                // that is normally over in microseconds.
-                drain.spin();
-                std::thread::yield_now();
-                drained = old_head.no_references();
-            }
-            ROTATE_DRAIN_NANOS.fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if !drained {
-                debug!(
-                    "Segment {} (chunk {}) still has {} references at rotation; leaving it \
-                         dirty and unsealed rather than archiving under an active writer",
-                    head_seg_id,
-                    self.id,
-                    old_head.references_count()
-                );
+            // Reject an obsolete physical-slot generation before touching protection.
+            if old_head.seq_id != head_seq_id {
                 return;
             }
+            let Some(_job) = old_head.protection.job() else {
+                self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                return;
+            };
+            if self.is_active_head(old_head.id) || old_head.is_head_owned() {
+                self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                return;
+            }
+            old_head.protection.head.store(false, Ordering::Release);
+            old_head
+                .protection
+                .seal_pending
+                .store(true, Ordering::Release);
+            // Keep the lookup protected until the exact generation is pinned.
+            // A reference snapshot alone permits reclamation during the archive.
+            let t_drain = std::time::Instant::now();
+            let drain = Backoff::new();
+            let mut exclusive = crate::ram::segs::SegmentExclusiveRefGuard::new(&old_head);
+            for _ in 0..512 {
+                if exclusive.is_some() {
+                    break;
+                }
+                drain.spin();
+                std::thread::yield_now();
+                exclusive = crate::ram::segs::SegmentExclusiveRefGuard::new(&old_head);
+            }
+            ROTATE_DRAIN_NANOS.fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let Some(_exclusive) = exclusive else {
+                self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                return;
+            };
+            drop(lookup);
             if let Err(e) = old_head.force_wal_sync() {
                 warn!(
                     "Failed to sync WAL for old head segment {}: {}",
                     head_seg_id, e
                 );
             }
-            let mut state = old_head.file_state.lock();
-            if let Some(wal) = state.wal.take() {
-                if let Err(e) = wal.sync_all() {
-                    warn!(
-                        "Failed to sync WAL during close for old head segment {}: {}",
-                        head_seg_id, e
-                    );
-                }
-                drop(wal);
-                debug!(
-                    "Closed WAL file for old head segment {} (freed file descriptor)",
-                    head_seg_id
-                );
-            }
-            drop(state);
-
             // Seal-time archive. A segment stops being head exactly
             // once, and from then on it is immutable, so this is the
             // one place its durable copy should be written -- and the
@@ -3098,19 +3135,32 @@ impl Chunk {
             // 977 such segments against 20,697 archived ones; TB13
             // carried 18,336 of them into the restart that lost data.
             let t_archive = std::time::Instant::now();
-            let archive_result = old_head.archive();
+            old_head
+                .protection
+                .seal_pending
+                .store(true, Ordering::Release);
+            drop(_job);
+            let archive_result = old_head.archive_rotated();
             ROTATE_ARCHIVE_NANOS
                 .fetch_add(t_archive.elapsed().as_nanos() as u64, Ordering::Relaxed);
             match archive_result {
-                Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
-                // Already archived: re-sealing must never rewrite an
-                // immutable segment.
-                Ok(false) => {}
-                Err(e) => error!(
-                    "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
+                Ok(crate::ram::segs::ArchiveOutcome::Refused) => {
+                    self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                }
+                Ok(_) => {
+                    old_head
+                        .protection
+                        .seal_pending
+                        .store(false, Ordering::Release);
+                }
+                Err(e) => {
+                    self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                    error!(
+                        "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
                          and resident; its only durable copy is its WAL.",
-                    head_seg_id, self.id, e
-                ),
+                        head_seg_id, self.id, e
+                    );
+                }
             }
         }
     }
@@ -3128,6 +3178,48 @@ impl Chunk {
             .map(|slot| slot.load(Ordering::Acquire))
             .find(|id| *id != HEAD_SEG_ID_EMPTY && *id != HEAD_SEG_ID_ALLOCATING);
         (head_or_none(self.get_head_seg_id()), first_blob)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_append_heads_for_test(&self) -> Vec<u64> {
+        let mut heads = Vec::new();
+        for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
+            let lookup = crate::ram::qsbr::QsbrSection::new();
+            let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
+            if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
+                if let Some(segment) = self.segs.get(&(old as usize)) {
+                    segment.protection.head.store(false, Ordering::Release);
+                }
+                heads.push(old);
+            }
+        }
+        self.wait_for_segment_jobs_for_test();
+        heads
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotate_heads_for_scrub_test(&self) {
+        for old in self.release_append_heads_for_test() {
+            let sequence = self.segs.get(&(old as usize)).unwrap().seq_id;
+            self.finish_rotated_head(old, sequence);
+        }
+        self.wait_for_segment_jobs_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_segment_jobs_for_test(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.segments().iter().any(|segment| {
+            segment.wal_sync_queued.load(Ordering::Acquire)
+                || segment.protection.seal_pending.load(Ordering::Acquire)
+                || !segment.protection.jobs_drained()
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "segment jobs did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
@@ -3153,6 +3245,7 @@ impl Chunk {
         // process stopped: at most one per chunk, bounded by the segment
         // size, and reclaimed by the cleaner like any other dead space.
         for segment in self.segments() {
+            segment.protection.head.store(false, Ordering::Release);
             if !segment.is_sealed() {
                 segment.seal();
             }
@@ -3189,6 +3282,12 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64, has_read: bool) -> Option<CellWriteGuard<'_>> {
+        #[cfg(test)]
+        TEST_BEFORE_WORD.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -3870,7 +3969,55 @@ impl Chunk {
         }
     }
 
+    // Deletes reserve before reacquiring the cell word, as do ordinary writes,
+    // upserts and CAS. update_cell_by and CellGuard updates still hold the word
+    // first. Near capacity, their best-effort head queue can conflict with a
+    // delete holding that head; it refuses at HEAD_QUEUE_DEADLINE, releasing the
+    // word so the delete can finish. These paths must not wait for full GC.
+    fn reserve_tombstone_for_remove(
+        &self,
+        hash: u64,
+        predict: Option<&dyn Fn(&SharedCell) -> bool>,
+    ) -> Result<PendingEntry, WriteError> {
+        // Preserve the absent-cell result even when the store has no capacity.
+        let guard = CellGuard::for_read(hash, self).map_err(|error| match error {
+            ReadError::CellDoesNotExisted | ReadError::CellIdIsUnitId => {
+                WriteError::CellDoesNotExisted
+            }
+            other => WriteError::ReadError(other),
+        })?;
+        // Reject a false predicate even at a full store. The caller checks it
+        // again under the second guard because the cell can change meanwhile.
+        let guard = if let Some(predict) = predict {
+            let (cell, _) = SharedCell::from_chunk_raw(hash, guard, self)
+                .map_err(WriteError::ReadError)?;
+            if !predict(&cell) {
+                return Err(WriteError::CellDoesNotExisted);
+            }
+            cell.into_cell_guard()
+        } else {
+            guard
+        };
+        #[cfg(test)]
+        TEST_DELETE_BEFORE_RESERVE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        drop(guard);
+        // Preserve best-effort collection for transaction apply callers.
+        let pending = self.acquire_tombstone(false)?;
+        #[cfg(test)]
+        TEST_DELETE_AFTER_RESERVE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        Ok(pending)
+    }
+
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
+        let pending_entry = self.reserve_tombstone_for_remove(hash, None)?;
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3880,7 +4027,9 @@ impl Chunk {
         };
         let cell_location = guard.get_ptr();
 
-        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
+        let removed_len =
+            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        drop(pending_entry);
 
         if let Some(indexer) = &self.index_builder {
             match SharedCell::from_chunk_raw(hash, guard, self) {
@@ -3913,6 +4062,7 @@ impl Chunk {
     /// Keeping the entries is not a leak: the cell still exists, on the recipient,
     /// and the entry still names it correctly. Removing them is what was wrong.
     fn remove_cell_keeping_indices(&self, hash: u64) -> Result<(), WriteError> {
+        let pending_entry = self.reserve_tombstone_for_remove(hash, None)?;
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
             Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
@@ -3920,7 +4070,9 @@ impl Chunk {
             Err(e) => return Err(WriteError::ReadError(e)),
         };
         let cell_location = guard.get_ptr();
-        let removed_len = self.put_tombstone_by_cell_loc_inner(cell_location, true, false)?;
+        let removed_len =
+            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        drop(pending_entry);
         guard.remove_cell();
         self.slot_bytes.sub(hash, removed_len);
         Ok(())
@@ -3942,6 +4094,7 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
+        let pending_entry = self.reserve_tombstone_for_remove(hash, Some(&predict))?;
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
@@ -3954,10 +4107,12 @@ impl Chunk {
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
-                    // The cleaner can probe this cell. Do not wait for its GC lock
-                    // while the cell-index guard is held, even at the allocator wall.
-                    let removed_len =
-                        self.put_tombstone_by_cell_loc_inner(cell_location, retire_old, false)?;
+                    let removed_len = self.put_tombstone_by_cell_loc_inner(
+                        cell_location,
+                        retire_old,
+                        &pending_entry,
+                    )?;
+                    drop(pending_entry);
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
                     self.slot_bytes.sub(hash, removed_len);
@@ -4100,15 +4255,29 @@ impl Chunk {
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
-        if let Some(segment) = self.segs.get(&(segment_id as usize)) {
-            if !self.cleaner_may_take(&segment) {
-                error!(
-                    "refusing to remove segment {} (chunk {}, seq {}): it is in progress",
-                    segment_id, self.id, segment.seq_id
-                );
-                return;
-            }
+        let Some(segment) = self.segs.get(&(segment_id as usize)) else {
+            return;
+        };
+        if !segment.protection.claim_cleaner() {
+            return;
         }
+        self.remove_segment_for_cleaner(segment_id);
+        segment.protection.release_cleaner();
+    }
+
+    pub(crate) fn remove_segment_for_cleaner(&self, segment_id: u64) {
+        let Some(segment) = self.segs.get(&(segment_id as usize)) else {
+            return;
+        };
+        if self.is_active_head(segment_id)
+            || segment.protection.in_progress()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            return;
+        }
+        segment.protection.retire();
         debug!(
             "Removing segment for chunk {} with id {}",
             self.id, segment_id
@@ -4203,7 +4372,7 @@ impl Chunk {
             // that took it, which QSBR's per-thread accounting cannot see.
             let quiesced = qsbr.is_quiesced(entry.stamp);
             let unreferenced = entry.segment.no_references();
-            if quiesced && unreferenced {
+            if quiesced && unreferenced && entry.segment.protection.jobs_drained() {
                 entry.segment.free_memory();
                 entry.segment.dispense();
                 for (hash, count) in entry.deleted_ids {
@@ -4315,14 +4484,7 @@ impl Chunk {
         return res;
     }
 
-    #[inline]
-    fn put_tombstone(
-        &self,
-        cell_header: &CellHeader,
-        cell_seg: &AArc<Segment>,
-        record_deleted_version: bool,
-        full_gc: bool,
-    ) -> Result<(), WriteError> {
+    fn acquire_tombstone(&self, full_gc: bool) -> Result<PendingEntry, WriteError> {
         // Bounded, and never retried when retrying cannot possibly work.
         //
         // This used to loop forever on ANY acquire error. Two ways that
@@ -4367,13 +4529,23 @@ impl Chunk {
         }
         let Some(pending_entry) = acquired else {
             error!(
-                "Chunk {} could not place a tombstone for {:?} after {} attempts: {:?}. The \
+                "Chunk {} could not place a tombstone after {} attempts: {:?}. The \
                  delete is REFUSED rather than retried forever, so the caller learns it did \
                  not happen.",
-                self.id, cell_header.id, TOMBSTONE_ACQUIRE_ATTEMPTS, last_error
+                self.id, TOMBSTONE_ACQUIRE_ATTEMPTS, last_error
             );
             return Err(last_error);
         };
+        Ok(pending_entry)
+    }
+
+    fn put_tombstone(
+        &self,
+        cell_header: &CellHeader,
+        cell_seg: &AArc<Segment>,
+        record_deleted_version: bool,
+        pending_entry: &PendingEntry,
+    ) -> Result<(), WriteError> {
         Tombstone::put(
             pending_entry.addr,
             cell_seg.seq_id,
@@ -4392,14 +4564,15 @@ impl Chunk {
     /// Returns the removed entry's content length, so the logical remove
     /// paths can settle the slot counter without a second decode.
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
-        self.put_tombstone_by_cell_loc_inner(cell_location, true, true)
+        let pending_entry = self.acquire_tombstone(true)?;
+        self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)
     }
 
     fn put_tombstone_by_cell_loc_inner(
         &self,
         cell_location: usize,
         retire_old: bool,
-        full_gc: bool,
+        pending_entry: &PendingEntry,
     ) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
@@ -4416,7 +4589,7 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg, retire_old, full_gc)?;
+        self.put_tombstone(&header, &cell_seg, retire_old, pending_entry)?;
         if retire_old {
             self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
         }
@@ -4442,6 +4615,7 @@ impl Chunk {
             addr,
             seg.id
         );
+        DEAD_BYTES_PRODUCED.fetch_add(size as u64, Ordering::Relaxed);
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
         seg.mark_dead_bit(addr);
         seg.note_dead_bytes_change();
@@ -4555,6 +4729,9 @@ impl Chunk {
                 *utilization < 1.0
                     && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
+                    && !seg.protection.in_progress()
+                    && !seg.is_head_owned()
+                    && !seg.wal_sync_queued.load(Ordering::Acquire)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     // A reservation in flight means the image may hold a gap:
                     // the cursor moves before the bytes land, and the combine
@@ -4795,24 +4972,48 @@ impl Chunk {
         CellGuard::for_write(hash, has_read, self).ok_or(ReadError::CellDoesNotExisted)
     }
 
+    /// The caller must hold no other cell word. Allocation can wait for the
+    /// cleaner, which acquires cell words while it holds the GC lock.
     pub fn compare_version_and_update_cell(
         &self,
         hash: u64,
         version: u64,
         cell: &mut OwnedCell,
     ) -> Result<CellHeader, WriteError> {
+        #[cfg(debug_assertions)]
+        HELD_CELL_GUARDS
+            .with(|held| debug_assert_eq!(held.get(), 0, "CAS caller holds a cell word"));
+        // Match ordinary upserts: claim a head before taking the cell word.
+        // The expected version is checked after allocation, under that word.
+        cell.header.version = version;
+        let write_plan = cell.plan_write(self)?;
+        // No cell word is held here, so a concurrent cleaner can finish
+        // before we decide whether the chunk has space.
+        struct CasAllocation;
+        impl Drop for CasAllocation {
+            fn drop(&mut self) {
+                CAS_ALLOCATING.with(|active| active.set(false));
+            }
+        }
+        CAS_ALLOCATING.with(|active| active.set(true));
+        let allocation = CasAllocation;
+        let pending_entry = write_plan.allocate(self, true)?;
+        drop(allocation);
         let mut guard = self
             .lock_cell_for_write(hash, true)
             .map_err(WriteError::ReadError)?;
-        let cell_version = guard.cell_version().map_err(WriteError::ReadError)?;
-        if cell_version == version {
-            cell.header.version = version; // update version to the latest version
-            guard.update_cell(cell)?;
-            return Ok(cell.header);
+        if guard.cell_version().map_err(WriteError::ReadError)? != version {
+            return Err(WriteError::CellVersionMismatch);
         }
-        return Err(WriteError::CellVersionMismatch);
+        let result = guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)?;
+        drop(write_plan);
+        cell.header.version = result.new_version;
+        cell.header.timestamp = result.new_timestamp;
+        cell.header.schema = result.new_schema;
+        Ok(cell.header)
     }
 
+    /// The caller must hold no cell word; see `compare_version_and_update_cell`.
     pub fn compare_version_and_set_field(
         &self,
         hash: u64,
@@ -4820,16 +5021,20 @@ impl Chunk {
         field: u64,
         value: OwnedValue,
     ) -> Result<CellHeader, WriteError> {
-        let mut guard = self
-            .lock_cell_for_write(hash, true)
-            .map_err(WriteError::ReadError)?;
-        let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
-        if cell.header.version == version {
-            cell.data[field] = value;
-            guard.update_cell(&mut cell)?;
-            return Ok(cell.header);
+        #[cfg(debug_assertions)]
+        HELD_CELL_GUARDS
+            .with(|held| debug_assert_eq!(held.get(), 0, "CAS caller holds a cell word"));
+        let mut cell = {
+            let mut guard = self
+                .lock_cell_for_write(hash, true)
+                .map_err(WriteError::ReadError)?;
+            guard.read_cell_owned().map_err(WriteError::ReadError)?
+        };
+        if cell.header.version != version {
+            return Err(WriteError::CellVersionMismatch);
         }
-        return Err(WriteError::CellVersionMismatch);
+        cell.data[field] = value;
+        self.compare_version_and_update_cell(hash, version, &mut cell)
     }
 }
 
@@ -5016,6 +5221,29 @@ pub struct Chunks {
 }
 
 impl Chunks {
+    /// Release only after a final discard or durable plain-entry rewrite.
+    pub(crate) fn release_transaction_pins(&self, txn: &crate::server::transactions::TxnId) {
+        for chunk in &self.list {
+            for segment in chunk.segments() {
+                segment.protection.abort_transaction(txn);
+            }
+        }
+        self.cleaner_wake.request();
+    }
+
+    /// Whole segments retained by transaction decisions, including dead bytes.
+    pub fn pinned_segments(&self) -> usize {
+        self.list
+            .iter()
+            .flat_map(|chunk| chunk.segments())
+            .filter(|segment| segment.protection.transaction_pending())
+            .count()
+    }
+
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned_segments() * SEGMENT_SIZE
+    }
+
     /// Stop this store's background threads.
     ///
     /// Called when the owning server goes away. Separate from dropping the
@@ -5029,29 +5257,77 @@ impl Chunks {
 
     /// Keep what recovery learned about transactions, for termination.
     ///
-    /// Every committed transaction with more than one participant is
-    /// retained, with no cap: a restarted store does not know which of them
-    /// a peer is still in doubt about, so it keeps all of them until their
-    /// participants report what they hold open. The open parts of the
-    /// in-doubt transactions are pinned too. The pins are in place before the
-    /// cleaner can run.
+    /// Every committed transaction with more than one participant stays in
+    /// progress, with no cap, until it is settled: a restarted store does
+    /// not know which of them a participant is still in doubt about. Its
+    /// segments are held in `Protection` before the cleaner can run, and the
+    /// commit point answers from the evidence. A transaction of one site is
+    /// not kept. The in-doubt transactions are held by recovery already
+    /// (`BracketLedger::settle`).
     pub fn remember_recovered_brackets(
         &self,
         mut brackets: crate::ram::recovery::RecoveredBrackets,
     ) {
-        let committed = std::mem::take(&mut brackets.committed);
-        let in_doubt: Vec<_> = brackets
-            .in_doubt
-            .iter()
-            .map(|bracket| crate::ram::evidence::RecoveredInDoubt {
-                txn: bracket.txn.clone(),
-                participants: bracket.participants.clone(),
-                open: bracket.open.clone(),
-            })
-            .collect();
-        self.evidence
-            .retain_recovered(&self.list, committed, in_doubt);
+        for commit in std::mem::take(&mut brackets.committed) {
+            let participants: std::collections::BTreeSet<u64> =
+                commit.participants.into_iter().collect();
+            if participants.len() < 2 {
+                continue;
+            }
+            for (chunk_id, segment_id) in &commit.segments {
+                if let Some(segment) = self
+                    .list
+                    .get(*chunk_id)
+                    .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
+                {
+                    segment.protection.hold_until_settled(&commit.txn);
+                }
+            }
+            self.evidence
+                .retain_commit(commit.txn, participants, commit.segments);
+        }
+        for bracket in &brackets.in_doubt {
+            self.evidence
+                .begin_resolving(bracket.txn.clone(), bracket.participants.clone());
+        }
         *self.recovered_brackets.lock() = brackets;
+    }
+
+    /// Hold a resolved multi-site transaction in every segment that holds it
+    /// now, until it is settled. Returns those segments.
+    pub(crate) fn hold_transaction_until_settled(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+    ) -> Vec<crate::ram::evidence::SegmentRef> {
+        let mut held = Vec::new();
+        for chunk in &self.list {
+            for segment in chunk.segments() {
+                if segment.protection.holds_transaction(txn) {
+                    segment.protection.hold_until_settled(txn);
+                    held.push((chunk.id, segment.id));
+                }
+            }
+        }
+        held
+    }
+
+    /// `txn` is settled at every participant: its segments are no longer in
+    /// progress for it.
+    pub(crate) fn settle_transaction(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        segments: &[crate::ram::evidence::SegmentRef],
+    ) {
+        for (chunk_id, segment_id) in segments {
+            if let Some(segment) = self
+                .list
+                .get(*chunk_id)
+                .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
+            {
+                segment.protection.settle_transaction(txn);
+            }
+        }
+        self.cleaner_wake.request();
     }
 
     /// Committed transactions whose evidence this store still keeps.
@@ -5323,9 +5599,9 @@ impl Chunks {
                         break;
                     }
                     let Some(chunks) = weak.upgrade() else { break };
-                    for (chunk_id, seg_id) in chunks.seal_queue().drain() {
+                    for (chunk_id, seg_id, seq_id) in chunks.seal_queue().drain() {
                         if let Some(chunk) = chunks.list.get(chunk_id) {
-                            chunk.finish_rotated_head(seg_id);
+                            chunk.finish_rotated_head(seg_id, seq_id);
                         }
                     }
                 })
@@ -5468,9 +5744,14 @@ impl Chunks {
     /// that no other exit -- an abort, a sweeper -- already ended the leases
     /// of a transaction that did write; `DataManager` keeps that knowledge in
     /// the transaction object it serializes every decision through.
+    ///
+    /// `multi_site`: the transaction has other participants. Its segments
+    /// then stay in progress after the COMMIT is synced, until the release
+    /// round settles it (D28, see `crate::ram::evidence`).
     pub fn commit_transaction_brackets(
         &self,
         txn: &crate::server::transactions::TxnId,
+        multi_site: bool,
     ) -> Result<(), CommitRefusal> {
         let manifest = transaction_manifest(txn, &self.address_range());
         if manifest.is_empty() {
@@ -5499,6 +5780,7 @@ impl Chunks {
         // Set once a segment that holds a COMMIT of this transaction is
         // synced. From then on recovery commits the transaction.
         let mut durable = false;
+        let mut proof = None;
         let decision: Result<(), WriteError> = 'decision: {
             for chunk_id in chunk_ids {
                 let Some(chunk) = self.list.get(chunk_id as usize) else {
@@ -5511,6 +5793,24 @@ impl Chunks {
             #[cfg(test)]
             if take_injected_commit_refusal(self.base_addr, txn) {
                 break 'decision Err(WriteError::CannotAllocateSpace);
+            }
+            let mut receipts = Vec::new();
+            let mut all_parts_proven = true;
+            for segment in &segments {
+                {
+                    let state = segment.file_state.lock();
+                    if state.wal.is_none()
+                        && (state.manager.wal_storage().is_some()
+                            || state.manager.backup_storage().is_some())
+                    {
+                        all_parts_proven = false;
+                    }
+                }
+                match segment.durable_receipt() {
+                    Ok(Some(receipt)) => receipts.push(receipt),
+                    Ok(None) => {}
+                    Err(error) => break 'decision Err(WriteError::from_wal_io(error)),
+                }
             }
             for segment in &segments {
                 #[cfg(test)]
@@ -5526,14 +5826,28 @@ impl Chunks {
                     durable = true;
                 }
             }
+            proof = Some((Arc::new(receipts), all_parts_proven));
             Ok(())
         };
         let Err(error) = decision else {
+            let (receipts, all_parts_proven) = proof.expect("a decision that succeeded has a proof");
+            if all_parts_proven {
+                for segment in &segments {
+                    if multi_site {
+                        segment
+                            .protection
+                            .decide_multi_site_transaction(txn, receipts.clone());
+                    } else {
+                        segment.protection.decide_transaction(txn, receipts.clone());
+                    }
+                }
+            }
             return Ok(());
         };
         if durable {
             // Retracting now would make the client hear "failed" about a
-            // transaction that recovery commits.
+            // transaction that recovery commits. The heads stay leased, so
+            // the segments stay in progress until a retry closes them.
             error!(
                 "transaction {:?}: a COMMIT is durable but closing every part failed: {:?}; \
                  the transaction is decided and the open parts are closed later",
@@ -5578,7 +5892,7 @@ impl Chunks {
                 // A swallowed sync failure here is a store that reports
                 // itself synced while its log is not on disk -- the exact
                 // shape of promise this campaign exists to stop making.
-                if let Err(error) = segment.force_wal_sync() {
+                if let Err(error) = segment.drain_wal_sync() {
                     error!(
                         "sync_all could not sync segment {} (chunk {}): {:?}",
                         segment.id, segment.chunk_id, error
@@ -5726,6 +6040,14 @@ impl Chunks {
         let mut total_errors = 0;
 
         for chunk in &self.list {
+            if chunk.writes_closed.load(Ordering::Acquire) {
+                for slot in chunk.head_pool.iter().chain(chunk.blob_head_pool.iter()) {
+                    let id = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
+                    if let Some(segment) = chunk.segs.get(&(id as usize)) {
+                        segment.protection.head.store(false, Ordering::Release);
+                    }
+                }
+            }
             for segment in chunk.segs.iter_values() {
                 // Check if segment needs archiving
                 let is_clean = !segment.is_dirty();
@@ -5867,6 +6189,32 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }
+    /// Certify existing cell WAL prefixes. Queued ranged tree writeback is excluded.
+    pub async fn flush_wal_durable(&self) -> Result<(), WriteError> {
+        let mut receipts = Vec::new();
+        for chunk in &self.list {
+            for segment in chunk.segments() {
+                if let Some(receipt) = segment.durable_receipt().map_err(WriteError::from_wal_io)? {
+                    receipts.push(receipt);
+                }
+            }
+        }
+        crate::ram::durability::wait(receipts).await
+    }
+
+    pub fn durability_failures(&self) -> Vec<crate::ram::durability::DurabilityError> {
+        self.list
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .segs
+                    .iter_values()
+                    .filter_map(|seg| seg.durability_failure())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.write_cell(cell);
@@ -6091,6 +6439,12 @@ impl Chunks {
     }
 }
 
+thread_local! {
+    #[cfg(debug_assertions)]
+    static HELD_CELL_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CAS_ALLOCATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub struct CellGuard<'a> {
     segment: Option<AArc<Segment>>,
     guard: Option<WordMutexGuard<'a>>,
@@ -6189,6 +6543,8 @@ impl<'a> CellGuard<'a> {
                                         tiered.add_cold_resident(newly_resident);
                                         tiered.note_cold_block_read();
                                     }
+                                    #[cfg(debug_assertions)]
+                                    HELD_CELL_GUARDS.with(|held| held.set(held.get() + 1));
                                     return Some(CellGuard {
                                         _qsbr: crate::ram::qsbr::QsbrSection::new(),
                                         hash,
@@ -6263,6 +6619,8 @@ impl<'a> CellGuard<'a> {
             version = cell_version_from_chunk_raw(*guard).unwrap();
         }
 
+        #[cfg(debug_assertions)]
+        HELD_CELL_GUARDS.with(|held| held.set(held.get() + 1));
         Some(Self {
             _qsbr: crate::ram::qsbr::QsbrSection::new(),
             guard: Some(guard),
@@ -6390,7 +6748,6 @@ impl<'a> CellGuard<'a> {
     }
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = self.get_ptr();
         if cell.header.version < self.version {
             cell.header.version = self.version;
         }
@@ -6399,12 +6756,26 @@ impl<'a> CellGuard<'a> {
         }
         let write_plan = cell.plan_write(self.chunk)?;
         let pending_entry = write_plan.allocate(self.chunk, false)?;
-        let write_result = self.chunk.write_cell_to_chunk(
-            cell,
-            &write_plan,
-            &pending_entry,
-            cell.header.version,
-        )?;
+        let write_result =
+            self.update_cell_in_entry(cell, &write_plan, &pending_entry, cell.header.version)?;
+        drop(write_plan);
+        cell.header.version = write_result.new_version;
+        cell.header.timestamp = write_result.new_timestamp;
+        cell.header.schema = write_result.new_schema;
+        Ok(cell.header)
+    }
+
+    fn update_cell_in_entry(
+        &mut self,
+        cell: &OwnedCell,
+        write_plan: &WritePlan<'_>,
+        pending_entry: &PendingEntry,
+        version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        let old_cell_loc = self.get_ptr();
+        let write_result =
+            self.chunk
+                .write_cell_to_chunk(cell, write_plan, pending_entry, version)?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
         let old_indices = self.old_index_res(schema)?;
@@ -6415,11 +6786,7 @@ impl<'a> CellGuard<'a> {
             .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         self.chunk.refresh_statistics_for_schema(schema.vid);
-        drop(write_plan);
-        cell.header.version = write_result.new_version;
-        cell.header.timestamp = write_result.new_timestamp;
-        cell.header.schema = write_result.new_schema;
-        Ok(cell.header)
+        Ok(write_result)
     }
 
     /// Upsert a cell - updates if the guard points to an existing cell, inserts if empty.
@@ -6510,6 +6877,8 @@ impl<'a> CellGuard<'a> {
 
 impl<'a> Drop for CellGuard<'a> {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        HELD_CELL_GUARDS.with(|held| held.set(held.get() - 1));
         #[cfg(feature = "tiered_memory")]
         self.decrement_segment_references();
     }
@@ -6523,13 +6892,251 @@ impl<'a> Deref for CellGuard<'a> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TEST_DELETE_AFTER_RESERVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_DELETE_BEFORE_RESERVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_ROTATION_ALLOCATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_WORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_CAS_HEAD_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ram::schema::{Field, LocalSchemasCache};
+    use crate::ram::segs::SegmentReferenceGuard;
     use crate::ram::types::Map;
     use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
+
+    #[test]
+    fn refused_seal_archives_after_jobs_and_pins_clear() {
+        for pin_transaction in [false, true] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let chunks = Chunks::new_dummy_with_backup(
+                1,
+                4 * SEGMENT_SIZE,
+                Some(directory.path().to_string_lossy().into_owned()),
+            );
+            chunks.stop_background();
+            let chunk = &chunks.list[0];
+            let id = chunk.get_head_seg_id();
+            let segment = chunk.segs.get(&(id as usize)).unwrap();
+            crate::ram::entry::stamp_reservation_padding(segment.addr, 8);
+            segment
+                .append_header
+                .store(segment.addr + 8, Ordering::Release);
+            segment.set_dirty();
+            segment.seal();
+            chunk.head_pool[0].store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+            segment.protection.head.store(false, Ordering::Release);
+            segment
+                .protection
+                .seal_pending
+                .store(true, Ordering::Release);
+            let txn = crate::server::transactions::test_hlc(9841, 1);
+            let job = if pin_transaction {
+                segment.protection.retain_transaction(&txn);
+                None
+            } else {
+                Some(segment.protection.job().unwrap())
+            };
+            assert_eq!(
+                segment.archive_rotated().unwrap(),
+                crate::ram::segs::ArchiveOutcome::Refused
+            );
+            chunk.finish_rotated_head(id, segment.seq_id);
+            assert!(segment.is_dirty());
+            assert_eq!(chunk.seal_queue.len(), 1, "a refusal must remain queued");
+            if pin_transaction {
+                assert_eq!(chunks.pinned_segments(), 1);
+                assert_eq!(chunks.pinned_bytes(), SEGMENT_SIZE);
+                chunks.release_transaction_pins(&txn);
+            }
+            drop(job);
+            for (chunk_id, id, sequence) in chunk.seal_queue.drain() {
+                chunks.list[chunk_id].finish_rotated_head(id, sequence);
+            }
+            assert_eq!(chunks.pinned_segments(), 0);
+            assert_eq!(
+                chunk
+                    .segments()
+                    .iter()
+                    .filter(|segment| segment.is_sealed() && segment.is_dirty())
+                    .count(),
+                0
+            );
+            assert!(chunk.seal_queue.drain().is_empty());
+            assert!(!segment.protection.seal_pending.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn compose_scrub_rotation_archives_the_selected_generation() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.get_head_seg_id();
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        crate::ram::entry::stamp_reservation_padding(segment.addr, 8);
+        segment
+            .append_header
+            .store(segment.addr + 8, Ordering::Release);
+
+        chunk.rotate_heads_for_scrub_test();
+
+        assert_eq!(chunk.head_seg_ids_for_test(), (None, None));
+        assert!(segment.is_sealed());
+        assert!(std::path::Path::new(
+            &chunk
+                .file_manager
+                .backup_path(chunk.id, segment.id, segment.seq_id)
+                .unwrap()
+        )
+        .exists());
+    }
+
+    #[test]
+    fn rotated_seal_protects_its_generation_until_archive_finishes() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.get_head_seg_id();
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        let sequence = segment.seq_id;
+        crate::ram::entry::stamp_reservation_padding(segment.addr, 8);
+        segment
+            .append_header
+            .store(segment.addr + 8, Ordering::Release);
+        for slot in chunk.head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
+        // Hold the archive at its first file operation after it takes the pin.
+        let file_state = segment.file_state.lock();
+        let worker_chunks = chunks.clone();
+        let worker = std::thread::spawn(move || {
+            worker_chunks.list[0].finish_rotated_head(id, sequence);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while segment.no_references() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let pinned = !segment.no_references();
+        let reclaimed = if pinned {
+            chunk.remove_segment(id);
+            chunk.drain_retired_segments()
+        } else {
+            0
+        };
+        drop(file_state);
+        worker.join().unwrap();
+        assert!(
+            pinned,
+            "the sealer must pin the selected generation during file operations"
+        );
+        assert_eq!(
+            reclaimed, 0,
+            "the cleaner must not recycle the archive source"
+        );
+        assert!(
+            segment.is_sealed(),
+            "a matching request must still archive the original segment"
+        );
+        chunk.remove_segment(id);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1
+        );
+    }
+
+    fn delayed_seal_preserves_reused_segment(active_head: bool) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            4 * SEGMENT_SIZE,
+            Some(directory.path().to_string_lossy().into_owned()),
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let old_id = chunk.get_head_seg_id();
+        let old_sequence = chunk.segs.get(&(old_id as usize)).unwrap().seq_id;
+        let queue = SealQueue::new();
+        assert!(queue.enqueue(chunk.id, old_id, old_sequence));
+        for slot in chunk.head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
+        chunk
+            .segs
+            .get(&(old_id as usize))
+            .unwrap()
+            .protection
+            .head
+            .store(false, Ordering::Release);
+        chunk.remove_segment(old_id);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1
+        );
+
+        let replacement = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        assert_eq!(
+            replacement.id, old_id,
+            "the allocator must reuse the physical slot"
+        );
+        assert_ne!(replacement.seq_id, old_sequence);
+        crate::ram::entry::stamp_reservation_padding(replacement.addr, 8);
+        replacement
+            .append_header
+            .store(replacement.addr + 8, Ordering::Release);
+        chunk.put_segment(replacement);
+        if active_head {
+            chunk.head_pool[0].store(old_id, Ordering::Release);
+        }
+        let replacement = chunk.segs.get(&(old_id as usize)).unwrap();
+        for (chunk_id, segment_id, sequence_id) in queue.drain() {
+            assert_eq!(chunk_id, chunk.id);
+            chunk.finish_rotated_head(segment_id, sequence_id);
+        }
+        assert!(
+            !replacement.is_sealed(),
+            "a delayed seal must not close a different segment generation"
+        );
+        assert!(
+            replacement.begin_pending_journal(),
+            "the replacement must still accept journal claims"
+        );
+        replacement.end_pending_journal();
+        assert!(!std::path::Path::new(
+            &chunk
+                .file_manager
+                .backup_path(chunk.id, replacement.id, replacement.seq_id)
+                .unwrap()
+        )
+        .exists());
+    }
+
+    #[test]
+    fn delayed_seal_does_not_close_a_reused_head() {
+        delayed_seal_preserves_reused_segment(true);
+    }
+
+    #[test]
+    fn delayed_seal_does_not_archive_a_reused_non_head() {
+        delayed_seal_preserves_reused_segment(false);
+    }
 
     #[test]
     fn deleted_version_map_memory_cost() {
@@ -7540,6 +8147,7 @@ mod tests {
         let chunk = &chunks.list[0];
         let seg_id = chunk.get_head_seg_id();
         let _section = crate::ram::qsbr::QsbrSection::new();
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(seg_id);
         assert_eq!(chunk.retired_segment_count(), 1);
         assert_eq!(
@@ -7569,6 +8177,7 @@ mod tests {
         assert!(seg_a.incr_references());
 
         let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.rotate_heads_for_scrub_test();
         chunk_b.remove_segment(b_seg_id);
         assert_eq!(chunk_b.retired_segment_count(), 1);
 
@@ -7602,6 +8211,7 @@ mod tests {
         let reading = CellGuard::for_read(id.bits(), chunk_a).expect("read guard");
 
         let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.rotate_heads_for_scrub_test();
         chunk_b.remove_segment(b_seg_id);
         assert_eq!(
             chunk_b.drain_retired_segments(),
@@ -7663,6 +8273,7 @@ mod tests {
         releasing.join().expect("releasing thread");
 
         let seg_id = chunk.get_head_seg_id();
+        chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(seg_id);
         assert_eq!(
             drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
@@ -7671,6 +8282,95 @@ mod tests {
         );
         finish_tx.send(()).unwrap();
         pinning.join().expect("pinning thread");
+    }
+
+    #[test]
+    fn delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(0);
+    }
+
+    #[test]
+    fn migration_delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(1);
+    }
+
+    #[test]
+    fn conditional_delete_reserves_before_locking_the_cell() {
+        delete_head_lock_order(2);
+    }
+
+    fn delete_head_lock_order(path: usize) {
+        let schema = Schema::new(
+            "delete_head_order",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed_array("data", Type::U8),
+            ]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        chunks.stop_background();
+        let id = Id::allocated(1, 0, 123);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        chunks.write_cell(&mut cell).unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+        let writer_chunks = chunks.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let chunk = &writer_chunks.list[0];
+            let pending = chunk.try_acquire(64, true).unwrap();
+            owned_tx.send(()).unwrap();
+            // Model an updater holding the only head before taking its word.
+            // Release on timeout so the reverted control fails an assertion.
+            let started = std::time::Instant::now();
+            let obtained = loop {
+                if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                    drop(guard);
+                    break true;
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(1) {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            drop(pending);
+            obtained
+        });
+        TEST_DELETE_BEFORE_RESERVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                owned_rx.recv().unwrap();
+            }))
+        });
+        let chunk = &chunks.list[0];
+        let result = match path {
+            0 => chunk.remove_cell(id.bits()),
+            1 => chunk.remove_cell_keeping_indices(id.bits()),
+            _ => chunk.remove_cell_by(id.bits(), |_| true),
+        };
+        let obtained = writer.join().unwrap();
+        result.expect("the delete must finish after the head becomes available");
+        assert!(
+            obtained,
+            "delete held the cell word while waiting for the head owner"
+        );
+        assert!(matches!(
+            chunks.read_cell(&id),
+            Err(ReadError::CellDoesNotExisted)
+        ));
     }
 
     /// A best-effort allocation must return while another cleaner owns the
@@ -7773,8 +8473,12 @@ mod tests {
             }
             ready_tx.send(()).unwrap();
             go_rx.recv().unwrap();
+            let checks = std::cell::Cell::new(0);
             let predict = |_: &SharedCell| {
-                guard_tx.send(()).unwrap();
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    guard_tx.send(()).unwrap();
+                }
                 true
             };
             let result = if transactional {
@@ -7782,6 +8486,9 @@ mod tests {
             } else {
                 writer_chunks.remove_cell_by(&id, predict)
             };
+            if checks.get() < 2 {
+                guard_tx.send(()).unwrap();
+            }
             drop(scope);
             done_tx.send(result).unwrap();
         });
@@ -7972,6 +8679,8 @@ mod tests {
             .segs
             .get(&(segment_id as usize))
             .expect("segment is published");
+        // Seal before the reader pins the segment; sealing requires exclusive access.
+        chunk.rotate_heads_for_scrub_test();
         assert!(
             segment.incr_references(),
             "the reader takes a live reference, as the read paths do"
@@ -8109,6 +8818,8 @@ mod tests {
             .segs
             .get(&(segment_id as usize))
             .expect("segment is published");
+        // Seal before the reader pins the segment; sealing requires exclusive access.
+        chunk.rotate_heads_for_scrub_test();
         assert!(reader.incr_references(), "reader takes a live reference");
 
         chunk.remove_segment(segment_id);
@@ -8141,6 +8852,10 @@ mod tests {
     }
 
     fn setup_test_chunks() -> (Arc<Chunks>, Schema) {
+        setup_test_chunks_with_size(TEST_CHUNK_SIZE)
+    }
+
+    fn setup_test_chunks_with_size(size: usize) -> (Arc<Chunks>, Schema) {
         let fields = Field::new_schema(vec![
             Field::new_unindexed("id", Type::I32),
             Field::new_unindexed_array("data", Type::U8),
@@ -8150,7 +8865,7 @@ mod tests {
         schemas.debug_only_new_schema(schema.clone());
         let chunks = Chunks::new(
             1,
-            TEST_CHUNK_SIZE,
+            size,
             Arc::new(ServerMeta { schemas }),
             None,
             None,
@@ -8171,16 +8886,780 @@ mod tests {
     }
 
     #[test]
+    fn cas_allocation_waits_for_inflight_cleaner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 42);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let version = chunks.write_cell(&mut cell).unwrap().version;
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            chunk.put_segment(seg);
+            pins.push((
+                id,
+                SegmentReferenceGuard::new(chunk.segs.get(&(id as usize)).unwrap()).unwrap(),
+            ));
+        }
+        let gc = chunk.gc_lock.lock();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_CAS_HEAD_WAIT.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                    }))
+                });
+                result_tx
+                    .send(chunks.list[0].compare_version_and_update_cell(
+                        id.bits(),
+                        version,
+                        &mut cell,
+                    ))
+                    .unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(200));
+        // Finish the simulated cleaner pass by retiring an unowned segment.
+        // No active head or transaction-owned segment is compacted.
+        let (victim, pin) = pins.pop().unwrap();
+        drop(pin);
+        chunk.remove_segment(victim);
+        drop(gc);
+        let result =
+            early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "CAS refused while a cleaner could release space: {:?}",
+            result
+        );
+        assert!(chunks.head_cell(&id).unwrap().version > version);
+        drop(pins);
+    }
+
+    #[test]
+    fn allocation_waits_for_pending_seals_before_repeating_gc() {
+        allocation_waits_for_reclamation(false);
+    }
+
+    #[test]
+    fn allocation_waits_for_retired_readers_before_refusing_capacity() {
+        allocation_waits_for_reclamation(true);
+    }
+
+    fn assert_delete_head_released(seg: &AArc<Segment>, cursor: usize) {
+        assert_eq!(seg.append_header.load(Ordering::Acquire), cursor);
+        assert_eq!(seg.references_count(), 0);
+        let seg = seg.clone();
+        assert!(std::thread::spawn(move || {
+            let owned = seg.try_own();
+            if owned { seg.release_own(); }
+            owned
+        }).join().unwrap(), "delete left the head owned");
+    }
+
+    #[test]
+    fn review_false_predicate_and_absent_deletes_at_full_capacity() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99701);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+        seg.retire_tail();
+        assert!(matches!(chunk.try_acquire(32, false), Err(WriteError::CannotAllocateSpace)));
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        assert!(matches!(chunks.remove_cell_by(&id, |_| false), Err(WriteError::CellDoesNotExisted)));
+        let absent = Id::allocated(0, 0, 99702);
+        assert!(matches!(chunks.remove_cell(&absent), Err(WriteError::CellDoesNotExisted)));
+        assert!(matches!(chunks.remove_cell_keeping_indices(&absent), Err(WriteError::CellDoesNotExisted)));
+        assert!(matches!(chunks.remove_cell_by(&absent, |_| true), Err(WriteError::CellDoesNotExisted)));
+        assert_delete_head_released(&seg, cursor);
+    }
+
+    #[test]
+    fn review_delete_removed_between_guards_releases_reservation() {
+        for path in 0..3 {
+            let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+            chunks.stop_background();
+            let chunk = &chunks.list[0];
+            let id = Id::allocated(0, 0, 99703);
+            chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+            let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+            let cursor = seg.append_header.load(Ordering::Acquire);
+            TEST_DELETE_AFTER_RESERVE.with(|hook| {
+                let chunks = chunks.clone();
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    CellGuard::for_read(id.bits(), &chunks.list[0]).unwrap().remove_cell();
+                }));
+            });
+            let result = match path {
+                0 => chunks.remove_cell(&id),
+                1 => chunks.remove_cell_keeping_indices(&id),
+                _ => chunks.remove_cell_by(&id, |_| true),
+            };
+            assert!(matches!(result, Err(WriteError::CellDoesNotExisted)));
+            assert_delete_head_released(&seg, cursor);
+        }
+    }
+
+    #[test]
+    fn review_delete_changed_predicate_releases_reservation() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99704);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        let calls = std::cell::Cell::new(0);
+        let result = chunks.remove_cell_by(&id, |_| {
+            calls.set(calls.get() + 1);
+            calls.get() == 1
+        });
+        assert!(matches!(result, Err(WriteError::CellDoesNotExisted)));
+        assert_eq!(calls.get(), 2);
+        assert!(chunks.read_cell(&id).is_ok());
+        assert_delete_head_released(&seg, cursor);
+    }
+
+    #[test]
+    fn review_transaction_delete_version_mismatch_releases_reservation() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99705);
+        let first = chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let old_ptr = chunks.address_of(&id);
+        let second = chunks.update_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let new_ptr = chunks.address_of(&id);
+        assert_ne!(first.version, second.version);
+        CellGuard::for_read(id.bits(), chunk).unwrap().set_ptr(old_ptr);
+        let seg = chunk.locate_segment(old_ptr).unwrap();
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        TEST_DELETE_AFTER_RESERVE.with(|hook| {
+            let chunks = chunks.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                CellGuard::for_read(id.bits(), &chunks.list[0]).unwrap().set_ptr(new_ptr);
+            }));
+        });
+        // apply_transaction_remove also supports an already resolved apply;
+        // no active lease is needed to exercise its version predicate.
+        let result = chunks.apply_transaction_remove(&id, |cell| cell.header.version == first.version);
+        assert!(matches!(result, Err(WriteError::CellDoesNotExisted)));
+        assert_eq!(chunks.read_cell(&id).unwrap().header.version, second.version);
+        assert_delete_head_released(&seg, cursor);
+    }
+
+    #[test]
+    fn review_delete_bad_second_schema_releases_reservation() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99706);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let original = chunks.address_of(&id);
+        let seg = chunk.locate_segment(original).unwrap();
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        TEST_DELETE_AFTER_RESERVE.with(|hook| {
+            let chunks = chunks.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Point at valid mapped padding, not a CELL entry.
+                CellGuard::for_read(id.bits(), &chunks.list[0]).unwrap().set_ptr(cursor);
+            }));
+        });
+        let result = chunks.remove_cell_by(&id, |_| true);
+        assert!(matches!(result, Err(WriteError::ReadError(_))));
+        assert_delete_head_released(&seg, cursor);
+        chunk.lock_or_insert_cell(id.bits()).set_ptr(original);
+    }
+
+    #[test]
+    fn review_pending_seal_without_progress_refuses_within_deadline() {
+        use std::time::{Duration, Instant};
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            seg.protection.seal_pending.store(true, Ordering::Release);
+            chunk.put_segment(seg);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = chunks.list[0].try_acquire(64, true).map(drop);
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(HEAD_QUEUE_DEADLINE + Duration::from_secs(5))
+            .expect("capacity retry exceeded its deadline plus an uncontended GC margin");
+        worker.join().unwrap();
+        assert!(matches!(result, Err(WriteError::CannotAllocateSpace)));
+        assert!(started.elapsed() >= HEAD_QUEUE_DEADLINE, "pending work was not awaited");
+    }
+
+    #[test]
+    fn review_own_transaction_lease_does_not_wait_for_capacity_progress() {
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(99707);
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).unwrap();
+        assert!(entry.leased);
+        drop(entry);
+        // A GC owner would count as pending without the own-lease check.
+        let gc = chunk.gc_lock.lock();
+        let mut since = None;
+        assert!(!chunk.wait_for_capacity_progress(true, SegmentClass::Regular, &mut since));
+        assert!(since.is_none());
+        drop(gc);
+        drop(scope);
+        retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+    }
+
+    #[test]
+    fn review_transaction_pinned_seal_does_not_cause_capacity_wait() {
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(99708);
+        let scope = TransactionScope::enter(txn.clone());
+        let entry = chunk.try_acquire(64, false).unwrap();
+        let seg = entry.seg.clone();
+        drop(entry);
+        drop(scope);
+        seg.protection.seal_pending.store(true, Ordering::Release);
+        assert!(seg.protection.transaction_pending());
+        let mut since = None;
+        assert!(!chunk.wait_for_capacity_progress(true, SegmentClass::Regular, &mut since));
+        assert!(since.is_none());
+        seg.protection.seal_pending.store(false, Ordering::Release);
+        retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "capacity progress caller holds a cell word")]
+    fn review_capacity_wait_rejects_a_held_cell_word() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let id = Id::allocated(0, 0, 99709);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let chunk = &chunks.list[0];
+        let _guard = CellGuard::for_read(id.bits(), chunk).unwrap();
+        // Best-effort callers must keep their nonblocking path.
+        assert!(!chunk.wait_for_capacity_progress(false, SegmentClass::Regular, &mut None));
+        chunk.wait_for_capacity_progress(true, SegmentClass::Regular, &mut None);
+    }
+
+    #[test]
+    fn review_rotation_allocator_refusal_waits_for_pending_seals() {
+        use std::time::Duration;
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_BEFORE_ROTATION_ALLOCATE.with(|hook| {
+                    let chunks = chunks.clone();
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let chunk = &chunks.list[0];
+                        let mut seals = Vec::new();
+                        while chunk.allocator.writer_headroom() > 0 {
+                            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                            seg.protection.seal_pending.store(true, Ordering::Release);
+                            seals.push((seg.id, seg.seq_id));
+                            chunk.put_segment(seg);
+                        }
+                        ready_tx.send(seals).unwrap();
+                    }));
+                });
+                let result = chunks.list[0].try_acquire(64, true).map(drop);
+                done_tx.send(result).unwrap();
+            }
+        });
+        let seals = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        for (id, seq) in seals { chunk.finish_rotated_head(id, seq); }
+        let waited = early.is_err();
+        let result = early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        writer.join().unwrap();
+        assert!(waited, "allocator refusal did not wait for pending seals");
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn review_delete_and_word_first_update_cycle_is_bounded() {
+        use std::time::{Duration, Instant};
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let id = Id::allocated(0, 0, 99710);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (word_tx, word_rx) = std::sync::mpsc::channel();
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                start_rx.recv().unwrap();
+                let result = chunks.update_cell_by(&id, |_| {
+                    word_tx.send(()).unwrap();
+                    Some(payload_cell(schema.vid.get(), &id, 64))
+                });
+                update_tx.send(result).unwrap();
+            }
+        });
+        let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let deleter = std::thread::spawn(move || {
+            TEST_DELETE_AFTER_RESERVE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    word_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            });
+            let _ = delete_tx.send(chunks.remove_cell(&id));
+        });
+        let updated = update_rx.recv_timeout(HEAD_QUEUE_DEADLINE + Duration::from_secs(5))
+            .expect("word-first updater exceeded the head-queue deadline");
+        assert!(matches!(updated, Err(WriteError::CannotAllocateSpace)));
+        assert!(started.elapsed() >= HEAD_QUEUE_DEADLINE);
+        assert!(delete_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        updater.join().unwrap();
+        deleter.join().unwrap();
+    }
+
+    #[test]
+    fn review_delete_wal_failure_releases_reservation() {
+        for path in 0..3 {
+            let (_, schema) = setup_test_chunks();
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let directory = tempfile::TempDir::new().unwrap();
+            let chunks = Chunks::new(
+                1, SEGMENT_SIZE, Arc::new(ServerMeta { schemas }), None, None,
+                Some(directory.path().to_string_lossy().into_owned()), None,
+            );
+            chunks.stop_background();
+            let chunk = &chunks.list[0];
+            let id = Id::allocated(0, 0, 99711);
+            let (written, _) = crate::ram::durability::capture(|| {
+                chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+            });
+            let before = written.unwrap();
+            let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+            let cursor = seg.append_header.load(Ordering::Acquire);
+            TEST_DELETE_AFTER_RESERVE.with(|hook| {
+                let seg = seg.clone();
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    seg.durable_file().unwrap().inject_failure();
+                    assert!(seg.force_wal_sync().is_err());
+                }));
+            });
+            let result = match path {
+                0 => chunks.remove_cell(&id),
+                1 => chunks.remove_cell_keeping_indices(&id),
+                _ => chunks.remove_cell_by(&id, |_| true),
+            };
+            assert!(matches!(result, Err(WriteError::Durability(_))), "{:?}", result);
+            assert_eq!(chunks.read_cell(&id).unwrap().header.version, before.version);
+            assert_delete_head_released(&seg, cursor);
+        }
+    }
+
+    fn allocation_waits_for_reclamation(retired: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        for slot in chunk.head_pool.iter() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            chunk.segs.get(&(id as usize)).unwrap().retire_tail();
+        }
+        let mut seals = Vec::new();
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > 0 {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            let seq = seg.seq_id;
+            chunk.put_segment(seg);
+            let seg = chunk.segs.get(&(id as usize)).unwrap();
+            if retired {
+                pins.push(SegmentReferenceGuard::new(seg.clone()).unwrap());
+                chunk.remove_segment(id);
+            } else {
+                seg.protection.seal_pending.store(true, Ordering::Release);
+                seals.push((id, seq));
+            }
+        }
+        // A caller holding a cell word must not wait for these same segments.
+        assert!(matches!(
+            chunk.try_acquire(64, false),
+            Err(WriteError::CannotAllocateSpace)
+        ));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || ready_tx.send(()).unwrap()));
+                });
+                let result = chunks.list[0]
+                    .try_acquire(64, true)
+                    .map(|entry| drop(entry));
+                done_tx.send(result).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        // Complete the deferred work. The next GC must see the newly eligible
+        // sealed segments, or drain the retired segments after their reader.
+        for (id, seq) in seals {
+            let segment = chunk.segs.get(&(id as usize)).unwrap();
+            chunk.finish_rotated_head(id, seq);
+            assert!(!segment.protection.seal_pending.load(Ordering::Acquire));
+        }
+        drop(pins);
+        let waited = early.is_err();
+        let result =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(
+            waited,
+            "allocation refused before deferred reclamation finished: {:?}",
+            result
+        );
+        assert!(
+            result.is_ok(),
+            "reclaimed space was not retried: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn allocation_uses_space_in_later_heads_before_rotating() {
+        allocation_at_full_capacity(false, false, false);
+    }
+
+    #[test]
+    fn allocation_rescans_a_head_replaced_before_capacity_refusal() {
+        allocation_at_full_capacity(true, false, false);
+    }
+
+    #[test]
+    fn allocation_queues_for_an_owned_head_with_space() {
+        allocation_at_full_capacity(false, true, false);
+    }
+
+    #[test]
+    fn allocation_rechecks_heads_after_losing_rotation_capacity() {
+        allocation_at_full_capacity(false, true, true);
+    }
+
+    fn allocation_at_full_capacity(replace_head: bool, own_available: bool, lose_rotation: bool) {
+        let chunks = Chunks::new_dummy(1, 12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let last = (head_affinity() + chunk.head_pool.len() - 1) % chunk.head_pool.len();
+        let mut available = 0;
+        for (i, slot) in chunk.head_pool.iter().enumerate() {
+            let mut id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+            let seg = chunk.segs.get(&(id as usize)).unwrap();
+            if !replace_head && i == last {
+                available = id;
+            } else {
+                seg.retire_tail();
+            }
+        }
+        // No address for another head. Keep non-head segments pinned so this
+        // tests use of existing head space, not cleaner scheduling.
+        let mut pins = Vec::new();
+        while chunk.allocator.writer_headroom() > if lose_rotation { 2 } else { 0 } {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let id = seg.id;
+            chunk.put_segment(seg);
+            pins.push(SegmentReferenceGuard::new(chunk.segs.get(&(id as usize)).unwrap()).unwrap());
+            if replace_head && available == 0 {
+                available = id;
+            }
+        }
+        if replace_head {
+            let chunks = chunks.clone();
+            TEST_BEFORE_CAPACITY_REFUSAL.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let chunk = &chunks.list[0];
+                    let first = head_affinity() % chunk.head_pool.len();
+                    chunk.head_pool[first].store(available, Ordering::Release);
+                }))
+            });
+        }
+        let available_seg = chunk.segs.get(&(available as usize)).unwrap();
+        if own_available {
+            assert!(available_seg.try_own());
+            let seg = available_seg.clone();
+            TEST_BEFORE_HEAD_QUEUE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    seg.release_own();
+                }))
+            });
+        }
+        if lose_rotation {
+            let chunks = chunks.clone();
+            TEST_BEFORE_ROTATION_ALLOCATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let chunk = &chunks.list[0];
+                    while chunk.allocator.writer_headroom() > 0 {
+                        let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                        chunk.put_segment(seg);
+                    }
+                }))
+            });
+        }
+        let result = chunk.try_acquire(64, true);
+        if own_available {
+            if result.is_err() {
+                available_seg.release_own();
+            }
+            TEST_BEFORE_HEAD_QUEUE.with(|hook| *hook.borrow_mut() = None);
+        }
+        let pending = result.expect("later head still has room");
+        assert_eq!(pending.seg.id, available);
+        drop(pending);
+        drop(pins);
+    }
+
+    #[test]
+    fn delayed_seal_job_does_not_seal_a_reused_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta {
+                schemas: LocalSchemasCache::new_local(""),
+            }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = chunk.head_pool[0].load(Ordering::Acquire);
+        let old = chunk.segs.get(&(id as usize)).unwrap();
+        assert!(chunk.seal_queue.enqueue(chunk.id, id, old.seq_id));
+        chunk.head_pool[0].store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        old.protection.head.store(false, Ordering::Release);
+        chunk.remove_segment(id);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1
+        );
+        let replacement = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        assert_eq!(replacement.id, id);
+        assert_ne!(replacement.seq_id, old.seq_id);
+        chunk.put_segment(replacement);
+        chunk.head_pool[0].store(id, Ordering::Release);
+        let current = chunk.segs.get(&(id as usize)).unwrap();
+        for (chunk_id, seg_id, seq_id) in chunk.seal_queue.drain() {
+            chunks.list[chunk_id].finish_rotated_head(seg_id, seq_id);
+        }
+        assert!(
+            !current.is_sealed(),
+            "a queued job for the retired incarnation sealed the current append head"
+        );
+        assert!(
+            current.begin_pending_journal(),
+            "the new head's journal gate must remain open"
+        );
+        current.end_pending_journal();
+    }
+
+    // Prepare the observed CAS word -> head / upsert head -> word cycle.
+    // The recovery phase frees a second head, so even the failing control joins.
+    #[test]
+    fn cas_field_allocation_does_not_hold_the_cell_word() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("cas_head_word_cycle", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            12 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 4242);
+        let mut seed = payload_cell(schema.vid.get(), &id, 64);
+        let version = chunks.write_cell(&mut seed).unwrap().version;
+        let mut exclusive = Vec::new();
+        for slot in chunk.head_pool.iter().skip(1) {
+            let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+            let seg_id = seg.id;
+            chunk.put_segment(seg);
+            slot.store(seg_id, Ordering::Release);
+            let seg = chunk.segs.get(&(seg_id as usize)).unwrap();
+            assert!(seg.obtain_exclusive_references());
+            exclusive.push(seg_id);
+        }
+        let head = chunk
+            .segs
+            .get(&(chunk.head_pool[0].load(Ordering::Acquire) as usize))
+            .unwrap()
+            .clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (owned_tx, owned_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (cas_tx, cas_rx) = mpsc::channel();
+        let (upsert_tx, upsert_rx) = mpsc::channel();
+        let cas = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                TEST_CAS_HEAD_WAIT.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        assert!(
+                            head.is_head_owned(),
+                            "upsert must own the only available head"
+                        );
+                        go_tx.send(()).unwrap();
+                    }))
+                });
+                cas_tx
+                    .send(chunks.list[0].compare_version_and_set_field(
+                        id.bits(),
+                        version,
+                        hash_str("id"),
+                        OwnedValue::I32(7),
+                    ))
+                    .unwrap();
+            }
+        });
+        let upsert = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                ready_rx.recv().unwrap();
+                TEST_BEFORE_WORD.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        owned_tx.send(()).unwrap();
+                        go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }))
+                });
+                let mut cell = payload_cell(schema.vid.get(), &id, 80);
+                upsert_tx
+                    .send(chunks.list[0].upsert_cell(&mut cell))
+                    .unwrap();
+            }
+        });
+        let cas_result = cas_rx.recv_timeout(Duration::from_secs(5));
+        let upsert_result = upsert_rx.recv_timeout(Duration::from_secs(5));
+        let stalled = cas_result.is_err() || upsert_result.is_err();
+        for seg_id in exclusive {
+            chunk
+                .segs
+                .get(&(seg_id as usize))
+                .unwrap()
+                .release_exclusive_references();
+        }
+        if cas_result.is_err() {
+            assert!(cas_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        }
+        if upsert_result.is_err() {
+            assert!(upsert_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        }
+        cas.join().unwrap();
+        upsert.join().unwrap();
+        assert!(!stalled, "CAS held the cell word while awaiting a head owned by upsert; freeing another head broke the cycle");
+        assert!(
+            matches!(cas_result.unwrap(), Err(WriteError::CellVersionMismatch)),
+            "CAS must revalidate after upsert changes the version"
+        );
+        assert!(upsert_result.unwrap().is_ok());
+        assert!(chunks.head_cell(&id).unwrap().version > version);
+    }
+
+    #[test]
     fn transaction_restore_rejects_a_changed_index_without_a_placeholder() {
         let (chunks, schema) = setup_test_chunks();
         let id = Id::allocated(1, 0, 43);
         let count = chunks.list[0].cell_count();
-        assert_eq!(chunks.restore_transaction_cell(&id, 0, 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(
+            chunks.restore_transaction_cell(&id, 0, 1),
+            Err(WriteError::CellVersionMismatch)
+        );
         assert_eq!(chunks.list[0].cell_count(), count);
         let mut cell = payload_cell(schema.vid.get(), &id, 64);
         let header = chunks.write_cell(&mut cell).unwrap();
         let address = chunks.address_of(&id);
-        assert_eq!(chunks.restore_transaction_cell(&id, 0, header.version + 1), Err(WriteError::CellVersionMismatch));
+        assert_eq!(
+            chunks.restore_transaction_cell(&id, 0, header.version + 1),
+            Err(WriteError::CellVersionMismatch)
+        );
         assert_eq!(chunks.address_of(&id), address);
         assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
     }

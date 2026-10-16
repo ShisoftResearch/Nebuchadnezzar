@@ -3,6 +3,7 @@ pub mod mem_cursor;
 
 pub mod bracket;
 pub mod dictionary;
+pub mod durability;
 pub mod cell;
 pub mod id_alloc;
 pub mod id_alloc_sm;
@@ -30,3 +31,6 @@ pub mod tests;
 
 #[cfg(feature = "abort_profile")]
 pub mod abort_profile;
+
+#[cfg(test)]
+mod durability_tests;

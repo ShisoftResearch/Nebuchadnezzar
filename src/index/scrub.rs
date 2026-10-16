@@ -56,6 +56,8 @@
 //! one-way hash and a spilled segment's id names nothing. That is the `OWNER`
 //! field of `HASH_INDEX_SCHEMA`.
 
+#[cfg(test)]
+use crate::index::full_text::ToOwnedValue;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -69,6 +71,7 @@ use crate::index::EntryKey;
 use crate::index::IndexerClients;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
+#[cfg(test)]
 use crate::ram::entry::EntryContent;
 use crate::ram::schema::IndexType;
 use crate::ram::types::Id;
@@ -141,8 +144,9 @@ pub struct ScrubReport {
     /// they name sits on another member. A ranged tree covers a key range for
     /// the whole cluster; a node's chunks do not.
     pub entries_not_local: u64,
-    /// The prune walk stopped before it covered the index. Its counts are a
-    /// partial account, so they must never be read as "clean".
+    /// A walk stopped before it covered the index or could not read a
+    /// snapshot ID. Unreadable counts identify failed cell reads.
+    /// These partial counts must never be read as "clean".
     pub prune_incomplete: u64,
     /// Hash bucket entries derived from the cells walked: one (bucket, cell) pair
     /// per indexed value per cell. Kept apart from `entries_derived` because a
@@ -186,8 +190,8 @@ pub struct ScrubReport {
     pub hash_cells_unreadable: u64,
     /// Cells whose schema is not in this member's catalog, seen by the hash walks.
     pub hash_cells_schema_missing: u64,
-    /// The bucket walk did not judge every entry. This includes foreign
-    /// members that the local bucket walk cannot judge.
+    /// A hash walk did not judge every entry. This includes foreign members
+    /// and snapshot IDs that could not be read (`hash_cells_unreadable`).
     pub hash_prune_incomplete: u64,
 }
 
@@ -483,8 +487,8 @@ pub async fn scrub_all_indexes(
 ///    lacks.
 ///
 /// Prune first, so the insert pass reads the index in its final shape and can
-/// re-add anything the prune removed on a race. The cell walk is batched by
-/// segment: the derivation half holds cell read guards and the reconciliation
+/// re-add anything the prune removed on a race. The cell walk uses ID batches:
+/// the derivation half holds cell read guards and the reconciliation
 /// half awaits RPCs, and those two must not overlap -- a guard held across an
 /// await pins a segment for the length of a network round trip, which is how a
 /// scrub of a large store would block the cleaner for its entire duration.
@@ -520,6 +524,7 @@ async fn reconcile_cell_entries(
             let mut derived_report = ScrubReport::default();
             for &id in ids {
                 let Ok(header) = chunk.head_cell(id) else {
+                    derived_report.prune_incomplete += 1;
                     derived_report.cells_unreadable += 1;
                     continue;
                 };
@@ -561,10 +566,9 @@ fn derive_into(
     report: &mut ScrubReport,
 ) {
     let Ok(cell) = chunk.read_cell(id.bits()) else {
-        // The index pointed here a moment ago -- `live_entries` only yields
-        // a cell when the cell index agrees -- so a failure now is either a
-        // concurrent move or real damage. Counted, not repaired: this pass
-        // fixes indexes, and a cell it cannot read is not an index problem.
+        // The snapshot included this ID. A failed read prevents a complete
+        // verdict, so the caller must retry or resolve the read failure.
+        report.prune_incomplete += 1;
         report.cells_unreadable += 1;
         return;
     };
@@ -1347,7 +1351,7 @@ async fn fill_one_bucket(
 /// Destructive pruning needs the stable singleton authority used by ranged
 /// pruning. Filling missing entries does not make an unsafe delete correct.
 ///
-/// Like the ranged walk, this is batched by segment, and for the same reason: the
+/// Like the ranged walk, this uses bounded batches of authoritative cell IDs. The
 /// derivation half holds cell read guards and the reconciliation half awaits RPCs,
 /// and a guard held across an await pins a segment for the length of a round trip.
 ///
@@ -1372,6 +1376,22 @@ pub async fn scrub_hash_index(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    scrub_hash_index_inner(
+        chunks,
+        indexers,
+        mode,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn scrub_hash_index_inner(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    #[cfg(test)] mut after_snapshot: Option<&mut (dyn FnMut(bool) + Send)>,
+) -> ScrubReport {
     HASH_STALE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     HASH_MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = ScrubReport::default();
@@ -1383,32 +1403,104 @@ pub async fn scrub_hash_index(
     // segments whose members live in a different chunk.
     for prune in [true, false] {
         let mut workers = tokio::task::JoinSet::new();
+        // Snapshot IDs, not addresses. Movement preserves each ID and cell
+        // guards resolve its current address when a worker visits it.
+        // Later writes cannot extend this finite walk.
         let mut pending = chunks
             .list
             .iter()
             .enumerate()
             .flat_map(|(chunk_index, chunk)| {
                 chunk
-                    .segments()
-                    .into_iter()
-                    .map(move |segment| (chunk_index, segment))
+                    .live_cell_ids()
+                    .chunks(1024)
+                    .map(|ids| (chunk_index, ids.to_vec()))
+                    .collect::<Vec<_>>()
             });
+        #[cfg(test)]
+        let mut moved_snapshot = if !prune
+            && mode == ScrubMode::Verify
+            && std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some()
+        {
+            let snapshot = pending.by_ref().collect::<Vec<_>>();
+            let mut moved_bytes = 0;
+            for chunk in &chunks.list {
+                let selected = chunk.segments();
+                let before = chunk
+                    .live_cell_ids()
+                    .into_iter()
+                    .map(|bits| {
+                        let cell = chunk.read_cell(bits).unwrap();
+                        (bits, cell.header.version, cell.data.to_owned_value())
+                    })
+                    .collect::<Vec<_>>();
+                chunk.rotate_heads_for_scrub_test();
+                for segment in &selected {
+                    eprintln!(
+                        "scrub source id={} used={} active={} refs={} cold={} class={:?}",
+                        segment.id,
+                        segment.used_spaces(),
+                        chunk.is_active_head(segment.id),
+                        segment.references_count(),
+                        segment.is_cold(),
+                        segment.segment_class()
+                    );
+                }
+                let (collected, _) =
+                    crate::ram::cleaner::combine::CombinedCleaner::combine_segments(
+                        chunk, &selected,
+                    );
+                moved_bytes += collected;
+                for (bits, version, data) in before {
+                    let cell = chunk.read_cell(bits).unwrap();
+                    assert_eq!(
+                        cell.header.version, version,
+                        "movement changed cell version"
+                    );
+                    assert_eq!(
+                        cell.data.to_owned_value(),
+                        data,
+                        "movement changed cell data"
+                    );
+                }
+            }
+            eprintln!("deterministic hash snapshot movement: collected {moved_bytes} bytes; authoritative cells unchanged");
+            assert!(moved_bytes > 0, "movement hook did not relocate a segment");
+            Some(snapshot.into_iter())
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let mut pending = {
+            let snapshot = pending.by_ref().collect::<Vec<_>>();
+            if let Some(hook) = after_snapshot.as_mut() {
+                hook(prune);
+            }
+            snapshot.into_iter()
+        };
         loop {
             while workers.len() < concurrency().min(4) {
-                let Some((chunk_index, segment)) = pending.next() else {
+                #[cfg(test)]
+                let next = match moved_snapshot.as_mut() {
+                    Some(snapshot) => snapshot.next(),
+                    None => pending.next(),
+                };
+                #[cfg(not(test))]
+                let next = pending.next();
+                let Some((chunk_index, ids)) = next else {
                     break;
                 };
                 let chunks = chunks.clone();
                 let indexers = indexers.clone();
                 workers.spawn(async move {
-                    scrub_hash_segment(
+                    scrub_hash_cells(
                         &chunks,
                         &indexers,
                         mode,
                         can_prune,
                         prune,
                         chunk_index,
-                        &segment,
+                        &ids,
                     )
                     .await
                 });
@@ -1435,16 +1527,16 @@ pub async fn scrub_hash_index(
     total
 }
 
-/// Bound parallel work to 4 storage segments. Guards remain inside the
+/// Bound parallel work to 4 batches of 1024 IDs. Guards remain inside the
 /// synchronous derive phase; each worker releases them before an RPC.
-async fn scrub_hash_segment(
+async fn scrub_hash_cells(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
     can_prune: bool,
     prune: bool,
     chunk_index: usize,
-    segment: &lightning::aarc::Arc<crate::ram::segs::Segment>,
+    ids: &[u64],
 ) -> ScrubReport {
     let mut total = ScrubReport::default();
     let chunk = &chunks.list[chunk_index];
@@ -1454,9 +1546,14 @@ async fn scrub_hash_segment(
     let mut owed: Vec<(Id, Id)> = Vec::new();
     let mut stale: Vec<(Id, Id, Id)> = Vec::new();
     let mut derived = ScrubReport::default();
-    for entry in chunk.live_entries(&segment) {
-        let EntryContent::Cell(header) = entry.content else {
-            continue;
+    for &bits in ids {
+        let header = match chunk.head_cell(bits) {
+            Ok(header) => header,
+            Err(_) => {
+                derived.hash_prune_incomplete += 1;
+                derived.hash_cells_unreadable += 1;
+                continue;
+            }
         };
         let id = header.id();
         if header.schema == *HASH_INDEX_SCHEMA_ID {
@@ -1469,12 +1566,9 @@ async fn scrub_hash_segment(
             // same job, because its keys live inside page images.
             let cell = match read_local_cell(chunk, id) {
                 LocalCell::Found(cell, _) => cell,
-                // `Absent` cannot happen: `live_entries` just said this
-                // cell is here. An unreadable cell, or one whose schema
-                // this restart never registered, holds no verdict either
-                // way, and no opinion is never a delete.
-                LocalCell::Absent => continue,
-                LocalCell::Unreadable => {
+                // A snapshot ID that cannot be read gives no verdict.
+                LocalCell::Absent | LocalCell::Unreadable => {
+                    derived.hash_prune_incomplete += 1;
                     derived.hash_cells_unreadable += 1;
                     continue;
                 }
@@ -1520,8 +1614,8 @@ async fn scrub_hash_segment(
         }
         let (cell, written_under) = match read_local_cell(chunk, id) {
             LocalCell::Found(cell, schema) => (cell, schema),
-            LocalCell::Absent => continue,
-            LocalCell::Unreadable => {
+            LocalCell::Absent | LocalCell::Unreadable => {
+                derived.hash_prune_incomplete += 1;
                 derived.hash_cells_unreadable += 1;
                 continue;
             }
@@ -1540,7 +1634,7 @@ async fn scrub_hash_segment(
     total.merge(&derived);
 
     // --- reconcile (asynchronous; nothing borrowed from the chunk)
-    // Prune the inspected segment first, including orphan spills.
+    // Prune this batch first, including orphan spills.
     // The indexer checks its owner before each CAS.
     for (_, bucket, member) in &stale {
         report_hash_stale(*member, *bucket);
@@ -1861,6 +1955,15 @@ mod tests {
         group: &str,
         dir: &TempDir,
     ) -> (Arc<NebServer>, Arc<AsyncClient>) {
+        server_with_indexed_schema_size(addr, group, dir, 64 * 1024 * 1024).await
+    }
+
+    async fn server_with_indexed_schema_size(
+        addr: &str,
+        group: &str,
+        dir: &TempDir,
+        chunk_size: usize,
+    ) -> (Arc<NebServer>, Arc<AsyncClient>) {
         let backup = dir.path().join("backup");
         let wal = dir.path().join("wal");
         let raft = dir.path().join("raft");
@@ -1869,8 +1972,8 @@ mod tests {
         }
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
-                db_size: 64 * 1024 * 1024,
+                chunk_size,
+                db_size: chunk_size,
                 tiered_config: None,
                 backup_storage: Some(backup.to_str().unwrap().to_string()),
                 wal_storage: Some(wal.to_str().unwrap().to_string()),
@@ -2092,11 +2195,7 @@ mod tests {
             true,
         );
         let client = server.data_client(&vec![addr.to_string()]).await.unwrap();
-        client
-            .new_schema_with_id(schema)
-            .await
-            .unwrap()
-            .unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
         (server, Arc::new(client))
     }
 
@@ -3280,6 +3379,297 @@ mod tests {
         }
     }
 
+    // The rotation and combine sequence comes from c3371a9e. Keep it local
+    // to this pass so concurrent tests cannot activate the hook.
+    async fn movement_fixture() -> (Arc<NebServer>, Arc<AsyncClient>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let (server, client) = server_with_indexed_schema_size(
+            &crate::utils::test_port::unique_localhost_addr(),
+            "scrub_movement",
+            &dir,
+            256 * 1024 * 1024,
+        )
+        .await;
+        server.cleaner().pause();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let schema = Schema::new_with_id(
+            HASH_SCHEMA_ID,
+            "movement_products",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                SKU_FIELD,
+                Type::U64,
+                vec![IndexType::Hashed, IndexType::Ranged],
+            )]),
+            false,
+            true,
+        );
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+        for i in 0..120 {
+            crate::index::builder::IndexBuilder::with_request_index_scope(|| {
+                server
+                    .chunks()
+                    .write_cell(&mut hash_product_cell(i, i))
+                    .unwrap();
+            })
+            .await;
+            if i % 30 == 29 {
+                for chunk in &server.chunks().list {
+                    chunk.rotate_heads_for_scrub_test();
+                }
+            }
+        }
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        assert!(
+            crate::index::ranged::tree::btree::storage::wait_until_updated().await,
+            "movement fixture did not drain page writeback"
+        );
+        (server, client, dir)
+    }
+
+    fn move_scrub_cells(chunks: &Arc<Chunks>, partial: bool) {
+        use crate::index::full_text::ToOwnedValue;
+        let mut moved = 0;
+        for chunk in &chunks.list {
+            let before = chunk
+                .live_cell_ids()
+                .into_iter()
+                .map(|bits| {
+                    let address = chunk.cell_location_and_version(bits).unwrap().0;
+                    let cell = chunk.read_cell(bits).unwrap();
+                    (
+                        bits,
+                        address,
+                        cell.header.version,
+                        cell.data.to_owned_value(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut selected = chunk.segments();
+            selected.retain(|segment| {
+                segment.segment_class() == crate::ram::segs::SegmentClass::Regular
+            });
+            selected.sort_by_key(|segment| segment.seq_id);
+            for segment in &selected {
+                let products = chunk.live_entries(segment).filter(|entry| matches!(
+                    &entry.content, EntryContent::Cell(header) if header.schema == SchemaVid(HASH_SCHEMA_ID)
+                )).count();
+                println!(
+                    "movement source: segment={} seq={} products={products}",
+                    segment.id, segment.seq_id
+                );
+            }
+            if partial {
+                // At least 2 source segments are required by the combine cleaner.
+                selected.truncate(2);
+            }
+            chunk.rotate_heads_for_scrub_test();
+            let (collected, _) =
+                crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &selected);
+            assert!(collected > 0, "controlled combine did not move cells");
+            for (bits, address, version, data) in before {
+                let current_address = chunk.cell_location_and_version(bits).unwrap().0;
+                let cell = chunk.read_cell(bits).unwrap();
+                assert_eq!(
+                    cell.header.version, version,
+                    "movement changed version for {bits:x}, schema {:?}",
+                    cell.header.schema
+                );
+                assert_eq!(cell.data.to_owned_value(), data, "movement changed data");
+                if cell.header.schema == SchemaVid(HASH_SCHEMA_ID) && current_address != address {
+                    moved += 1;
+                }
+            }
+        }
+        println!("controlled scrub movement: {moved}/120 product cells");
+        if partial {
+            assert!(
+                moved > 0 && moved < 120,
+                "fixture did not move a proper subset: {moved}"
+            );
+        } else {
+            assert_eq!(moved, 120);
+        }
+    }
+
+    async fn check_scrub_movement(partial: bool, mode: ScrubMode, move_prune: bool) {
+        let (server, client, _dir) = movement_fixture().await;
+        let chunks = server.chunks();
+        let indexers = &server.indexer().unwrap().clients;
+        if mode.repairs() {
+            // Leave a hole and a ghost in each index direction.
+            indexers
+                .hashed_client
+                .indexer
+                .remove_index(&hash_product_id(0), &sku_bucket(0))
+                .await
+                .unwrap();
+            indexers
+                .hashed_client
+                .insert(&sku_bucket(1), &hash_product_id(9999))
+                .await
+                .unwrap();
+            let chunk = chunks.locate_chunk_by_partition(hash_product_id(0).locality() as u64);
+            let mut keys = Vec::new();
+            derive_into(
+                chunk,
+                hash_product_id(0),
+                &mut keys,
+                &mut ScrubReport::default(),
+            );
+            for key in keys {
+                indexers.ranged_client.delete(&key).await.unwrap();
+            }
+            indexers
+                .ranged_client
+                .insert(&EntryKey::for_scannable(
+                    &hash_product_id(9999),
+                    SchemaUid(HASH_SCHEMA_ID),
+                ))
+                .await
+                .unwrap();
+        }
+        // Repair setup also changes pages. Finish those writes before the
+        // controlled combine checks versions and requires idle source segments.
+        assert!(
+            crate::index::ranged::tree::btree::storage::wait_until_updated().await,
+            "movement setup did not drain page writeback"
+        );
+        let mut hook = |prune: bool| {
+            if prune == move_prune {
+                move_scrub_cells(chunks, partial);
+            }
+        };
+        let report = scrub_hash_index_inner(chunks, indexers, mode, Some(&mut hook)).await;
+        println!("movement pass: {report}");
+        assert_eq!(report.hash_entries_derived, 120, "{report}");
+        assert_eq!(report.hash_prune_incomplete, 0, "{report}");
+        assert_eq!(report.hash_index_ids_scanned, 120, "{report}");
+        assert_eq!(
+            report.hash_entries_pruned,
+            u64::from(mode.repairs()),
+            "{report}"
+        );
+        for i in 0..120 {
+            assert_eq!(
+                bucket_ids(&client, sku_bucket(i)).await,
+                vec![hash_product_id(i)],
+                "moved cell lost its bucket entry"
+            );
+        }
+        if mode.repairs() {
+            assert_eq!(report.hash_entries_repaired, 1, "{report}");
+            let ranged = scrub_ranged_index(chunks, indexers, mode).await;
+            assert_eq!(ranged.entries_repaired, 2, "{ranged}");
+            assert_eq!(ranged.entries_pruned, 1, "{ranged}");
+        } else {
+            assert!(report.is_clean(), "{report}");
+        }
+        let after = scrub_all_indexes(chunks, indexers, ScrubMode::Verify).await;
+        assert!(after.is_clean(), "{after}");
+        assert_eq!(after.hash_entries_derived, 120, "{after}");
+        assert_eq!(after.hash_index_ids_scanned, 120, "{after}");
+        assert_eq!(after.entries_derived, 240, "{after}");
+        assert_eq!(after.index_keys_scanned, 240, "{after}");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compose_captured_receipts_survive_scrub_movement() {
+        let (server, client, _dir) = movement_fixture().await;
+        let capture = crate::client::CapturedWriteBatch::new();
+        for i in 0..120 {
+            client
+                .compare_version_and_update_cell_captured(
+                    &capture,
+                    hash_product_id(i),
+                    client
+                        .read_cell(hash_product_id(i))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .header
+                        .version,
+                    hash_product_cell(i, i),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Drain page writes so the controlled combine is the only movement.
+        // Captured receipts remain pending across the checkpoint and combine.
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+        crate::index::ranged::tree::service::local_tree_service("scrub_movement", "scrub_movement")
+            .unwrap()
+            .flush_all_trees()
+            .await;
+        let chunks = server.chunks();
+        let indexers = &server.indexer().unwrap().clients;
+        let mut hook = |prune: bool| {
+            if !prune {
+                move_scrub_cells(chunks, false);
+            }
+        };
+        let report =
+            scrub_hash_index_inner(chunks, indexers, ScrubMode::Verify, Some(&mut hook)).await;
+        assert!(report.is_clean(), "{report}");
+        assert_eq!(report.hash_entries_derived, 120);
+        capture.finish().await.unwrap().unwrap();
+        let after = scrub_all_indexes(chunks, indexers, ScrubMode::Verify).await;
+        assert!(after.is_clean(), "{after}");
+        assert_eq!(after.entries_derived, 240);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scrub_movement_full_verify() {
+        check_scrub_movement(false, ScrubMode::Verify, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scrub_movement_partial_verify() {
+        check_scrub_movement(true, ScrubMode::Verify, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scrub_movement_prune_and_repair() {
+        check_scrub_movement(false, ScrubMode::Repair, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scrub_movement_unreadable_snapshot_is_incomplete() {
+        use lightning::map::Map;
+        let (server, _client, _dir) = movement_fixture().await;
+        let chunks = server.chunks();
+        let mut hook = |prune: bool| {
+            if !prune {
+                // Remove an ID after the snapshot, without secondary writes.
+                let id = hash_product_id(0);
+                let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
+                chunk.cell_index.remove(&(id.bits() as usize));
+            }
+        };
+        let report = scrub_hash_index_inner(
+            chunks,
+            &server.indexer().unwrap().clients,
+            ScrubMode::Verify,
+            Some(&mut hook),
+        )
+        .await;
+        println!("incomplete pass: {report}");
+        assert_eq!(report.hash_prune_incomplete, 1, "{report}");
+        assert_eq!(report.hash_cells_unreadable, 1, "{report}");
+        assert!(
+            !report.is_clean(),
+            "an incomplete pass reported clean: {report}"
+        );
+        let mut merged = ScrubReport::default();
+        merged.merge(&report);
+        assert!(!merged.is_clean());
+        assert!(merged.to_string().contains("unreadable=1"));
+        server.shutdown().await;
+    }
+
     /// A store with no hash index at all must cost the hash walk nothing it can
     /// be charged for: no derived pairs, no scanned ids, no abstains. Without
     /// this, "the hash pass is cheap" is a claim about the stores that happen to
@@ -3601,6 +3991,12 @@ mod tests {
         )
         .await;
         let indexers = &server.indexer().unwrap().clients;
+        if std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some() {
+            server.cleaner().pause();
+            // Allow an already-running cleaner round to finish before the
+            // controlled snapshot. No production scheduling is changed.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
 
         let mut missing = Vec::new();
         let mut stale = Vec::new();
@@ -3665,6 +4061,9 @@ mod tests {
         assert_eq!(hash_report.hash_entries_missing, 0);
         assert_eq!(hash_report.hash_entries_stale, 0);
 
+        // The controlled move runs once. Its destination can be the only
+        // segment left when the next verification starts.
+        std::env::remove_var("NEB_TEST_HASH_SCRUB_MOVE");
         let all = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("post-recovery full scrub: {}", all);
         assert!(all.is_clean(), "recovered index is not clean: {}", all);

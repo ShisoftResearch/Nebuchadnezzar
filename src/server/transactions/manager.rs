@@ -2758,7 +2758,9 @@ mod tests {
         )
         .await;
 
+        let reads_complete = Arc::new(tokio::sync::Barrier::new(40));
         let tasks = join_all((0..40).map(|index| {
+            let reads_complete = reads_complete.clone();
             let address = address.to_string();
             let group = group.to_string();
             let database_name = if index % 2 == 0 {
@@ -2791,6 +2793,9 @@ mod tests {
                             .await
                             .unwrap()
                             .unwrap();
+                        // A commit can reject an older read still in transit. Finish
+                        // all reads before the concurrent prepare and cleanup phase.
+                        reads_complete.wait().await;
                         if index % 3 == 0 {
                             let abort_result =
                                 txn_client.abort(txn_id.clone()).await.unwrap().unwrap();

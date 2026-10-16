@@ -324,6 +324,10 @@ fn test_eviction_on_memory_overflow() {
         }
     }
 
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
+
     // Final eviction check to ensure memory limit is respected
     info!("Final eviction check");
     for chunk in &chunks.list {
@@ -476,12 +480,23 @@ fn test_cold_segment_promotion() {
 
     info!("Wrote {} cells", written_ids.len());
 
-    // Force eviction to make sure we have cold segments
+    // A queued seal protects its segment from eviction until the archive finishes.
     for chunk in &chunks.list {
-        if let Some(ref manager) = chunk.tiered_manager {
-            match manager.explicit_evict(chunk, 2) {
-                Ok(evicted) => info!("Explicitly evicted {} segments", evicted),
-                Err(e) => error!("Explicit eviction failed: {:?}", e),
+        chunk.wait_for_segment_jobs_for_test();
+    }
+
+    // This test checks promotion, so choose a sealed victim without CLOCK's extra chances.
+    for chunk in &chunks.list {
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|segment| !chunk.is_active_head(segment.id))
+            .collect();
+        assert!(!candidates.is_empty(), "the fixture must rotate a segment");
+        for segment in candidates {
+            if segment.is_hot() {
+                crate::ram::tiered::eviction::evict_segment(&segment, chunk)
+                    .expect("a sealed fixture segment must be evictable");
             }
         }
     }
@@ -732,6 +747,21 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
     );
 }
 
+// Eviction policy assertions need eligible victims. Rotation archives on a
+// background thread, which pins its source until the durable image is complete.
+// Wait for that setup work, rather than racing eviction against the archive.
+fn wait_for_rotated_archive(segment: &crate::ram::segs::Segment) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(segment.is_sealed() && segment.no_references()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rotated segment {} must finish its archive before eviction",
+            segment.id
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn test_blob_segments_evict_before_regular_segments() {
     let _guard = test_lock();
@@ -839,6 +869,11 @@ fn test_blob_segments_evict_before_regular_segments() {
         "setup should keep the blob non-head hot before eviction"
     );
 
+    for id in [regular_non_head, blob_non_head] {
+        wait_for_rotated_archive(&chunk.segs.get(&(id as usize)).unwrap());
+    }
+
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -941,6 +976,11 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         .find(|(_, segment_id)| *segment_id != blob_head)
         .expect("setup should create a non-head blob segment to evict");
 
+    wait_for_rotated_archive(
+        &chunk.segs.get(&(cold_target_segment_id as usize)).unwrap(),
+    );
+
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -1172,6 +1212,9 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
         "single database should reach the exact hot-segment threshold before eviction is triggered for the next allocation"
     );
 
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
     let cold_before_crossing = total_cold_segments(&chunks);
     let evicted_after_threshold = manager
         .evict_for_allocation()
@@ -1983,6 +2026,17 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         databases.push((chunks, schema_dir, backup_dir, wal_dir));
     }
 
+    // All writes are complete. Make their rotated segments eligible before
+    // asking the policy to reach a watermark that includes those victims.
+    for (chunks, _, _, _) in &databases {
+        let chunk = &chunks.list[0];
+        for segment in chunk.segments() {
+            if !chunk.is_active_head(segment.id) {
+                wait_for_rotated_archive(&segment);
+            }
+        }
+    }
+
     let hot_before: usize = databases
         .iter()
         .map(|(chunks, _, _, _)| total_hot_segments(chunks))
@@ -1992,6 +2046,11 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         "equal-sized databases should exceed the shared lower watermark before eviction"
     );
 
+    for (chunks, _, _, _) in &databases {
+        for chunk in &chunks.list {
+            chunk.wait_for_segment_jobs_for_test();
+        }
+    }
     let mut evicted_total = 0;
     for _ in 0..4 {
         let hot_now: usize = databases
@@ -3645,6 +3704,9 @@ fn blocks_faulted_into_cold_segments_are_accounted_and_released() {
     );
 
     let chunk = &chunks.list[0];
+    // This fixture needs a cold segment. Rotation archives asynchronously,
+    // and eviction must skip a segment until that seal job finishes.
+    chunk.wait_for_segment_jobs_for_test();
     assert!(manager.explicit_evict(chunk, 4).expect("evict") > 0);
 
     // Read a handful of cells to fault blocks into cold segments.

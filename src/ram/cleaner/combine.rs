@@ -191,13 +191,9 @@ impl CombinedCleaner {
                 if !seg.no_references() {
                     return None;
                 }
-                let candidate = SegmentCandidate::new(&seg)?;
-                // The invariant is checked after the claim, so a pin placed
-                // before the claim cannot be missed.
-                if !chunk.cleaner_may_take(seg) {
-                    return None;
-                }
-                Some(candidate)
+                // The in-progress rule (D20, D28) is checked in one place,
+                // after the claim: `SegmentCandidate::for_cleaner`.
+                SegmentCandidate::for_cleaner(&seg)
             })
             .collect_vec();
 
@@ -683,7 +679,7 @@ impl CombinedCleaner {
     fn cleanup_segments(chunk: &Chunk, segments: Vec<SegmentCandidate>) {
         debug!("Unpublishing {} source segments", segments.len());
         for old_seg in &segments {
-            chunk.remove_segment(old_seg.id);
+            chunk.remove_segment_for_cleaner(old_seg.id);
         }
         // Releases our references; from here the segments can go quiescent.
         drop(segments);

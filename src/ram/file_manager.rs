@@ -101,7 +101,13 @@ impl SegmentFileManager {
                     std::fs::remove_file(&wal_path)?;
                     return Err(error);
                 }
-                file.sync_data()?;
+                let started = std::time::Instant::now();
+                let result = file.sync_data();
+                crate::ram::segs::WAL_HEADER_SYNC_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                result?;
             } else {
                 // Appending framed records to an unframed log would leave one
                 // file holding two formats, and recovery would have to guess
@@ -294,7 +300,8 @@ impl SegmentFileManager {
         let mut wal_file = File::open(&wal_path)?;
         let mut wal_data = Vec::new();
         wal_file.read_to_end(&mut wal_data)?;
-        let outcome = crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
+        let outcome =
+            crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
         let image = outcome.image;
         let wal_size = image.len();
 
@@ -346,7 +353,8 @@ impl SegmentFileManager {
         // a raw segment image -- which is what the unframed path did -- means
         // replaying bytes nothing can verify.
         {
-            let outcome = crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
+            let outcome =
+                crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
             if let crate::ram::wal_format::TailStop::Torn {
                 at_file_offset,
                 reason,

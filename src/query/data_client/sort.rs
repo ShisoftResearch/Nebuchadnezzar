@@ -5,6 +5,8 @@ use dovahkiin::{ahash::HashMap, types::Id};
 
 use crate::index::ranged::tree::btree::Ordering;
 
+use crate::ram::cell::OwnedCell;
+
 use super::{IndexedDataClient, QueryOrdering, ValueRange, ValueRangeTerm};
 
 impl IndexedDataClient {
@@ -14,10 +16,11 @@ impl IndexedDataClient {
         field_id: u64,
         ids: &[Id],
         ordering: QueryOrdering,
+        cached: &HashMap<Id, OwnedCell>,
     ) -> Result<Vec<Id>, RPCError> {
         let _ = schema;
         let mut result = ids.to_vec();
-        self.sort_ids_by_field(field_id, &mut result, ordering, ordering)
+        self.sort_ids_by_field(field_id, &mut result, ordering, ordering, cached)
             .await;
         Ok(result)
     }
@@ -27,8 +30,9 @@ impl IndexedDataClient {
         field_id: u64,
         ids: &mut [Id],
         ordering: QueryOrdering,
+        cached: &HashMap<Id, OwnedCell>,
     ) {
-        self.sort_ids_by_field(field_id, ids, ordering, QueryOrdering::Asc)
+        self.sort_ids_by_field(field_id, ids, ordering, QueryOrdering::Asc, cached)
             .await;
     }
 
@@ -38,6 +42,7 @@ impl IndexedDataClient {
         ids: &mut [Id],
         ordering: QueryOrdering,
         tie_break_ordering: QueryOrdering,
+        cached: &HashMap<Id, OwnedCell>,
     ) {
         if ids.len() <= 1 {
             return;
@@ -45,7 +50,12 @@ impl IndexedDataClient {
 
         let mut feature_by_id = HashMap::default();
         let id_list = ids.to_vec();
-        match self.index_clients.neb_client.read_all_cells(&id_list).await {
+        let cells = if id_list.iter().all(|id| cached.contains_key(id)) {
+            Ok(id_list.iter().map(|id| Ok(cached[id].clone())).collect())
+        } else {
+            self.index_clients.neb_client.read_all_cells(&id_list).await
+        };
+        match cells {
             Ok(cells) => {
                 for (id, cell_res) in id_list.into_iter().zip(cells) {
                     match cell_res {
@@ -78,13 +88,23 @@ impl IndexedDataClient {
         });
     }
 
-    pub(super) async fn distinct_ids_by_fields(&self, field_ids: &[u64], ids: Vec<Id>) -> Vec<Id> {
+    pub(super) async fn distinct_ids_by_fields(
+        &self,
+        field_ids: &[u64],
+        ids: Vec<Id>,
+        cached: &HashMap<Id, OwnedCell>,
+    ) -> Vec<Id> {
         if ids.len() <= 1 {
             return ids;
         }
 
         let id_list = ids.clone();
-        let cells = match self.index_clients.neb_client.read_all_cells(&id_list).await {
+        let read = if id_list.iter().all(|id| cached.contains_key(id)) {
+            Ok(id_list.iter().map(|id| Ok(cached[id].clone())).collect())
+        } else {
+            self.index_clients.neb_client.read_all_cells(&id_list).await
+        };
+        let cells = match read {
             Ok(cells) => cells,
             Err(e) => {
                 warn!("Bulk cell read error during DISTINCT: {:?}", e);
