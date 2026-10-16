@@ -610,12 +610,15 @@ async fn power_cut_participants_resolve(durable: bool) {
             .unwrap()
             .unwrap();
     }
-    let before_prepare =
-        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    // A forced sync that the watermark covers does not run `fsync`.
+    let forced = || {
+        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+            + crate::ram::segs::COVERED_FORCED_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before_prepare = forced();
     txn.prepare(tid.clone()).await.unwrap().unwrap();
     assert!(
-        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
-            >= before_prepare + 2,
+        forced() >= before_prepare + 2,
         "round 1 must sync both participants before any decision"
     );
     for server in &servers {

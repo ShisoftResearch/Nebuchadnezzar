@@ -58,6 +58,10 @@ pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static BACKGROUND_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static DRAIN_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Forced syncs that the durability watermark already covered: another
+/// sync (a group sync or another transaction's) took these bytes to disk, so
+/// no `fsync` ran. Group commit on the forced path.
+pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
 /// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
@@ -2873,8 +2877,11 @@ image, not an empty segment; archiving it would persist the damage.",
             let reuse_watermark = true;
             #[cfg(test)]
             let reuse_watermark = std::env::var_os("NEB_TEST_DISABLE_WATERMARK_REUSE").is_none();
+            // The watermark is the durable length of this file, with its
+            // name published: a sync that covers every byte written so far
+            // has nothing to add. A forced sync reuses it too, so several
+            // transactions that commit on one segment share one `fsync`.
             if reuse_watermark
-                && !force
                 && state
                     .durability
                     .as_ref()
@@ -2882,6 +2889,9 @@ image, not an empty segment; archiving it would persist the damage.",
             {
                 self.wal_bytes_synced
                     .fetch_max(self.wal_bytes_written.load(Relaxed), Release);
+                if force {
+                    COVERED_FORCED_SYNCS.fetch_add(1, Relaxed);
+                }
                 return Ok(());
             }
             // A transaction can sync this segment while the timer waits for the lock.
