@@ -333,7 +333,7 @@ async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO)
             .await;
     }
 
@@ -391,7 +391,7 @@ async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO)
             .await;
     }
 
@@ -759,18 +759,14 @@ async fn power_cut_participants_resolve(durable: bool) {
     peer.shutdown().await;
 }
 
-/// A silent peer must not be counted as a vote to abort.
+/// A silent participant must not be counted as a vote to abort (D29).
 ///
 /// The participant is in doubt and the peer that knows the answer is DOWN.
 /// Concluding abort here is the tear: the peer holds a durable COMMIT and
 /// will still hold it when it comes back. So the heads stay held and the
-/// question stays open -- but not forever, because a held head is a writer
-/// slot gone from its chunk with no refill path.
-///
-/// Both halves are asserted: it holds while inside the grace window, and it
-/// gives up once past it.
+/// question stays open, with no time limit.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
+async fn a_silent_peer_holds_the_transaction_open() {
     let (servers, client, addresses, _temp) = start_txn_cluster("tear_silent").await;
     let ids = two_ids_on_distinct_servers(&client, &servers).await;
 
@@ -809,13 +805,13 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
     knows.shutdown().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Inside the grace window: hold, do not decide.
+    // Hold, do not decide.
     let site = in_doubt
         .database_runtime()
         .data_site()
         .expect("the in-doubt server runs a data site");
     let hold = site
-        .terminate_in_doubt_transactions(Duration::ZERO, Duration::from_secs(300))
+        .terminate_in_doubt_transactions(Duration::ZERO)
         .await;
     assert!(
         hold.contains(&tid),
@@ -826,20 +822,21 @@ async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
         leases_before,
         "holding means KEEPING the leases; a commit still needs them"
     );
-    assert_ne!(
-        in_doubt.chunks().durable_txn_status(&tid),
-        DurableTxnStatus::Committed,
-        "holding is not deciding"
+    // Again, through the whole sweep: there is no grace window after which
+    // the site gives up.
+    for _ in 0..3 {
+        site.sweep_idle_transactions(Duration::ZERO).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        crate::ram::chunk::transaction_lease_count(&tid, &in_doubt.chunks().address_range()),
+        leases_before,
+        "a site in doubt never presumes abort while a participant is silent"
     );
-
-    // Past it: give up, so a permanently silent peer cannot cost a writer
-    // slot for the life of the process.
-    let hold = site
-        .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
-        .await;
-    assert!(
-        !hold.contains(&tid),
-        "past the grace window the transaction must be released to the sweeper"
+    assert_eq!(
+        in_doubt.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Prepared,
+        "the in-doubt bracket must still be there"
     );
 
     for server in servers {
