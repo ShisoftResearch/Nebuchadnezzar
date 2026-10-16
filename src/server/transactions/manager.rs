@@ -1866,6 +1866,12 @@ impl TransactionManager {
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
         let mut committed = false;
+        // A participant that refused but keeps the transaction decided (a
+        // refused close: store full, WAL error) commits it later.
+        let mut decided_elsewhere = false;
+        // A refusal that is not a decision: the site was fenced by a
+        // participant in doubt, or no longer holds the transaction (D29).
+        let mut undecided_refusal = None;
         let mut every_participant_closed = true;
         let mut unreachable = false;
         let mut lock_report = None;
@@ -1882,8 +1888,22 @@ impl TransactionManager {
                             every_participant_closed &= !is_participant;
                             lock_report.get_or_insert(report);
                         }
+                        refusal @ (EndResult::CheckFailed(_) | EndResult::DecidedPending) => {
+                            every_participant_closed &= !is_participant;
+                            if matches!(refusal, EndResult::DecidedPending) {
+                                decided_elsewhere |= is_participant;
+                            } else {
+                                warn!(
+                                    "site {} refused `end` for {:?}: {:?}; the participant \
+                                     fence decides the transaction",
+                                    server_id, tid, refusal
+                                );
+                                undecided_refusal.get_or_insert(refusal);
+                            }
+                        }
                         refusal => {
                             every_participant_closed &= !is_participant;
+                            decided_elsewhere |= is_participant;
                             error!(
                                 "site {} refused to close {:?} for now: {:?}; it keeps the \
                                  transaction decided",
@@ -1907,10 +1927,13 @@ impl TransactionManager {
         if committed {
             return Ok(lock_report.unwrap_or(EndResult::Success));
         }
+        if decided_elsewhere {
+            return Ok(EndResult::DecidedPending);
+        }
         if unreachable {
             return Err(TMError::RPCErrorFromCellServer);
         }
-        Ok(EndResult::DecidedPending)
+        Ok(undecided_refusal.unwrap_or(EndResult::DecidedPending))
     }
 
     /// `end` to each of `sites` in parallel; the first non-success wins.
