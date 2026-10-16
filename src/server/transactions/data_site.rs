@@ -1907,7 +1907,11 @@ impl DataManager {
         self.update_clock(*clock);
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
-        let committing = meta.owner.is_some();
+        // A cell of a bracket that is in doubt after a restart has no owner
+        // here, and its committed version may still come (review R1): a read
+        // waits as it waits for a prepared writer.
+        let committing = meta.owner.is_some()
+            || self.chunks().txn_status().is_in_doubt_cell(id.bits());
 
         // Use the more recent timestamp between the transaction ID and the incoming clock
         // This allows transactions to proceed even if their original timestamp is stale

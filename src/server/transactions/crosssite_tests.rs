@@ -2163,6 +2163,58 @@ async fn a_prepare_inside_the_fence_gap_is_refused() {
     cluster.shutdown().await;
 }
 
+fn score_of(
+    read: &Result<
+        Result<TxnExecResult<OwnedCell, crate::ram::cell::ReadError>, TMError>,
+        bifrost::rpc::RPCError,
+    >,
+) -> Option<Option<u64>> {
+    match read {
+        Ok(Ok(TxnExecResult::Accepted(cell))) => Some(cell.data["score"].u64().copied()),
+        Ok(Ok(TxnExecResult::Error(crate::ram::cell::ReadError::CellDoesNotExisted))) => Some(None),
+        _ => None,
+    }
+}
+
+/// Review R1: after a restart, a transactional read of a cell of an
+/// in-doubt bracket is not held. A read-only transaction R reads T's Y at B
+/// and X at A while T is in doubt at A; it must not see T half applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_transaction_does_not_see_an_in_doubt_transaction_half_applied() {
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
+    let (mut cluster, client) = Cluster::start("crosssite_r1_read_in_doubt").await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 38_000).await;
+    drop(client);
+    wait_status_synced(&cluster, B, &tid).await;
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(b_id);
+    cluster.restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid), "test setup: A must wait for B");
+
+    let reader = coordinator(&cluster).await;
+    let r = reader.begin().await.unwrap().unwrap();
+    let y = reader.read(r.clone(), ids[1]).await;
+    let x = reader.read(r.clone(), ids[0]).await;
+    let ended = reader.commit(r.clone()).await;
+    let (x_seen, y_seen) = (score_of(&x), score_of(&y));
+    warn!(
+        "CROSSSITE R1: R read X {:?} and Y {:?} (T wrote {} and {}); R ended {:?}",
+        x_seen, y_seen, scores[0], scores[1], ended
+    );
+    super::data_site::silent_peers_for_test().lock().remove(&b_id);
+    wait_until("A's resolution", 60, || !in_doubt_on(&cluster, A, &tid)).await;
+    if let (Some(x_seen), Some(y_seen)) = (x_seen, y_seen) {
+        assert_eq!(
+            x_seen == Some(scores[0]),
+            y_seen == Some(scores[1]),
+            "R saw T half applied: X {:?}, Y {:?}",
+            x_seen,
+            y_seen
+        );
+    }
+    cluster.shutdown().await;
+}
+
 /// C16 (F6): A aborts after the fence; the cleaner runs on A; A restarts;
 /// a duplicate `prepare` arrives. A refuses it: the fence survives the
 /// compaction and the start.
