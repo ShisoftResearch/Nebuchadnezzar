@@ -1781,7 +1781,7 @@ impl Chunk {
         Ok(None)
     }
 
-    /// Claim `size` bytes in a regular head that can be owned now. This
+    /// Claim `size` bytes in a head of `segment_class` that can be owned now. This
     /// never rotates, grows the pool, runs GC or queues. It gives up after
     /// `FREE_HEAD_CLAIM_ROUNDS` scans, so a caller that holds a cell word
     /// can use it: a head owner can wait for that word, and a wait without
@@ -1789,7 +1789,7 @@ impl Chunk {
     /// is `docs/tla/HeadWordLock.tla`.
     ///
     /// Not for transactions: their entries go to the leased head.
-    fn try_claim_free_head(&self, size: u32) -> Option<PendingEntry> {
+    fn try_claim_free_head(&self, size: u32, segment_class: SegmentClass) -> Option<PendingEntry> {
         const FREE_HEAD_CLAIM_ROUNDS: usize = 12;
         if current_txn().is_some()
             || is_in_transaction()
@@ -1797,7 +1797,7 @@ impl Chunk {
         {
             return None;
         }
-        let slots = self.head_slots(SegmentClass::Regular);
+        let slots = self.head_slots(segment_class);
         let start = head_affinity();
         let backoff = Backoff::new();
         for _ in 0..FREE_HEAD_CLAIM_ROUNDS {
@@ -3944,7 +3944,7 @@ impl Chunk {
         let free_head_claim = true;
         if free_head_claim {
             let target = self.tombstone_target(guard.get_ptr())?;
-            if let Some(pending) = self.try_claim_free_head(TOMBSTONE_ENTRY_SIZE as u32) {
+            if let Some(pending) = self.try_claim_free_head(TOMBSTONE_ENTRY_SIZE as u32, SegmentClass::Regular) {
                 #[cfg(test)]
                 TEST_DELETE_AFTER_RESERVE.with(|hook| {
                     if let Some(hook) = hook.borrow_mut().take() {
@@ -4958,10 +4958,50 @@ impl Chunk {
         #[cfg(debug_assertions)]
         HELD_CELL_GUARDS
             .with(|held| debug_assert_eq!(held.get(), 0, "CAS caller holds a cell word"));
-        // Match ordinary upserts: claim a head before taking the cell word.
-        // The expected version is checked after allocation, under that word.
         cell.header.version = version;
         let write_plan = cell.plan_write(self)?;
+        {
+            let mut guard = self
+                .lock_cell_for_write(hash, true)
+                .map_err(WriteError::ReadError)?;
+            // A lost CAS claims no space, even at a full store.
+            if guard.cell_version().map_err(WriteError::ReadError)? != version {
+                return Err(WriteError::CellVersionMismatch);
+            }
+            if let Some(pending_entry) = self.try_claim_free_head_for_cas(&write_plan) {
+                let result = Self::finish_cas(guard, cell, write_plan, pending_entry, version)?;
+                return Ok(Self::cas_header(cell, result));
+            }
+        }
+        let result =
+            self.compare_version_and_update_cell_after_wait(hash, version, cell, write_plan)?;
+        Ok(Self::cas_header(cell, result))
+    }
+
+    /// CAS lock order. If a head can be owned now, the version check, the
+    /// write and the publication run under one hold of the cell word, so no
+    /// other writer can change the cell in between. If not, the word is
+    /// released before the CAS waits for a head: a head owner can wait for
+    /// this word, and the allocation can wait for the cleaner, which takes
+    /// cell words under the GC lock. Then the version is checked again under
+    /// a new hold. The model is `docs/tla/HeadWordLock.tla` (`cas_wordfast`).
+    fn try_claim_free_head_for_cas(&self, write_plan: &WritePlan<'_>) -> Option<PendingEntry> {
+        #[cfg(test)]
+        if TEST_CAS_SLOW_PATH.with(|forced| forced.get()) {
+            return None;
+        }
+        self.try_claim_free_head(write_plan.total_size, write_plan.segment_class)
+    }
+
+    fn compare_version_and_update_cell_after_wait(
+        &self,
+        hash: u64,
+        version: u64,
+        cell: &OwnedCell,
+        write_plan: WritePlan<'_>,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        #[cfg(test)]
+        TEST_CAS_SLOW_PATHS.with(|count| count.set(count.get() + 1));
         // No cell word is held here, so a concurrent cleaner can finish
         // before we decide whether the chunk has space.
         struct CasAllocation;
@@ -4980,12 +5020,25 @@ impl Chunk {
         if guard.cell_version().map_err(WriteError::ReadError)? != version {
             return Err(WriteError::CellVersionMismatch);
         }
-        let result = guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)?;
-        drop(write_plan);
+        Self::finish_cas(guard, cell, write_plan, pending_entry, version)
+    }
+
+    /// Write and publish under `guard`, which checked the version.
+    fn finish_cas(
+        mut guard: CellGuard<'_>,
+        cell: &OwnedCell,
+        write_plan: WritePlan<'_>,
+        pending_entry: PendingEntry,
+        version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)
+    }
+
+    fn cas_header(cell: &mut OwnedCell, result: WriteToChunkResult) -> CellHeader {
         cell.header.version = result.new_version;
         cell.header.timestamp = result.new_timestamp;
         cell.header.schema = result.new_schema;
-        Ok(cell.header)
+        cell.header
     }
 
     /// The caller must hold no cell word; see `compare_version_and_update_cell`.
@@ -5003,13 +5056,24 @@ impl Chunk {
             let mut guard = self
                 .lock_cell_for_write(hash, true)
                 .map_err(WriteError::ReadError)?;
-            guard.read_cell_owned().map_err(WriteError::ReadError)?
+            let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
+            if cell.header.version != version {
+                return Err(WriteError::CellVersionMismatch);
+            }
+            cell.data[field] = value;
+            // Read, check and write under one hold when a head is free.
+            let write_plan = cell.plan_write(self)?;
+            if let Some(pending_entry) = self.try_claim_free_head_for_cas(&write_plan) {
+                let result = Self::finish_cas(guard, &cell, write_plan, pending_entry, version)?;
+                return Ok(Self::cas_header(&mut cell, result));
+            }
+            drop(write_plan);
+            cell
         };
-        if cell.header.version != version {
-            return Err(WriteError::CellVersionMismatch);
-        }
-        cell.data[field] = value;
-        self.compare_version_and_update_cell(hash, version, &mut cell)
+        let write_plan = cell.plan_write(self)?;
+        let result =
+            self.compare_version_and_update_cell_after_wait(hash, version, &cell, write_plan)?;
+        Ok(Self::cas_header(&mut cell, result))
     }
 }
 
@@ -6756,6 +6820,10 @@ thread_local! {
     static TEST_DELETE_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Deletes on this thread that released the word to wait for a head.
     static TEST_DELETE_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Skip the free-head claim, so a CAS releases the word and waits.
+    static TEST_CAS_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// CAS calls on this thread that released the word to wait for a head.
+    static TEST_CAS_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_BEFORE_ROTATION_ALLOCATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -9198,6 +9266,115 @@ mod tests {
         assert_eq!(default_head_pool_len(48, 1), 8);
     }
 
+    /// D40: with a head free, a CAS checks, writes and publishes under one
+    /// hold of the cell word, so a concurrent writer cannot make it lose.
+    #[test]
+    fn cas_with_a_free_head_checks_and_writes_under_one_word() {
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 99750);
+        let version = chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+            .unwrap()
+            .version;
+        TEST_CAS_SLOW_PATHS.with(|count| count.set(0));
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let header = chunk
+            .compare_version_and_update_cell(id.bits(), version, &mut cell)
+            .unwrap();
+        assert!(header.version > version);
+        let header = chunk
+            .compare_version_and_set_field(id.bits(), header.version, hash_str("id"), OwnedValue::I32(7))
+            .unwrap();
+        assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
+        assert_eq!(
+            TEST_CAS_SLOW_PATHS.with(|count| count.get()),
+            0,
+            "a CAS released the word to wait for a free head"
+        );
+    }
+
+    /// A CAS that holds the word tries a head only for a bounded time. A
+    /// writer that owns the only head and waits for the word must get it.
+    #[test]
+    fn cas_free_head_try_is_bounded_while_the_word_is_held() {
+        for set_field in [false, true] {
+            let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+            chunks.stop_background();
+            let id = Id::allocated(1, 0, 99751);
+            let version = chunks
+                .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+                .unwrap()
+                .version;
+            let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+            let writer_chunks = chunks.clone();
+            let writer = std::thread::spawn(move || {
+                let chunk = &writer_chunks.list[0];
+                let pending = chunk.try_acquire(64, true).unwrap();
+                owned_tx.send(()).unwrap();
+                // Model a writer that owns the only head before its word.
+                let started = std::time::Instant::now();
+                let obtained = loop {
+                    if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                        drop(guard);
+                        break true;
+                    }
+                    if started.elapsed() >= std::time::Duration::from_secs(1) {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                drop(pending);
+                obtained
+            });
+            owned_rx.recv().unwrap();
+            let chunk = &chunks.list[0];
+            let result = if set_field {
+                chunk.compare_version_and_set_field(id.bits(), version, hash_str("id"), OwnedValue::I32(7))
+            } else {
+                let mut cell = payload_cell(schema.vid.get(), &id, 64);
+                chunk.compare_version_and_update_cell(id.bits(), version, &mut cell)
+            };
+            let obtained = writer.join().unwrap();
+            result.expect("the CAS must finish after the head becomes available");
+            assert!(obtained, "CAS held the cell word while waiting for the head owner");
+        }
+    }
+
+    /// A CAS that has lost claims no space, even at a full store; a CAS with
+    /// the right version is refused there and leaves the head as it was.
+    #[test]
+    fn cas_at_full_capacity_claims_no_space_for_a_lost_version() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 99752);
+        let version = chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+            .unwrap()
+            .version;
+        let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+        seg.retire_tail();
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        assert!(matches!(
+            chunk.compare_version_and_update_cell(id.bits(), version + 1, &mut cell),
+            Err(WriteError::CellVersionMismatch)
+        ));
+        assert!(matches!(
+            chunk.compare_version_and_set_field(id.bits(), version + 1, hash_str("id"), OwnedValue::I32(7)),
+            Err(WriteError::CellVersionMismatch)
+        ));
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        assert!(matches!(
+            chunk.compare_version_and_update_cell(id.bits(), version, &mut cell),
+            Err(WriteError::CannotAllocateSpace)
+        ));
+        assert_eq!(chunks.head_cell(&id).unwrap().version, version);
+        assert_delete_head_released(&seg, cursor);
+    }
+
     /// D35: with a head free, a delete reserves its tombstone under the word
     /// that checked the cell, so it takes the word once.
     #[test]
@@ -9623,6 +9800,8 @@ mod tests {
         let cas = std::thread::spawn({
             let chunks = chunks.clone();
             move || {
+                // This order exists only when the CAS must wait for a head.
+                TEST_CAS_SLOW_PATH.with(|forced| forced.set(true));
                 TEST_CAS_HEAD_WAIT.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move || {
                         ready_tx.send(()).unwrap();
