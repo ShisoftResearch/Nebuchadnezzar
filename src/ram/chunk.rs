@@ -2437,7 +2437,7 @@ impl Chunk {
                 };
                 // OWN the head first. Under the pool a segment has ONE
                 // writer at a time, from here through the journal write
-                // (released after append, or by a canceled PendingEntry): the cursor cannot run
+                // (released in PendingEntry::drop): the cursor can never run
                 // ahead of another writer's unwritten bytes, so mid-segment
                 // holes are impossible by construction and the WAL is
                 // offset-ordered. A head someone else owns is simply the
@@ -4970,12 +4970,6 @@ impl PendingEntry {
         match self.seg.write_wal(self.addr, self.size, self.skip_sync) {
             Ok(()) => {
                 self.journaled.set(true);
-                // WAL order is fixed now. Publication still owns the reference
-                // and journal claim, so rotation cannot archive this image yet.
-                // Let another writer append while this caller updates indexes.
-                if !self.leased {
-                    self.seg.release_own();
-                }
                 if self.skip_sync {
                     note_transactional_write(&self.seg);
                 } else {
@@ -5003,8 +4997,7 @@ impl Drop for PendingEntry {
             }
         }
         self.seg.end_pending_journal();
-        // A successful append already handed ownership to the next writer.
-        if !self.leased && !self.journaled.get() {
+        if !self.leased {
             self.seg.release_own();
         }
         self.seg.decr_references();
@@ -7983,34 +7976,6 @@ mod tests {
         );
         finish_tx.send(()).unwrap();
         pinning.join().expect("pinning thread");
-    }
-
-    #[test]
-    fn journaled_entry_releases_head_but_keeps_publication_pin() {
-        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
-        let pending = chunks.list[0].try_acquire(64, false).unwrap();
-        let segment = pending.seg.clone();
-        assert!(segment.is_head_owned());
-        pending.append().unwrap();
-        assert!(!segment.is_head_owned(), "journal completion must release the head");
-        assert_eq!(segment.pending_journal_count(), 1);
-        assert!(crate::ram::segs::SegmentExclusiveRefGuard::new(&segment).is_none());
-        drop(pending);
-        assert_eq!(segment.pending_journal_count(), 0);
-        assert!(segment.no_references());
-    }
-
-    #[test]
-    fn journaled_entry_drop_keeps_the_next_writers_ownership() {
-        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
-        let pending = chunks.list[0].try_acquire(64, false).unwrap();
-        let segment = pending.seg.clone();
-        pending.append().unwrap();
-        assert!(segment.try_own(), "next writer must acquire before publication finishes");
-        drop(pending);
-        assert!(segment.is_head_owned(), "old reservation must not release the next writer");
-        segment.release_own();
-        assert!(!segment.is_head_owned());
     }
 
     #[test]
