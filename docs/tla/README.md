@@ -135,3 +135,28 @@ deletion set was correct for the shared-leaf design and became a defect
 the moment ownership was made disjoint — an invariant that changed
 meaning under a refactor, which is exactly the class of thing a model
 catches and a test suite does not.
+
+## `HeadWordLock.tla` — cell words, write heads, the GC lock
+
+Covers the lock order of one chunk in `ram/chunk.rs`: the word lock of each
+cell (the mutex bit of its cell-index word), the head pool (one owner per
+head), the GC lock and transaction leases. The processes are head-first
+writers (writes, upserts, CAS), word-first updaters (`update_cell_by`),
+deletes, the cleaner and a transaction. `HeadWordLock.py` writes one MC
+module per scenario, runs TLC and compares each result with the expected
+one:
+
+```sh
+TLC=tlc python3 HeadWordLock.py --out /some/scratch/dir
+```
+
+| scenario | result |
+|---|---|
+| `old_k1`, `old_k2` | Deadlock. The delete order before e6a64539: the delete holds the word and waits for a head, the head owner waits for the word. |
+| `cur_*` | No error. The e6a64539 order: the delete releases the word before it waits for a head. |
+| `new_*` | No error. The current order: the delete reserves its tombstone under the word that checked the cell if a head is free; the try has a bound, then the e6a64539 path runs. |
+| `ctl_new_unbounded_try` | Deadlock, on purpose: the try without a bound is the old order again. |
+| `ctl_new_no_recheck` | `AppendUnderBoth` violated, on purpose: a word taken again after a wait must check the cell again. |
+| `full_old`, `full_cur`, `full_new` | No error. At a full store an absent cell or a false predicate gives "absent", never "no space". |
+| `cur_u_unbounded`, `new_u_unbounded` | Deadlock. A word-first updater that holds the word and waits for a head, while every head owner waits for that word. Away from the wall this wait has no bound. This cycle is older than the delete orders above. |
+| `cas_wordfast_*` | No error. A CAS with the same bounded try as the delete is also free of deadlock. |
