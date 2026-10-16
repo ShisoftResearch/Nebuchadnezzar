@@ -1697,6 +1697,70 @@ async fn a_fenced_site_without_a_bracket_refuses_a_late_prepare_after_a_power_cu
     cluster.shutdown().await;
 }
 
+/// Review finding 1: a fence lands while B's `prepare` is between the fence
+/// check and the transaction object. B answers the fence, and then must
+/// refuse that `prepare` or the coordinator's `end`: a fencer that saw every
+/// answer `Fenced`/`Unknown` aborts. Here A is fenced too, so A refuses its
+/// `end`; if B commits, the transaction is torn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fence_during_a_prepare_in_flight_is_kept() {
+    let (cluster, client) = Cluster::start("crosssite_r1_fence_in_prepare").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    drop(client);
+    let ids = vec![
+        Id::from_parts(HERE as u64, 41),
+        Id::from_parts(THERE as u64, 41),
+    ];
+    let scores = vec![29_000, 29_001];
+    let txn = coordinator(&cluster).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (id, score) in ids.iter().zip(scores.iter()) {
+        txn.write(tid.clone(), cell_of(*id, *score))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let hold = super::data_site::install_prepare_delay_after_fence_check(tid.clone(), ids[1]);
+    let prepare = {
+        let txn = txn.clone();
+        let tid = tid.clone();
+        tokio::spawn(async move { txn.prepare(tid).await })
+    };
+    hold.wait_until_entered().await;
+    let b_answer = data_site(&cluster, B).fence_here(&tid);
+    hold.release();
+    let prepared = prepare.await.unwrap();
+    let a_answer = data_site(&cluster, A).fence_here(&tid);
+    warn!(
+        "CROSSSITE finding 1: B answered {:?} during its prepare, A answered {:?}, the \
+         prepare returned {:?}",
+        b_answer, a_answer, prepared
+    );
+    assert!(matches!(
+        b_answer,
+        FenceAnswer::Fenced | FenceAnswer::Unknown
+    ));
+    let committed = if matches!(prepared, Ok(Ok(TMPrepareResult::Success))) {
+        let result = txn.commit(tid.clone()).await;
+        warn!("CROSSSITE finding 1: the commit returned {:?}", result);
+        matches!(
+            result,
+            Ok(Ok(EndResult::Success)) | Ok(Ok(EndResult::DecidedPending))
+        )
+    } else {
+        false
+    };
+    assert_ne!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "B answered the fence, so it must not commit the transaction"
+    );
+    assert!(!committed, "the client must not hear that the transaction committed");
+    assert_all_or_nothing(&cluster, &ids, &scores, "fence during a prepare in flight");
+    cluster.shutdown().await;
+}
+
 /// C16 (F6): A aborts after the fence; the cleaner runs on A; A restarts;
 /// a duplicate `prepare` arrives. A refuses it: the fence survives the
 /// compaction and the start.

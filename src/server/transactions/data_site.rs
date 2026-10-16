@@ -116,6 +116,43 @@ fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDela
     PREPARE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Test hook (review finding 1): a `prepare` of this cell waits before it
+/// takes the transaction object, where the fence check ran before the fix,
+/// as a thread that the scheduler stops there.
+#[cfg(test)]
+static PREPARE_AFTER_FENCE_CHECK_HOOKS: OnceLock<
+    Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_prepare_delay_after_fence_check(tid: TxnId, id: Id) -> PrepareDelayHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    PREPARE_AFTER_FENCE_CHECK_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .insert(key.clone(), state.clone());
+    PrepareDelayHandle { key, state }
+}
+
+#[cfg(test)]
+fn take_prepare_delay_after_fence_check(
+    tid: &TxnId,
+    prepared_ops: &[PrepareOp],
+) -> Option<Arc<PrepareDelayState>> {
+    let mut hooks = PREPARE_AFTER_FENCE_CHECK_HOOKS.get()?.lock();
+    let key = prepared_ops
+        .iter()
+        .map(|op| (tid.clone(), op.id))
+        .find(|key| hooks.contains_key(key))?;
+    hooks.remove(&key)
+}
+
 #[cfg(test)]
 pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelayHandle {
     let key = (tid, id);
@@ -1436,6 +1473,14 @@ impl DataManager {
         if self.chunks().txn_status().get(tid).is_some() {
             return FenceAnswer::Committing;
         }
+        // Recorded BEFORE the object lookup. A `prepare` checks the fence
+        // under the transaction lock, after it takes the object: so a
+        // `prepare` that has not taken the object yet sees this record, and
+        // one that has is found below.
+        if let Err(error) = self.chunks().fences().record(tid) {
+            error!("cannot record the fence of {:?}: {}", tid, error);
+            return FenceAnswer::Committing;
+        }
         if let Some(txn_lock) = self.find_transaction(tid) {
             let mut txn = txn_lock.lock();
             if txn.decided_commit {
@@ -1447,16 +1492,8 @@ impl DataManager {
             // Under the transaction lock, so `close_committed_brackets` sees
             // either no fence and closes first (then this answers
             // `Committing`), or the fence and refuses.
-            if let Err(error) = self.chunks().fences().record(tid) {
-                error!("cannot record the fence of {:?}: {}", tid, error);
-                return FenceAnswer::Committing;
-            }
             txn.fenced = true;
             return FenceAnswer::Fenced;
-        }
-        if let Err(error) = self.chunks().fences().record(tid) {
-            error!("cannot record the fence of {:?}: {}", tid, error);
-            return FenceAnswer::Committing;
         }
         if self.chunks().txn_status().resolving_participants(tid).is_some() {
             // In doubt after a restart: its parts are here, undecided.
@@ -7011,20 +7048,30 @@ impl Service for DataManager {
                 Self::await_prepare_delay(&state).await;
             }
 
-            // A fenced transaction is never prepared again (D29). Free while
-            // nothing is fenced: the log keeps a count.
-            if self.chunks().fences().is_fenced(&tid) {
-                return self
-                    .response_with(DMPrepareResult::StateError(TxnState::Aborted))
-                    .await;
+            #[cfg(test)]
+            if let Some(state) = take_prepare_delay_after_fence_check(&tid, &prepared_ops) {
+                Self::await_prepare_delay(&state).await;
             }
             let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
                 prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
             let requester = TxnPriority::new(tid.clone(), coordinator_id);
 
+            let mut refused_unprepared = false;
             let result = 'result: {
                 let txn_lock = self.get_or_create_transaction(&tid);
                 let mut txn = txn_lock.lock();
+                // A fenced transaction is never prepared again (D29). Under
+                // the transaction lock: `fence_here` records the fence before
+                // it looks for this object, so either this check sees the
+                // fence, or the fencer finds the object, waits for this lock
+                // and sets `txn.fenced`. Free while nothing is fenced: the log
+                // keeps a count.
+                if txn.fenced || self.chunks().fences().is_fenced(&tid) {
+                    // An object this `prepare` just made, or one of reads only:
+                    // nothing else ends it.
+                    refused_unprepared = txn.state == TxnState::Started;
+                    break 'result DMPrepareResult::StateError(TxnState::Aborted);
+                }
                 match txn.state {
                     TxnState::Started => {}
                     TxnState::Prepared => {
@@ -7105,6 +7152,9 @@ impl Service for DataManager {
                 debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
                 DMPrepareResult::Success
             };
+            if refused_unprepared {
+                self.wipe_out_transaction(&tid);
+            }
 
             self.response_with(result).await
         }
