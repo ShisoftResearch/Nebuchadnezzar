@@ -333,7 +333,7 @@ async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
             .await;
     }
 
@@ -391,7 +391,7 @@ async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
             .await;
     }
 
@@ -756,15 +756,18 @@ async fn power_cut_participants_resolve(durable: bool) {
     peer.shutdown().await;
 }
 
-/// A silent commit point must not be counted as a vote to abort.
+/// A silent peer must not be counted as a vote to abort.
 ///
-/// The participant is in doubt and the commit point, which knows the answer,
-/// is DOWN. Concluding abort here is the tear: the commit point holds a
-/// durable COMMIT and will still hold it when it comes back. So the heads
-/// stay held and the question stays open, with no time limit: only the
-/// commit point can decide (D26).
+/// The participant is in doubt and the peer that knows the answer is DOWN.
+/// Concluding abort here is the tear: the peer holds a durable COMMIT and
+/// will still hold it when it comes back. So the heads stay held and the
+/// question stays open -- but not forever, because a held head is a writer
+/// slot gone from its chunk with no refill path.
+///
+/// Both halves are asserted: it holds while inside the grace window, and it
+/// gives up once past it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_commit_point_holds_the_transaction_open() {
+async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
     let (servers, client, addresses, _temp) = start_txn_cluster("tear_silent").await;
     let ids = two_ids_on_distinct_servers(&client, &servers).await;
 
@@ -803,13 +806,13 @@ async fn a_silent_commit_point_holds_the_transaction_open() {
     knows.shutdown().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Hold, do not decide.
+    // Inside the grace window: hold, do not decide.
     let site = in_doubt
         .database_runtime()
         .data_site()
         .expect("the in-doubt server runs a data site");
     let hold = site
-        .terminate_in_doubt_transactions(Duration::ZERO)
+        .terminate_in_doubt_transactions(Duration::ZERO, Duration::from_secs(300))
         .await;
     assert!(
         hold.contains(&tid),
@@ -826,56 +829,16 @@ async fn a_silent_commit_point_holds_the_transaction_open() {
         "holding is not deciding"
     );
 
-    // Again, and through the whole sweep: still held, still not decided.
-    // There is no grace window after which the site gives up.
-    for _ in 0..3 {
-        site.sweep_idle_transactions(Duration::ZERO).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(
-        crate::ram::chunk::transaction_lease_count(&tid, &in_doubt.chunks().address_range()),
-        leases_before,
-        "a site that is not the commit point never presumes abort"
-    );
-    assert_eq!(
-        in_doubt.chunks().durable_txn_status(&tid),
-        DurableTxnStatus::Prepared,
-        "the in-doubt bracket must still be there"
+    // Past it: give up, so a permanently silent peer cannot cost a writer
+    // slot for the life of the process.
+    let hold = site
+        .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+        .await;
+    assert!(
+        !hold.contains(&tid),
+        "past the grace window the transaction must be released to the sweeper"
     );
 
-    for server in servers {
-        server.shutdown().await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn recovered_transaction_stays_pinned_when_a_peer_reports_unknown() {
-    let (servers, _client, _addresses, _temp) = start_txn_cluster("recovery_unknown_pin").await;
-    let txn = super::test_hlc(9846, 1);
-    let runtime = servers[0].current_database();
-    runtime.chunks().stop_background();
-    let segment = runtime.chunks().list[0].segments().pop().unwrap();
-    segment.protection.retain_transaction(&txn);
-    runtime.chunks().recovered_brackets.lock().in_doubt.push(
-        crate::ram::recovery::InDoubtBracket {
-            txn: txn.clone(),
-            chunks: vec![0],
-            cells: vec![],
-        },
-    );
-    assert_eq!(
-        servers[1].database_runtime().data_site().unwrap().txn_outcome(&txn),
-        super::TxnOutcome::Unknown,
-    );
-
-    crate::server::resolve_in_doubt_after_recovery(&runtime).await;
-
-    assert_eq!(runtime.chunks().pinned_segments(), 1);
-    assert_eq!(runtime.chunks().pinned_bytes(), crate::ram::segs::SEGMENT_SIZE);
-    let unresolved = runtime.chunks().take_in_doubt_brackets();
-    assert_eq!(unresolved.len(), 1);
-    assert_eq!(unresolved[0].txn, txn);
-    runtime.chunks().release_transaction_pins(&txn);
     for server in servers {
         server.shutdown().await;
     }

@@ -5206,13 +5206,6 @@ pub struct Chunks {
     /// Committed transactions a peer, or this store's next recovery, may
     /// still need the evidence of. See `crate::ram::evidence`.
     evidence: crate::ram::evidence::DecisionEvidence,
-    /// In-doubt transactions that wait for an answer from their commit point.
-    unresolved: Mutex<
-        std::collections::BTreeMap<
-            crate::server::transactions::TxnId,
-            crate::ram::recovery::InDoubtBracket,
-        >,
-    >,
     /// Set when the owning server goes away, so the background sweeper exits
     /// without waiting for the store itself to be dropped. The store can
     /// outlive its server -- an RPC service still holds it -- and a thread that
@@ -5343,29 +5336,6 @@ impl Chunks {
     /// Take the transactions recovery could not decide, for resolution.
     pub fn take_in_doubt_brackets(&self) -> Vec<crate::ram::recovery::InDoubtBracket> {
         std::mem::take(&mut self.recovered_brackets.lock().in_doubt)
-    }
-
-    /// Keep an in-doubt transaction that waits for its commit point. The
-    /// background resolver and the operator tool take it from here; each
-    /// takes it under this lock, so only one of them resolves it.
-    pub fn park_unresolved(&self, bracket: crate::ram::recovery::InDoubtBracket) {
-        self.unresolved.lock().insert(bracket.txn.clone(), bracket);
-    }
-
-    pub fn take_unresolved(
-        &self,
-        txn: &crate::server::transactions::TxnId,
-    ) -> Option<crate::ram::recovery::InDoubtBracket> {
-        self.unresolved.lock().remove(txn)
-    }
-
-    /// The parked transactions and their participant sets.
-    pub fn unresolved_transactions(&self) -> Vec<(crate::server::transactions::TxnId, Vec<u64>)> {
-        self.unresolved
-            .lock()
-            .iter()
-            .map(|(txn, bracket)| (txn.clone(), bracket.participants.clone()))
-            .collect()
     }
 
     /// See [`stop_background`]. Observable so a test can assert the teardown
@@ -5567,7 +5537,6 @@ impl Chunks {
             ),
             recovered_brackets: Mutex::new(crate::ram::recovery::RecoveredBrackets::empty()),
             evidence: crate::ram::evidence::DecisionEvidence::new(),
-            unresolved: Mutex::new(std::collections::BTreeMap::new()),
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,
@@ -7307,7 +7276,7 @@ mod tests {
         // The first store decides. It must close and release ITS head and
         // nothing else.
         first
-            .commit_transaction_brackets(&txn)
+            .commit_transaction_brackets(&txn, false)
             .expect("first store commits");
         assert_eq!(
             release_transaction_leases(&txn, &first.address_range()),
@@ -7334,7 +7303,7 @@ mod tests {
         );
 
         second
-            .commit_transaction_brackets(&txn)
+            .commit_transaction_brackets(&txn, false)
             .expect("second store commits");
         assert_eq!(
             release_transaction_leases(&txn, &second.address_range()),
@@ -7385,7 +7354,7 @@ mod tests {
         drop(scope);
 
         // Decided: every bracket closed, so the heads may go back.
-        chunks.commit_transaction_brackets(&txn).expect("commit");
+        chunks.commit_transaction_brackets(&txn, false).expect("commit");
         assert_eq!(
             release_transaction_leases(&txn, &chunks.address_range()),
             Ok(1)
@@ -7428,7 +7397,7 @@ mod tests {
                     Ok(1)
                 );
             } else {
-                chunks.commit_transaction_brackets(&txn).expect("commit");
+                chunks.commit_transaction_brackets(&txn, false).expect("commit");
                 assert_eq!(
                     release_transaction_leases(&txn, &chunks.address_range()),
                     Ok(1)
@@ -7630,7 +7599,7 @@ mod tests {
         assert!(seg.is_head_owned());
 
         // Closing the bracket is what makes the release legal.
-        chunks.commit_transaction_brackets(&txn).expect("commit");
+        chunks.commit_transaction_brackets(&txn, false).expect("commit");
         assert!(seg.bracket_is_committed());
         assert_eq!(
             release_transaction_leases(&txn, &chunks.address_range()),
@@ -7850,7 +7819,7 @@ mod tests {
             .is_none());
         drop(scope);
 
-        chunks.commit_transaction_brackets(&txn).expect("commit");
+        chunks.commit_transaction_brackets(&txn, false).expect("commit");
         for seg in [&first_seg, &second_seg] {
             let types = entry_types_in(seg);
             assert_eq!(types.first(), Some(&crate::ram::entry::EntryType::BEGIN));

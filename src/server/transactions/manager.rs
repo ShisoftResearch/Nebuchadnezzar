@@ -41,10 +41,9 @@ static END_FANOUT_LIMIT: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<TxnId, 
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum EndFanoutPlan {
-    /// Before the commit point hears the decision: no site is told.
+    /// No site is told.
     BeforeCommitPoint,
-    /// After the commit point made its COMMIT durable, before any other
-    /// site is told.
+    /// Only the participant with the lowest server id is told.
     AfterCommitPoint,
 }
 
@@ -70,7 +69,7 @@ impl Drop for EndFanoutLimit {
     }
 }
 
-/// The coordinator decides and stops before it tells the commit point.
+/// The coordinator decides and stops before it tells any site.
 #[cfg(test)]
 pub(crate) fn stop_end_fanout_before_commit_point(tid: TxnId) -> EndFanoutLimit {
     end_fanout_limits()
@@ -79,8 +78,8 @@ pub(crate) fn stop_end_fanout_before_commit_point(tid: TxnId) -> EndFanoutLimit 
     EndFanoutLimit(tid)
 }
 
-/// The coordinator tells the commit point, which commits, and stops. Every
-/// other participant is in doubt.
+/// The coordinator tells the participant with the lowest server id, and
+/// stops. Every other participant is in doubt.
 #[cfg(test)]
 pub(crate) fn stop_end_fanout_after_commit_point(tid: TxnId) -> EndFanoutLimit {
     end_fanout_limits()
@@ -1797,164 +1796,39 @@ impl TransactionManager {
             Some(rollback_failures)
         }))
     }
-    /// The decision COMMIT, in two steps.
-    ///
-    /// 1. `end` to the commit point (`super::commit_point`) alone. Its
-    ///    `Success` means its COMMIT is durable: from then on the
-    ///    transaction is committed, whatever happens to this coordinator.
-    /// 2. `end` to every other site, in parallel. A refusal there does not
-    ///    change the outcome: that site keeps the transaction decided and
-    ///    finishes it. The client is told `Success`.
-    ///
-    /// If the commit point refuses, it is asked for its outcome. `Aborted`
-    /// or `Unknown`: it rolled the transaction back, so the other sites are
-    /// aborted and the client gets the refusal. `InDoubt`: the commit point
-    /// cannot tell yet whether its COMMIT is on disk, so nothing else is
-    /// sent; the other sites wait for it. If the commit point does not
-    /// answer at all, nothing else is sent either, for the same reason.
+    /// The decision COMMIT: `end` to every site, in parallel.
     async fn sites_end(
         &self,
         tid: &TxnId,
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<EndResult, TMError> {
-        // The same set the participants got at prepare (`sites_prepare`).
-        let commit_point = changed_objs
-            .iter()
-            .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
-            .map(|(server, _)| *server)
-            .min();
-        let Some(commit_point) = commit_point else {
-            // Read-only: no site holds a bracket, so there is nothing to
-            // decide, only locks and pins to release.
-            let sites: Vec<u64> = changed_objs.keys().copied().collect();
-            return self.end_sites(tid, &sites, data_sites).await;
-        };
         // A coordinator that dies mid-decision, on demand. Invisible from any
         // single node, so without an injection point there is no way to
         // demonstrate the hazard OR to prove the fix.
         #[cfg(test)]
-        if matches!(end_fanout_limit(tid), Some(EndFanoutPlan::BeforeCommitPoint)) {
+        if let Some(plan) = end_fanout_limit(tid) {
+            let lowest = changed_objs
+                .iter()
+                .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
+                .map(|(server, _)| *server)
+                .min();
+            let told: Vec<u64> = match plan {
+                EndFanoutPlan::BeforeCommitPoint => Vec::new(),
+                EndFanoutPlan::AfterCommitPoint => lowest.into_iter().collect(),
+            };
+            for server_id in &told {
+                let data_site = data_sites.get(server_id).unwrap();
+                let _ = data_site.end(self.get_clock(), tid.clone()).await;
+            }
             warn!(
-                "TEST: coordinator for {:?} stops before it tells the commit point",
-                tid
+                "TEST: coordinator for {:?} stops after telling {:?}",
+                tid, told
             );
             return Err(TMError::RPCErrorFromCellServer);
         }
-        let commit_point_site = data_sites.get(&commit_point).unwrap();
-        let at_commit_point = match commit_point_site.end(self.get_clock(), tid.clone()).await {
-            Ok(response) => {
-                self.merge_clock(response.clock);
-                response.payload
-            }
-            Err(error) => {
-                // Not known whether the commit point committed. The other
-                // sites ask it; telling them anything could be wrong.
-                error!(
-                    "commit point {} did not answer `end` for {:?}: {:?}",
-                    commit_point, tid, error
-                );
-                return Err(TMError::RPCErrorFromCellServer);
-            }
-        };
-        let report = match at_commit_point {
-            EndResult::Success
-            | EndResult::SomeLocksNotReleased { .. }
-            | EndResult::LockReleaseRetriesExhausted { .. } => at_commit_point,
-            refusal => match self.commit_point_outcome(tid, commit_point_site).await {
-                Some(TxnOutcome::Committed) => EndResult::Success,
-                Some(outcome @ (TxnOutcome::Aborted | TxnOutcome::Unknown)) => {
-                    warn!(
-                        "commit point {} refused COMMIT for {:?} ({:?}) and reports {:?}; \
-                         aborting the other sites",
-                        commit_point, tid, refusal, outcome
-                    );
-                    let others: Vec<u64> = changed_objs
-                        .keys()
-                        .copied()
-                        .filter(|server| *server != commit_point)
-                        .collect();
-                    if let Err(error) = self.abort_sites(tid, &others, data_sites).await {
-                        // A site the abort did not reach asks the commit
-                        // point, which answers `Aborted`.
-                        error!(
-                            "could not abort every site of {:?} after its commit point refused: \
-                             {:?}",
-                            tid, error
-                        );
-                    }
-                    return Ok(refusal);
-                }
-                Some(TxnOutcome::InDoubt) | None => {
-                    error!(
-                        "commit point {} refused COMMIT for {:?} ({:?}) and cannot tell yet \
-                         whether it is committed; the other sites wait for it",
-                        commit_point, tid, refusal
-                    );
-                    return Ok(refusal);
-                }
-            },
-        };
-        #[cfg(test)]
-        if matches!(end_fanout_limit(tid), Some(EndFanoutPlan::AfterCommitPoint)) {
-            warn!(
-                "TEST: coordinator for {:?} stops after the commit point {} committed",
-                tid, commit_point
-            );
-            return Err(TMError::RPCErrorFromCellServer);
-        }
-        let others: Vec<u64> = changed_objs
-            .keys()
-            .copied()
-            .filter(|server| *server != commit_point)
-            .collect();
-        let end_futures: FuturesUnordered<_> = others
-            .iter()
-            .map(|server_id| {
-                let server_id = *server_id;
-                let data_site = data_sites.get(&server_id).unwrap();
-                async move { (server_id, data_site.end(self.get_clock(), tid.clone()).await) }
-            })
-            .collect();
-        let end_results: Vec<_> = end_futures.collect().await;
-        for (server_id, result) in end_results {
-            match result {
-                Ok(response) => {
-                    self.merge_clock(response.clock);
-                    if !matches!(response.payload, EndResult::Success) {
-                        error!(
-                            "{:?} is committed at its commit point {}; site {} reports {:?} and \
-                             finishes the close itself",
-                            tid, commit_point, server_id, response.payload
-                        );
-                    }
-                }
-                Err(error) => error!(
-                    "{:?} is committed at its commit point {}; site {} did not answer `end` \
-                     ({:?}) and resolves it from the commit point",
-                    tid, commit_point, server_id, error
-                ),
-            }
-        }
-        Ok(report)
-    }
-
-    /// Ask the commit point for its outcome after it refused a COMMIT.
-    async fn commit_point_outcome(
-        &self,
-        tid: &TxnId,
-        site: &Arc<data_site::AsyncServiceClient>,
-    ) -> Option<TxnOutcome> {
-        match site.txn_status(tid.clone()).await {
-            Ok(response) => {
-                self.merge_clock(response.clock);
-                Some(response.payload)
-            }
-            Err(error) => {
-                debug!("commit point did not answer about {:?}: {:?}", tid, error);
-                None
-            }
-        }
+        let sites: Vec<u64> = changed_objs.keys().copied().collect();
+        self.end_sites(tid, &sites, data_sites).await
     }
 
     /// `end` to each of `sites` in parallel; the first non-success wins.

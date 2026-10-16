@@ -280,9 +280,8 @@ struct Transaction {
     /// Pinned versions of LARGE cells read under repeatable-read semantics.
     pinned_reads: PinnedReadSet,
     /// Every server that will hold a bracket for this transaction, learned
-    /// from the coordinator at prepare. The lowest id is the commit point
-    /// (`super::commit_point`). Each BEGIN record also carries it, so a site
-    /// that restarts in doubt still knows its commit point.
+    /// from the coordinator at prepare. Each BEGIN record also carries it, so
+    /// a site that restarts still knows the participants of a transaction.
     participants: Vec<u64>,
     /// This site was told to COMMIT and has started writing COMMIT records.
     ///
@@ -365,9 +364,22 @@ pub struct DataManager {
     /// store's decision evidence (`crate::ram::evidence`), durably and until
     /// no participant holds it open; this map is the fast path.
     decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
-    /// Decided transactions whose close was refused, with the count of
-    /// refusals. The sweeper retries each one on every tick.
-    pending_close: Mutex<BTreeMap<TxnId, u32>>,
+    /// When each in-doubt transaction was first found unresolvable because a
+    /// participant would not answer. Bounds how long its write heads stay
+    /// held: a hostage head is a writer slot gone from its chunk with no
+    /// refill path, so waiting forever trades one wrong answer for a
+    /// different one.
+    in_doubt_since: Mutex<BTreeMap<TxnId, std::time::Instant>>,
+}
+
+/// How long an in-doubt transaction keeps its write heads while a
+/// participant stays silent, before this node gives up and presumes abort.
+fn termination_answer_grace() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_ANSWER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
 /// What `close_committed_brackets` did.
@@ -416,10 +428,6 @@ service! {
     // each of them. A peer keeps the evidence of a commit until no site that
     // can ask reports it here.
     rpc open_transactions() -> DataSiteResponse<Vec<TxnId>>;
-
-    // Operator tool: decide one in-doubt transaction on this site, when its
-    // commit point is lost for good. See `ForceResolveResult`.
-    rpc force_resolve(tid: TxnId, outcome: ForcedOutcome) -> DataSiteResponse<ForceResolveResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -442,7 +450,7 @@ impl DataManager {
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             decided: Mutex::new(BTreeMap::new()),
-            pending_close: Mutex::new(BTreeMap::new()),
+            in_doubt_since: Mutex::new(BTreeMap::new()),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -453,7 +461,7 @@ impl DataManager {
                     cleanup_signal.store(false, Relaxed);
                 }
                 manager_clone
-                    .sweep_idle_transactions(txn_lease_timeout())
+                    .sweep_idle_transactions(txn_lease_timeout(), termination_answer_grace())
                     .await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -901,21 +909,23 @@ impl DataManager {
     /// A transaction holding write heads past `idle` has lost its
     /// coordinator, or is about to be told something late. In order:
     ///
-    /// 1. Finish the closes that are pending, and ask the commit point about
-    ///    the rest (`terminate_in_doubt_transactions`). Runs first because
-    ///    closing a bracket needs the leases every later step gives up.
-    /// 2. Presume abort for the transactions that are not held: the ones
-    ///    this site is the commit point of, and the ones the commit point
-    ///    answered as aborted. The same rollback, rewind and release an
-    ///    explicit abort performs, under the same transaction lock -- which
-    ///    is also what makes a slow owner safe. An apply still running holds
-    ///    that lock, so the sweep waits for it rather than padding over a
-    ///    span that is still growing; and a late `end` finds the transaction
-    ///    gone and is refused, rather than told it committed something whose
-    ///    spans were just disowned.
+    /// 1. Ask the other participants (cooperative termination) and finish
+    ///    the ones a peer reports committed. Runs first because closing a
+    ///    bracket needs the leases every later step gives up.
+    /// 2. Presume abort for the rest this site knows: the same rollback,
+    ///    rewind and release an explicit abort performs, under the same
+    ///    transaction lock -- which is also what makes a slow owner safe. An
+    ///    apply still running holds that lock, so the sweep waits for it
+    ///    rather than padding over a span that is still growing; and a late
+    ///    `end` finds the transaction gone and is refused, rather than told
+    ///    it committed something whose spans were just disowned.
     /// 3. Retire whatever is left: leases no participant object knows about.
-    pub(crate) async fn sweep_idle_transactions(&self, idle: std::time::Duration) {
-        let hold = self.terminate_in_doubt_transactions(idle).await;
+    pub(crate) async fn sweep_idle_transactions(
+        &self,
+        idle: std::time::Duration,
+        grace: std::time::Duration,
+    ) {
+        let hold = self.terminate_in_doubt_transactions(idle, grace).await;
         let store = self.chunks().address_range();
         for tid in crate::ram::chunk::transactions_with_idle_leases(idle, &store) {
             if hold.contains(&tid) {
@@ -930,9 +940,6 @@ impl DataManager {
 
     /// Presumed abort for a transaction whose coordinator went silent.
     /// Returns whether the transaction was ended here.
-    ///
-    /// Only for a transaction that the commit point answered as aborted, or
-    /// that this site is the commit point of: see `commit_point`.
     fn presume_abort(&self, tid: &TxnId) -> bool {
         let Some(txn_lock) = self.find_transaction(tid) else {
             // Nothing to roll back here; the retire pass reclaims the heads.
@@ -965,44 +972,35 @@ impl DataManager {
                 );
             }
         }
-        // Recorded, so this site answers `Aborted` if it is the commit point
-        // and a peer asks.
         self.record_decision(tid, TxnOutcome::Aborted);
         self.wipe_out_transaction(tid);
         true
-    }
-
-    /// Whether this site is the commit point of a transaction with these
-    /// participants.
-    fn is_commit_point(&self, participants: &[u64]) -> bool {
-        let me = self.database_runtime.rpc.server_id;
-        super::commit_point(participants, me) == me
     }
 
     /// The commit decision's physical half: every bracket gets its COMMIT,
     /// fsynced, and only then do the heads go back to the pool.
     ///
     /// Under the transaction lock, and re-checked there, because the decision
-    /// can race the lease sweeper and the commit point's answer to a peer: a
-    /// presumed abort has rolled the transaction back and padded over its
-    /// spans, and a COMMIT written after that would commit nothing -- while a
-    /// ram layer that finds no leases answers `Ok`. So a transaction that is
-    /// gone, or no longer in the applied-and-undecided state, is refused here
-    /// and the coordinator is not told it committed.
+    /// can race the lease sweeper: a sweep that already presumed abort has
+    /// rolled the transaction back and padded over its spans, and a COMMIT
+    /// written after that would commit nothing -- while a ram layer that finds
+    /// no leases answers `Ok`. So a transaction that is gone, or no longer in
+    /// the applied-and-undecided state, is refused here and the coordinator
+    /// is not told it committed.
     ///
-    /// What a refused COMMIT means depends on where the commit point is:
+    /// What a refused COMMIT means:
     ///
-    /// * On the commit point (which includes a single-site transaction), a
-    ///   refusal with no durable COMMIT rolls the transaction back: no other
-    ///   site was told to commit, because the coordinator tells the others
-    ///   only after the commit point succeeds. A refusal after one COMMIT
-    ///   fsync succeeded keeps the transaction decided, because recovery
-    ///   commits it from that record; the coordinator is told `Success`.
-    /// * On another site, the commit point is already durable, so every
-    ///   refusal keeps the transaction decided.
-    ///
-    /// A decided transaction keeps its entries, locks and heads, and the
-    /// sweeper finishes the close (`terminate_in_doubt_transactions`).
+    /// * With other participants, the transaction stays decided. The
+    ///   coordinator sends the decision to every participant at once, so
+    ///   another site can already hold a durable COMMIT, and a rollback here
+    ///   would tear the transaction. Its entries, locks and heads stay, and
+    ///   the lease sweeper finishes it (`terminate_in_doubt_transactions`).
+    /// * With no other participant (Q4), it rolls back only if no COMMIT
+    ///   fsync succeeded and the retraction is synced. If one COMMIT fsync
+    ///   succeeded, recovery commits the transaction from it, so it stays
+    ///   decided and the client is told `Success`. If the retraction could
+    ///   not be synced, a COMMIT can come back after a power loss, so it stays
+    ///   decided and the client is told the refusal.
     fn close_committed_brackets(&self, tid: &TxnId) -> CloseOutcome {
         let Some(txn_lock) = self.find_transaction(tid) else {
             return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
@@ -1012,14 +1010,11 @@ impl DataManager {
             return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
         }
         let store = self.chunks().address_range();
-        // The segments that will hold this site's COMMITs. Read while the
-        // leases are held: they name the heads the brackets live in.
         let segments: Vec<crate::ram::evidence::SegmentRef> =
             crate::ram::chunk::transaction_leased_segments(tid, &store)
                 .iter()
                 .map(|segment| (segment.chunk_id, segment.id))
                 .collect();
-        let at_commit_point = self.is_commit_point(&txn.participants);
         let multi_site = self.has_other_participants(&txn.participants);
         if let Err(refusal) = self
             .chunks()
@@ -1031,68 +1026,56 @@ impl DataManager {
                 }
                 other => EndResult::WriteError(other.clone()),
             };
-            if !at_commit_point {
-                // The coordinator told this site only after the commit point
-                // made its COMMIT durable: the transaction is decided.
+            if multi_site {
                 txn.decided_commit = true;
                 txn.commit_durable = true;
-                let attempts = self.note_pending_close(tid);
                 error!(
-                    "refused COMMIT for {:?} (attempt {}): {:?}; the commit point decided it, \
-                     so this site keeps it decided and finishes it later",
-                    tid, attempts, reason
+                    "refused COMMIT for {:?}: {:?}; another participant may already be \
+                     committed, so this site keeps the transaction decided and finishes it later",
+                    tid, reason
                 );
                 return CloseOutcome::Pending(reason);
-            } else {
-                match refusal {
-                    crate::ram::chunk::CommitRefusal::Durable(_) => {
-                        txn.decided_commit = true;
-                        txn.commit_durable = true;
-                        self.retain_commit_evidence(tid, &txn.participants, segments.clone());
-                        self.record_decision(tid, TxnOutcome::Committed);
-                        self.note_pending_close(tid);
-                        error!(
-                            "COMMIT for {:?} is durable but not every part closed: {:?}; the \
-                             transaction is committed and this site finishes the close later",
-                            tid, reason
-                        );
-                        return CloseOutcome::Pending(EndResult::Success);
-                    }
-                    crate::ram::chunk::CommitRefusal::Unresolved(_) => {
-                        // A COMMIT can come back after a power loss, so a
-                        // rollback can tear the transaction, and `Success`
-                        // can be untrue. Keep it decided, retry, and answer
-                        // `InDoubt` until a COMMIT is synced.
-                        txn.decided_commit = true;
-                        self.note_pending_close(tid);
-                        error!(
-                            "refused COMMIT for {:?}: {:?}, and its retraction is not durable; \
-                             this commit point keeps the transaction decided and retries",
-                            tid, reason
-                        );
-                        return CloseOutcome::Pending(reason);
-                    }
-                    crate::ram::chunk::CommitRefusal::Retracted(_) if txn.decided_commit => {
-                        self.note_pending_close(tid);
-                        return CloseOutcome::Pending(if txn.commit_durable {
-                            EndResult::Success
-                        } else {
-                            reason
-                        });
-                    }
-                    crate::ram::chunk::CommitRefusal::Retracted(_) => {
-                        // Metadata locks still belong to this participant.
-                        // Restore the prepared writes before readers can
-                        // acquire them.
-                        let rollback = self.abort_locked(tid, &mut txn);
-                        error!(
-                            "refused COMMIT for {:?}: {:?}; rollback: {:?}",
-                            tid, reason, rollback
-                        );
-                        return CloseOutcome::RolledBack(reason);
-                    }
-                }
             }
+            return match refusal {
+                crate::ram::chunk::CommitRefusal::Durable(_) => {
+                    txn.decided_commit = true;
+                    txn.commit_durable = true;
+                    self.record_decision(tid, TxnOutcome::Committed);
+                    error!(
+                        "COMMIT for {:?} is durable but not every part closed: {:?}; the \
+                         transaction is committed and this site finishes the close later",
+                        tid, reason
+                    );
+                    CloseOutcome::Pending(EndResult::Success)
+                }
+                crate::ram::chunk::CommitRefusal::Unresolved(_) => {
+                    txn.decided_commit = true;
+                    error!(
+                        "refused COMMIT for {:?}: {:?}, and its retraction is not durable; the \
+                         transaction stays decided and the close is retried",
+                        tid, reason
+                    );
+                    CloseOutcome::Pending(reason)
+                }
+                crate::ram::chunk::CommitRefusal::Retracted(_) if txn.decided_commit => {
+                    CloseOutcome::Pending(if txn.commit_durable {
+                        EndResult::Success
+                    } else {
+                        reason
+                    })
+                }
+                crate::ram::chunk::CommitRefusal::Retracted(_) => {
+                    // Metadata locks still belong to this participant.
+                    // Restore the prepared writes before readers can acquire
+                    // them.
+                    let rollback = self.abort_locked(tid, &mut txn);
+                    error!(
+                        "refused COMMIT for {:?}: {:?}; rollback: {:?}",
+                        tid, reason, rollback
+                    );
+                    CloseOutcome::RolledBack(reason)
+                }
+            };
         }
         txn.decided_commit = true;
         txn.commit_durable = true;
@@ -1120,76 +1103,36 @@ impl DataManager {
             );
         }
         drop(txn);
-        self.pending_close.lock().remove(tid);
         CloseOutcome::Closed
-    }
-
-    /// Count one more refused close of `tid`; returns the count.
-    fn note_pending_close(&self, tid: &TxnId) -> u32 {
-        let mut pending = self.pending_close.lock();
-        let attempts = pending.entry(tid.clone()).or_insert(0);
-        *attempts += 1;
-        *attempts
     }
 
     /// Cooperative termination, participant side.
     ///
     /// A participant whose coordinator went silent knows its entries are
-    /// durable and knows nothing else. Only the commit point (the lowest
-    /// participant id, see `commit_point`) can decide alone, because the
-    /// coordinator tells the other sites only after the commit point made
-    /// its COMMIT durable. So:
+    /// durable and knows nothing else. Presuming abort -- what this site did
+    /// unconditionally before -- is safe only if no OTHER participant was
+    /// told to commit, and that is precisely what it cannot see on its own.
     ///
-    /// * The commit point is not held: the sweeper presumes abort.
-    /// * Another site asks the commit point. `Committed` means commit.
-    ///   `Aborted` and `Unknown` mean abort: the commit point keeps the
-    ///   evidence of every commit until no participant holds it open, and it
-    ///   answers a transaction it never decided by recording an abort.
-    ///   `InDoubt` or no answer means wait, with no time limit: the heads and
-    ///   locks stay held. Presuming abort here is what tore transactions.
+    /// So it asks. The participant set came from the coordinator at prepare
+    /// and lives in memory; a peer that was told answers `Committed` from its
+    /// decision record, and this site then closes its bracket instead of
+    /// abandoning it.
     ///
-    /// A pending close (a refused COMMIT on a decided transaction) is
-    /// retried on every call, not only when its leases are idle.
-    ///
-    /// A site that has RESTARTED has lost the transaction object, so it
-    /// never gets here. That case is recovery's (see
-    /// `resolve_in_doubt_after_recovery`), and it asks the commit point
-    /// that the BEGIN records name.
+    /// What this does NOT fix: a site that has RESTARTED has lost both the
+    /// transaction object and the participant set, so it never gets here.
+    /// That case is recovery's, and it broadcasts rather than asks.
     pub(crate) async fn terminate_in_doubt_transactions(
         &self,
         idle: std::time::Duration,
+        grace: std::time::Duration,
     ) -> std::collections::BTreeSet<TxnId> {
-        // Transactions whose leases must NOT be released this round, because
-        // the question "did anyone commit this?" is still open, or because
-        // the transaction is decided and its close is not finished.
-        let mut hold = std::collections::BTreeSet::new();
-        let pending: Vec<TxnId> = self.pending_close.lock().keys().cloned().collect();
-        for tid in pending {
-            let decided = self
-                .find_transaction(&tid)
-                .map_or(false, |txn_lock| txn_lock.lock().decided_commit);
-            if !decided {
-                self.pending_close.lock().remove(&tid);
-                continue;
-            }
-            let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
-                .await
-                .payload;
-            if self.pending_close.lock().contains_key(&tid) {
-                error!(
-                    "transaction {:?} is decided COMMIT here and still cannot close its \
-                     brackets: {:?}; holding its heads and retrying",
-                    tid, ended
-                );
-                hold.insert(tid);
-            }
-        }
         let store = self.chunks().address_range();
         let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+        // Transactions whose leases must NOT be released this round, because
+        // the question "did anyone commit this?" is still open. Releasing
+        // them would throw away the leases a commit needs.
+        let mut hold = std::collections::BTreeSet::new();
         for tid in candidates {
-            if hold.contains(&tid) {
-                continue;
-            }
             // The transaction lock is READ and dropped before the network
             // call. Holding it across the await would also make this future
             // non-Send, which is how the first version announced itself.
@@ -1204,9 +1147,21 @@ impl DataManager {
                 continue;
             };
             if decided_commit {
-                // Decided, and the close was not refused yet: it is running
-                // now, or will be retried through `pending_close`.
-                hold.insert(tid);
+                // This site was TOLD to commit and could not finish closing
+                // its brackets. There is nothing to ask anyone: finish it.
+                // Until that succeeds the heads stay held -- presuming abort
+                // now would tear a transaction one COMMIT may already decide.
+                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                    .await
+                    .payload;
+                if !matches!(ended, EndResult::Success) {
+                    error!(
+                        "transaction {:?} was decided COMMIT here and still cannot close its \
+                         brackets: {:?}; holding its heads and retrying",
+                        tid, ended
+                    );
+                    hold.insert(tid);
+                }
                 continue;
             }
             // `Committed` here means "entries durable", not "decided" -- see
@@ -1214,18 +1169,13 @@ impl DataManager {
             if !matches!(state, TxnState::Prepared | TxnState::Committed) {
                 continue;
             }
-            let me = self.database_runtime.rpc.server_id;
-            let commit_point = super::commit_point(&participants, me);
-            if commit_point == me {
-                // The commit point decides alone. Not held: presume abort.
-                continue;
-            }
-            match self.ask_commit_point(&tid, commit_point).await {
-                Some(TxnOutcome::Committed) => {
+            let (outcome, all_answered) = self.ask_participants(&tid, &participants).await;
+            match outcome {
+                TxnOutcome::Committed => {
                     warn!(
-                        "transaction {:?} was in doubt here and its commit point {} reports \
-                         it COMMITTED; committing",
-                        tid, commit_point
+                        "transaction {:?} was in doubt here and a participant reports it \
+                         COMMITTED; committing rather than presuming abort",
+                        tid
                     );
                     // Scoped, not just dropped: `Transaction` is not `Send`,
                     // and the async capture analysis keeps a `let ... else`
@@ -1240,8 +1190,8 @@ impl DataManager {
                     };
                     if !still_here {
                         error!(
-                            "transaction {:?} was resolved COMMITTED by its commit point but \
-                             vanished from this site before it could be committed",
+                            "transaction {:?} was resolved COMMITTED by its peers but vanished \
+                             from this site before it could be committed",
                             tid
                         );
                         continue;
@@ -1249,70 +1199,134 @@ impl DataManager {
                     let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
                         .await
                         .payload;
-                    if !matches!(ended, EndResult::Success)
-                        || self.pending_close.lock().contains_key(&tid)
-                    {
+                    if !matches!(ended, EndResult::Success) {
                         error!(
-                            "transaction {:?} was resolved COMMITTED by its commit point but \
-                             this site could not end it yet: {:?}; holding its heads",
+                            "transaction {:?} was resolved COMMITTED by its peers but this site \
+                             could not end it: {:?}. Its bracket stays open and the next start \
+                             will ask again.",
                             tid, ended
+                        );
+                        continue;
+                    }
+                    self.in_doubt_since.lock().remove(&tid);
+                    TERMINATION_COMMITTED.fetch_add(1, Relaxed);
+                }
+                _ if !all_answered => {
+                    // SILENCE IS NOT A VOTE. A participant that could not be
+                    // reached has not said "not committed", so the heads stay
+                    // held and this runs again next second -- but not
+                    // forever: a hostage head is a writer slot gone from its
+                    // chunk with no refill path, so the wait is bounded and
+                    // the give-up is loud.
+                    let waited = {
+                        let mut since = self.in_doubt_since.lock();
+                        let first = since
+                            .entry(tid.clone())
+                            .or_insert_with(std::time::Instant::now);
+                        first.elapsed()
+                    };
+                    if waited < grace {
+                        debug!(
+                            "transaction {:?} is in doubt and not every participant has answered; \
+                             holding its heads ({:?} of {:?})",
+                            tid, waited, grace
                         );
                         hold.insert(tid);
                         continue;
                     }
-                    TERMINATION_COMMITTED.fetch_add(1, Relaxed);
-                }
-                Some(outcome @ (TxnOutcome::Aborted | TxnOutcome::Unknown)) => {
-                    warn!(
-                        "transaction {:?} was in doubt here and its commit point {} reports \
-                         {:?}; aborting",
-                        tid, commit_point, outcome
+                    error!(
+                        "transaction {:?} stayed in doubt for {:?}: not every participant \
+                         answered. Presuming abort, which is the only thing this node can do \
+                         alone -- if a peer did commit it, this store has lost its half.",
+                        tid, waited
                     );
+                    self.in_doubt_since.lock().remove(&tid);
                     TERMINATION_ABORTED.fetch_add(1, Relaxed);
                 }
-                Some(TxnOutcome::InDoubt) | None => {
-                    // SILENCE IS NOT A VOTE, and neither is "in doubt". Only
-                    // the commit point can decide, so wait for it.
-                    debug!(
-                        "transaction {:?} is in doubt and its commit point {} has no answer; \
-                         holding its heads",
-                        tid, commit_point
+                TxnOutcome::Aborted | TxnOutcome::Unknown | TxnOutcome::InDoubt => {
+                    // Every participant answered and none had committed it.
+                    // Presume abort, which is what happened before -- but now
+                    // it is a conclusion rather than an assumption, and the
+                    // log says which.
+                    warn!(
+                        "transaction {:?} was in doubt here and all {} participant(s) report \
+                         {:?}; presuming abort",
+                        tid,
+                        participants.len(),
+                        outcome
                     );
-                    hold.insert(tid);
+                    self.in_doubt_since.lock().remove(&tid);
+                    TERMINATION_ABORTED.fetch_add(1, Relaxed);
                 }
             }
         }
+        // Anything not held this round is no longer in doubt -- decided, or
+        // gone because its `end` finally arrived. Without this the map keeps
+        // an entry per transaction that was ever waiting on a silent peer,
+        // for the life of the process.
+        self.in_doubt_since
+            .lock()
+            .retain(|tid, _| hold.contains(tid));
         hold
     }
 
-    /// Ask the commit point of `tid` what became of it. `None` when it does
-    /// not answer.
-    async fn ask_commit_point(&self, tid: &TxnId, commit_point: u64) -> Option<TxnOutcome> {
-        let txn_manager = self.database_runtime.txn_manager()?;
-        let site = match txn_manager.data_site_for(commit_point).await {
-            Ok(site) => site,
-            Err(error) => {
-                debug!(
-                    "cannot reach commit point {} to resolve {:?}: {}",
-                    commit_point, tid, error
-                );
-                return None;
-            }
+    /// Ask every other participant what became of `tid`.
+    ///
+    /// Resolution rule, in order: one `Committed` decides the transaction, so
+    /// the first is returned immediately. Failing that an explicit `Aborted`
+    /// is a real decision and is reported as one. Everything else -- peers in
+    /// doubt, peers that never heard of it, peers that cannot be reached --
+    /// is `Unknown`, which the caller presumes abort on.
+    ///
+    /// A `Committed` cannot be wrong: only `end` writes a decision record,
+    /// and only a coordinator that decided commit sends `end`.
+    async fn ask_participants(&self, tid: &TxnId, participants: &[u64]) -> (TxnOutcome, bool) {
+        let Some(txn_manager) = self.database_runtime.txn_manager() else {
+            return (TxnOutcome::Unknown, true);
         };
-        match site.txn_status(tid.clone()).await {
-            Ok(response) => {
-                self.update_clock(response.clock);
-                Some(response.payload)
-            }
-            Err(error) => {
-                debug!(
-                    "commit point {} did not answer about {:?}: {:?}",
-                    commit_point, tid, error
-                );
-                None
+        let me = self.database_runtime.rpc.server_id;
+        let mut saw_abort = false;
+        let peers: Vec<u64> = participants
+            .iter()
+            .copied()
+            .filter(|peer| *peer != me)
+            .collect();
+        let mut answered = 0usize;
+        for peer in peers.iter().copied() {
+            let site = match txn_manager.data_site_for(peer).await {
+                Ok(site) => site,
+                Err(error) => {
+                    debug!(
+                        "cannot reach participant {} to resolve {:?}: {}",
+                        peer, tid, error
+                    );
+                    continue;
+                }
+            };
+            match site.txn_status(tid.clone()).await {
+                Ok(response) => {
+                    self.update_clock(response.clock);
+                    answered += 1;
+                    match response.payload {
+                        TxnOutcome::Committed => return (TxnOutcome::Committed, true),
+                        TxnOutcome::Aborted => saw_abort = true,
+                        TxnOutcome::InDoubt | TxnOutcome::Unknown => {}
+                    }
+                }
+                Err(error) => debug!(
+                    "participant {} did not answer about {:?}: {:?}",
+                    peer, tid, error
+                ),
             }
         }
+        let all_answered = answered == peers.len();
+        if saw_abort {
+            (TxnOutcome::Aborted, all_answered)
+        } else {
+            (TxnOutcome::Unknown, all_answered)
+        }
     }
+
 
     /// Keep a multi-site transaction this site committed until it is
     /// settled at every participant. Every participant keeps one: the
@@ -1434,11 +1448,6 @@ impl DataManager {
         }
     }
 
-    /// Record an abort that recovery decided, as the commit point of `tid`.
-    pub(crate) fn record_presumed_abort(&self, tid: &TxnId) {
-        self.record_decision(tid, TxnOutcome::Aborted);
-    }
-
     /// Test hook: record as many later, unrelated decisions as the decision
     /// memory holds, the way that many finished transactions would.
     #[cfg(test)]
@@ -1448,17 +1457,15 @@ impl DataManager {
         }
     }
 
-    /// What this site can say about a transaction, with no side effect.
-    /// For tests: a peer gets `answer_as_commit_point`.
-    #[cfg(test)]
+    /// What this site can say about a transaction, for a peer resolving it.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(outcome) = self.decided.lock().get(tid) {
             return *outcome;
         }
-        // The live record is bounded and a RESTART empties it. The commit
-        // evidence is kept until no participant can ask, so a commit point
-        // that durably committed never answers "never heard of it" to a peer
-        // that is still in doubt.
+        // The live record is bounded and a RESTART empties it. The evidence
+        // keeps every unsettled multi-site commit, so a site that durably
+        // committed never answers "never heard of it" to a peer that is
+        // still in doubt.
         if self.chunks().holds_commit_evidence(tid) {
             return TxnOutcome::Committed;
         }
@@ -1474,139 +1481,6 @@ impl DataManager {
             Some((TxnState::Aborted, false, _)) => TxnOutcome::Aborted,
             Some(_) => TxnOutcome::InDoubt,
             None => TxnOutcome::Unknown,
-        }
-    }
-
-    /// The answer of this site, as the commit point, to a peer that asks
-    /// about `tid`. Only a commit point is asked.
-    ///
-    /// Every answer is final: `Committed` comes from a durable COMMIT, and
-    /// `Aborted` is made true before it is given. A transaction that is live
-    /// here and not decided is aborted now, under its lock, and the abort is
-    /// recorded; a late `end` then finds no transaction and is refused, so
-    /// the coordinator never tells another site to commit. A transaction
-    /// this site never saw is recorded as aborted, so a late prepare of it
-    /// is refused too.
-    ///
-    /// The answer is `InDoubt` only when this site cannot decide: a commit
-    /// whose COMMIT may or may not be on disk, or a transaction this site is
-    /// not the commit point of.
-    pub(crate) fn answer_as_commit_point(&self, tid: &TxnId) -> TxnOutcome {
-        if let Some(outcome) = self.decided.lock().get(tid) {
-            return *outcome;
-        }
-        if self.chunks().holds_commit_evidence(tid) {
-            return TxnOutcome::Committed;
-        }
-        if let Some(txn_lock) = self.find_transaction(tid) {
-            let mut txn = txn_lock.lock();
-            if txn.decided_commit {
-                return if txn.commit_durable {
-                    TxnOutcome::Committed
-                } else {
-                    TxnOutcome::InDoubt
-                };
-            }
-            if !self.is_commit_point(&txn.participants) {
-                return match txn.state {
-                    TxnState::Aborted => TxnOutcome::Aborted,
-                    _ => TxnOutcome::InDoubt,
-                };
-            }
-            let outcome = self.abort_locked(tid, &mut txn);
-            drop(txn);
-            warn!(
-                "transaction {:?} was not decided at its commit point when a peer asked; \
-                 aborted here ({:?}) and answered ABORTED",
-                tid, outcome
-            );
-            self.record_decision(tid, TxnOutcome::Aborted);
-            self.wipe_out_transaction(tid);
-            return TxnOutcome::Aborted;
-        }
-        if let Some(participants) = self.chunks().evidence().resolving_participants(tid) {
-            let me = self.database_runtime.rpc.server_id;
-            if super::commit_point(&participants, me) != me {
-                return TxnOutcome::InDoubt;
-            }
-            // In doubt after a restart, and this site is its commit point:
-            // it holds no COMMIT, so the transaction is aborted. Startup
-            // discards the bracket.
-            self.record_decision(tid, TxnOutcome::Aborted);
-            return TxnOutcome::Aborted;
-        }
-        self.record_decision(tid, TxnOutcome::Aborted);
-        TxnOutcome::Aborted
-    }
-
-    /// Operator tool: decide an in-doubt transaction here, when its commit
-    /// point is lost for good. See `ForceResolveResult`.
-    ///
-    /// WARNING: the operator asserts that the commit point never comes back
-    /// with its data. If it does, and its decision differs, the transaction
-    /// is torn.
-    pub(crate) async fn force_resolve_here(
-        &self,
-        tid: &TxnId,
-        outcome: ForcedOutcome,
-    ) -> ForceResolveResult {
-        let me = self.database_runtime.rpc.server_id;
-        // Read and dropped before any await: `Transaction` is not `Send`.
-        let live = self.find_transaction(tid).map(|txn_lock| {
-            let txn = txn_lock.lock();
-            (txn.state, txn.participants.clone(), txn.decided_commit)
-        });
-        if let Some((state, participants, decided_commit)) = live {
-            if super::commit_point(&participants, me) == me {
-                return ForceResolveResult::CommitPoint;
-            }
-            if decided_commit {
-                return ForceResolveResult::NotInDoubt;
-            }
-            error!(
-                "OPERATOR force-resolve: transaction {:?} is resolved {:?} here without its \
-                 commit point",
-                tid, outcome
-            );
-            return match (outcome, state) {
-                (ForcedOutcome::Commit, TxnState::Committed) => {
-                    match <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
-                        .await
-                        .payload
-                    {
-                        EndResult::Success => ForceResolveResult::Resolved,
-                        other => ForceResolveResult::Failed(format!("{:?}", other)),
-                    }
-                }
-                (ForcedOutcome::Commit, other) => ForceResolveResult::Failed(format!(
-                    "the transaction is {:?} here, so it has no durable entries to commit",
-                    other
-                )),
-                (ForcedOutcome::Abort, _) => {
-                    self.presume_abort(tid);
-                    ForceResolveResult::Resolved
-                }
-            };
-        }
-        let Some(bracket) = self.chunks().take_unresolved(tid) else {
-            return ForceResolveResult::NotInDoubt;
-        };
-        if super::commit_point(&bracket.participants, me) == me {
-            self.chunks().park_unresolved(bracket);
-            return ForceResolveResult::CommitPoint;
-        }
-        error!(
-            "OPERATOR force-resolve: transaction {:?}, in doubt after recovery, is resolved {:?} \
-             here without its commit point",
-            tid, outcome
-        );
-        let commit = matches!(outcome, ForcedOutcome::Commit);
-        if crate::server::finish_in_doubt_bracket(&self.database_runtime, bracket, commit) {
-            ForceResolveResult::Resolved
-        } else {
-            ForceResolveResult::Failed(String::from(
-                "the resolved COMMIT could not be written; the transaction stays in doubt",
-            ))
         }
     }
 
@@ -3661,7 +3535,7 @@ mod tests {
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .sweep_idle_transactions(Duration::ZERO)
+                    .sweep_idle_transactions(Duration::ZERO, Duration::ZERO)
                     .await
             })
         };
@@ -6858,19 +6732,6 @@ impl Service for DataManager {
                 Self::await_prepare_delay(&state).await;
             }
 
-            // A transaction this site already ended, or answered as aborted
-            // to a peer, cannot be prepared again: as the commit point, that
-            // could commit a transaction its peers already aborted.
-            let already_decided = self.decided.lock().get(&tid).copied();
-            if let Some(outcome) = already_decided {
-                debug!(
-                    "PREPARE for {:?} refused: this site already decided it ({:?})",
-                    tid, outcome
-                );
-                return self
-                    .response_with(DMPrepareResult::StateError(TxnState::Aborted))
-                    .await;
-            }
             let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
                 prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
             let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -7034,25 +6895,13 @@ impl Service for DataManager {
         self.response_with(result)
     }
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
-        let outcome = self.answer_as_commit_point(&tid);
+        let outcome = self.txn_outcome(&tid);
         async move { self.response_with(outcome).await }.boxed()
     }
 
     fn open_transactions(&self) -> BoxFuture<'_, DataSiteResponse<Vec<TxnId>>> {
         let open = self.open_transaction_ids();
         async move { self.response_with(open).await }.boxed()
-    }
-
-    fn force_resolve(
-        &self,
-        tid: TxnId,
-        outcome: ForcedOutcome,
-    ) -> BoxFuture<'_, DataSiteResponse<ForceResolveResult>> {
-        async move {
-            let result = self.force_resolve_here(&tid, outcome).await;
-            self.response_with(result).await
-        }
-        .boxed()
     }
 
     fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
