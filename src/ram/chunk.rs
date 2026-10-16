@@ -2145,7 +2145,7 @@ impl Chunk {
             let Ok(cell) = self.read_cell(id.bits()) else {
                 continue;
             };
-            if let Some((found, participants)) =
+            if let Ok((found, participants)) =
                 crate::ram::txn_status::decode_status_cell(&cell.to_owned())
             {
                 if &found == txn {
@@ -2165,7 +2165,7 @@ impl Chunk {
                 Err(_) => return Some(id),
                 Ok(cell) => {
                     if crate::ram::txn_status::decode_status_cell(&cell.to_owned())
-                        .is_some_and(|(found, _)| &found == txn)
+                        .is_ok_and(|(found, _)| &found == txn)
                     {
                         return Some(id);
                     }

@@ -573,17 +573,14 @@ impl BracketLedger {
     /// "this transaction aborted", because another participant may have been
     /// told to commit. Both halves are handed back so the store can ask its
     /// peers before deciding: see [`RecoveredBrackets`].
-    pub(crate) fn settle(
-        &self,
-        chunks: &[Chunk],
-    ) -> Result<RecoveredBrackets, RecoveryCellReadError> {
+    pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, SettleError> {
         let mut commits = std::mem::take(&mut *self.commits.lock());
         let mut participants = std::mem::take(&mut *self.participants.lock());
         // An open bracket of a transaction whose status cell this store holds
         // is committed (D31): a status cell in the index came from a
         // committed bracket, and it survives the compaction that drops the
         // COMMIT of a closed part. Plain status cells are in the index by now.
-        let found_before = self.found_status_cells(chunks);
+        let found_before = self.found_status_cells(chunks)?;
         // A status cell inside an open bracket decides it too: a site writes
         // it only after the transaction is decided COMMIT (the coordinator's
         // `end`, or a participant's `Committed`), and a fenced site never
@@ -756,12 +753,17 @@ impl BracketLedger {
         Ok(RecoveredBrackets {
             committed: committed_txns,
             in_doubt,
-            status_cells: self.found_status_cells(chunks),
+            status_cells: self.found_status_cells(chunks)?,
         })
     }
 
     /// The status cells this recovery met that are live in the index now.
-    fn found_status_cells(&self, chunks: &[Chunk]) -> Vec<crate::ram::txn_status::FoundStatusCell> {
+    /// A live cell in the status schema that does not decode stops the start
+    /// (AGENTS.md §10.1): it may decide a transaction.
+    fn found_status_cells(
+        &self,
+        chunks: &[Chunk],
+    ) -> Result<Vec<crate::ram::txn_status::FoundStatusCell>, SettleError> {
         let mut seen = std::collections::HashSet::new();
         let mut found = Vec::new();
         for (chunk_id, id) in self.status_cells.lock().iter() {
@@ -771,21 +773,29 @@ impl BracketLedger {
             let Some(chunk) = chunks.get(*chunk_id) else {
                 continue;
             };
-            let Ok(cell) = chunk.read_cell(id.bits()) else {
-                continue;
+            let cell = match chunk.read_cell(id.bits()) {
+                Ok(cell) => cell.to_owned(),
+                // Not live: a discarded bracket or a tombstoned status cell.
+                Err(super::cell::ReadError::CellDoesNotExisted) => continue,
+                Err(error) => return Err(SettleError::CellRead(RecoveryCellReadError(error))),
             };
-            if let Some((txn, participants)) =
-                crate::ram::txn_status::decode_status_cell(&cell.to_owned())
-            {
-                found.push(crate::ram::txn_status::FoundStatusCell {
-                    txn,
+            if cell.header.schema != *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
+                continue;
+            }
+            let (txn, participants) = crate::ram::txn_status::decode_status_cell(&cell)
+                .map_err(|error| SettleError::StatusCell {
                     chunk: *chunk_id,
                     id: *id,
-                    participants,
-                });
-            }
+                    error,
+                })?;
+            found.push(crate::ram::txn_status::FoundStatusCell {
+                txn,
+                chunk: *chunk_id,
+                id: *id,
+                participants,
+            });
         }
-        found
+        Ok(found)
     }
 }
 
@@ -986,6 +996,39 @@ impl std::fmt::Display for RecoveryCellReadError {
 }
 
 impl std::error::Error for RecoveryCellReadError {}
+
+/// Why recovery could not settle the brackets it read. The start stops.
+#[derive(Debug)]
+pub(crate) enum SettleError {
+    CellRead(RecoveryCellReadError),
+    /// A live cell in the status schema does not decode.
+    StatusCell {
+        chunk: usize,
+        id: Id,
+        error: crate::ram::txn_status::StatusCellError,
+    },
+}
+
+impl From<RecoveryCellReadError> for SettleError {
+    fn from(error: RecoveryCellReadError) -> Self {
+        SettleError::CellRead(error)
+    }
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SettleError::CellRead(error) => write!(f, "{}", error),
+            SettleError::StatusCell { chunk, id, error } => write!(
+                f,
+                "the status cell {:?} in chunk {} does not decode: {}",
+                id, chunk, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SettleError {}
 
 // Recovery can install cold segments without resident cell bytes. Use the
 // normal read guard to load and pin the block before reading its header.
@@ -4938,6 +4981,34 @@ mod tests {
                 data: data_map_value!(id: id.bits() as i32, data: vec![0x5a_u8; payload]),
             }
         }
+    }
+
+    /// Review finding 5: a status cell that does not decode stops the start.
+    /// A status cell names at least two participants; this one names one.
+    #[test]
+    fn a_start_with_an_undecodable_status_cell_does_not_come_up() {
+        let store = BracketCleanerStore::new(8943, "bad_status_cell");
+        let txn = crate::server::transactions::test_hlc(8943, 1);
+        {
+            let chunks = store.open(false);
+            let id = crate::ram::txn_status::status_id(&txn, 0, 0);
+            let mut cell = crate::ram::txn_status::status_cell(&txn, &id, &[7]);
+            chunks.write_cell(&mut cell).unwrap();
+            let _ = chunks.sync_all();
+            chunks.stop_background();
+        }
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.open(true)));
+        if let Ok(chunks) = &started {
+            warn!(
+                "TEST: the start came up and registered {:?}",
+                chunks.txn_status().get(&txn).map(|entry| entry.participants)
+            );
+            chunks.stop_background();
+        }
+        assert!(
+            started.is_err(),
+            "a start with a status cell that does not decode must stop"
+        );
     }
 
     fn segment_of(chunks: &Chunks, id: &Id) -> lightning::aarc::Arc<crate::ram::segs::Segment> {

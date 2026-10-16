@@ -94,19 +94,56 @@ pub fn status_cell(txn: &TxnId, id: &Id, participants: &[u64]) -> OwnedCell {
     OwnedCell::new_with_id(*TXN_STATUS_SCHEMA_ID, id, OwnedValue::Map(map))
 }
 
-/// The transaction and participants a status cell names.
-pub fn decode_status_cell(cell: &OwnedCell) -> Option<(TxnId, Vec<u64>)> {
-    if cell.header.schema != *TXN_STATUS_SCHEMA_ID {
-        return None;
+/// A cell in the status schema that does not decode as a status cell. It
+/// stops the start: a status cell decides transactions (AGENTS.md §10.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusCellError {
+    /// The cell is not in the status schema.
+    NotAStatusCell,
+    /// A field is missing or has another type.
+    Field(&'static str),
+    /// A status cell names at least two participants.
+    Participants(usize),
+}
+
+impl std::fmt::Display for StatusCellError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatusCellError::NotAStatusCell => write!(f, "the cell is not a status cell"),
+            StatusCellError::Field(name) => {
+                write!(f, "the status cell field {} is missing or has another type", name)
+            }
+            StatusCellError::Participants(count) => write!(
+                f,
+                "the status cell names {} participant(s); a status cell names at least 2",
+                count
+            ),
+        }
     }
-    let ts = *cell.data[TS_FIELD].u64()?;
-    let node = *cell.data[NODE_FIELD].u64()?;
-    let participants = match &cell.data[PARTICIPANTS_FIELD] {
-        OwnedValue::PrimArray(OwnedPrimArray::U64(ids)) => ids.clone(),
-        OwnedValue::Array(values) => values.iter().filter_map(|v| v.u64().copied()).collect(),
-        _ => Vec::new(),
+}
+
+impl std::error::Error for StatusCellError {}
+
+/// The transaction and participants a status cell names. The writer
+/// (`status_cell`) makes one encoding only, and only that one decodes.
+pub fn decode_status_cell(cell: &OwnedCell) -> Result<(TxnId, Vec<u64>), StatusCellError> {
+    if cell.header.schema != *TXN_STATUS_SCHEMA_ID {
+        return Err(StatusCellError::NotAStatusCell);
+    }
+    let ts = *cell.data[TS_FIELD]
+        .u64()
+        .ok_or(StatusCellError::Field(TS_FIELD))?;
+    let node = *cell.data[NODE_FIELD]
+        .u64()
+        .ok_or(StatusCellError::Field(NODE_FIELD))?;
+    let OwnedValue::PrimArray(OwnedPrimArray::U64(participants)) = &cell.data[PARTICIPANTS_FIELD]
+    else {
+        return Err(StatusCellError::Field(PARTICIPANTS_FIELD));
     };
-    Some((TxnId { ts, node }, participants))
+    if participants.len() < 2 {
+        return Err(StatusCellError::Participants(participants.len()));
+    }
+    Ok((TxnId { ts, node }, participants.clone()))
 }
 
 /// A status cell recovery found live in the index.
@@ -303,5 +340,10 @@ mod tests {
         let (decoded, participants) = decode_status_cell(&cell).unwrap();
         assert_eq!(decoded, txn);
         assert_eq!(participants, vec![9, 4]);
+        let lone = status_cell(&txn, &id, &[9]);
+        assert_eq!(
+            decode_status_cell(&lone),
+            Err(StatusCellError::Participants(1))
+        );
     }
 }
