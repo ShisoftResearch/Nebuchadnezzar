@@ -1028,10 +1028,25 @@ pub async fn reshard_slots(
     for round in 0..plan.delta_rounds.max(1) {
         let held = match enumerate_slots(&donor, &began).await {
             Ok(held) => held,
-            Err(error) if round == 0 => fail_all!(
-                began.clone(),
-                format!("could not enumerate donor: {error:?}")
-            ),
+            Err(error) if round == 0 => {
+                // Nothing moved yet. Give every begun slot back to its donor,
+                // as `migrate_slot` does, or the table keeps them `Migrating`
+                // (review N1). A `SlotInDoubt` refusal comes here.
+                for slot in &began {
+                    if let Err(abort_error) = placement.abort_slot_migration(&group, slot).await {
+                        warn!(
+                            "slot {slot}: the reshard could not enumerate donor {from} \
+                             ({error}) and the migration could not be aborted \
+                             ({abort_error:?}); the slot stays with its donor but its table \
+                             entry still reads as migrating"
+                        );
+                    }
+                }
+                fail_all!(
+                    began.clone(),
+                    format!("could not enumerate donor: {error:?}")
+                )
+            }
             // A later round failing is not fatal: the earlier rounds transferred,
             // and the reclaim's carry-over is the backstop for anything missed.
             Err(error) => {

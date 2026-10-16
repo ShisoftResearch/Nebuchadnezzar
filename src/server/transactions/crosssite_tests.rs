@@ -2269,6 +2269,63 @@ async fn a_slot_migration_of_an_in_doubt_cell_keeps_the_transaction() {
     cluster.shutdown().await;
 }
 
+/// Review N1: a bulk reshard refused with `SlotInDoubt` must not leave its
+/// slots `Migrating`. Slot `HERE` holds a cell of T, in doubt at A; slot
+/// `HERE_TOO` holds nothing. After the refusal both slots read `Stable` on A.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_reshard_leaves_every_slot_stable_on_its_donor() {
+    const D: usize = 3;
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
+    let (mut cluster, client) = Cluster::start_with(
+        "crosssite_n1_reshard",
+        vec![vec![Service::Cell, Service::Transaction]],
+    )
+    .await;
+    place_slot(&cluster, &client, HERE_TOO, A).await;
+    let (tid, _ids, _scores) = torn_transaction(&cluster, &client, 41_000).await;
+    wait_status_synced(&cluster, B, &tid).await;
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(b_id);
+    cluster.restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid), "test setup: A must wait for B");
+    let from = cluster.site(A).server_id;
+    let to = cluster.site(D).server_id;
+    let plan = crate::migration::MigrationPlan {
+        batch_cells: 8,
+        ..Default::default()
+    };
+    let slots = [HERE as u32, HERE_TOO as u32];
+    let reshard = crate::migration::reshard_slots(&client, &slots, from, to, &plan).await;
+    warn!("CROSSSITE N1: the reshard failed {:?}", reshard.failed);
+    let placement = crate::migration::placement_client(&client);
+    let group = crate::slots::slot_group_id(client.group_name());
+    let mut states = Vec::new();
+    for slot in slots {
+        states.push(placement.slot_state(&group, &slot).await.unwrap());
+    }
+    super::data_site::silent_peers_for_test().lock().remove(&b_id);
+    wait_until("A's resolution", 60, || !in_doubt_on(&cluster, A, &tid)).await;
+    assert!(reshard.handovers.is_empty(), "nothing may move while T is in doubt");
+    assert_eq!(reshard.failed.len(), 2, "both slots fail: {:?}", reshard.failed);
+    for (slot, state) in slots.iter().zip(states) {
+        assert_eq!(
+            state,
+            Some(bifrost::conshash::slots::SlotState::Stable { owner: from }),
+            "slot {} must be stable on its donor after the refusal",
+            slot
+        );
+    }
+    assert!(
+        reshard
+            .failed
+            .iter()
+            .all(|(_, reason)| reason.contains("SlotInDoubt")),
+        "the failure must name the slot in doubt: {:?}",
+        reshard.failed
+    );
+    cluster.shutdown().await;
+}
+
 /// Review R5: one silent peer must not block a commit that another peer
 /// proves. Three sites: the seed, A and B (every pair knows the other's
 /// address in this harness). Only the lowest id L is told. H learns the
