@@ -9,6 +9,8 @@
 //! `NEB_IWP_CHUNK_SIZE` overrides the chunk size of the write rows in bytes.
 //! `NEB_IWP_WRITERS` sets the writer count of the multi-writer rows
 //! (default: 16), such as `delete_32`.
+//! `NEB_IWP_LOCALITIES` spreads the cells over that many localities, so over
+//! that many chunks (default: 1, every cell at locality 3).
 //! Output includes throughput, latency percentiles, and peak RSS.
 use dovahkiin::types::*;
 use futures::FutureExt;
@@ -56,10 +58,20 @@ fn extended_counters() -> [u64; 8] {
 
 const SCHEMA: u32 = 7402;
 const SEED_VERSION: u64 = 2;
+fn cell_id(id: u64) -> Id {
+    static SPREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let spread = *SPREAD.get_or_init(|| {
+        std::env::var("NEB_IWP_LOCALITIES")
+            .map(|v| v.parse().expect("NEB_IWP_LOCALITIES must be a count"))
+            .unwrap_or(1)
+    });
+    Id::from_parts(3 + id % spread.max(1), id)
+}
+
 fn cell(id: u64, value: u64) -> OwnedCell {
     let mut data = OwnedValue::Map(OwnedMap::new());
     data["value"] = OwnedValue::U64(value);
-    OwnedCell::new_with_id(SchemaVid(SCHEMA), &Id::from_parts(3, id), data)
+    OwnedCell::new_with_id(SchemaVid(SCHEMA), &cell_id(id), data)
 }
 async fn phase(
     client: Arc<AsyncClient>,
@@ -106,7 +118,7 @@ async fn phase(
                     "compare" => {
                         let result = client
                             .compare_version_and_update_cell(
-                                Id::from_parts(3, id),
+                                cell_id(id),
                                 SEED_VERSION,
                                 cell(id, 1 + seq % 8),
                             )
@@ -121,11 +133,7 @@ async fn phase(
                         result.unwrap();
                     }
                     "delete" => {
-                        client
-                            .remove_cell(Id::from_parts(3, id))
-                            .await
-                            .unwrap()
-                            .unwrap();
+                        client.remove_cell(cell_id(id)).await.unwrap().unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -331,7 +339,7 @@ async fn run() {
             while !read_finished.load(Ordering::Acquire) {
                 let started = Instant::now();
                 reader
-                    .read_cell(Id::from_parts(3, 16_000_000 + sequence % count))
+                    .read_cell(cell_id(16_000_000 + sequence % count))
                     .await
                     .unwrap()
                     .unwrap();
