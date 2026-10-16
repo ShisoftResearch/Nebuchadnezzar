@@ -4501,7 +4501,7 @@ mod tests {
             let range = chunks.address_range();
             match how {
                 "closed" => {
-                    chunks.commit_transaction_brackets(&txn).unwrap();
+                    chunks.commit_transaction_brackets(&txn, false).unwrap();
                     crate::ram::chunk::release_transaction_leases(&txn, &range).unwrap();
                 }
                 "release" => {
@@ -4728,7 +4728,7 @@ mod tests {
                     drop(pending);
                     drop(scope);
                     // The caller is told this succeeded.
-                    let committed = chunks.commit_transaction_brackets(&txn);
+                    let committed = chunks.commit_transaction_brackets(&txn, false);
                     eprintln!("H1 no_room: commit_transaction_brackets -> {:?}", committed);
                     assert!(committed.is_ok());
                     drop(crate::ram::chunk::take_transactional_segments());
@@ -4979,7 +4979,7 @@ mod tests {
             assert_ne!(part2.id, part1.id, "test setup: a second part must open");
             drop(scope);
 
-            chunks.commit_transaction_brackets(&txn).expect("commit");
+            chunks.commit_transaction_brackets(&txn, false).expect("commit");
             crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range())
                 .expect("release after commit");
 
@@ -7676,7 +7676,7 @@ mod tests {
                 segment.force_wal_sync().unwrap();
             }
             crate::ram::chunk::retire_transaction_leases(&txn, &chunks.address_range()).unwrap();
-            chunks.list[0].write_resolved_commit(&txn).unwrap();
+            chunks.list[0].write_resolved_commit(&txn, &[]).unwrap();
         }
         {
             let recovered = store.open(true);
@@ -7725,7 +7725,9 @@ mod tests {
                 let segment = &segment;
                 scope.spawn(move || {
                     let result = if decision {
-                        chunks.commit_transaction_brackets(txn)
+                        chunks
+                            .commit_transaction_brackets(txn, false)
+                            .map_err(|refusal| refusal.error().clone())
                     } else {
                         segment
                             .force_wal_sync()
@@ -7766,7 +7768,7 @@ mod tests {
             segment.durable_receipt().unwrap().is_none(),
             "the prepare sync must cover both the WAL prefix and its namespace"
         );
-        chunks.commit_transaction_brackets(&txn).unwrap();
+        chunks.commit_transaction_brackets(&txn, false).unwrap();
         crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
         drop(crate::ram::chunk::take_transactional_segments());
     }
@@ -7792,7 +7794,7 @@ mod tests {
             chunks.write_cell(&mut store.cell(&id, 1024)).unwrap();
         }
         let segment = segment_of(&chunks, &id);
-        chunks.commit_transaction_brackets(&txn).unwrap();
+        chunks.commit_transaction_brackets(&txn, false).unwrap();
         crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range()).unwrap();
         rotate_out(&chunks.list[0], segment.id);
         assert!(segment.protection.transaction_pending());
@@ -7836,7 +7838,7 @@ mod tests {
         }
         let entries_synced = last.wal_append_position();
         let (result, _receipts) =
-            crate::ram::durability::capture(|| chunks.commit_transaction_brackets(&txn));
+            crate::ram::durability::capture(|| chunks.commit_transaction_brackets(&txn, false));
         result.unwrap();
         let last_synced = last.durable_file().unwrap().watermark();
         assert!(last.wal_append_position() > entries_synced);
@@ -7977,7 +7979,7 @@ mod tests {
             if before_commit {
                 Ok(())
             } else {
-                chunks.commit_transaction_brackets(&txn)
+                chunks.commit_transaction_brackets(&txn, false)
             }
         });
         if refuse {
