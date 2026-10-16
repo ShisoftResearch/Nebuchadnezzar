@@ -237,6 +237,15 @@ impl Transaction {
                     },
                 ))
             }
+            Ok(Ok(EndResult::DecidedPending)) => {
+                // Decided COMMIT: every site keeps it and finishes its close
+                // later. A retry would apply it twice.
+                warn!(
+                    "Transaction {:?} is committed; its sites finish closing it later",
+                    self.tid
+                );
+                Ok(())
+            }
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
