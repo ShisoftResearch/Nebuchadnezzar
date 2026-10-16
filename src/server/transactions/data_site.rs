@@ -1419,8 +1419,9 @@ impl DataManager {
     /// The participant fence for one in-doubt transaction (D29).
     ///
     /// 1. Ask every other participant. One `Committed` decides commit: only a
-    ///    coordinator that decided commit sends `end`. A participant that
-    ///    does not answer means wait.
+    ///    coordinator that decided commit sends `end`. A peer that is silent
+    ///    does not stop the others from being asked. If no peer answered
+    ///    `Committed`, a silent peer or a `Committing` answer means wait.
     /// 2. Fence this site, then every other participant. A fenced site
     ///    refuses the coordinator's `end` under its transaction lock, so
     ///    `end` and the fence are ordered on each site.
@@ -1436,11 +1437,16 @@ impl DataManager {
         let Some(txn_manager) = self.database_runtime.txn_manager().cloned() else {
             return InDoubtDecision::Wait;
         };
+        // Ask every peer: one `Committed` decides commit, also while another
+        // peer is silent (review R5). Silence or `Committing` means wait, but
+        // only after every reachable peer was asked.
         let mut sites = Vec::with_capacity(peers.len());
+        let mut wait = false;
         for peer in peers {
             #[cfg(test)]
             if silent_peers_for_test().lock().contains(peer) {
-                return InDoubtDecision::Wait;
+                wait = true;
+                continue;
             }
             match txn_manager.data_site_for(*peer).await {
                 Ok(site) => sites.push((*peer, site)),
@@ -1449,7 +1455,7 @@ impl DataManager {
                         "cannot reach participant {} to resolve {:?}: {}",
                         peer, tid, error
                     );
-                    return InDoubtDecision::Wait;
+                    wait = true;
                 }
             }
         }
@@ -1460,7 +1466,7 @@ impl DataManager {
                     match response.payload {
                         TxnOutcome::Committed => return InDoubtDecision::Commit,
                         // Decided, not synced yet (F1): ask again later.
-                        TxnOutcome::Committing => return InDoubtDecision::Wait,
+                        TxnOutcome::Committing => wait = true,
                         _ => {}
                     }
                 }
@@ -1469,9 +1475,12 @@ impl DataManager {
                         "participant {} did not answer about {:?}: {:?}",
                         peer, tid, error
                     );
-                    return InDoubtDecision::Wait;
+                    wait = true;
                 }
             }
+        }
+        if wait {
+            return InDoubtDecision::Wait;
         }
         match self.fence_here(tid) {
             FenceAnswer::Fenced | FenceAnswer::Unknown | FenceAnswer::Aborted => {}

@@ -2269,6 +2269,72 @@ async fn a_slot_migration_of_an_in_doubt_cell_keeps_the_transaction() {
     cluster.shutdown().await;
 }
 
+/// Review R5: one silent peer must not block a commit that another peer
+/// proves. Three sites: the seed, A and B (every pair knows the other's
+/// address in this harness). Only the lowest id L is told. H learns the
+/// commit from L. Then L is silent to M; M must still commit from H.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_silent_peer_does_not_block_a_commit_another_peer_proves() {
+    const HERE_SEED: u16 = 95;
+    let (cluster, client) = Cluster::start("crosssite_r5_silent_peer").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    place_slot(&cluster, &client, HERE_SEED, SEED).await;
+    drop(client);
+    let sites = [A, B, SEED];
+    let ids: Vec<Id> = [HERE, THERE, HERE_SEED]
+        .iter()
+        .map(|slot| Id::from_parts(*slot as u64, 5))
+        .collect();
+    let scores: Vec<u64> = (0..3).map(|n| 40_000 + n).collect();
+    let txn = coordinator(&cluster).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (id, score) in ids.iter().zip(scores.iter()) {
+        txn.write(tid.clone(), cell_of(*id, *score))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+    let mut by_id = sites.to_vec();
+    by_id.sort_by_key(|index| cluster.site(*index).server_id);
+    let (low, mid, high) = (by_id[0], by_id[1], by_id[2]);
+    let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    wait_status_synced(&cluster, low, &tid).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while in_doubt_on(&cluster, high, &tid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test setup: H must learn the commit from L"
+        );
+        data_site(&cluster, high)
+            .sweep_idle_transactions(Duration::ZERO)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    wait_status_synced(&cluster, high, &tid).await;
+    let low_id = cluster.site(low).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(low_id);
+    for _ in 0..3 {
+        data_site(&cluster, mid)
+            .sweep_idle_transactions(Duration::ZERO)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let waiting = in_doubt_on(&cluster, mid, &tid);
+    warn!(
+        "CROSSSITE R5: M in doubt {} while L is silent and H committed",
+        waiting
+    );
+    super::data_site::silent_peers_for_test().lock().remove(&low_id);
+    assert!(!waiting, "M must commit from H's `Committed` while L is silent");
+    let n = sites.iter().position(|site| *site == mid).unwrap();
+    assert_eq!(score_on(cluster.site(mid), &ids[n]), Some(scores[n]));
+    cluster.shutdown().await;
+}
+
 /// C16 (F6): A aborts after the fence; the cleaner runs on A; A restarts;
 /// a duplicate `prepare` arrives. A refuses it: the fence survives the
 /// compaction and the start.
