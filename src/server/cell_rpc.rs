@@ -101,6 +101,13 @@ service! {
     rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_verified(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr, checks: &Vec<crate::index::verification::IndexCheck>) -> Vec<Result<OwnedCell, ReadError>>;
+    // Plain writes: `write_cell`, `update_cell`, `upsert_cell`,
+    // `upsert_all_cells`, `remove_cell` and their durable and captured forms.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write survives the resolution of an in-doubt
+    // transaction: after a restart with a transaction T in doubt, the plain
+    // write and T's write can get the same version, and only one is kept.
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc head_cell(key: Id) -> Result<CellHeader, ReadError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -135,6 +142,12 @@ service! {
     rpc fence_renew(token: u64, lease_ms: u64) -> bool;
     rpc fence_release(token: u64) -> ();
 
+    // Plain writes, durable and captured forms.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write survives the resolution of an in-doubt
+    // transaction: after a restart with a transaction T in doubt, the plain
+    // write and T's write can get the same version, and only one is kept.
     rpc write_cell_durable(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
