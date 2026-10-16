@@ -5,6 +5,7 @@
 //! `NEB_IWP_ONLY` selects comma-separated rows, such as `update_1,delete_16`.
 //! `compare_1,compare_16` uses successful CAS on distinct seeded cells.
 //! `NEB_IWP_INDEXES` selects none, hashed, or mixed (ranged and hashed).
+//! `NEB_IWP_DB_SIZE` overrides store capacity in bytes.
 //! Output includes throughput, latency percentiles, and peak RSS.
 use dovahkiin::types::*;
 use futures::FutureExt;
@@ -240,11 +241,13 @@ async fn run() {
             } else {
                 128 * 1024 * 1024
             },
-            db_size: if startup {
-                16 * 1024 * 1024 * 1024
-            } else {
-                512 * 1024 * 1024
-            },
+            db_size: std::env::var("NEB_IWP_DB_SIZE")
+                .map(|value| value.parse().expect("NEB_IWP_DB_SIZE must be bytes"))
+                .unwrap_or(if startup {
+                    16 * 1024 * 1024 * 1024
+                } else {
+                    512 * 1024 * 1024
+                }),
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into()),
