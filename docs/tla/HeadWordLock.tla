@@ -292,15 +292,22 @@ AppendUnderBoth ==
     /\ pc[p] \in {"d_append", "w_append"} =>
          word[CellOf(p)] = p /\ myHead[p] # NoOne /\ head[myHead[p]] = p
     /\ pc[p] = "d_append" => exists[CellOf(p)] /\ PredOf(p)
+    /\ (pc[p] = "w_append" /\ WAlgoOf(p) = "wordfast") => exists[CellOf(p)] /\ PredOf(p)
 
 \* Result codes of a delete (and of the CAS candidate) follow the last check made
 \* under the word: an absent cell or a false predicate is never "nospace", even
 \* at a full store; "ok" only for a cell that existed.
 ResultCodes ==
-  \A p \in Procs : KindOf(p) \in {"D"} =>
-    /\ result[p] = "nospace" => sawExists[p]
-    /\ result[p] = "absent" => ~sawExists[p]
-    /\ result[p] = "ok" => sawExists[p]
+  /\ \A p \in Procs : KindOf(p) \in {"D"} =>
+       /\ result[p] = "nospace" => sawExists[p]
+       /\ result[p] = "absent" => ~sawExists[p]
+       /\ result[p] = "ok" => sawExists[p]
+  \* The CAS order: a lost CAS never reports "no space", and "ok" only after
+  \* the version check passed under the word.
+  /\ \A p \in Procs : (KindOf(p) = "W" /\ WAlgoOf(p) = "wordfast") =>
+       /\ result[p] = "nospace" => sawExists[p]
+       /\ result[p] = "mismatch" => ~sawExists[p]
+       /\ result[p] = "ok" => sawExists[p]
 
 \* The lease rule keeps one unleased head.
 LeaseSpare == Cardinality({h \in Heads : leased[h]}) <= Cardinality(Heads) - 1

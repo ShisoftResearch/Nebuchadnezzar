@@ -64,6 +64,11 @@ for a in ['old', 'cur', 'new']:
     sc(f'full_{a}', 'pass', full_procs, full_exists, 2, a, full=True)
 # 5. CAS candidate (second target): word first with the same bounded try.
 sc('cas_wordfast_k2', 'pass', {'w1': W(alg='wordfast'), 'w2': W(alg='wordfast'), 'w3': W(), 'd1': D(), 'c1': C(), 't1': T()}, X, 2, 'new')
+sc('ctl_cas_unbounded_try', 'deadlock', {'w1': W(alg='wordfast'), 'w2': W()}, X, 1, 'new', fast_bounded=False,
+   note='control: the CAS free-head try without its bound')
+sc('full_cas', 'pass', {'w1': W('x', alg='wordfast'), 'w2': W('z', alg='wordfast'), 'd1': D('y')},
+   {'x': False, 'y': True, 'z': True}, 2, 'new', full=True,
+   note='full store: a lost CAS gives mismatch, never no space')
 sc('cas_wordfast_k1', 'pass', {'w1': W(alg='wordfast'), 'w2': W(), 'd1': D(), 'c1': C()}, X, 1, 'new')
 
 def write(name, s):

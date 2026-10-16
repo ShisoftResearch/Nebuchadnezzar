@@ -160,4 +160,6 @@ TLC=tlc python3 HeadWordLock.py --out /some/scratch/dir
 | `full_old`, `full_cur`, `full_new` | No error. At a full store an absent cell or a false predicate gives "absent", never "no space". |
 | `new_u_bounded_c1`, `new_u_bounded_c1_k3` | No error. A word-first updater holds the word and waits for a head while every head owner waits for that word (cycle C1). The updater refuses at the head-queue deadline and releases the word. |
 | `cur_u_unbounded`, `new_u_unbounded` | Deadlock, on purpose: C1 without that deadline, which was the code before the C1 fix. |
+| `ctl_cas_unbounded_try` | Deadlock, on purpose: the CAS free-head try without its bound. |
+| `full_cas` | No error. At a full store a CAS on an absent cell (a lost CAS in the model) reports a mismatch, never "no space". |
 | `cas_wordfast_*` | No error. The current CAS order: check the version, write and publish under one word hold if a head is free; else the bounded try ends, the word is released, and the CAS checks again under a new hold after it gets a head. |
