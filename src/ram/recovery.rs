@@ -493,6 +493,13 @@ pub struct PendingBracketCell {
 pub static BRACKETS_DISCARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BRACKETS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+impl PendingBracketCell {
+    /// The id (bits) of the cell this entry writes or deletes.
+    pub(crate) fn id_bits(&self) -> u64 {
+        self.hash
+    }
+}
+
 impl BracketLedger {
     pub fn new(files: &[SegmentFileInfo]) -> Self {
         BracketLedger {

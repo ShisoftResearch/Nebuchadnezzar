@@ -7083,6 +7083,18 @@ impl Service for DataManager {
                     }
                     _ => break 'result DMPrepareResult::StateError(txn.state),
                 }
+                // A cell of a bracket that is in doubt after a restart has no
+                // lock owner here, and its committed version may still come
+                // (review finding 2). Wait for the resolution.
+                {
+                    let registry = self.chunks().txn_status();
+                    if prepared_ops
+                        .iter()
+                        .any(|op| registry.is_in_doubt_cell(op.id.bits()))
+                    {
+                        break 'result DMPrepareResult::Wait;
+                    }
+                }
 
                 let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
                 let mut cell_guards = Vec::with_capacity(prepared_ops.len());

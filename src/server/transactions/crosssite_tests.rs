@@ -1761,6 +1761,79 @@ async fn a_fence_during_a_prepare_in_flight_is_kept() {
     cluster.shutdown().await;
 }
 
+/// Review finding 2: after a restart, the cells of an in-doubt bracket are
+/// not locked. A later transaction T2 writes the same cell while T is in
+/// doubt. When T resolves `Committed`, one of the two writes is lost: T is
+/// torn, or T2's acknowledged write is gone. T2 must not commit while T is in
+/// doubt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_to_an_in_doubt_cell_after_a_restart_waits_for_the_resolution() {
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
+    let (mut cluster, client) = Cluster::start("crosssite_r2_in_doubt_cell").await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 30_000).await;
+    drop(client);
+    wait_status_synced(&cluster, B, &tid).await;
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(b_id);
+    cluster.restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid), "test setup: A must wait for B");
+
+    const T2_SCORE: u64 = 30_500;
+    let later = coordinator(&cluster).await;
+    let x = ids[0];
+    let t2_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let t2_flag = t2_done.clone();
+    let t2 = tokio::spawn(async move {
+        let t2 = later.begin().await.unwrap().unwrap();
+        later
+            .write(t2.clone(), cell_of(x, T2_SCORE))
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared = later.prepare(t2.clone()).await;
+        if !matches!(prepared, Ok(Ok(TMPrepareResult::Success))) {
+            return false;
+        }
+        let committed = matches!(
+            later.commit(t2.clone()).await,
+            Ok(Ok(EndResult::Success)) | Ok(Ok(EndResult::DecidedPending))
+        );
+        t2_flag.store(committed, std::sync::atomic::Ordering::SeqCst);
+        committed
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let committed_in_doubt = t2_done.load(std::sync::atomic::Ordering::SeqCst);
+
+    super::data_site::silent_peers_for_test().lock().remove(&b_id);
+    wait_until("A's resolution", 60, || !in_doubt_on(&cluster, A, &tid)).await;
+    let t2_committed = tokio::time::timeout(Duration::from_secs(60), t2)
+        .await
+        .expect("T2 must finish once T is resolved")
+        .unwrap();
+    let held = score_on(cluster.site(A), &x);
+    let (_, b) = halves(&cluster, &ids, &scores);
+    warn!(
+        "CROSSSITE finding 2: T2 finished while T was in doubt: {}, T2 committed: {}, X holds \
+         {:?} (T wrote {}, T2 wrote {}), B holds T's half: {}",
+        committed_in_doubt, t2_committed, held, scores[0], T2_SCORE, b
+    );
+    assert!(b, "test setup: B committed T");
+    if t2_committed {
+        assert_eq!(
+            held,
+            Some(T2_SCORE),
+            "T2's acknowledged write is lost"
+        );
+    } else {
+        assert_eq!(held, Some(scores[0]), "T is torn: A lost its half");
+    }
+    assert!(
+        !committed_in_doubt,
+        "T2 committed a write to a cell of the in-doubt T"
+    );
+    cluster.shutdown().await;
+}
+
 /// C16 (F6): A aborts after the fence; the cleaner runs on A; A restarts;
 /// a duplicate `prepare` arrives. A refuses it: the fence survives the
 /// compaction and the start.

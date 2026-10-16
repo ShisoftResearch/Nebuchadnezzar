@@ -5289,7 +5289,11 @@ impl Chunks {
         }
         for bracket in &brackets.in_doubt {
             self.txn_status
-                .begin_resolving(bracket.txn.clone(), bracket.participants.clone());
+                .begin_resolving(
+                    bracket.txn.clone(),
+                    bracket.participants.clone(),
+                    bracket.cells.iter().map(|cell| cell.id_bits()).collect(),
+                );
         }
         *self.recovered_brackets.lock() = brackets;
     }

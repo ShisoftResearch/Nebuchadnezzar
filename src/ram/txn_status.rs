@@ -144,12 +144,20 @@ struct State {
     ids: HashSet<u64>,
     /// In doubt after recovery, and not resolved yet: the participants.
     resolving: BTreeMap<TxnId, Vec<u64>>,
+    /// The cell ids of each in-doubt bracket, and how many in-doubt
+    /// brackets hold each id. A `prepare` that writes one of these ids waits
+    /// until the bracket is resolved (review finding 2).
+    resolving_cells: BTreeMap<TxnId, Vec<u64>>,
+    in_doubt_cells: std::collections::HashMap<u64, usize>,
 }
 
 /// The status cells of one store, and the transactions it resolves.
 #[derive(Default)]
 pub struct TxnStatusRegistry {
     state: Mutex<State>,
+    /// How many cell ids `in_doubt_cells` holds: the common path pays one
+    /// atomic load.
+    in_doubt_cell_count: std::sync::atomic::AtomicUsize,
 }
 
 impl TxnStatusRegistry {
@@ -212,12 +220,55 @@ impl TxnStatusRegistry {
             .collect()
     }
 
-    pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>) {
-        self.state.lock().resolving.insert(txn, participants);
+    /// `txn` is in doubt after recovery: its bracket writes `cells` (id
+    /// bits) here.
+    pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>, mut cells: Vec<u64>) {
+        cells.sort_unstable();
+        cells.dedup();
+        let mut state = self.state.lock();
+        state.resolving.insert(txn.clone(), participants);
+        for id in &cells {
+            *state.in_doubt_cells.entry(*id).or_insert(0) += 1;
+        }
+        if let Some(old) = state.resolving_cells.insert(txn, cells) {
+            Self::forget_cells(&mut state, &old);
+        }
+        self.in_doubt_cell_count
+            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
     }
 
     pub fn end_resolving(&self, txn: &TxnId) {
-        self.state.lock().resolving.remove(txn);
+        let mut state = self.state.lock();
+        state.resolving.remove(txn);
+        if let Some(cells) = state.resolving_cells.remove(txn) {
+            Self::forget_cells(&mut state, &cells);
+        }
+        self.in_doubt_cell_count
+            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    fn forget_cells(state: &mut State, cells: &[u64]) {
+        for id in cells {
+            if let Some(holders) = state.in_doubt_cells.get_mut(id) {
+                *holders -= 1;
+                if *holders == 0 {
+                    state.in_doubt_cells.remove(id);
+                }
+            }
+        }
+    }
+
+    /// Whether `id` is a cell of a bracket that is in doubt after recovery.
+    /// One atomic load while no bracket is in doubt.
+    pub fn is_in_doubt_cell(&self, id: u64) -> bool {
+        if self
+            .in_doubt_cell_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            return false;
+        }
+        self.state.lock().in_doubt_cells.contains_key(&id)
     }
 
     pub fn resolving(&self) -> Vec<TxnId> {
