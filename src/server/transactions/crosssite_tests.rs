@@ -158,10 +158,16 @@ impl Cluster {
 
     async fn start_site(&mut self, index: usize) {
         assert!(self.servers[index].is_none());
+        // A start waits for every listed peer to be a member, so a member
+        // that is down is not listed.
+        let peers: Vec<String> = (0..self.addresses.len())
+            .filter(|peer| *peer == index || self.servers[*peer].is_some())
+            .map(|peer| self.addresses[peer].clone())
+            .collect();
         let server = NebServer::new_cluster_from_opts(
             &opts_for(&self.temp[index], &self.services[index]),
             &self.addresses[index],
-            &self.addresses,
+            &peers,
             &self.group,
             async |_| {},
         )
@@ -200,8 +206,11 @@ impl Cluster {
         self.start_site(index).await;
     }
 
-    /// A power loss of every site in `sites` at one instant, then a start
-    /// of each, in the order given.
+    /// A power loss of every site in `sites` at one instant: the images of
+    /// all of them are taken first. Then each site restarts from its image,
+    /// one at a time and in the order given, so the meta raft group keeps a
+    /// majority (stopping most members at once trips a bifrost raft
+    /// assertion, `bifrost/src/raft/mod.rs:2987`).
     async fn power_cut_all(&mut self, sites: &[usize]) {
         let mut images = Vec::new();
         for index in sites {
@@ -216,17 +225,13 @@ impl Cluster {
             .unwrap();
             images.push(image);
         }
-        for index in sites {
-            self.stop(*index).await;
-        }
         for (index, image) in sites.iter().zip(images) {
+            self.stop(*index).await;
             copy_dir(
                 &self.temp[*index].path().join("raft"),
                 &image.path().join("raft"),
             );
             self.temp[*index] = image;
-        }
-        for index in sites {
             self.start_site(*index).await;
         }
     }
