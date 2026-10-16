@@ -206,9 +206,8 @@ const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
 /// Pool sizes per class. Elastic in USE (slots fill only under real
-/// contention), fixed in CAPACITY. The .239 contention spike showed K=4
-/// degrading badly at 96-192 threads and K=8-16 behaving well; blobs see a
-/// fraction of the traffic and 8 MiB per resident head is real money.
+/// contention), fixed in CAPACITY. Blobs see a fraction of the traffic and
+/// 8 MiB per resident head is real money.
 ///
 /// The blob pool is 4 rather than 2 because a transaction leases a head for
 /// its whole lifetime, and `can_spare_a_head_for_lease` will not hand out
@@ -217,23 +216,56 @@ const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 /// resident until blob traffic actually contends -- an EMPTY slot counts as
 /// available to a lease without a segment behind it -- so this buys blob
 /// atomicity at zero cost in the quiet case, which is the common one.
-fn head_pool_len(segment_class: SegmentClass) -> usize {
-    static REGULAR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn head_pool_override(var: &str) -> Option<usize> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        // Floor of 2, not 1: with a single slot, a thread that ever
+        // needed a second entry while holding its first would spin on
+        // its own ownership forever.
+        .map(|v| v.clamp(2, 64))
+}
+
+fn blob_head_pool_len() -> usize {
     static BLOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let read = |var: &str, default: usize| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            // Floor of 2, not 1: with a single slot, a thread that ever
-            // needed a second entry while holding its first would spin on
-            // its own ownership forever.
-            .map(|v| v.clamp(2, 64))
-            .unwrap_or(default)
-    };
-    match segment_class {
-        SegmentClass::Regular => *REGULAR.get_or_init(|| read("NEB_HEAD_POOL", 8)),
-        SegmentClass::Blob => *BLOB.get_or_init(|| read("NEB_BLOB_HEAD_POOL", 4)),
+    *BLOB.get_or_init(|| head_pool_override("NEB_BLOB_HEAD_POOL").unwrap_or(4))
+}
+
+/// Regular head-pool size of a chunk with `segments` segments.
+/// `NEB_HEAD_POOL` sets it for every chunk; see `default_head_pool_len`.
+fn regular_head_pool_len(segments: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(len) = *OVERRIDE.get_or_init(|| head_pool_override("NEB_HEAD_POOL")) {
+        return len;
     }
+    // The process's own parallelism: it follows the CPU affinity mask and
+    // the cgroup quota, not the machine.
+    let cores = *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(MIN_HEAD_POOL)
+    });
+    default_head_pool_len(cores, segments)
+}
+
+/// The fixed default before the pool followed the core count. The .239
+/// contention test showed K=4 degrading at 96-192 threads and K=8-16
+/// behaving well.
+const MIN_HEAD_POOL: usize = 8;
+
+/// One head per thread that can run at once, with three limits:
+///
+/// * A quarter of the chunk's segments. Slots get a segment as writers
+///   contend, so a pool near the segment count fills the chunk with partly
+///   written heads and leaves no segment for rotation. Observed at 16
+///   segments and a pool of 16, before e9b2b744 and 50c181de: 15 heads held
+///   0.3-0.9 MiB each, the writer of the one full head found no segment to
+///   rotate into, and the write failed with `CannotAllocateSpace`.
+/// * 64, the upper clamp of `NEB_HEAD_POOL`.
+/// * At least `MIN_HEAD_POOL`, so no chunk gets fewer heads than before.
+fn default_head_pool_len(cores: usize, segments: usize) -> usize {
+    cores.min(segments / 4).min(64).max(MIN_HEAD_POOL)
 }
 
 /// Stable per-thread starting slot, so threads spread across the pool and a
@@ -1519,7 +1551,7 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_pool: {
-                let pool: Vec<AtomicU64> = (0..head_pool_len(SegmentClass::Regular))
+                let pool: Vec<AtomicU64> = (0..regular_head_pool_len(num_segs))
                     .map(|i| {
                         AtomicU64::new(if i == 0 {
                             bootstrap_segment.id
@@ -1530,7 +1562,7 @@ impl Chunk {
                     .collect();
                 pool.into_boxed_slice()
             },
-            blob_head_pool: (0..head_pool_len(SegmentClass::Blob))
+            blob_head_pool: (0..blob_head_pool_len())
                 .map(|_| AtomicU64::new(HEAD_SEG_ID_EMPTY))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -9116,6 +9148,23 @@ mod tests {
         assert!(delete_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
         updater.join().unwrap();
         deleter.join().unwrap();
+    }
+
+    #[test]
+    fn head_pool_follows_cores_with_a_segment_cap_and_a_floor() {
+        // 128 MiB chunks (16 segments) keep the floor on any machine.
+        assert_eq!(default_head_pool_len(48, 16), 8);
+        assert_eq!(default_head_pool_len(192, 16), 8);
+        // A quarter of the segments caps the cores.
+        assert_eq!(default_head_pool_len(48, 64), 16);
+        assert_eq!(default_head_pool_len(48, 128), 32);
+        // The cores cap a large chunk.
+        assert_eq!(default_head_pool_len(48, 512), 48);
+        assert_eq!(default_head_pool_len(16, 512), 16);
+        // 64 at most; never below the floor.
+        assert_eq!(default_head_pool_len(192, 4096), 64);
+        assert_eq!(default_head_pool_len(2, 4096), 8);
+        assert_eq!(default_head_pool_len(48, 1), 8);
     }
 
     /// D35: with a head free, a delete reserves its tombstone under the word
