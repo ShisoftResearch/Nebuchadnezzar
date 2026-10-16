@@ -2,9 +2,10 @@
 //!
 //! Contract: a cell takes plain (non-transactional) writes or transactions,
 //! not both. If a caller mixes them on one cell, Neb does not guarantee that
-//! an acknowledged plain write survives the resolution of an in-doubt
-//! transaction: after a restart with a transaction T in doubt, the plain
-//! write and T's write can get the same version, and only one is kept.
+//! an acknowledged plain write or delete survives the resolution of an
+//! in-doubt transaction: after a restart with a transaction T in doubt, the
+//! plain write and T's write can get the same version, and only one is kept;
+//! an acknowledged delete is undone when the resolution installs T's cell.
 
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;

@@ -105,9 +105,10 @@ service! {
     // `upsert_all_cells`, `remove_cell` and their durable and captured forms.
     // Contract: a cell takes plain (non-transactional) writes or transactions,
     // not both. If a caller mixes them on one cell, Neb does not guarantee that
-    // an acknowledged plain write survives the resolution of an in-doubt
-    // transaction: after a restart with a transaction T in doubt, the plain
-    // write and T's write can get the same version, and only one is kept.
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc head_cell(key: Id) -> Result<CellHeader, ReadError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -127,6 +128,13 @@ service! {
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64, applied_index: u64) -> ();
     rpc note_slot_owners(owners: &Vec<(u32, u64)>, applied_index: u64) -> ();
+    // Plain compare-and-set writes.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -145,9 +153,10 @@ service! {
     // Plain writes, durable and captured forms.
     // Contract: a cell takes plain (non-transactional) writes or transactions,
     // not both. If a caller mixes them on one cell, Neb does not guarantee that
-    // an acknowledged plain write survives the resolution of an in-doubt
-    // transaction: after a restart with a transaction T in doubt, the plain
-    // write and T's write can get the same version, and only one is kept.
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc write_cell_durable(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;

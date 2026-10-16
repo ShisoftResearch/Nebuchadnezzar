@@ -571,9 +571,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn write_cell(
         &self,
         cell: OwnedCell,
@@ -612,9 +613,10 @@ impl AsyncClient {
     }
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn update_cell(
         &self,
         cell: OwnedCell,
@@ -647,9 +649,10 @@ impl AsyncClient {
     }
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_cell(
         &self,
         cell: OwnedCell,
@@ -686,6 +689,13 @@ impl AsyncClient {
     /// server, amortizing per-cell location lookup and RPC round-trips.
     /// Results are returned in the same order as `cells`. Used by B-tree
     /// write-back to drain many dirty pages at once.
+    ///
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_all_cells(
         &self,
         cells: Vec<OwnedCell>,
@@ -718,9 +728,10 @@ impl AsyncClient {
     }
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell(id).await? {
@@ -903,6 +914,12 @@ impl AsyncClient {
         Ok(total)
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_update_cell(
         &self,
         id: Id,
@@ -924,6 +941,12 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_set_field(
         &self,
         id: Id,
@@ -948,9 +971,10 @@ impl AsyncClient {
     }
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn write_cell_durable(
         &self,
         cell: OwnedCell,
@@ -990,9 +1014,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn update_cell_durable(
         &self,
         cell: OwnedCell,
@@ -1026,9 +1051,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_cell_durable(
         &self,
         cell: OwnedCell,
@@ -1063,9 +1089,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn remove_cell_durable(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell_durable(id).await? {
@@ -1120,9 +1147,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn write_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1169,9 +1197,10 @@ impl AsyncClient {
 
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write survives the resolution of an in-doubt
-    /// transaction: after a restart with a transaction T in doubt, the plain
-    /// write and T's write can get the same version, and only one is kept.
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn remove_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1201,6 +1230,13 @@ impl AsyncClient {
     }
 
     /// Certify current WAL prefixes on every member of this database.
+    ///
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_update_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1231,6 +1267,12 @@ impl AsyncClient {
         }
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_set_field_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1262,6 +1304,12 @@ impl AsyncClient {
         }
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn write_all_cells_durable(
         &self,
         cells: Vec<OwnedCell>,
@@ -1293,6 +1341,12 @@ impl AsyncClient {
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_all_cells_durable(
         &self,
         cells: Vec<OwnedCell>,
@@ -1324,6 +1378,12 @@ impl AsyncClient {
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_update_cell_durable(
         &self,
         id: Id,
@@ -1346,6 +1406,12 @@ impl AsyncClient {
         }
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_set_field_durable(
         &self,
         id: Id,
