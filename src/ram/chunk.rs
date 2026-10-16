@@ -3943,6 +3943,7 @@ impl Chunk {
         #[cfg(not(test))]
         let free_head_claim = true;
         if free_head_claim {
+            let target = self.tombstone_target(guard.get_ptr())?;
             if let Some(pending) = self.try_claim_free_head(TOMBSTONE_ENTRY_SIZE as u32) {
                 #[cfg(test)]
                 TEST_DELETE_AFTER_RESERVE.with(|hook| {
@@ -3953,6 +3954,7 @@ impl Chunk {
                 return Ok(RemoveLock {
                     pending,
                     guard,
+                    target,
                     checked: true,
                 });
             }
@@ -3970,9 +3972,11 @@ impl Chunk {
         });
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = CellGuard::for_read(hash, self).map_err(read_error)?;
+        let target = self.tombstone_target(guard.get_ptr())?;
         Ok(RemoveLock {
             pending,
             guard,
+            target,
             checked: false,
         })
     }
@@ -3981,12 +3985,10 @@ impl Chunk {
         let RemoveLock {
             pending: pending_entry,
             guard,
+            target,
             ..
         } = self.lock_cell_for_remove(hash, None)?;
-        let cell_location = guard.get_ptr();
-
-        let removed_len =
-            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        let removed_len = self.put_tombstone_for(&target, true, &pending_entry)?;
         drop(pending_entry);
 
         if let Some(indexer) = &self.index_builder {
@@ -4023,11 +4025,10 @@ impl Chunk {
         let RemoveLock {
             pending: pending_entry,
             guard,
+            target,
             ..
         } = self.lock_cell_for_remove(hash, None)?;
-        let cell_location = guard.get_ptr();
-        let removed_len =
-            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        let removed_len = self.put_tombstone_for(&target, true, &pending_entry)?;
         drop(pending_entry);
         guard.remove_cell();
         self.slot_bytes.sub(hash, removed_len);
@@ -4053,19 +4054,15 @@ impl Chunk {
         let RemoveLock {
             pending: pending_entry,
             guard,
+            target,
             checked,
         } = self.lock_cell_for_remove(hash, Some(&predict))?;
-        let cell_location = *guard;
 
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 // A guard taken again after the reservation must check again.
                 if checked || predict(&cell) {
-                    let removed_len = self.put_tombstone_by_cell_loc_inner(
-                        cell_location,
-                        retire_old,
-                        &pending_entry,
-                    )?;
+                    let removed_len = self.put_tombstone_for(&target, retire_old, &pending_entry)?;
                     drop(pending_entry);
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
@@ -4528,6 +4525,15 @@ impl Chunk {
         retire_old: bool,
         pending_entry: &PendingEntry,
     ) -> Result<u32, WriteError> {
+        let target = self.tombstone_target(cell_location)?;
+        self.put_tombstone_for(&target, retire_old, pending_entry)
+    }
+
+    /// Read what a tombstone for the cell at `cell_location` needs. A delete
+    /// does this before it claims a head when it can: these are reads of the
+    /// old cell, and every read inside the head window delays the other
+    /// writers that wait for the head.
+    fn tombstone_target(&self, cell_location: usize) -> Result<TombstoneTarget, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -4542,12 +4548,27 @@ impl Chunk {
             entry.content_length
         };
 
-        let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg, retire_old, pending_entry)?;
+        let segment = self.locate_segment_ensured(cell_location, &header.id());
+        Ok(TombstoneTarget {
+            location: cell_location,
+            header,
+            entry_size,
+            segment,
+        })
+    }
+
+    /// Returns the removed entry's content length.
+    fn put_tombstone_for(
+        &self,
+        target: &TombstoneTarget,
+        retire_old: bool,
+        pending_entry: &PendingEntry,
+    ) -> Result<u32, WriteError> {
+        self.put_tombstone(&target.header, &target.segment, retire_old, pending_entry)?;
         if retire_old {
-            self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+            self.mark_dead_entry_with_size(target.location, target.entry_size, &target.segment);
         }
-        Ok(entry_size)
+        Ok(target.entry_size)
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
@@ -4992,10 +5013,20 @@ impl Chunk {
     }
 }
 
+/// The old cell that a tombstone deletes, read under its word.
+struct TombstoneTarget {
+    location: usize,
+    header: CellHeader,
+    entry_size: u32,
+    segment: AArc<Segment>,
+}
+
 /// A tombstone reservation with the word of the cell that it deletes.
 struct RemoveLock<'a> {
     pending: PendingEntry,
     guard: CellGuard<'a>,
+    /// Read under `guard`.
+    target: TombstoneTarget,
     /// The cell and the predicate were checked under this guard. A guard
     /// taken again after a wait for a head was not checked yet.
     checked: bool,
