@@ -2640,6 +2640,24 @@ impl Chunk {
                             );
                             return Err(WriteError::CannotAllocateSpace);
                         }
+                        // A best-effort caller can hold a cell word, and every
+                        // head owner can wait for that word (cycle C1 in
+                        // docs/tla/HeadWordLock.tla). Give that caller the
+                        // head-queue deadline here too, so it releases the word.
+                        if !full_gc
+                            && queueing_since
+                                .get_or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                >= HEAD_QUEUE_DEADLINE
+                        {
+                            error!(
+                                "chunk {} had every head owned for {:?}; refusing a best-effort \
+                                 write, which can hold a cell word that the owners wait for",
+                                self.id, HEAD_QUEUE_DEADLINE
+                            );
+                            HEAD_QUEUE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                            return Err(WriteError::CannotAllocateSpace);
+                        }
                         let t_spin = std::time::Instant::now();
                         backoff.spin();
                         ALLOC_SPIN_NANOS
@@ -9272,6 +9290,90 @@ mod tests {
         assert_eq!(default_head_pool_len(192, 4096), 64);
         assert_eq!(default_head_pool_len(2, 4096), 8);
         assert_eq!(default_head_pool_len(48, 1), 8);
+    }
+
+    /// C1 (docs/tla/HeadWordLock.tla, `cur_u_unbounded`): a word-first
+    /// `update_cell_by` holds word X and needs a head while every head is
+    /// owned by a writer that waits for X. Away from the wall nothing bounds
+    /// that wait unless the allocation gives up. The writers here give up
+    /// after 25 s so that a failing run still ends.
+    #[test]
+    fn word_first_update_does_not_wait_forever_for_heads_held_by_its_word() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99760);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        for slot in chunk.head_pool.iter() {
+            if slot.load(Ordering::Acquire) == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                let seg_id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(seg_id, Ordering::Release);
+            }
+        }
+        assert!(chunk.allocator.writer_headroom() >= 2, "the chunk is not at its wall");
+        let heads = chunk.head_pool.len();
+        // One writer per head: it owns the head, then waits for word X.
+        let (owned_tx, owned_rx) = mpsc::channel();
+        let mut starts = Vec::new();
+        let mut writers = Vec::new();
+        for _ in 0..heads {
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            starts.push(start_tx);
+            let chunks = chunks.clone();
+            let owned_tx = owned_tx.clone();
+            writers.push(std::thread::spawn(move || {
+                let chunk = &chunks.list[0];
+                let pending = chunk.try_acquire(64, true).unwrap();
+                owned_tx.send(pending.seg.id).unwrap();
+                start_rx.recv().unwrap();
+                let started = Instant::now();
+                let obtained = loop {
+                    if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                        drop(guard);
+                        break true;
+                    }
+                    if started.elapsed() >= Duration::from_secs(25) {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                drop(pending);
+                obtained
+            }));
+            // Claims one at a time, so each writer owns a different head.
+            owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let updater = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                let result = chunks.update_cell_by(&id, |_| {
+                    // Word X is held here: let the head owners wait for it.
+                    for start in &starts {
+                        start.send(()).unwrap();
+                    }
+                    Some(payload_cell(schema.vid.get(), &id, 64))
+                });
+                done_tx.send(result.is_ok()).unwrap();
+            }
+        });
+        let bound = HEAD_QUEUE_DEADLINE + Duration::from_secs(10);
+        let finished = done_rx.recv_timeout(bound);
+        let obtained: Vec<bool> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        updater.join().unwrap();
+        assert!(
+            finished.is_ok(),
+            "update_cell_by held the cell word for {:?} while every head owner waited for it",
+            bound
+        );
+        assert!(
+            obtained.iter().all(|got| *got),
+            "a head owner never got the word the word-first update held: {obtained:?}"
+        );
     }
 
     /// D40: with a head free, a CAS checks, writes and publishes under one

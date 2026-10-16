@@ -158,5 +158,6 @@ TLC=tlc python3 HeadWordLock.py --out /some/scratch/dir
 | `ctl_new_unbounded_try` | Deadlock, on purpose: the try without a bound is the old order again. |
 | `ctl_new_no_recheck` | `AppendUnderBoth` violated, on purpose: a word taken again after a wait must check the cell again. |
 | `full_old`, `full_cur`, `full_new` | No error. At a full store an absent cell or a false predicate gives "absent", never "no space". |
-| `cur_u_unbounded`, `new_u_unbounded` | Deadlock. A word-first updater that holds the word and waits for a head, while every head owner waits for that word. Away from the wall this wait has no bound. This cycle is older than the delete orders above. |
+| `new_u_bounded_c1`, `new_u_bounded_c1_k3` | No error. A word-first updater holds the word and waits for a head while every head owner waits for that word (cycle C1). The updater refuses at the head-queue deadline and releases the word. |
+| `cur_u_unbounded`, `new_u_unbounded` | Deadlock, on purpose: C1 without that deadline, which was the code before the C1 fix. |
 | `cas_wordfast_*` | No error. The current CAS order: check the version, write and publish under one word hold if a head is free; else the bounded try ends, the word is released, and the CAS checks again under a new hold after it gets a head. |

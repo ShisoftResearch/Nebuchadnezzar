@@ -39,7 +39,7 @@ sc('cur_k1', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'c1': C()}, X, 1, 'cur')
 sc('cur_k2', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'w2': W(), 'c1': C(), 't1': T()}, X, 2, 'cur')
 sc('cur_k2_two_cells', 'pass', {'d1': D('x'), 'd2': D('y'), 'w1': W('y'), 'w2': W('x'), 'c1': C('y'), 't1': T('x')}, XY, 2, 'cur')
 # 2b. Pre-existing cycle C1: word-first updater, no deadline away from the wall.
-sc('cur_u_unbounded', 'deadlock', {'u1': U(), 'w1': W(), 'w2': W()}, X, 2, 'cur', ubounded=False, note='C1, pre-existing')
+sc('cur_u_unbounded', 'deadlock', {'u1': U(), 'w1': W(), 'w2': W()}, X, 2, 'cur', ubounded=False, note='control: C1 without the deadline')
 sc('cur_u_bounded', 'pass', {'u1': U(), 'd1': D(), 'w1': W(), 'w2': W()}, X, 2, 'cur', ubounded=True)
 # 3. D35 candidate: one word acquisition on the fast path.
 sc('new_k1', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'c1': C()}, X, 1, 'new')
@@ -47,8 +47,11 @@ sc('new_k2', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'w2': W(), 'c1': C(), 't1
 sc('new_k2_u', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'u1': U(), 'c1': C(), 't1': T()}, X, 2, 'new', ubounded=True)
 sc('new_k2_two_cells', 'pass', {'d1': D('x'), 'd2': D('y'), 'w1': W('y'), 'w2': W('x'), 'c1': C('y'), 't1': T('x')}, XY, 2, 'new')
 sc('new_k3', 'pass', {'d1': D(), 'd2': D(), 'w1': W(), 'w2': W(), 'w3': W(), 't1': T()}, X, 3, 'new')
+sc('new_u_bounded_c1', 'pass', {'u1': U(), 'w1': W(), 'w2': W()}, X, 2, 'new', ubounded=True,
+   note='C1 shape with the head-queue deadline for best-effort callers')
+sc('new_u_bounded_c1_k3', 'pass', {'u1': U(), 'w1': W(), 'w2': W(), 'w3': W(), 'd1': D()}, X, 3, 'new', ubounded=True)
 sc('new_u_unbounded', 'deadlock', {'u1': U(), 'd1': D(), 'w1': W(), 'w2': W()}, X, 2, 'new', ubounded=False,
-   note='C1 stays (pre-existing, not caused by the delete)')
+   note='control: C1 without the deadline')
 # 3b. Reverted controls of the candidate.
 sc('ctl_new_unbounded_try', 'deadlock', {'d1': D(), 'w1': W()}, X, 1, 'new', fast_bounded=False,
    note='control: remove the bound of the fast try')
