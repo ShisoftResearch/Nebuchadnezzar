@@ -4987,6 +4987,12 @@ impl Chunk {
     /// a new hold. The model is `docs/tla/HeadWordLock.tla` (`cas_wordfast`).
     fn try_claim_free_head_for_cas(&self, write_plan: &WritePlan<'_>) -> Option<PendingEntry> {
         #[cfg(test)]
+        TEST_CAS_BEFORE_FREE_HEAD.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        #[cfg(test)]
         if TEST_CAS_SLOW_PATH.with(|forced| forced.get()) {
             return None;
         }
@@ -6820,6 +6826,8 @@ thread_local! {
     static TEST_DELETE_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Deletes on this thread that released the word to wait for a head.
     static TEST_DELETE_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs under the cell word, after the version check of a CAS.
+    static TEST_CAS_BEFORE_FREE_HEAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Skip the free-head claim, so a CAS releases the word and waits.
     static TEST_CAS_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// CAS calls on this thread that released the word to wait for a head.
@@ -9307,9 +9315,11 @@ mod tests {
                 .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
                 .unwrap()
                 .version;
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
             let (owned_tx, owned_rx) = std::sync::mpsc::channel();
             let writer_chunks = chunks.clone();
             let writer = std::thread::spawn(move || {
+                start_rx.recv().unwrap();
                 let chunk = &writer_chunks.list[0];
                 let pending = chunk.try_acquire(64, true).unwrap();
                 owned_tx.send(()).unwrap();
@@ -9328,7 +9338,13 @@ mod tests {
                 drop(pending);
                 obtained
             });
-            owned_rx.recv().unwrap();
+            // The writer takes the only head while the CAS holds the word.
+            TEST_CAS_BEFORE_FREE_HEAD.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    owned_rx.recv().unwrap();
+                }))
+            });
             let chunk = &chunks.list[0];
             let result = if set_field {
                 chunk.compare_version_and_set_field(id.bits(), version, hash_str("id"), OwnedValue::I32(7))
