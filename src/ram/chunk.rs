@@ -206,9 +206,8 @@ const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
 /// Pool sizes per class. Elastic in USE (slots fill only under real
-/// contention), fixed in CAPACITY. The .239 contention spike showed K=4
-/// degrading badly at 96-192 threads and K=8-16 behaving well; blobs see a
-/// fraction of the traffic and 8 MiB per resident head is real money.
+/// contention), fixed in CAPACITY. Blobs see a fraction of the traffic and
+/// 8 MiB per resident head is real money.
 ///
 /// The blob pool is 4 rather than 2 because a transaction leases a head for
 /// its whole lifetime, and `can_spare_a_head_for_lease` will not hand out
@@ -217,23 +216,56 @@ const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 /// resident until blob traffic actually contends -- an EMPTY slot counts as
 /// available to a lease without a segment behind it -- so this buys blob
 /// atomicity at zero cost in the quiet case, which is the common one.
-fn head_pool_len(segment_class: SegmentClass) -> usize {
-    static REGULAR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn head_pool_override(var: &str) -> Option<usize> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        // Floor of 2, not 1: with a single slot, a thread that ever
+        // needed a second entry while holding its first would spin on
+        // its own ownership forever.
+        .map(|v| v.clamp(2, 64))
+}
+
+fn blob_head_pool_len() -> usize {
     static BLOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let read = |var: &str, default: usize| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            // Floor of 2, not 1: with a single slot, a thread that ever
-            // needed a second entry while holding its first would spin on
-            // its own ownership forever.
-            .map(|v| v.clamp(2, 64))
-            .unwrap_or(default)
-    };
-    match segment_class {
-        SegmentClass::Regular => *REGULAR.get_or_init(|| read("NEB_HEAD_POOL", 8)),
-        SegmentClass::Blob => *BLOB.get_or_init(|| read("NEB_BLOB_HEAD_POOL", 4)),
+    *BLOB.get_or_init(|| head_pool_override("NEB_BLOB_HEAD_POOL").unwrap_or(4))
+}
+
+/// Regular head-pool size of a chunk with `segments` segments.
+/// `NEB_HEAD_POOL` sets it for every chunk; see `default_head_pool_len`.
+fn regular_head_pool_len(segments: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(len) = *OVERRIDE.get_or_init(|| head_pool_override("NEB_HEAD_POOL")) {
+        return len;
     }
+    // The process's own parallelism: it follows the CPU affinity mask and
+    // the cgroup quota, not the machine.
+    let cores = *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(MIN_HEAD_POOL)
+    });
+    default_head_pool_len(cores, segments)
+}
+
+/// The fixed default before the pool followed the core count. The .239
+/// contention test showed K=4 degrading at 96-192 threads and K=8-16
+/// behaving well.
+const MIN_HEAD_POOL: usize = 8;
+
+/// One head per thread that can run at once, with three limits:
+///
+/// * A quarter of the chunk's segments. Slots get a segment as writers
+///   contend, so a pool near the segment count fills the chunk with partly
+///   written heads and leaves no segment for rotation. Observed at 16
+///   segments and a pool of 16, before e9b2b744 and 50c181de: 15 heads held
+///   0.3-0.9 MiB each, the writer of the one full head found no segment to
+///   rotate into, and the write failed with `CannotAllocateSpace`.
+/// * 64, the upper clamp of `NEB_HEAD_POOL`.
+/// * At least `MIN_HEAD_POOL`, so no chunk gets fewer heads than before.
+fn default_head_pool_len(cores: usize, segments: usize) -> usize {
+    cores.min(segments / 4).min(64).max(MIN_HEAD_POOL)
 }
 
 /// Stable per-thread starting slot, so threads spread across the pool and a
@@ -1683,7 +1715,7 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_pool: {
-                let pool: Vec<AtomicU64> = (0..head_pool_len(SegmentClass::Regular))
+                let pool: Vec<AtomicU64> = (0..regular_head_pool_len(num_segs))
                     .map(|i| {
                         AtomicU64::new(if i == 0 {
                             bootstrap_segment.id
@@ -1694,7 +1726,7 @@ impl Chunk {
                     .collect();
                 pool.into_boxed_slice()
             },
-            blob_head_pool: (0..head_pool_len(SegmentClass::Blob))
+            blob_head_pool: (0..blob_head_pool_len())
                 .map(|_| AtomicU64::new(HEAD_SEG_ID_EMPTY))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -1911,6 +1943,65 @@ impl Chunk {
         // let the caller write one cell the ordinary way. That call rotates
         // or fills a slot, and the next run claim finds a fresh segment.
         Ok(None)
+    }
+
+    /// Claim `size` bytes in a head of `segment_class` that can be owned now. This
+    /// never rotates, grows the pool, runs GC or queues. It gives up after
+    /// `FREE_HEAD_CLAIM_ROUNDS` scans, so a caller that holds a cell word
+    /// can use it: a head owner can wait for that word, and a wait without
+    /// a bound on its head is the lock cycle fixed in e6a64539. The model
+    /// is `docs/tla/HeadWordLock.tla`.
+    ///
+    /// Not for transactions: their entries go to the leased head.
+    fn try_claim_free_head(&self, size: u32, segment_class: SegmentClass) -> Option<PendingEntry> {
+        const FREE_HEAD_CLAIM_ROUNDS: usize = 12;
+        if current_txn().is_some()
+            || is_in_transaction()
+            || self.writes_closed.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let slots = self.head_slots(segment_class);
+        let start = head_affinity();
+        let backoff = Backoff::new();
+        for _ in 0..FREE_HEAD_CLAIM_ROUNDS {
+            for i in 0..slots.len() {
+                let head_seg_id = slots[(start + i) % slots.len()].load(Ordering::Acquire);
+                if head_seg_id == HEAD_SEG_ID_ALLOCATING || head_seg_id == HEAD_SEG_ID_EMPTY {
+                    continue;
+                }
+                let Some(head) = self.segs.get(&(head_seg_id as usize)) else {
+                    continue;
+                };
+                // The same order as `try_acquire_claim`: own, reference, then
+                // the journal claim before the cursor moves.
+                if !head.try_own() {
+                    continue;
+                }
+                if !head.incr_references() {
+                    head.release_own();
+                    continue;
+                }
+                if head.begin_pending_journal() {
+                    if let Some(addr) = head.try_acquire(size) {
+                        crate::ram::entry::stamp_reservation_padding(addr, size);
+                        return Some(PendingEntry {
+                            addr,
+                            seg: head,
+                            size,
+                            skip_sync: false,
+                            leased: false,
+                            journaled: std::cell::Cell::new(false),
+                        });
+                    }
+                    head.end_pending_journal();
+                }
+                head.decr_references();
+                head.release_own();
+            }
+            backoff.spin();
+        }
+        None
     }
 
     /// Record a freshly claimed head as the current transaction's, keeping it
@@ -2613,7 +2704,7 @@ impl Chunk {
                 };
                 // OWN the head first. Under the pool a segment has ONE
                 // writer at a time, from here through the journal write
-                // (released in PendingEntry::drop): the cursor can never run
+                // (released after append, or by a canceled PendingEntry): the cursor cannot run
                 // ahead of another writer's unwritten bytes, so mid-segment
                 // holes are impossible by construction and the WAL is
                 // offset-ordered. A head someone else owns is simply the
@@ -2723,6 +2814,36 @@ impl Chunk {
                                  Refusing the write instead of hanging.",
                                 self.id
                             );
+                            return Err(WriteError::CannotAllocateSpace);
+                        }
+                        // A best-effort caller can hold a cell word, and every
+                        // head owner can wait for that word (cycle C1 in
+                        // docs/tla/HeadWordLock.tla). Give that caller the
+                        // head-queue deadline here too, so it releases the word.
+                        // A caller that waits without the deadline must hold no
+                        // word, or C1 comes back.
+                        #[cfg(debug_assertions)]
+                        if full_gc {
+                            HELD_CELL_GUARDS.with(|held| {
+                                debug_assert_eq!(
+                                    held.get(),
+                                    0,
+                                    "a full-GC allocation waits for a head while it holds a cell word"
+                                )
+                            });
+                        }
+                        if !full_gc
+                            && queueing_since
+                                .get_or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                >= HEAD_QUEUE_DEADLINE
+                        {
+                            error!(
+                                "chunk {} had every head owned for {:?}; refusing a best-effort \
+                                 write, which can hold a cell word that the owners wait for",
+                                self.id, HEAD_QUEUE_DEADLINE
+                            );
+                            HEAD_QUEUE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                             return Err(WriteError::CannotAllocateSpace);
                         }
                         let t_spin = std::time::Instant::now();
@@ -3983,25 +4104,30 @@ impl Chunk {
         }
     }
 
-    // Deletes reserve before reacquiring the cell word, as do ordinary writes,
-    // upserts and CAS. update_cell_by and CellGuard updates still hold the word
-    // first. Near capacity, their best-effort head queue can conflict with a
-    // delete holding that head; it refuses at HEAD_QUEUE_DEADLINE, releasing the
-    // word so the delete can finish. These paths must not wait for full GC.
-    fn reserve_tombstone_for_remove(
+    // Lock order of a delete. The first word acquisition checks the cell and
+    // the predicate. If a head can be owned now, the tombstone is reserved
+    // under that word, and the delete takes the word once. If not, the delete
+    // releases the word before it waits for a head and then takes the word
+    // again. Ordinary writes, upserts and CAS reserve a head before they take
+    // the word, so a delete must not wait for a head without a bound while
+    // it holds a word (the cycle fixed in e6a64539). update_cell_by and
+    // CellGuard updates still hold the word first; near capacity their head
+    // queue refuses at HEAD_QUEUE_DEADLINE. These paths must not wait for
+    // full GC.
+    fn lock_cell_for_remove(
         &self,
         hash: u64,
         predict: Option<&dyn Fn(&SharedCell) -> bool>,
-    ) -> Result<PendingEntry, WriteError> {
-        // Preserve the absent-cell result even when the store has no capacity.
-        let guard = CellGuard::for_read(hash, self).map_err(|error| match error {
+    ) -> Result<RemoveLock<'_>, WriteError> {
+        let read_error = |error| match error {
             ReadError::CellDoesNotExisted | ReadError::CellIdIsUnitId => {
                 WriteError::CellDoesNotExisted
             }
             other => WriteError::ReadError(other),
-        })?;
-        // Reject a false predicate even at a full store. The caller checks it
-        // again under the second guard because the cell can change meanwhile.
+        };
+        // Preserve the absent-cell result even when the store has no capacity.
+        let guard = CellGuard::for_read(hash, self).map_err(read_error)?;
+        // Reject a false predicate even at a full store.
         let guard = if let Some(predict) = predict {
             let (cell, _) = SharedCell::from_chunk_raw(hash, guard, self)
                 .map_err(WriteError::ReadError)?;
@@ -4018,7 +4144,30 @@ impl Chunk {
                 hook();
             }
         });
+        #[cfg(test)]
+        let free_head_claim = !TEST_DELETE_SLOW_PATH.with(|forced| forced.get());
+        #[cfg(not(test))]
+        let free_head_claim = true;
+        if free_head_claim {
+            let target = self.tombstone_target(guard.get_ptr())?;
+            if let Some(pending) = self.try_claim_free_head(TOMBSTONE_ENTRY_SIZE as u32, SegmentClass::Regular) {
+                #[cfg(test)]
+                TEST_DELETE_AFTER_RESERVE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                return Ok(RemoveLock {
+                    pending,
+                    guard,
+                    target,
+                    checked: true,
+                });
+            }
+        }
         drop(guard);
+        #[cfg(test)]
+        TEST_DELETE_SLOW_PATHS.with(|count| count.set(count.get() + 1));
         // Preserve best-effort collection for transaction apply callers.
         let pending = self.acquire_tombstone(false)?;
         #[cfg(test)]
@@ -4027,22 +4176,25 @@ impl Chunk {
                 hook();
             }
         });
-        Ok(pending)
+        // Use location_for_read to ensure promotion happens if segment is cold
+        let guard = CellGuard::for_read(hash, self).map_err(read_error)?;
+        let target = self.tombstone_target(guard.get_ptr())?;
+        Ok(RemoveLock {
+            pending,
+            guard,
+            target,
+            checked: false,
+        })
     }
 
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        let pending_entry = self.reserve_tombstone_for_remove(hash, None)?;
-        // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match CellGuard::for_read(hash, self) {
-            Ok(guard) => guard,
-            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
-            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
-            Err(e) => return Err(WriteError::ReadError(e)),
-        };
-        let cell_location = guard.get_ptr();
-
-        let removed_len =
-            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        let RemoveLock {
+            pending: pending_entry,
+            guard,
+            target,
+            ..
+        } = self.lock_cell_for_remove(hash, None)?;
+        let removed_len = self.put_tombstone_for(&target, true, &pending_entry)?;
         drop(pending_entry);
 
         if let Some(indexer) = &self.index_builder {
@@ -4076,16 +4228,13 @@ impl Chunk {
     /// Keeping the entries is not a leak: the cell still exists, on the recipient,
     /// and the entry still names it correctly. Removing them is what was wrong.
     fn remove_cell_keeping_indices(&self, hash: u64) -> Result<(), WriteError> {
-        let pending_entry = self.reserve_tombstone_for_remove(hash, None)?;
-        let guard = match CellGuard::for_read(hash, self) {
-            Ok(guard) => guard,
-            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
-            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
-            Err(e) => return Err(WriteError::ReadError(e)),
-        };
-        let cell_location = guard.get_ptr();
-        let removed_len =
-            self.put_tombstone_by_cell_loc_inner(cell_location, true, &pending_entry)?;
+        let RemoveLock {
+            pending: pending_entry,
+            guard,
+            target,
+            ..
+        } = self.lock_cell_for_remove(hash, None)?;
+        let removed_len = self.put_tombstone_for(&target, true, &pending_entry)?;
         drop(pending_entry);
         guard.remove_cell();
         self.slot_bytes.sub(hash, removed_len);
@@ -4108,24 +4257,18 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
-        let pending_entry = self.reserve_tombstone_for_remove(hash, Some(&predict))?;
-        // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match CellGuard::for_read(hash, self) {
-            Ok(guard) => guard,
-            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
-            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
-            Err(e) => return Err(WriteError::ReadError(e)),
-        };
-        let cell_location = *guard;
+        let RemoveLock {
+            pending: pending_entry,
+            guard,
+            target,
+            checked,
+        } = self.lock_cell_for_remove(hash, Some(&predict))?;
 
         match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
-                if predict(&cell) {
-                    let removed_len = self.put_tombstone_by_cell_loc_inner(
-                        cell_location,
-                        retire_old,
-                        &pending_entry,
-                    )?;
+                // A guard taken again after the reservation must check again.
+                if checked || predict(&cell) {
+                    let removed_len = self.put_tombstone_for(&target, retire_old, &pending_entry)?;
                     drop(pending_entry);
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
@@ -4588,6 +4731,15 @@ impl Chunk {
         retire_old: bool,
         pending_entry: &PendingEntry,
     ) -> Result<u32, WriteError> {
+        let target = self.tombstone_target(cell_location)?;
+        self.put_tombstone_for(&target, retire_old, pending_entry)
+    }
+
+    /// Read what a tombstone for the cell at `cell_location` needs. A delete
+    /// does this before it claims a head when it can: these are reads of the
+    /// old cell, and every read inside the head window delays the other
+    /// writers that wait for the head.
+    fn tombstone_target(&self, cell_location: usize) -> Result<TombstoneTarget, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -4602,12 +4754,27 @@ impl Chunk {
             entry.content_length
         };
 
-        let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg, retire_old, pending_entry)?;
+        let segment = self.locate_segment_ensured(cell_location, &header.id());
+        Ok(TombstoneTarget {
+            location: cell_location,
+            header,
+            entry_size,
+            segment,
+        })
+    }
+
+    /// Returns the removed entry's content length.
+    fn put_tombstone_for(
+        &self,
+        target: &TombstoneTarget,
+        retire_old: bool,
+        pending_entry: &PendingEntry,
+    ) -> Result<u32, WriteError> {
+        self.put_tombstone(&target.header, &target.segment, retire_old, pending_entry)?;
         if retire_old {
-            self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
+            self.mark_dead_entry_with_size(target.location, target.entry_size, &target.segment);
         }
-        Ok(entry_size)
+        Ok(target.entry_size)
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
@@ -4997,10 +5164,56 @@ impl Chunk {
         #[cfg(debug_assertions)]
         HELD_CELL_GUARDS
             .with(|held| debug_assert_eq!(held.get(), 0, "CAS caller holds a cell word"));
-        // Match ordinary upserts: claim a head before taking the cell word.
-        // The expected version is checked after allocation, under that word.
         cell.header.version = version;
         let write_plan = cell.plan_write(self)?;
+        {
+            let mut guard = self
+                .lock_cell_for_write(hash, true)
+                .map_err(WriteError::ReadError)?;
+            // A lost CAS claims no space, even at a full store.
+            if guard.cell_version().map_err(WriteError::ReadError)? != version {
+                return Err(WriteError::CellVersionMismatch);
+            }
+            if let Some(pending_entry) = self.try_claim_free_head_for_cas(&write_plan) {
+                let result = Self::finish_cas(guard, cell, write_plan, pending_entry, version)?;
+                return Ok(Self::cas_header(cell, result));
+            }
+        }
+        let result =
+            self.compare_version_and_update_cell_after_wait(hash, version, cell, write_plan)?;
+        Ok(Self::cas_header(cell, result))
+    }
+
+    /// CAS lock order. If a head can be owned now, the version check, the
+    /// write and the publication run under one hold of the cell word, so no
+    /// other writer can change the cell in between. If not, the word is
+    /// released before the CAS waits for a head: a head owner can wait for
+    /// this word, and the allocation can wait for the cleaner, which takes
+    /// cell words under the GC lock. Then the version is checked again under
+    /// a new hold. The model is `docs/tla/HeadWordLock.tla` (`cas_wordfast`).
+    fn try_claim_free_head_for_cas(&self, write_plan: &WritePlan<'_>) -> Option<PendingEntry> {
+        #[cfg(test)]
+        TEST_CAS_BEFORE_FREE_HEAD.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        #[cfg(test)]
+        if TEST_CAS_SLOW_PATH.with(|forced| forced.get()) {
+            return None;
+        }
+        self.try_claim_free_head(write_plan.total_size, write_plan.segment_class)
+    }
+
+    fn compare_version_and_update_cell_after_wait(
+        &self,
+        hash: u64,
+        version: u64,
+        cell: &OwnedCell,
+        write_plan: WritePlan<'_>,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        #[cfg(test)]
+        TEST_CAS_SLOW_PATHS.with(|count| count.set(count.get() + 1));
         // No cell word is held here, so a concurrent cleaner can finish
         // before we decide whether the chunk has space.
         struct CasAllocation;
@@ -5019,12 +5232,25 @@ impl Chunk {
         if guard.cell_version().map_err(WriteError::ReadError)? != version {
             return Err(WriteError::CellVersionMismatch);
         }
-        let result = guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)?;
-        drop(write_plan);
+        Self::finish_cas(guard, cell, write_plan, pending_entry, version)
+    }
+
+    /// Write and publish under `guard`, which checked the version.
+    fn finish_cas(
+        mut guard: CellGuard<'_>,
+        cell: &OwnedCell,
+        write_plan: WritePlan<'_>,
+        pending_entry: PendingEntry,
+        version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)
+    }
+
+    fn cas_header(cell: &mut OwnedCell, result: WriteToChunkResult) -> CellHeader {
         cell.header.version = result.new_version;
         cell.header.timestamp = result.new_timestamp;
         cell.header.schema = result.new_schema;
-        Ok(cell.header)
+        cell.header
     }
 
     /// The caller must hold no cell word; see `compare_version_and_update_cell`.
@@ -5042,14 +5268,44 @@ impl Chunk {
             let mut guard = self
                 .lock_cell_for_write(hash, true)
                 .map_err(WriteError::ReadError)?;
-            guard.read_cell_owned().map_err(WriteError::ReadError)?
+            let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
+            if cell.header.version != version {
+                return Err(WriteError::CellVersionMismatch);
+            }
+            cell.data[field] = value;
+            // Read, check and write under one hold when a head is free.
+            let write_plan = cell.plan_write(self)?;
+            if let Some(pending_entry) = self.try_claim_free_head_for_cas(&write_plan) {
+                let result = Self::finish_cas(guard, &cell, write_plan, pending_entry, version)?;
+                return Ok(Self::cas_header(&mut cell, result));
+            }
+            drop(write_plan);
+            cell
         };
-        if cell.header.version != version {
-            return Err(WriteError::CellVersionMismatch);
-        }
-        cell.data[field] = value;
-        self.compare_version_and_update_cell(hash, version, &mut cell)
+        let write_plan = cell.plan_write(self)?;
+        let result =
+            self.compare_version_and_update_cell_after_wait(hash, version, &cell, write_plan)?;
+        Ok(Self::cas_header(&mut cell, result))
     }
+}
+
+/// The old cell that a tombstone deletes, read under its word.
+struct TombstoneTarget {
+    location: usize,
+    header: CellHeader,
+    entry_size: u32,
+    segment: AArc<Segment>,
+}
+
+/// A tombstone reservation with the word of the cell that it deletes.
+struct RemoveLock<'a> {
+    pending: PendingEntry,
+    guard: CellGuard<'a>,
+    /// Read under `guard`.
+    target: TombstoneTarget,
+    /// The cell and the predicate were checked under this guard. A guard
+    /// taken again after a wait for a head was not checked yet.
+    checked: bool,
 }
 
 /// A contiguous span of a segment claimed for a run of entries.
@@ -5146,6 +5402,12 @@ impl PendingEntry {
         match self.seg.write_wal(self.addr, self.size, self.skip_sync) {
             Ok(()) => {
                 self.journaled.set(true);
+                // WAL order is fixed now. Publication still owns the reference
+                // and journal claim, so rotation cannot archive this image yet.
+                // Let another writer append while this caller updates indexes.
+                if !self.leased {
+                    self.seg.release_own();
+                }
                 if self.skip_sync {
                     note_transactional_write(&self.seg);
                 } else {
@@ -5173,7 +5435,8 @@ impl Drop for PendingEntry {
             }
         }
         self.seg.end_pending_journal();
-        if !self.leased {
+        // A successful append already handed ownership to the next writer.
+        if !self.leased && !self.journaled.get() {
             self.seg.release_own();
         }
         self.seg.decr_references();
@@ -6976,6 +7239,16 @@ impl<'a> Deref for CellGuard<'a> {
 thread_local! {
     static TEST_DELETE_AFTER_RESERVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_DELETE_BEFORE_RESERVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Skip the free-head claim, so a delete takes the word twice.
+    static TEST_DELETE_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Deletes on this thread that released the word to wait for a head.
+    static TEST_DELETE_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs under the cell word, after the version check of a CAS.
+    static TEST_CAS_BEFORE_FREE_HEAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Skip the free-head claim, so a CAS releases the word and waits.
+    static TEST_CAS_SLOW_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// CAS calls on this thread that released the word to wait for a head.
+    static TEST_CAS_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_BEFORE_ROTATION_ALLOCATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_HEAD_QUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_CAPACITY_REFUSAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -8366,6 +8639,34 @@ mod tests {
     }
 
     #[test]
+    fn journaled_entry_releases_head_but_keeps_publication_pin() {
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let pending = chunks.list[0].try_acquire(64, false).unwrap();
+        let segment = pending.seg.clone();
+        assert!(segment.is_head_owned());
+        pending.append().unwrap();
+        assert!(!segment.is_head_owned(), "journal completion must release the head");
+        assert_eq!(segment.pending_journal_count(), 1);
+        assert!(crate::ram::segs::SegmentExclusiveRefGuard::new(&segment).is_none());
+        drop(pending);
+        assert_eq!(segment.pending_journal_count(), 0);
+        assert!(segment.no_references());
+    }
+
+    #[test]
+    fn journaled_entry_drop_keeps_the_next_writers_ownership() {
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let pending = chunks.list[0].try_acquire(64, false).unwrap();
+        let segment = pending.seg.clone();
+        pending.append().unwrap();
+        assert!(segment.try_own(), "next writer must acquire before publication finishes");
+        drop(pending);
+        assert!(segment.is_head_owned(), "old reservation must not release the next writer");
+        segment.release_own();
+        assert!(!segment.is_head_owned());
+    }
+
+    #[test]
     fn delete_reserves_before_locking_the_cell() {
         delete_head_lock_order(0);
     }
@@ -9046,6 +9347,21 @@ mod tests {
         allocation_waits_for_reclamation(true);
     }
 
+    /// Make deletes on this thread release the word and wait for a head, as
+    /// when no head is free. Hooks that take the cell word need this path.
+    struct SlowDeletes;
+    impl SlowDeletes {
+        fn force() -> Self {
+            TEST_DELETE_SLOW_PATH.with(|forced| forced.set(true));
+            SlowDeletes
+        }
+    }
+    impl Drop for SlowDeletes {
+        fn drop(&mut self) {
+            TEST_DELETE_SLOW_PATH.with(|forced| forced.set(false));
+        }
+    }
+
     fn assert_delete_head_released(seg: &AArc<Segment>, cursor: usize) {
         assert_eq!(seg.append_header.load(Ordering::Acquire), cursor);
         assert_eq!(seg.references_count(), 0);
@@ -9078,6 +9394,7 @@ mod tests {
 
     #[test]
     fn review_delete_removed_between_guards_releases_reservation() {
+        let _slow = SlowDeletes::force();
         for path in 0..3 {
             let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
             chunks.stop_background();
@@ -9104,6 +9421,7 @@ mod tests {
 
     #[test]
     fn review_delete_changed_predicate_releases_reservation() {
+        let _slow = SlowDeletes::force();
         let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
         chunks.stop_background();
         let chunk = &chunks.list[0];
@@ -9124,6 +9442,7 @@ mod tests {
 
     #[test]
     fn review_transaction_delete_version_mismatch_releases_reservation() {
+        let _slow = SlowDeletes::force();
         let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
         chunks.stop_background();
         let chunk = &chunks.list[0];
@@ -9152,6 +9471,7 @@ mod tests {
 
     #[test]
     fn review_delete_bad_second_schema_releases_reservation() {
+        let _slow = SlowDeletes::force();
         let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
         chunks.stop_background();
         let chunk = &chunks.list[0];
@@ -9335,6 +9655,8 @@ mod tests {
         let (delete_tx, delete_rx) = std::sync::mpsc::channel();
         let started = Instant::now();
         let deleter = std::thread::spawn(move || {
+            // The cycle exists only on the path that waits for a head.
+            let _slow = SlowDeletes::force();
             TEST_DELETE_AFTER_RESERVE.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {
                     start_tx.send(()).unwrap();
@@ -9353,8 +9675,437 @@ mod tests {
     }
 
     #[test]
-    fn review_delete_wal_failure_releases_reservation() {
+    fn head_pool_follows_cores_with_a_segment_cap_and_a_floor() {
+        // 128 MiB chunks (16 segments) keep the floor on any machine.
+        assert_eq!(default_head_pool_len(48, 16), 8);
+        assert_eq!(default_head_pool_len(192, 16), 8);
+        // A quarter of the segments caps the cores.
+        assert_eq!(default_head_pool_len(48, 64), 16);
+        assert_eq!(default_head_pool_len(48, 128), 32);
+        // The cores cap a large chunk.
+        assert_eq!(default_head_pool_len(48, 512), 48);
+        assert_eq!(default_head_pool_len(16, 512), 16);
+        // 64 at most; never below the floor.
+        assert_eq!(default_head_pool_len(192, 4096), 64);
+        assert_eq!(default_head_pool_len(2, 4096), 8);
+        assert_eq!(default_head_pool_len(48, 1), 8);
+    }
+
+    /// C1 (docs/tla/HeadWordLock.tla, `cur_u_unbounded`): a word-first
+    /// `update_cell_by` holds word X and needs a head while every head is
+    /// owned by a writer that waits for X. Away from the wall nothing bounds
+    /// that wait unless the allocation gives up. The writers here give up
+    /// after 25 s so that a failing run still ends.
+    #[test]
+    fn word_first_update_does_not_wait_forever_for_heads_held_by_its_word() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(0, 0, 99760);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        for slot in chunk.head_pool.iter() {
+            if slot.load(Ordering::Acquire) == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                let seg_id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(seg_id, Ordering::Release);
+            }
+        }
+        assert!(chunk.allocator.writer_headroom() >= 2, "the chunk is not at its wall");
+        let heads = chunk.head_pool.len();
+        // One writer per head: it owns the head, then waits for word X.
+        let (owned_tx, owned_rx) = mpsc::channel();
+        let mut starts = Vec::new();
+        let mut writers = Vec::new();
+        for _ in 0..heads {
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            starts.push(start_tx);
+            let chunks = chunks.clone();
+            let owned_tx = owned_tx.clone();
+            writers.push(std::thread::spawn(move || {
+                let chunk = &chunks.list[0];
+                let pending = chunk.try_acquire(64, true).unwrap();
+                owned_tx.send(pending.seg.id).unwrap();
+                start_rx.recv().unwrap();
+                let started = Instant::now();
+                let obtained = loop {
+                    if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                        drop(guard);
+                        break true;
+                    }
+                    if started.elapsed() >= Duration::from_secs(25) {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                drop(pending);
+                obtained
+            }));
+            // Claims one at a time, so each writer owns a different head.
+            owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let updater = std::thread::spawn({
+            let chunks = chunks.clone();
+            move || {
+                let result = chunks.update_cell_by(&id, |_| {
+                    // Word X is held here: let the head owners wait for it.
+                    for start in &starts {
+                        start.send(()).unwrap();
+                    }
+                    Some(payload_cell(schema.vid.get(), &id, 64))
+                });
+                done_tx.send(result.is_ok()).unwrap();
+            }
+        });
+        let bound = HEAD_QUEUE_DEADLINE + Duration::from_secs(10);
+        let finished = done_rx.recv_timeout(bound);
+        let obtained: Vec<bool> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        updater.join().unwrap();
+        assert!(
+            finished.is_ok(),
+            "update_cell_by held the cell word for {:?} while every head owner waited for it",
+            bound
+        );
+        assert!(
+            obtained.iter().all(|got| *got),
+            "a head owner never got the word the word-first update held: {obtained:?}"
+        );
+    }
+
+    /// Contention soak for the C1 deadline: many writers on few heads, with
+    /// word-first updates, head-first updates and CAS on shared cells. In a
+    /// roomy chunk no write may hit the head-queue deadline or refuse.
+    /// The pool is 2 when this process creates its first chunk here (the
+    /// isolated runner gives each test its own process).
+    /// `NEB_SOAK_SECS` sets the duration (default 60).
+    #[test]
+    #[ignore = "soak, about 60 s"]
+    fn head_contention_soak_has_no_head_queue_timeouts() {
+        use std::time::{Duration, Instant};
+        std::env::set_var("NEB_HEAD_POOL", "2");
+        let secs: u64 = std::env::var("NEB_SOAK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        // A chunk large enough that the cleaner keeps up with the churn:
+        // this soak is about heads, not about capacity.
+        let segments: usize = std::env::var("NEB_SOAK_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let (chunks, schema) = setup_test_chunks_with_size(segments * SEGMENT_SIZE);
+        let pool = chunks.list[0].head_pool.len();
+        const WRITERS: u64 = 64;
+        const SHARED: u64 = 16;
+        for i in 0..WRITERS + SHARED {
+            let id = Id::allocated(0, 0, 99800 + i);
+            chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+        }
+        let timeouts = HEAD_QUEUE_TIMEOUTS.load(Ordering::Relaxed);
+        let refusals = ALLOCATION_EXHAUSTED.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let workers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let chunks = chunks.clone();
+                std::thread::spawn(move || {
+                    let own = Id::allocated(0, 0, 99800 + w);
+                    let (mut ops, mut lost, mut no_space) = (0u64, 0u64, 0u64);
+                    let mut step = w;
+                    while Instant::now() < deadline {
+                        step += 1;
+                        let shared = Id::allocated(0, 0, 99800 + WRITERS + step % SHARED);
+                        let result = match step % 4 {
+                            0 | 1 => chunks
+                                .update_cell(&mut payload_cell(schema.vid.get(), &own, 64))
+                                .map(|_| ()),
+                            2 => chunks
+                                .update_cell_by(&shared, |_| {
+                                    Some(payload_cell(schema.vid.get(), &shared, 64))
+                                })
+                                .map(|_| ()),
+                            _ => {
+                                let version = chunks.head_cell(&shared).unwrap().version;
+                                chunks.list[0]
+                                    .compare_version_and_set_field(
+                                        shared.bits(),
+                                        version,
+                                        hash_str("id"),
+                                        OwnedValue::I32(step as i32),
+                                    )
+                                    .map(|_| ())
+                            }
+                        };
+                        match result {
+                            Ok(()) => ops += 1,
+                            Err(WriteError::CellVersionMismatch) => lost += 1,
+                            Err(WriteError::CannotAllocateSpace) => no_space += 1,
+                            Err(other) => panic!("unexpected write error: {other:?}"),
+                        }
+                    }
+                    (ops, lost, no_space)
+                })
+            })
+            .collect();
+        let (mut ops, mut lost, mut no_space) = (0, 0, 0);
+        for worker in workers {
+            let (o, l, n) = worker.join().unwrap();
+            ops += o;
+            lost += l;
+            no_space += n;
+        }
+        let timeouts = HEAD_QUEUE_TIMEOUTS.load(Ordering::Relaxed) - timeouts;
+        let refusals = ALLOCATION_EXHAUSTED.load(Ordering::Relaxed) - refusals;
+        eprintln!(
+            "head contention soak: pool={pool} segments={segments} secs={secs} writers={WRITERS} ops={ops} \
+             lost_cas={lost} no_space={no_space} head_queue_timeouts={timeouts} \
+             allocation_refusals={refusals}"
+        );
+        assert!(ops > 0);
+        assert_eq!(timeouts, 0, "a write hit the head-queue deadline in a roomy chunk");
+        assert_eq!(no_space, 0, "a write was refused in a roomy chunk");
+        assert_eq!(refusals, 0);
+    }
+
+    /// D40: with a head free, a CAS checks, writes and publishes under one
+    /// hold of the cell word, so a concurrent writer cannot make it lose.
+    #[test]
+    fn cas_with_a_free_head_checks_and_writes_under_one_word() {
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 99750);
+        let version = chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+            .unwrap()
+            .version;
+        TEST_CAS_SLOW_PATHS.with(|count| count.set(0));
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        let header = chunk
+            .compare_version_and_update_cell(id.bits(), version, &mut cell)
+            .unwrap();
+        assert!(header.version > version);
+        let header = chunk
+            .compare_version_and_set_field(id.bits(), header.version, hash_str("id"), OwnedValue::I32(7))
+            .unwrap();
+        assert_eq!(chunks.head_cell(&id).unwrap().version, header.version);
+        assert_eq!(
+            TEST_CAS_SLOW_PATHS.with(|count| count.get()),
+            0,
+            "a CAS released the word to wait for a free head"
+        );
+    }
+
+    /// A CAS that holds the word tries a head only for a bounded time. A
+    /// writer that owns the only head and waits for the word must get it.
+    #[test]
+    fn cas_free_head_try_is_bounded_while_the_word_is_held() {
+        for set_field in [false, true] {
+            let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+            chunks.stop_background();
+            let id = Id::allocated(1, 0, 99751);
+            let version = chunks
+                .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+                .unwrap()
+                .version;
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+            let writer_chunks = chunks.clone();
+            let writer = std::thread::spawn(move || {
+                start_rx.recv().unwrap();
+                let chunk = &writer_chunks.list[0];
+                let pending = chunk.try_acquire(64, true).unwrap();
+                owned_tx.send(()).unwrap();
+                // Model a writer that owns the only head before its word.
+                let started = std::time::Instant::now();
+                let obtained = loop {
+                    if let Some(Some(guard)) = chunk.cell_index.try_lock(id.bits() as usize) {
+                        drop(guard);
+                        break true;
+                    }
+                    if started.elapsed() >= std::time::Duration::from_secs(1) {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                drop(pending);
+                obtained
+            });
+            // The writer takes the only head while the CAS holds the word.
+            TEST_CAS_BEFORE_FREE_HEAD.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    owned_rx.recv().unwrap();
+                }))
+            });
+            let chunk = &chunks.list[0];
+            let result = if set_field {
+                chunk.compare_version_and_set_field(id.bits(), version, hash_str("id"), OwnedValue::I32(7))
+            } else {
+                let mut cell = payload_cell(schema.vid.get(), &id, 64);
+                chunk.compare_version_and_update_cell(id.bits(), version, &mut cell)
+            };
+            let obtained = writer.join().unwrap();
+            result.expect("the CAS must finish after the head becomes available");
+            assert!(obtained, "CAS held the cell word while waiting for the head owner");
+        }
+    }
+
+    /// A CAS that has lost claims no space, even at a full store; a CAS with
+    /// the right version is refused there and leaves the head as it was.
+    #[test]
+    fn cas_at_full_capacity_claims_no_space_for_a_lost_version() {
+        let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let id = Id::allocated(1, 0, 99752);
+        let version = chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &id, 64))
+            .unwrap()
+            .version;
+        let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+        seg.retire_tail();
+        let cursor = seg.append_header.load(Ordering::Acquire);
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        assert!(matches!(
+            chunk.compare_version_and_update_cell(id.bits(), version + 1, &mut cell),
+            Err(WriteError::CellVersionMismatch)
+        ));
+        assert!(matches!(
+            chunk.compare_version_and_set_field(id.bits(), version + 1, hash_str("id"), OwnedValue::I32(7)),
+            Err(WriteError::CellVersionMismatch)
+        ));
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        assert!(matches!(
+            chunk.compare_version_and_update_cell(id.bits(), version, &mut cell),
+            Err(WriteError::CannotAllocateSpace)
+        ));
+        assert_eq!(chunks.head_cell(&id).unwrap().version, version);
+        assert_delete_head_released(&seg, cursor);
+    }
+
+    /// D35: with a head free, a delete reserves its tombstone under the word
+    /// that checked the cell, so it takes the word once.
+    #[test]
+    fn delete_with_a_free_head_takes_the_word_once() {
         for path in 0..3 {
+            let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+            chunks.stop_background();
+            let chunk = &chunks.list[0];
+            let id = Id::allocated(0, 0, 99720 + path as u64);
+            chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+            let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+            let calls = std::cell::Cell::new(0);
+            TEST_DELETE_SLOW_PATHS.with(|count| count.set(0));
+            match path {
+                0 => chunks.remove_cell(&id),
+                1 => chunks.remove_cell_keeping_indices(&id),
+                _ => chunks.remove_cell_by(&id, |_| {
+                    calls.set(calls.get() + 1);
+                    true
+                }),
+            }
+            .unwrap();
+            assert_eq!(
+                TEST_DELETE_SLOW_PATHS.with(|count| count.get()),
+                0,
+                "path {path}: the delete released the word to wait for a free head"
+            );
+            if path == 2 {
+                assert_eq!(calls.get(), 1, "the predicate is checked once under one word");
+            }
+            assert!(matches!(chunks.read_cell(&id), Err(ReadError::CellDoesNotExisted)));
+            assert_eq!(seg.references_count(), 0);
+            let seg = seg.clone();
+            assert!(std::thread::spawn(move || {
+                let owned = seg.try_own();
+                if owned { seg.release_own(); }
+                owned
+            }).join().unwrap(), "delete left the head owned");
+        }
+    }
+
+    /// A delete inside a transaction puts its tombstone in the leased head,
+    /// even when another head is free. The free-head claim is not for it.
+    #[test]
+    fn transactional_delete_writes_its_tombstone_into_the_leased_head() {
+        let (chunks, schema) = setup_test_chunks_with_size(12 * SEGMENT_SIZE);
+        chunks.stop_background();
+        let chunk = &chunks.list[0];
+        let victim = Id::allocated(0, 0, 99740);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &victim, 64)).unwrap();
+        // Every slot gets a live head, so a free one is always there.
+        for slot in chunk.head_pool.iter() {
+            if slot.load(Ordering::Acquire) == HEAD_SEG_ID_EMPTY {
+                let seg = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+                let id = seg.id;
+                chunk.put_segment(seg);
+                slot.store(id, Ordering::Release);
+            }
+        }
+        let txn = crate::server::transactions::test_hlc(8890, 3);
+        let _scope = TransactionScope::enter(txn.clone());
+        let first = Id::allocated(0, 0, 99741);
+        chunks.write_cell(&mut payload_cell(schema.vid.get(), &first, 64)).unwrap();
+        let leased = chunk.locate_segment(chunks.address_of(&first)).unwrap();
+        let cursors: Vec<(u64, usize)> = chunk
+            .head_pool
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .filter(|id| *id != leased.id)
+            .map(|id| {
+                let seg = chunk.segs.get(&(id as usize)).unwrap();
+                (id, seg.append_header.load(Ordering::Acquire))
+            })
+            .collect();
+        assert!(!cursors.is_empty());
+        let leased_cursor = leased.append_header.load(Ordering::Acquire);
+        TEST_DELETE_SLOW_PATHS.with(|count| count.set(0));
+        chunks.remove_cell(&victim).unwrap();
+        assert_eq!(TEST_DELETE_SLOW_PATHS.with(|count| count.get()), 1);
+        assert!(leased.append_header.load(Ordering::Acquire) > leased_cursor);
+        for (id, cursor) in cursors {
+            let seg = chunk.segs.get(&(id as usize)).unwrap();
+            assert_eq!(
+                seg.append_header.load(Ordering::Acquire),
+                cursor,
+                "a transactional tombstone went to head {id}, outside the lease"
+            );
+        }
+    }
+
+    /// An existing cell at a full store: the free-head claim finds no room,
+    /// the slow path refuses, and the head and the cell stay as they were.
+    #[test]
+    fn delete_of_an_existing_cell_at_full_capacity_releases_the_head() {
+        for path in 0..3 {
+            let (chunks, schema) = setup_test_chunks_with_size(SEGMENT_SIZE);
+            chunks.stop_background();
+            let chunk = &chunks.list[0];
+            let id = Id::allocated(0, 0, 99730 + path as u64);
+            chunks.write_cell(&mut payload_cell(schema.vid.get(), &id, 64)).unwrap();
+            let seg = chunk.locate_segment(chunks.address_of(&id)).unwrap();
+            seg.retire_tail();
+            let cursor = seg.append_header.load(Ordering::Acquire);
+            TEST_DELETE_SLOW_PATHS.with(|count| count.set(0));
+            let result = match path {
+                0 => chunks.remove_cell(&id),
+                1 => chunks.remove_cell_keeping_indices(&id),
+                _ => chunks.remove_cell_by(&id, |_| true),
+            };
+            assert!(matches!(result, Err(WriteError::CannotAllocateSpace)), "{result:?}");
+            assert_eq!(TEST_DELETE_SLOW_PATHS.with(|count| count.get()), 1);
+            assert!(chunks.read_cell(&id).is_ok());
+            assert_delete_head_released(&seg, cursor);
+        }
+    }
+
+    #[test]
+    fn review_delete_wal_failure_releases_reservation() {
+        for (path, slow) in (0..3).flat_map(|path| [(path, false), (path, true)]) {
+            let _slow = slow.then(SlowDeletes::force);
             let (_, schema) = setup_test_chunks();
             let schemas = LocalSchemasCache::new_local("");
             schemas.debug_only_new_schema(schema.clone());
@@ -9660,6 +10411,8 @@ mod tests {
         let cas = std::thread::spawn({
             let chunks = chunks.clone();
             move || {
+                // This order exists only when the CAS must wait for a head.
+                TEST_CAS_SLOW_PATH.with(|forced| forced.set(true));
                 TEST_CAS_HEAD_WAIT.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move || {
                         ready_tx.send(()).unwrap();
