@@ -1132,7 +1132,7 @@ async fn a_status_cell_is_hidden_from_scans_and_counts() {
         );
     }
     let slots: std::collections::HashSet<u16> = [entry.id.locality()].into_iter().collect();
-    assert!(!chunks.cell_ids_in_slots(&slots).contains(&entry.id));
+    assert!(!chunks.cell_ids_in_slots(&slots).unwrap().contains(&entry.id));
     let mut scan = client.cell_id_scan().await.unwrap();
     while let Some(page) = scan.next_page(1024).await.unwrap() {
         assert!(
@@ -2212,6 +2212,60 @@ async fn a_read_only_transaction_does_not_see_an_in_doubt_transaction_half_appli
             y_seen
         );
     }
+    cluster.shutdown().await;
+}
+
+/// Review R2: a slot migration of a cell of an in-doubt bracket copies the
+/// version before T, and the resolution then installs T's cell at the old
+/// owner. The owner of X must hold T's X after the resolution.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_migration_of_an_in_doubt_cell_keeps_the_transaction() {
+    const D: usize = 3;
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
+    let (mut cluster, client) = Cluster::start_with(
+        "crosssite_r2_migration",
+        vec![vec![Service::Cell, Service::Transaction]],
+    )
+    .await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 39_000).await;
+    wait_status_synced(&cluster, B, &tid).await;
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test().lock().insert(b_id);
+    cluster.restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid), "test setup: A must wait for B");
+    let from = cluster.site(A).server_id;
+    let to = cluster.site(D).server_id;
+    let plan = crate::migration::MigrationPlan {
+        batch_cells: 8,
+        ..Default::default()
+    };
+    let moved = crate::migration::migrate_slot(&client, HERE as u32, from, to, &plan).await;
+    warn!(
+        "CROSSSITE R2: the migration while T is in doubt returned {:?}",
+        moved.as_ref().map(|_| ())
+    );
+    if let Err(error) = &moved {
+        assert!(
+            matches!(error, crate::migration::MigrationError::SlotInDoubt(_)),
+            "a refused migration must name the in-doubt slot, not {:?}",
+            error
+        );
+    }
+    super::data_site::silent_peers_for_test().lock().remove(&b_id);
+    wait_until("A's resolution", 60, || !in_doubt_on(&cluster, A, &tid)).await;
+    if moved.is_err() {
+        crate::migration::migrate_slot(&client, HERE as u32, from, to, &plan)
+            .await
+            .expect("after the resolution the slot moves");
+    }
+    client.reload_slot_owners().await;
+    let held = client
+        .read_cell(ids[0])
+        .await
+        .unwrap()
+        .ok()
+        .and_then(|cell| cell.data["score"].u64().copied());
+    assert_eq!(held, Some(scores[0]), "the owner of X must hold T's X");
     cluster.shutdown().await;
 }
 

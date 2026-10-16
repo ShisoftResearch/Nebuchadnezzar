@@ -111,7 +111,9 @@ service! {
     rpc drop_migrated_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
     rpc receive_migrated_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc push_cells_to(keys: &Vec<Id>, target: u64) -> Result<Vec<Id>, String>;
-    rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
+    // Refused with `SlotInDoubt` while a slot holds a cell of a bracket in
+    // doubt after a restart: such a cell must not move (review R2).
+    rpc cell_ids_in_slots(slots: &Vec<u32>) -> Result<Vec<Id>, crate::ram::txn_status::SlotInDoubt>;
     rpc slot_live_bytes(slots: &Vec<u32>) -> Vec<u64>;
     rpc total_live_bytes() -> u64;
     rpc can_admit_bytes(bytes: u64) -> bool;
@@ -666,7 +668,10 @@ impl Service for NebRPCService {
         .boxed()
     }
 
-    fn cell_ids_in_slots(&self, slots: &Vec<u32>) -> BoxFuture<'_, Vec<Id>> {
+    fn cell_ids_in_slots(
+        &self,
+        slots: &Vec<u32>,
+    ) -> BoxFuture<'_, Result<Vec<Id>, crate::ram::txn_status::SlotInDoubt>> {
         // Slots are `u32` on the wire because that is what the placement state
         // machine speaks, and `u16` at the storage layer because a Neb slot IS
         // an id's locality, which is 15 bits. A value too large to be a

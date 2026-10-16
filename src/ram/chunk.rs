@@ -6390,13 +6390,23 @@ impl Chunks {
     /// One pass per chunk, and the caller supplies the whole slot set so a
     /// migration plan covering many slots costs one sweep rather than one per
     /// slot.
-    pub fn cell_ids_in_slots(&self, slots: &std::collections::HashSet<u16>) -> Vec<Id> {
+    ///
+    /// Refused while a slot of `slots` holds a cell of a bracket in doubt
+    /// after a restart (`SlotInDoubt`): a migration must not copy it.
+    pub fn cell_ids_in_slots(
+        &self,
+        slots: &std::collections::HashSet<u16>,
+    ) -> Result<Vec<Id>, crate::ram::txn_status::SlotInDoubt> {
+        if let Some(in_doubt) = self.txn_status.in_doubt_slot(slots) {
+            return Err(in_doubt);
+        }
         // A status cell belongs to this site and is never migrated.
-        self.list
+        Ok(self
+            .list
             .iter()
             .flat_map(|chunk| chunk.cell_ids_in_slots(slots))
             .filter(|id| !self.is_status_cell(id.bits()))
-            .collect()
+            .collect())
     }
 
     /// Whether the live cell `id` is a status cell (D31). Status cells have

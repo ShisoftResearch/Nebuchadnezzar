@@ -1333,6 +1333,7 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
     for slot in SLOTS {
         let found: HashSet<Id> = chunks
             .cell_ids_in_slots(&HashSet::from([slot]))
+            .unwrap()
             .into_iter()
             .collect();
         assert_eq!(
@@ -1347,6 +1348,7 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
     let all_requested: HashSet<u16> = SLOTS.into_iter().collect();
     let found: HashSet<Id> = chunks
         .cell_ids_in_slots(&all_requested)
+        .unwrap()
         .into_iter()
         .collect();
     let union: HashSet<Id> = expected.values().flatten().copied().collect();
@@ -1360,11 +1362,12 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
     assert!(
         chunks
             .cell_ids_in_slots(&HashSet::from([9999u16]))
+            .unwrap()
             .is_empty(),
         "an unused slot must enumerate empty"
     );
     assert!(
-        chunks.cell_ids_in_slots(&HashSet::new()).is_empty(),
+        chunks.cell_ids_in_slots(&HashSet::new()).unwrap().is_empty(),
         "an empty slot set must enumerate empty"
     );
 }

@@ -146,6 +146,29 @@ pub fn decode_status_cell(cell: &OwnedCell) -> Result<(TxnId, Vec<u64>), StatusC
     Ok((TxnId { ts, node }, participants.clone()))
 }
 
+/// A slot that holds a cell of a bracket in doubt after a restart. Its
+/// cells must not move: the resolution installs the committed version at
+/// this site, so a copy made now would keep the version before the
+/// transaction for good (review R2). The caller retries after the
+/// resolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SlotInDoubt {
+    pub slot: u32,
+    pub txn: TxnId,
+}
+
+impl std::fmt::Display for SlotInDoubt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "slot {} holds a cell of transaction {:?}, which is in doubt here",
+            self.slot, self.txn
+        )
+    }
+}
+
+impl std::error::Error for SlotInDoubt {}
+
 /// A status cell recovery found live in the index.
 pub struct FoundStatusCell {
     pub txn: TxnId,
@@ -293,6 +316,31 @@ impl TxnStatusRegistry {
                 }
             }
         }
+    }
+
+    /// The first slot of `slots` that holds a cell of a bracket in doubt
+    /// after recovery. One atomic load while no bracket is in doubt.
+    pub fn in_doubt_slot(&self, slots: &std::collections::HashSet<u16>) -> Option<SlotInDoubt> {
+        if self
+            .in_doubt_cell_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            return None;
+        }
+        let state = self.state.lock();
+        for (txn, cells) in &state.resolving_cells {
+            for id in cells {
+                let slot = Id::from_bits(*id).locality();
+                if slots.contains(&slot) {
+                    return Some(SlotInDoubt {
+                        slot: slot as u32,
+                        txn: txn.clone(),
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Whether `id` is a cell of a bracket that is in doubt after recovery.

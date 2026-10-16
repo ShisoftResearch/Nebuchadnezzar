@@ -208,6 +208,9 @@ pub enum MigrationError {
     /// The table does not say what the caller believed it says. Nothing was
     /// destroyed.
     NotCommitted(String),
+    /// The donor holds a cell of this slot in a bracket that is in doubt
+    /// after a restart. Nothing moved; retry after the resolution.
+    SlotInDoubt(crate::ram::txn_status::SlotInDoubt),
 }
 
 impl fmt::Display for MigrationError {
@@ -218,6 +221,7 @@ impl fmt::Display for MigrationError {
             MigrationError::Rpc(error) => write!(f, "member unreachable: {error:?}"),
             MigrationError::Transfer(reason) => write!(f, "transfer failed: {reason}"),
             MigrationError::NotCommitted(reason) => write!(f, "not committed: {reason}"),
+            MigrationError::SlotInDoubt(in_doubt) => write!(f, "slot in doubt: {in_doubt}"),
         }
     }
 }
@@ -255,8 +259,14 @@ fn range_batches(ids: Vec<Id>, batch_cells: usize) -> Vec<Vec<Id>> {
 }
 
 /// Ids of every live cell a member holds in one slot.
-async fn enumerate_slot(member: &Arc<CellServiceClient>, slot: u32) -> Result<Vec<Id>, RPCError> {
-    member.cell_ids_in_slots(&vec![slot]).await
+async fn enumerate_slot(
+    member: &Arc<CellServiceClient>,
+    slot: u32,
+) -> Result<Vec<Id>, MigrationError> {
+    member
+        .cell_ids_in_slots(&vec![slot])
+        .await?
+        .map_err(MigrationError::SlotInDoubt)
 }
 
 /// Every live cell a member holds across many slots, bucketed by slot, in ONE
@@ -274,12 +284,16 @@ async fn enumerate_slot(member: &Arc<CellServiceClient>, slot: u32) -> Result<Ve
 async fn enumerate_slots(
     member: &Arc<CellServiceClient>,
     slots: &[u32],
-) -> Result<std::collections::HashMap<u32, Vec<Id>>, RPCError> {
+) -> Result<std::collections::HashMap<u32, Vec<Id>>, MigrationError> {
     let mut held: std::collections::HashMap<u32, Vec<Id>> = Default::default();
     if slots.is_empty() {
         return Ok(held);
     }
-    for id in member.cell_ids_in_slots(&slots.to_vec()).await? {
+    for id in member
+        .cell_ids_in_slots(&slots.to_vec())
+        .await?
+        .map_err(MigrationError::SlotInDoubt)?
+    {
         held.entry(crate::slots::slot_of(id_ref(&id)))
             .or_default()
             .push(id);
@@ -618,7 +632,7 @@ async fn migrate_slot_prepared(
         // benign orphan as before, just rarer, and a retried migration
         // upserts over it.
         if let Ok(recipient) = client.client_by_server_id(to).await {
-            if let Ok(orphaned) = recipient.cell_ids_in_slots(&vec![slot]).await {
+            if let Ok(Ok(orphaned)) = recipient.cell_ids_in_slots(&vec![slot]).await {
                 if !orphaned.is_empty() {
                     match recipient.drop_migrated_cells(&orphaned).await {
                         Ok(results) => {
@@ -1178,7 +1192,11 @@ pub async fn reshard_slots(
             .filter(|slot| !committed_map.contains_key(slot)),
     );
     if !orphaned_slots.is_empty() {
-        match recipient.cell_ids_in_slots(&orphaned_slots).await {
+        match recipient
+            .cell_ids_in_slots(&orphaned_slots)
+            .await
+            .map(|scanned| scanned.unwrap_or_default())
+        {
             Ok(orphaned) if !orphaned.is_empty() => {
                 match recipient.drop_migrated_cells(&orphaned).await {
                     Ok(results) => {
@@ -1536,6 +1554,7 @@ mod cluster_tests {
         server
             .chunks()
             .cell_ids_in_slots(&HashSet::from([slot]))
+            .unwrap()
             .into_iter()
             .collect()
     }
@@ -2791,7 +2810,11 @@ mod cluster_tests {
             .await
             .unwrap()
             .unwrap();
-        let ids = donor.cell_ids_in_slots(&vec![SLOT as u32]).await.unwrap();
+        let ids = donor
+            .cell_ids_in_slots(&vec![SLOT as u32])
+            .await
+            .unwrap()
+            .unwrap();
         donor
             .push_cells_to(&ids, recipient_id)
             .await
