@@ -2443,6 +2443,12 @@ impl NebServer {
         // segment is exactly the twin that costs the post-archive suffix at
         // the next crash. Refusing those writes makes them the client's
         // problem to retry rather than silent loss.
+        // Stop the cleaner before writes close. With writes closed,
+        // `archive_all` takes the heads out of the pool, and a cleaner that
+        // still runs then compacts those segments while the store goes down.
+        // That work gains nothing and raised the peak RSS of shutdown: with
+        // 128 chunks the cleaner copied the former heads into fresh segments.
+        self.cleaner().stop();
         self.chunks().close_writes();
         info!("Archiving all dirty segments to backup storage...");
         self.chunks().archive_all();
@@ -2538,6 +2544,7 @@ impl NebServer {
             }
         }
         for (_, runtime) in &secondary_runtimes {
+            runtime.cleaner().stop();
             runtime.chunks().sync_all();
             runtime.chunks().close_writes();
             runtime.chunks().archive_all();
