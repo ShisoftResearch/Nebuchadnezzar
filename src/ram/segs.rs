@@ -509,24 +509,73 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// Pooled 8 MiB staging buffers for `Segment::archive` (slab adopter #1).
-/// Bounded in practice by archiver concurrency; `cold_ranges` on so buffer
-/// memory returns to the OS when archiver threads retire.
-type ArchiveStagingBuf = [u8; SEGMENT_SIZE];
+/// At most 32 MiB of staging, including inline and shutdown archives.
+/// Lightning's slab allocator prefaults a 64 MiB range per calling thread.
+/// A shared buffer pool keeps this cost independent of the thread count.
+const ARCHIVE_STAGING_LIMIT: usize = 4;
 
-fn archive_staging_pool(
-) -> &'static std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>> {
-    static POOL: std::sync::OnceLock<
-        std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>>,
-    > = std::sync::OnceLock::new();
-    POOL.get_or_init(|| lightning::slab_pool::SlabPool::new("archive_staging", true))
+#[derive(Default)]
+struct ArchiveStagingState {
+    allocated: usize,
+    idle: Vec<Vec<u8>>,
 }
 
-/// Frees the staging buffer on every exit path (plain data, no destructor).
-struct ArchiveStagingGuard(lightning::slab_pool::SlabHandle<ArchiveStagingBuf>);
-impl Drop for ArchiveStagingGuard {
+#[derive(Default)]
+struct ArchiveStagingPool {
+    state: parking_lot::Mutex<ArchiveStagingState>,
+    available: parking_lot::Condvar,
+}
+
+impl ArchiveStagingPool {
+    fn acquire(&self) -> ArchiveStagingGuard<'_> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(buffer) = state.idle.pop() {
+                return ArchiveStagingGuard {
+                    pool: self,
+                    buffer: Some(buffer),
+                };
+            }
+            if state.allocated < ARCHIVE_STAGING_LIMIT {
+                state.allocated += 1;
+                drop(state);
+                return ArchiveStagingGuard {
+                    pool: self,
+                    buffer: Some(vec![0; SEGMENT_SIZE]),
+                };
+            }
+            self.available.wait(&mut state);
+        }
+    }
+}
+
+fn archive_staging_pool() -> &'static ArchiveStagingPool {
+    static POOL: std::sync::OnceLock<ArchiveStagingPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(ArchiveStagingPool::default)
+}
+
+/// Return the buffer on success, an I/O error, or a panic.
+struct ArchiveStagingGuard<'a> {
+    pool: &'a ArchiveStagingPool,
+    buffer: Option<Vec<u8>>,
+}
+
+impl ArchiveStagingGuard<'_> {
+    fn snapshot(&mut self, data: &[u8]) -> &[u8] {
+        let buffer = self.buffer.as_mut().unwrap();
+        buffer.copy_from_slice(data);
+        buffer
+    }
+}
+
+impl Drop for ArchiveStagingGuard<'_> {
     fn drop(&mut self) {
-        archive_staging_pool().free_forget(self.0);
+        self.pool
+            .state
+            .lock()
+            .idle
+            .push(self.buffer.take().unwrap());
+        self.pool.available.notify_one();
     }
 }
 
@@ -2287,28 +2336,8 @@ image, not an empty segment; archiving it would persist the damage.",
                         let used_len_at_snapshot =
                             self.append_header.load(Ordering::Acquire) - self.addr;
 
-                        // Snapshot the segment into a pooled staging buffer
-                        // (slab adopter #1; Lightning docs/slab-pools-
-                        // design.md). Previously a per-archive 8 MiB
-                        // Vec::from — one large-block heap alloc + free per
-                        // archived segment, continuously for the life of an
-                        // import. The pool is bounded by archiver
-                        // concurrency and recycles the same slots.
-                        let staging = archive_staging_pool();
-                        let staging_handle = staging.alloc_with(|slot| {
-                            ptr::copy_nonoverlapping(
-                                data_block.as_ptr(),
-                                slot.as_mut_ptr() as *mut u8,
-                                SEGMENT_SIZE,
-                            );
-                        });
-                        // Plain-data buffer: freed via free_forget on every
-                        // exit path by this guard.
-                        let _staging_guard = ArchiveStagingGuard(staging_handle);
-                        let padded_data: &[u8] = slice::from_raw_parts(
-                            staging_handle.as_ptr() as *const u8,
-                            SEGMENT_SIZE,
-                        );
+                        let mut staging = archive_staging_pool().acquire();
+                        let padded_data = staging.snapshot(data_block);
 
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
@@ -4030,6 +4059,77 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_staging_buffers_are_bounded_across_threads() {
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let addresses = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        // Replace every worker twice. The buffers belong to the pool, not TLS.
+        for _ in 0..3 {
+            let barrier = Arc::new(std::sync::Barrier::new(ARCHIVE_STAGING_LIMIT));
+            let workers: Vec<_> = (0..ARCHIVE_STAGING_LIMIT)
+                .map(|worker| {
+                    let pool = pool.clone();
+                    let addresses = addresses.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let source = vec![worker as u8 + 1; SEGMENT_SIZE];
+                        for _ in 0..8 {
+                            let mut staging = pool.acquire();
+                            let data = staging.snapshot(&source);
+                            addresses.lock().insert(data.as_ptr() as usize);
+                            barrier.wait();
+                            assert_eq!(data, source.as_slice());
+                            drop(staging);
+                            barrier.wait();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+        assert_eq!(
+            addresses.lock().len(),
+            ARCHIVE_STAGING_LIMIT,
+            "archive staging exceeded the 32 MiB buffer budget"
+        );
+    }
+
+    #[test]
+    fn archive_staging_waits_at_capacity_and_reuses_a_returned_buffer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let mut held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_pool = pool.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let staging = waiter_pool.acquire();
+            acquired_tx
+                .send(staging.buffer.as_ref().unwrap().as_ptr() as usize)
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        let returned = held.pop().unwrap();
+        let address = returned.buffer.as_ref().unwrap().as_ptr() as usize;
+        drop(returned);
+        let acquired = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("staging waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(acquired, address);
+    }
 
     #[test]
     fn seal_waits_for_in_flight_sync_and_credits_all_covered_bytes() {
