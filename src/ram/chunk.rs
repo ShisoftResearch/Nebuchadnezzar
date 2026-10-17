@@ -10243,6 +10243,27 @@ mod tests {
         late_writer_scenario(true, false);
     }
 
+    /// An archive that does not seal (an eviction pass, for one) closes the
+    /// gate and reopens it on exit. A rotated segment must stay closed.
+    #[test]
+    fn a_rotated_segment_keeps_its_journal_gate_closed() {
+        let (chunks, _dir, rotated) = dead_rotated_heads("rotated_gate");
+        let chunk = &chunks.list[0];
+        let (id, seq) = rotated[0];
+        chunk.finish_rotated_head(id, seq);
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        assert!(segment.protection.rotated.load(Ordering::Acquire));
+        segment.close_journal_gate();
+        segment.reopen_journal_gate();
+        assert!(!segment.begin_pending_journal());
+        // A segment that never rotated reopens as before.
+        let plain = chunk.segs.get(&(rotated[1].0 as usize)).unwrap();
+        plain.close_journal_gate();
+        plain.reopen_journal_gate();
+        assert!(plain.begin_pending_journal());
+        plain.end_pending_journal();
+    }
+
     fn late_writer_scenario(archive_first: bool, skip_gate_close: bool) {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
