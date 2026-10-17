@@ -1111,18 +1111,38 @@ pub fn is_in_transaction() -> bool {
 /// Segments waiting for their post-rotation drain/sync/archive/seal.
 ///
 /// A plain locked vec, not a channel: rotations are rare (once per 8 MB of
-/// writes), the consumer is one background thread, and `enqueue` must be able
+/// writes), the consumers are `SEAL_ARCHIVERS` threads, and `enqueue` must be able
 /// to answer "no" for backpressure -- past `SEAL_QUEUE_LIMIT` the rotating
 /// writer archives inline, throttling writers to what archiving sustains.
 pub struct SealQueue {
-    // The sequence distinguishes generations that reuse the same physical slot.
-    pending: parking_lot::Mutex<Vec<(usize, u64, u64)>>,
+    state: parking_lot::Mutex<SealQueueState>,
+}
+
+/// One seal job. The sequence distinguishes generations that reuse the same
+/// physical slot.
+type SealJob = (usize, u64, u64);
+
+#[derive(Default)]
+struct SealQueueState {
+    pending: Vec<SealJob>,
+    /// Jobs that a seal refused, with the time of the refusal. `pop` does not
+    /// return them before `SEAL_RETRY_INTERVAL` has passed.
+    refused: Vec<(SealJob, std::time::Instant)>,
 }
 
 /// Beyond this backlog, rotation archives inline. Small on purpose: the queue
 /// exists to absorb bursts, not to let backup creation lag a sustained import
 /// without bound.
 const SEAL_QUEUE_LIMIT: usize = 64;
+
+/// The minimum time between two attempts of one refused seal job.
+///
+/// A refusal (a transaction pin, a leased head, a cleaner claim) stays until
+/// another thread changes the segment. Each attempt takes a forced WAL sync.
+/// With immediate retries, four archivers attempted one pinned segment more
+/// than 8,000 times in 500 ms. One archiver that drained the queue once per
+/// 10 ms poll made about 50 attempts in the same time.
+const SEAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Background threads that run the queued seal jobs.
 ///
@@ -1138,37 +1158,50 @@ const SEAL_ARCHIVERS: usize = 4;
 impl SealQueue {
     pub fn new() -> Self {
         Self {
-            pending: parking_lot::Mutex::new(Vec::new()),
+            state: parking_lot::Mutex::new(SealQueueState::default()),
         }
     }
     /// True if accepted; false means the caller must do the work inline.
     fn enqueue(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> bool {
-        let mut pending = self.pending.lock();
-        if pending.len() >= SEAL_QUEUE_LIMIT {
+        let mut state = self.state.lock();
+        if state.pending.len() + state.refused.len() >= SEAL_QUEUE_LIMIT {
             return false;
         }
-        pending.push((chunk_id, seg_id, seq_id));
+        state.pending.push((chunk_id, seg_id, seq_id));
         true
     }
     /// A refusal already owns a segment. Retain it even under queue backpressure.
     fn retry(&self, chunk_id: usize, seg_id: u64, seq_id: u64) {
-        let mut pending = self.pending.lock();
+        let mut state = self.state.lock();
         let job = (chunk_id, seg_id, seq_id);
-        if !pending.contains(&job) {
-            pending.push(job);
+        if !state.pending.contains(&job) && !state.refused.iter().any(|(held, _)| *held == job) {
+            state.refused.push((job, std::time::Instant::now()));
             crate::ram::segs::SEAL_RETRIES.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn drain(&self) -> Vec<(usize, u64, u64)> {
-        std::mem::take(&mut *self.pending.lock())
+    /// Every queued job, including refused jobs that are not yet due.
+    pub fn drain(&self) -> Vec<SealJob> {
+        let mut state = self.state.lock();
+        let mut jobs = std::mem::take(&mut state.pending);
+        jobs.extend(state.refused.drain(..).map(|(job, _)| job));
+        jobs
     }
-    /// The oldest queued job, so each archiver takes one job at a time.
-    fn pop(&self) -> Option<(usize, u64, u64)> {
-        let mut pending = self.pending.lock();
+    /// The oldest job that is due, so each archiver takes one job at a time.
+    fn pop(&self) -> Option<SealJob> {
+        let mut state = self.state.lock();
+        let SealQueueState { pending, refused } = &mut *state;
+        refused.retain(|(job, refused_at)| {
+            let due = refused_at.elapsed() >= SEAL_RETRY_INTERVAL;
+            if due {
+                pending.push(*job);
+            }
+            !due
+        });
         (!pending.is_empty()).then(|| pending.remove(0))
     }
     pub fn len(&self) -> usize {
-        self.pending.lock().len()
+        let state = self.state.lock();
+        state.pending.len() + state.refused.len()
     }
 }
 
@@ -9968,6 +10001,75 @@ mod tests {
         assert_eq!(pending.seg.id, available);
         drop(pending);
         drop(pins);
+    }
+
+    /// A seal job that a pin refuses must not be attempted again at once:
+    /// each attempt takes a forced WAL sync, and the pin can stay for long.
+    #[test]
+    fn a_refused_seal_job_waits_before_its_next_attempt() {
+        use std::time::{Duration, Instant};
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("refused_seal_retry", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = Chunks::new(
+            1,
+            12 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        chunks
+            .write_cell(&mut payload_cell(
+                schema.vid.get(),
+                &Id::allocated(1, 0, 99890),
+                64,
+            ))
+            .unwrap();
+        let rotated = chunk.release_append_heads_for_test();
+        assert_eq!(rotated.len(), 1, "the test needs one rotated head");
+        let id = rotated[0];
+        let segment = chunk.segs.get(&(id as usize)).unwrap();
+        // A transaction pin makes every seal attempt refuse the segment.
+        let txn = crate::server::transactions::test_hlc(77001, 9);
+        segment.protection.retain_transaction(&txn);
+        segment
+            .protection
+            .seal_pending
+            .store(true, Ordering::Release);
+        let window = Duration::from_millis(500);
+        let before = crate::ram::segs::SEAL_RETRIES.load(Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(chunk.seal_queue.enqueue(chunk.id, id, segment.seq_id));
+        std::thread::sleep(window);
+        let retries = crate::ram::segs::SEAL_RETRIES.load(Ordering::Relaxed) - before;
+        let elapsed = started.elapsed();
+        eprintln!("seal retries of one pinned segment: {retries} in {elapsed:?}");
+        // One attempt at the start, then at most one per retry interval.
+        let bound = (elapsed.as_millis() / SEAL_RETRY_INTERVAL.as_millis()) as u64 + 2;
+        assert!(
+            retries <= bound,
+            "{retries} seal retries of one pinned segment in {elapsed:?}; the bound is {bound}"
+        );
+        assert!(retries >= 1, "the pinned seal job was never attempted");
+        // A deferred job is not lost: after the pin clears, the seal finishes.
+        segment.protection.abort_transaction(&txn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while segment.protection.seal_pending.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "the deferred seal job did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(segment.is_sealed());
     }
 
     /// A seal job that takes long must not hold up the next one: the
