@@ -10199,7 +10199,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         for (id, _) in &rotated {
             let segment = chunk.segs.get(&(*id as usize)).unwrap();
-            while !segment.is_sealed() {
+            // Sealing precedes WAL cleanup. Wait for the seal job to finish too.
+            while !segment.is_sealed()
+                || segment.protection.seal_pending.load(Ordering::Acquire)
+            {
                 assert!(
                     Instant::now() < deadline,
                     "the seal job did not archive the segment after its waits"
