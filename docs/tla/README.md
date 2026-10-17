@@ -170,9 +170,19 @@ Covers one rotated segment in `ram/chunk.rs` (`finish_rotated_head`) and
 `ram/cleaner` (`Protection::blocks_cleaner`, `SegmentCandidate::for_cleaner`).
 The seal job drains the segment, syncs its WAL and archives it. A mostly
 dead segment first waits for the cleaner for a bounded number of attempts.
-The archive and the cleaner claim exclude each other. One write of the
-segment is still in flight at the rotation. The model gives the cleaner no
-other check, so it shows what the seal rule alone guarantees.
+The archive and the cleaner claim exclude each other.
+
+Two writers touch the segment. The first write is in flight at the rotation,
+and the drain waits for it. The second write is a late writer. It loaded the
+head before the rotation and owns it later, so it can start after the drain
+while the journal gate is open. The D46 review found this case (F1): with
+`e07b3561` the cleaner removed a synced segment under such a write, and the
+acknowledged cell was lost. The fix is `CloseGate`: the seal job closes the
+journal gate before the drain, and the gate never reopens
+(`Protection::rotated`). The model also has the WAL syncer, which needs
+`Protection::job`, and the other cleaner checks (owned head, pending journals,
+`wal_sync_queued`). The constant `OtherChecks` switches these checks off, to
+show what the seal rule alone guarantees.
 `SealReclaim.py` writes one cfg per scenario, runs TLC and compares each
 result with the expected one:
 
@@ -182,8 +192,11 @@ TLC=tlc python3 SealReclaim.py --out /some/scratch/dir
 
 | scenario | result |
 |---|---|
-| `synced_wait` | No error. The current rule: the cleaner may take a seal-pending segment after the drain and the WAL sync; the seal job waits for it at most `Waits` times, then archives. |
+| `synced_wait` | No error. The current rule: the cleaner may take a seal-pending segment after the drain and the WAL sync; the gate is closed before the drain; the seal job waits for the cleaner at most `Waits` times, then archives. 67 distinct states. |
 | `synced_live` | No error. A segment that is not mostly dead is archived without a wait. |
+| `synced_rule_only` | No error. The same as `synced_wait`, with no other cleaner check: the seal rule and the gate close are enough. |
 | `d20` | No error. The rule of 15370976: the cleaner never takes a seal-pending segment. |
-| `ctl_no_gate`, `ctl_no_gate_wait` | `NoLostWrite` violated, on purpose: without a rule (441c1ff7), the cleaner copies the segment before its last write lands. |
+| `ctl_synced_no_close` | `NoLostLateWrite` violated, on purpose: the `synced` rule without `CloseGate` (`e07b3561`). A late writer appends after the drain, and the cleaner removes the segment without the write. |
+| `ctl_none` | `NoLostLateWrite` violated, on purpose: no rule and no gate close (`441c1ff7`). |
+| `ctl_no_gate`, `ctl_no_gate_wait` | `NoLostWrite` violated, on purpose: without a rule and without other cleaner checks, the cleaner copies the segment before its in-flight write lands. |
 | `ctl_unbounded_wait` | `SealEnds` violated, on purpose: without the bound, a seal job waits forever for a cleaner that never reclaims. |
