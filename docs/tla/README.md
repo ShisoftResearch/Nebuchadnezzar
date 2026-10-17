@@ -190,6 +190,8 @@ result with the expected one:
 TLC=tlc python3 SealReclaim.py --out /some/scratch/dir
 ```
 
+The model does not cover the gate reopen; the Rust control `gate_reopen` covers it.
+
 | scenario | result |
 |---|---|
 | `synced_wait` | No error. The current rule: the cleaner may take a seal-pending segment after the drain and the WAL sync; the gate is closed before the drain; the seal job waits for the cleaner at most `Waits` times, then archives. 67 distinct states. |

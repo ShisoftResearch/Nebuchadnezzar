@@ -10252,6 +10252,7 @@ mod tests {
         let (id, seq) = rotated[0];
         chunk.finish_rotated_head(id, seq);
         let segment = chunk.segs.get(&(id as usize)).unwrap();
+        assert!(!segment.is_sealed());
         assert!(segment.protection.rotated.load(Ordering::Acquire));
         segment.close_journal_gate();
         segment.reopen_journal_gate();
