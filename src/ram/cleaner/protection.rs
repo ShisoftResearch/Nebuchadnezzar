@@ -16,6 +16,11 @@ pub(crate) struct Protection {
     pub head: AtomicBool,
     /// Set before rotation unpublishes the head; cleared after the seal job.
     pub seal_pending: AtomicBool,
+    /// Set when the seal job has drained the segment and synced its WAL. From
+    /// then on, the cleaner may reclaim the segment before its archive.
+    pub synced: AtomicBool,
+    /// Seal attempts that left a synced, mostly dead segment to the cleaner.
+    pub reclaim_waits: AtomicUsize,
     activity: AtomicUsize,
     transactions: Mutex<HashMap<TxnId, Option<Arc<Vec<Receipt>>>>>,
 }
@@ -51,6 +56,19 @@ impl Protection {
     pub fn in_progress(&self) -> bool {
         self.head.load(Ordering::Acquire)
             || self.seal_pending.load(Ordering::Acquire)
+            || self.activity.load(Ordering::Acquire) & !CLEANING != 0
+            || self.transaction_pending()
+    }
+
+    /// The cleaner must not select, claim or remove this segment.
+    ///
+    /// Like `in_progress`, except that a seal job blocks the cleaner only until
+    /// it has drained the segment and synced its WAL. After that, the segment
+    /// is immutable and durable in its WAL, and a reclaim makes its archive
+    /// unnecessary. The cleaner claim and the archive exclude each other.
+    pub fn blocks_cleaner(&self) -> bool {
+        self.head.load(Ordering::Acquire)
+            || (self.seal_pending.load(Ordering::Acquire) && !self.synced.load(Ordering::Acquire))
             || self.activity.load(Ordering::Acquire) & !CLEANING != 0
             || self.transaction_pending()
     }

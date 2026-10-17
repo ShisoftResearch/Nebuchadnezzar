@@ -1144,6 +1144,21 @@ const SEAL_QUEUE_LIMIT: usize = 64;
 /// 10 ms poll made about 50 attempts in the same time.
 const SEAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// Seal attempts that leave a synced, mostly dead segment to the cleaner
+/// before the seal job archives it. With `SEAL_RETRY_INTERVAL`, this is at
+/// least 500 ms.
+///
+/// Since D20, the cleaner could not reclaim a rotated segment before its seal
+/// job finished, so the seal job archived 99 % of rotated segments (441c1ff7:
+/// 53-57 %; its cleaner reclaimed about 36 % first). In a local indexed
+/// 16-writer CAS run with 1 GiB chunks, the archives wrote 3.7 GB against
+/// 2.0-2.5 GB. Their fsyncs shared the WAL's file system and made the inline
+/// WAL syncs slower (p99 42-49 ms against 22-25 ms), and CAS16 took 27.1-29.0 s
+/// against 22.7-24.7 s. With the backups on another device, both took 19-21 s.
+/// With this wait, the cleaner reclaims 95 % of rotated segments, the archives
+/// write 0.12-0.17 GB and CAS16 takes 19.0-20.2 s.
+const SEAL_RECLAIM_WAITS: usize = 50;
+
 /// Background threads that run the queued seal jobs.
 ///
 /// One thread was not enough once the cleaner may reclaim a rotated segment
@@ -3128,11 +3143,27 @@ impl Chunk {
                 return;
             };
             drop(lookup);
-            if let Err(e) = old_head.force_wal_sync() {
-                warn!(
-                    "Failed to sync WAL for old head segment {}: {}",
-                    head_seg_id, e
-                );
+            if !old_head.protection.synced.load(Ordering::Acquire) {
+                match old_head.force_wal_sync() {
+                    Ok(()) => old_head.protection.synced.store(true, Ordering::Release),
+                    Err(e) => warn!(
+                        "Failed to sync WAL for old head segment {}: {}",
+                        head_seg_id, e
+                    ),
+                }
+            }
+            // A mostly dead segment costs less to reclaim than to archive.
+            // Leave it to the cleaner for a short time; archive it after that.
+            if old_head.protection.synced.load(Ordering::Acquire)
+                && old_head.living_rate() < self.combine_dead_bar()
+                && old_head
+                    .protection
+                    .reclaim_waits
+                    .fetch_add(1, Ordering::AcqRel)
+                    < SEAL_RECLAIM_WAITS
+            {
+                self.seal_queue.retry(self.id, head_seg_id, head_seq_id);
+                return;
             }
             // Seal-time archive. A segment stops being head exactly
             // once, and from then on it is immutable, so this is the
@@ -4308,7 +4339,7 @@ impl Chunk {
             return;
         };
         if self.is_active_head(segment_id)
-            || segment.protection.in_progress()
+            || segment.protection.blocks_cleaner()
             || segment.is_head_owned()
             || segment.pending_journal_count() != 0
             || segment.wal_sync_queued.load(Ordering::Acquire)
@@ -4763,7 +4794,18 @@ impl Chunk {
         None
     }
 
+    /// The live fraction below which a partial combine pass selects a segment.
+    fn combine_dead_bar(&self) -> f32 {
+        let fill_x8 = (self.segs.len() * SEGMENT_SIZE).saturating_mul(8) / self.capacity.max(1);
+        if fill_x8 >= 6 {
+            DEAD_RATE_FOR_COMBINE_CLEANER
+        } else {
+            DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED
+        }
+    }
+
     fn segs_for_combine_cleaner_impl(&self, full: bool) -> Vec<(AArc<Segment>, f32)> {
+        let dead_bar = self.combine_dead_bar();
         let mut mapping: Vec<_> = self
             .segments()
             .into_iter()
@@ -4781,17 +4823,10 @@ impl Chunk {
                 // there on its own, and combining it later halves the live
                 // cells relocated (and the foreground conflicts relocation
                 // causes). Under pressure, fall back to the eager bar.
-                let fill_x8 =
-                    (self.segs.len() * SEGMENT_SIZE).saturating_mul(8) / self.capacity.max(1);
-                let dead_bar = if fill_x8 >= 6 {
-                    DEAD_RATE_FOR_COMBINE_CLEANER
-                } else {
-                    DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED
-                };
                 *utilization < 1.0
                     && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
-                    && !seg.protection.in_progress()
+                    && !seg.protection.blocks_cleaner()
                     && !seg.is_head_owned()
                     && !seg.wal_sync_queued.load(Ordering::Acquire)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
@@ -10001,6 +10036,139 @@ mod tests {
         assert_eq!(pending.seg.id, available);
         drop(pending);
         drop(pins);
+    }
+
+    /// Two rotated, seal-pending heads whose only cells were deleted.
+    fn dead_rotated_heads(name: &str) -> (Arc<Chunks>, tempfile::TempDir, Vec<(u64, u64)>) {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new(name, None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = Chunks::new(
+            1,
+            12 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let ids = [Id::allocated(1, 0, 99990), Id::allocated(1, 0, 99991)];
+        chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &ids[0], 64))
+            .unwrap();
+        // Hold the first head while the second cell is written, so the pool
+        // grows a second head: a combine needs two sources.
+        let held = chunk.try_acquire(64, true).unwrap();
+        chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &ids[1], 64))
+            .unwrap();
+        drop(held);
+        let rotated: Vec<(u64, u64)> = chunk
+            .release_append_heads_for_test()
+            .into_iter()
+            .map(|id| {
+                let seg = chunk.segs.get(&(id as usize)).unwrap();
+                seg.protection.seal_pending.store(true, Ordering::Release);
+                (id, seg.seq_id)
+            })
+            .collect();
+        assert_eq!(rotated.len(), 2, "the test needs two rotated heads");
+        for id in &ids {
+            chunks.remove_cell(id).unwrap();
+        }
+        for (id, _) in &rotated {
+            let seg = chunk.segs.get(&(*id as usize)).unwrap();
+            assert!(
+                seg.living_rate() < chunk.combine_dead_bar(),
+                "segment {id} must be mostly dead, living rate {}",
+                seg.living_rate()
+            );
+        }
+        (chunks, dir, rotated)
+    }
+
+    /// After the seal job drained and synced a mostly dead segment, the
+    /// cleaner reclaims it, and the segment is never archived.
+    #[test]
+    fn cleaner_reclaims_a_dead_seal_segment_before_its_archive() {
+        use std::time::{Duration, Instant};
+        let (chunks, _dir, rotated) = dead_rotated_heads("dead_seal_reclaim");
+        let chunk = &chunks.list[0];
+        let segments: Vec<_> = rotated
+            .iter()
+            .map(|(id, _)| chunk.segs.get(&(*id as usize)).unwrap())
+            .collect();
+        for (id, seq) in &rotated {
+            chunk.finish_rotated_head(*id, *seq);
+        }
+        // Take the queued attempts away from the archivers.
+        let queued = chunk.seal_queue.drain();
+        assert_eq!(queued.len(), 2, "each seal job must wait for the cleaner");
+        for segment in &segments {
+            assert!(segment.protection.synced.load(Ordering::Acquire));
+            assert!(segment.protection.seal_pending.load(Ordering::Acquire));
+            assert!(!segment.is_sealed(), "a waiting seal job must not archive");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rotated
+            .iter()
+            .any(|(id, _)| chunk.segs.get(&(*id as usize)).is_some())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the cleaner did not reclaim the synced seal segments"
+            );
+            crate::ram::cleaner::Cleaner::clean(chunk, false, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for segment in &segments {
+            assert!(!segment.is_sealed(), "a reclaimed segment needs no archive");
+        }
+        // The queued attempts now find no segment and end.
+        for (chunk_id, id, seq) in queued {
+            chunks.list[chunk_id].finish_rotated_head(id, seq);
+        }
+        assert_eq!(chunk.seal_queue.len(), 0);
+    }
+
+    /// If the cleaner does not reclaim a mostly dead segment, its seal job
+    /// archives it after `SEAL_RECLAIM_WAITS` attempts.
+    #[test]
+    fn a_dead_seal_segment_is_archived_when_the_cleaner_leaves_it() {
+        use std::time::{Duration, Instant};
+        let (chunks, _dir, rotated) = dead_rotated_heads("dead_seal_archive");
+        let chunk = &chunks.list[0];
+        let started = Instant::now();
+        for (id, seq) in &rotated {
+            assert!(chunk.seal_queue.enqueue(chunk.id, *id, *seq));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for (id, _) in &rotated {
+            let segment = chunk.segs.get(&(*id as usize)).unwrap();
+            while !segment.is_sealed() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the seal job did not archive the segment after its waits"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                segment.protection.reclaim_waits.load(Ordering::Acquire),
+                SEAL_RECLAIM_WAITS + 1
+            );
+            assert!(!segment.protection.seal_pending.load(Ordering::Acquire));
+        }
+        assert!(
+            started.elapsed() >= SEAL_RETRY_INTERVAL * SEAL_RECLAIM_WAITS as u32,
+            "the waits ended after {:?}",
+            started.elapsed()
+        );
     }
 
     /// A seal job that a pin refuses must not be attempted again at once:

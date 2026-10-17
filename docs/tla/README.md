@@ -163,3 +163,27 @@ TLC=tlc python3 HeadWordLock.py --out /some/scratch/dir
 | `ctl_cas_unbounded_try` | Deadlock, on purpose: the CAS free-head try without its bound. |
 | `full_cas` | No error. At a full store a CAS on an absent cell (a lost CAS in the model) reports a mismatch, never "no space". |
 | `cas_wordfast_*` | No error. The current CAS order: check the version, write and publish under one word hold if a head is free; else the bounded try ends, the word is released, and the CAS checks again under a new hold after it gets a head. |
+
+## `SealReclaim.tla` — the seal job and the cleaner
+
+Covers one rotated segment in `ram/chunk.rs` (`finish_rotated_head`) and
+`ram/cleaner` (`Protection::blocks_cleaner`, `SegmentCandidate::for_cleaner`).
+The seal job drains the segment, syncs its WAL and archives it. A mostly
+dead segment first waits for the cleaner for a bounded number of attempts.
+The archive and the cleaner claim exclude each other. One write of the
+segment is still in flight at the rotation. The model gives the cleaner no
+other check, so it shows what the seal rule alone guarantees.
+`SealReclaim.py` writes one cfg per scenario, runs TLC and compares each
+result with the expected one:
+
+```sh
+TLC=tlc python3 SealReclaim.py --out /some/scratch/dir
+```
+
+| scenario | result |
+|---|---|
+| `synced_wait` | No error. The current rule: the cleaner may take a seal-pending segment after the drain and the WAL sync; the seal job waits for it at most `Waits` times, then archives. |
+| `synced_live` | No error. A segment that is not mostly dead is archived without a wait. |
+| `d20` | No error. The rule of 15370976: the cleaner never takes a seal-pending segment. |
+| `ctl_no_gate`, `ctl_no_gate_wait` | `NoLostWrite` violated, on purpose: without a rule (441c1ff7), the cleaner copies the segment before its last write lands. |
+| `ctl_unbounded_wait` | `SealEnds` violated, on purpose: without the bound, a seal job waits forever for a cleaner that never reclaims. |
