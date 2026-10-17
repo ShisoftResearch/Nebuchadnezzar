@@ -2,6 +2,7 @@
 //! comparisons of any change to the WAL, tombstones or recovery.
 //!
 //!   neb_perf_probe populate --base DIR [--cells 1000000]
+//!   neb_perf_probe churn    --base DIR [--cells 1000000] [--rounds 4]
 //!   neb_perf_probe recover  --base DIR
 //!   neb_perf_probe txn      --base DIR [--txns 20000] [--tasks 16,64] [--workers 4]
 //!   neb_perf_probe mix      --base DIR [--txns 20000] [--abort-every 10]
@@ -224,13 +225,128 @@ async fn populate(base: &str, cells: u64) {
     );
     println!("METRIC populate_peak_rss_kb {}", peak_rss_kb());
     {
-        use std::sync::atomic::Ordering::Relaxed;
         use neb::ram::segs::*;
-        println!("METRIC seal_waiting_peak {}", SEAL_WAITING_PEAK.load(Relaxed));
+        use std::sync::atomic::Ordering::Relaxed;
+        println!(
+            "METRIC seal_waiting_peak {}",
+            SEAL_WAITING_PEAK.load(Relaxed)
+        );
         println!("METRIC seal_inline {}", SEAL_INLINE.load(Relaxed));
-        println!("METRIC seal_wait_retries {}", SEAL_RECLAIM_WAIT_RETRIES.load(Relaxed));
+        println!(
+            "METRIC seal_wait_retries {}",
+            SEAL_RECLAIM_WAIT_RETRIES.load(Relaxed)
+        );
         println!("METRIC seal_retries {}", SEAL_RETRIES.load(Relaxed));
     }
+}
+
+/// Fragment live segments, then measure the combine pass separately from writes.
+async fn churn(base: &str, cells: u64, rounds: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut opts = options(base, false);
+    opts.chunk_size = 2 * 1024 * 1024 * 1024;
+    opts.db_size = opts.chunk_size;
+    let addr = format!("127.0.0.1:{}", 47900 + std::process::id() % 100);
+    let server = NebServer::new_from_opts(&opts, &addr, "churn_probe", async |_| {})
+        .await
+        .expect("server start");
+    server.cleaner().pause();
+    server.meta().schemas.register_internal_schema(schema());
+    let chunks = server.chunks();
+    // The repeat distance exceeds LZ4's dictionary. Compression remains real work.
+    let pads: Vec<String> = (0..1024u64)
+        .map(|seed| {
+            let mut state = seed + 1;
+            (0..768)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (b'!' + (state % 90) as u8) as char
+                })
+                .collect()
+        })
+        .collect();
+    let make_cell = |i, version| {
+        let mut cell = cell(i, version);
+        cell.data["PAD"] = OwnedValue::String(pads[i as usize % pads.len()].clone());
+        cell
+    };
+    for i in 0..cells {
+        chunks.write_cell(&mut make_cell(i, 0)).expect("seed");
+    }
+    let began = Instant::now();
+    let mut cleaner_secs = 0.0;
+    let mut write_secs = 0.0;
+    let mut operations = 0;
+    for round in 0..rounds {
+        let started = Instant::now();
+        if round != 0 {
+            for i in (1..cells).step_by(4) {
+                chunks
+                    .write_cell(&mut make_cell(i, round))
+                    .expect("reinsert");
+                operations += 1;
+            }
+        }
+        for i in (0..cells).step_by(2) {
+            chunks
+                .update_cell(&mut make_cell(i, round + 1))
+                .expect("update");
+            operations += 1;
+        }
+        for i in (1..cells).step_by(4) {
+            chunks.remove_cell(&id(i)).expect("delete");
+            operations += 1;
+        }
+        write_secs += started.elapsed().as_secs_f64();
+        // Finish seal work before the measured combine pass.
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while chunks.list.iter().any(|chunk| {
+            chunk
+                .segs
+                .iter_values()
+                .any(|segment| !chunk.is_active_head(segment.id) && !segment.is_sealed())
+        }) {
+            assert!(Instant::now() < deadline, "seal jobs did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = neb::ram::segs::ARCHIVE_COUNT.load(Relaxed);
+        let started = Instant::now();
+        for chunk in &chunks.list {
+            neb::ram::cleaner::Cleaner::clean(chunk, true, true);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        cleaner_secs += elapsed;
+        let archives = neb::ram::segs::ARCHIVE_COUNT.load(Relaxed) - before;
+        println!("METRIC churn_round_{round}_cleaner_secs {elapsed:.6}");
+        println!("METRIC churn_round_{round}_combine_archives {archives}");
+        assert!(
+            archives > 4,
+            "the workload did not exercise parallel combine archives"
+        );
+    }
+    println!("METRIC cleaner_secs {cleaner_secs:.6}");
+    println!(
+        "METRIC churn_write_ops_per_sec {:.3}",
+        operations as f64 / write_secs
+    );
+    println!(
+        "METRIC churn_ops_per_sec {:.3}",
+        operations as f64 / began.elapsed().as_secs_f64()
+    );
+    println!(
+        "METRIC churn_cleaner_fraction {:.6}",
+        cleaner_secs / began.elapsed().as_secs_f64()
+    );
+    let wrong = (0..cells)
+        .step_by((cells / 1000).max(1) as usize)
+        .flat_map(|first| first..(first + 4).min(cells))
+        .filter(|i| chunks.read_cell(&id(*i)).is_ok() != (*i % 4 != 1))
+        .count();
+    println!("METRIC sampled_wrong {wrong}");
+    assert_eq!(wrong, 0);
+    server.shutdown().await;
 }
 
 async fn recover(base: &str, cells: u64) {
@@ -767,6 +883,10 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("populate") => runtime.block_on(populate(&base, cells)),
         Some("recover") => runtime.block_on(recover(&base, cells)),
+        Some("churn") => {
+            let rounds = arg(&args, "--rounds").map(|v| v.parse().expect("rounds")).unwrap_or(4);
+            runtime.block_on(churn(&base, cells, rounds));
+        }
         Some("txn") => {
             let txns: u64 = arg(&args, "--txns")
                 .and_then(|v| v.parse().ok())
@@ -820,7 +940,7 @@ fn main() {
             }
         }
         _ => eprintln!(
-            "usage: neb_perf_probe <populate|recover|txn|mix|plain|heads> --base DIR [--cells N] \
+            "usage: neb_perf_probe <populate|recover|churn|txn|mix|plain|heads> --base DIR [--cells N] \
              [--txns N --tasks 16,64 --workers W] [--ops N --threads 1,16]"
         ),
     }
