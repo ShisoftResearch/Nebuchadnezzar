@@ -1288,6 +1288,17 @@ pub struct SealQueue {
 /// without bound.
 const SEAL_QUEUE_LIMIT: usize = 64;
 
+/// Background threads that run the queued seal jobs.
+///
+/// One thread was not enough once the cleaner may reclaim a rotated segment
+/// only after its archive (D20): every rotated segment is archived, and one
+/// archiver fell behind the rotations of 16 writers. The queue then filled, the
+/// writers archived inline, and each writer thread that archived kept its own
+/// 8 MiB staging buffers resident. A fixed set keeps the archiving threads
+/// bounded. Seal jobs of different segments already ran concurrently (inline
+/// beside the archiver); a job is in the queue at most once.
+const SEAL_ARCHIVERS: usize = 4;
+
 impl SealQueue {
     pub fn new() -> Self {
         Self {
@@ -1314,6 +1325,11 @@ impl SealQueue {
     }
     pub fn drain(&self) -> Vec<(usize, u64, u64)> {
         std::mem::take(&mut *self.pending.lock())
+    }
+    /// The oldest queued job, so each archiver takes one job at a time.
+    fn pop(&self) -> Option<(usize, u64, u64)> {
+        let mut pending = self.pending.lock();
+        (!pending.is_empty()).then(|| pending.remove(0))
     }
     pub fn len(&self) -> usize {
         self.pending.lock().len()
@@ -3209,6 +3225,14 @@ impl Chunk {
     /// NEB_SYNC_SEAL_ARCHIVE toggle) or on the background sealer; the sequence
     /// is identical either way.
     pub(crate) fn finish_rotated_head(&self, head_seg_id: u64, head_seq_id: u64) {
+        #[cfg(test)]
+        {
+            // Release the lock before the gate runs: other jobs read it too.
+            let gate = TEST_SEAL_JOB_GATE.lock().take();
+            if let Some(gate) = gate {
+                gate();
+            }
+        }
         let lookup = crate::ram::qsbr::QsbrSection::new();
         if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
             // Reject an obsolete physical-slot generation before touching protection.
@@ -5854,21 +5878,33 @@ impl Chunks {
         {
             let weak = Arc::downgrade(&chunks_arc);
             let stopped = chunks_arc.background_stopped.clone();
-            std::thread::Builder::new()
-                .name("seal-archiver".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let Some(chunks) = weak.upgrade() else { break };
-                    for (chunk_id, seg_id, seq_id) in chunks.seal_queue().drain() {
-                        if let Some(chunk) = chunks.list.get(chunk_id) {
-                            chunk.finish_rotated_head(seg_id, seq_id);
+            for archiver in 0..SEAL_ARCHIVERS {
+                let weak = weak.clone();
+                let stopped = stopped.clone();
+                std::thread::Builder::new()
+                    .name(format!("seal-archiver-{archiver}"))
+                    .spawn(move || loop {
+                        if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
                         }
-                    }
-                })
-                .expect("spawn seal-archiver");
+                        let Some(chunks) = weak.upgrade() else { break };
+                        let mut worked = false;
+                        while let Some((chunk_id, seg_id, seq_id)) = chunks.seal_queue().pop() {
+                            worked = true;
+                            if let Some(chunk) = chunks.list.get(chunk_id) {
+                                chunk.finish_rotated_head(seg_id, seq_id);
+                            }
+                            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        drop(chunks);
+                        if !worked {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    })
+                    .expect("spawn seal-archiver");
+            }
         }
 
         // Statistics sweeper: the only place chunk statistics are rebuilt.
@@ -7234,6 +7270,11 @@ impl<'a> Deref for CellGuard<'a> {
         &**self.guard.as_ref().unwrap()
     }
 }
+
+/// Runs once, at the start of the next seal job on any thread.
+#[cfg(test)]
+static TEST_SEAL_JOB_GATE: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    parking_lot::Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
@@ -10314,6 +10355,97 @@ mod tests {
         assert_eq!(pending.seg.id, available);
         drop(pending);
         drop(pins);
+    }
+
+    /// A seal job that takes long must not hold up the next one: the
+    /// background archivers run queued jobs in parallel.
+    #[test]
+    fn a_slow_seal_job_does_not_block_the_next_one() {
+        use std::time::{Duration, Instant};
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("slow_seal_job", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = Chunks::new(
+            1,
+            12 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        // Two heads with data: hold the first head while the second cell is
+        // written, so the pool grows a second head.
+        chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &Id::allocated(1, 0, 99790), 64))
+            .unwrap();
+        let held = chunk.try_acquire(64, true).unwrap();
+        chunks
+            .write_cell(&mut payload_cell(schema.vid.get(), &Id::allocated(1, 0, 99791), 64))
+            .unwrap();
+        drop(held);
+        let rotated: Vec<(u64, u64)> = chunk
+            .release_append_heads_for_test()
+            .into_iter()
+            .map(|id| {
+                let seg = chunk.segs.get(&(id as usize)).unwrap();
+                seg.protection.seal_pending.store(true, Ordering::Release);
+                (id, seg.seq_id)
+            })
+            .collect();
+        assert_eq!(rotated.len(), 2, "the test needs two rotated heads");
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *TEST_SEAL_JOB_GATE.lock() = Some(Box::new(move || {
+            blocked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        }));
+        for (id, seq) in &rotated {
+            assert!(chunk.seal_queue.enqueue(chunk.id, *id, *seq));
+        }
+        blocked_rx.recv_timeout(Duration::from_secs(5)).expect("no archiver took the first job");
+        let pending = |id: u64| {
+            chunk
+                .segs
+                .get(&(id as usize))
+                .map_or(false, |seg| seg.protection.seal_pending.load(Ordering::Acquire))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut other_done = false;
+        while Instant::now() < deadline {
+            if rotated.iter().filter(|(id, _)| !pending(*id)).count() == 1 {
+                other_done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let states: Vec<_> = rotated
+            .iter()
+            .map(|(id, _)| {
+                let seg = chunk.segs.get(&(*id as usize)).unwrap();
+                (
+                    *id,
+                    seg.protection.seal_pending.load(Ordering::Acquire),
+                    seg.is_sealed(),
+                    seg.protection.jobs_drained(),
+                )
+            })
+            .collect();
+        let queued = chunk.seal_queue.len();
+        release_tx.send(()).unwrap();
+        assert!(
+            other_done,
+            "the second seal job waited behind the blocked first one: \
+             (id, seal_pending, sealed, jobs_drained) {states:?}, queued {queued}"
+        );
+        chunk.wait_for_segment_jobs_for_test();
+        assert!(rotated.iter().all(|(id, _)| !pending(*id)));
     }
 
     #[test]
