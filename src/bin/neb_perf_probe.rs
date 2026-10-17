@@ -223,6 +223,14 @@ async fn populate(base: &str, cells: u64) {
         started.elapsed().as_secs_f64()
     );
     println!("METRIC populate_peak_rss_kb {}", peak_rss_kb());
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        use neb::ram::segs::*;
+        println!("METRIC seal_waiting_peak {}", SEAL_WAITING_PEAK.load(Relaxed));
+        println!("METRIC seal_inline {}", SEAL_INLINE.load(Relaxed));
+        println!("METRIC seal_wait_retries {}", SEAL_RECLAIM_WAIT_RETRIES.load(Relaxed));
+        println!("METRIC seal_retries {}", SEAL_RETRIES.load(Relaxed));
+    }
 }
 
 async fn recover(base: &str, cells: u64) {
