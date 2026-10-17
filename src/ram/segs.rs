@@ -528,6 +528,7 @@ struct ArchiveStagingPool {
 
 impl ArchiveStagingPool {
     fn acquire(&self) -> ArchiveStagingGuard<'_> {
+        // During snapshot, compression, and write, holders take no lock and wait for no thread.
         let mut state = self.state.lock();
         loop {
             if let Some(buffer) = state.idle.pop() {
@@ -2079,6 +2080,7 @@ impl Segment {
             ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
             return Ok(ArchiveOutcome::Refused);
         }
+        let staging = archive_staging_pool().acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -2329,6 +2331,8 @@ image, not an empty segment; archiving it would persist the damage.",
                         let data_block =
                             slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
+                        let mut staging = staging;
+
                         // Read the append cursor BEFORE snapshotting the
                         // image, so the recorded length can never exceed the
                         // bytes captured. See the call to
@@ -2336,7 +2340,6 @@ image, not an empty segment; archiving it would persist the damage.",
                         let used_len_at_snapshot =
                             self.append_header.load(Ordering::Acquire) - self.addr;
 
-                        let mut staging = archive_staging_pool().acquire();
                         let padded_data = staging.snapshot(data_block);
 
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
@@ -4129,6 +4132,35 @@ mod tests {
         waiter.join().unwrap();
         assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout));
         assert_eq!(acquired, address);
+    }
+
+    #[test]
+    fn archive_staging_returns_a_buffer_after_a_panic() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let panic_pool = pool.clone();
+        let panic = std::thread::spawn(move || {
+            let _staging = panic_pool.acquire();
+            panic!("panic with an archive staging buffer");
+        })
+        .join()
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"panic with an archive staging buffer")
+        );
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+            acquired_tx.send(held.len()).unwrap();
+        });
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ARCHIVE_STAGING_LIMIT
+        );
+        worker.join().unwrap();
     }
 
     #[test]
