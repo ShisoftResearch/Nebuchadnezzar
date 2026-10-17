@@ -21,6 +21,12 @@ pub(crate) struct Protection {
     pub synced: AtomicBool,
     /// Seal attempts that left a synced, mostly dead segment to the cleaner.
     pub reclaim_waits: AtomicUsize,
+    /// Set when the seal job closes the segment for appends. It never clears:
+    /// a rotated segment never takes another append, so nothing reopens its
+    /// journal gate.
+    pub rotated: AtomicBool,
+    /// Set while the segment is counted in `SEAL_WAITING_SEGMENTS`.
+    waiting: AtomicBool,
     activity: AtomicUsize,
     transactions: Mutex<HashMap<TxnId, Option<Arc<Vec<Receipt>>>>>,
 }
@@ -53,6 +59,23 @@ impl Protection {
         !transactions.is_empty()
     }
 
+    /// Count this segment as waiting for the cleaner. True on the first call.
+    pub fn enter_wait(&self) -> bool {
+        let first = !self.waiting.swap(true, Ordering::AcqRel);
+        if first {
+            let now = crate::ram::segs::SEAL_WAITING_SEGMENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::ram::segs::SEAL_WAITING_PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+        first
+    }
+
+    /// Stop counting this segment as waiting. Safe to call more than once.
+    pub fn leave_wait(&self) {
+        if self.waiting.swap(false, Ordering::AcqRel) {
+            crate::ram::segs::SEAL_WAITING_SEGMENTS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn in_progress(&self) -> bool {
         self.head.load(Ordering::Acquire)
             || self.seal_pending.load(Ordering::Acquire)
@@ -63,8 +86,10 @@ impl Protection {
     /// The cleaner must not select, claim or remove this segment.
     ///
     /// Like `in_progress`, except that a seal job blocks the cleaner only until
-    /// it has drained the segment and synced its WAL. After that, the segment
-    /// is immutable and durable in its WAL, and a reclaim makes its archive
+    /// it has drained the segment and synced its WAL. The seal job closes the
+    /// journal gate of the segment before that drain, and the gate stays closed
+    /// (`rotated`). So after `synced`, the segment takes no append, and its WAL
+    /// holds every acknowledged write. A reclaim then makes its archive
     /// unnecessary. The cleaner claim and the archive exclude each other.
     pub fn blocks_cleaner(&self) -> bool {
         self.head.load(Ordering::Acquire)

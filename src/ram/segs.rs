@@ -36,7 +36,16 @@ pub(crate) enum ArchiveOutcome {
 }
 
 pub static ARCHIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that a pin, a claim or a lease refused, then queued again.
 pub static SEAL_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that left a synced, mostly dead segment to the cleaner, then
+/// queued again. A wait is not a refusal: it takes no fsync.
+pub static SEAL_RECLAIM_WAIT_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Segments that wait for the cleaner now, and the most that waited at once.
+pub static SEAL_WAITING_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+pub static SEAL_WAITING_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Rotations whose seal job ran on the rotating writer: the queue was full.
+pub static SEAL_INLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Durability write accounting, for attributing disk write volume.
 ///
@@ -2858,9 +2867,12 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     /// Accept claims again: for an archive that decided not to seal after
-    /// all. A sealed segment's gate stays shut -- nothing may append to it.
+    /// all. The gate of a sealed or rotated segment stays shut -- nothing may
+    /// append to it.
     pub fn reopen_journal_gate(&self) {
-        if !self.is_sealed() {
+        // A rotated segment stays closed for the rest of its life, also after
+        // the seal job ends without a seal (the cleaner took it, or no backup).
+        if !self.is_sealed() && !self.protection.rotated.load(Ordering::Acquire) {
             self.pending_journals
                 .fetch_and(!JOURNAL_GATE_CLOSED, Ordering::AcqRel);
         }
