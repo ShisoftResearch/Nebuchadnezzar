@@ -435,10 +435,10 @@ impl TransactionLeases {
 }
 
 lazy_static! {
-    /// A transaction keeps its lease state in one hash partition. Placement
-    /// and revocation use the same partition, including across stores.
-    static ref TXN_LEASES: crate::utils::sharded::Sharded<Mutex<std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>>> =
-        Default::default();
+    /// Placement and revocation share only their transaction's state.
+    /// The ordered side index streams sweep candidates without copying the map.
+    static ref TXN_LEASES: crate::utils::keyed_state::KeyedState<crate::server::transactions::TxnId, TransactionLeases> =
+        crate::utils::keyed_state::KeyedState::ordered();
 }
 
 /// Guard acquisitions abandoned at the deadline. Non-zero means a cell index
@@ -557,9 +557,8 @@ impl TransactionScope {
         txn: crate::server::transactions::TxnId,
         participants: Vec<u64>,
     ) -> Self {
-        crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
-            .entry(txn.clone())
-            .or_insert_with(TransactionLeases::new)
+        crate::profile_lock!(H01, TXN_LEASES.entry(&txn))
+            .get_or_insert_with(TransactionLeases::new)
             .live_scopes += 1;
         TransactionScope {
             previous: set_transaction_id(Some(txn)),
@@ -574,11 +573,11 @@ impl Drop for TransactionScope {
         let previous_participants = std::mem::take(&mut self.previous_participants);
         CURRENT_PARTICIPANTS.with(|p| p.replace(previous_participants));
         if let Some(txn) = set_transaction_id(self.previous.take()) {
-            let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-            if let Some(leases) = held.get_mut(&txn) {
+            let mut held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+            if let Some(leases) = held.as_mut() {
                 leases.live_scopes = leases.live_scopes.saturating_sub(1);
                 if leases.live_scopes == 0 && leases.per_chunk.is_empty() {
-                    held.remove(&txn);
+                    held.take();
                 }
             }
         }
@@ -608,8 +607,8 @@ fn take_store_leases(
     store: &StoreRange,
     revoke: bool,
 ) -> Vec<((usize, usize), Vec<HeadLease>)> {
-    let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-    take_store_leases_locked(&mut held, txn, store, revoke)
+    let mut held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+    take_store_leases_locked(&mut held, store, revoke)
 }
 
 /// `revoke`: the transaction is being ENDED without a commit, so any thread
@@ -617,12 +616,11 @@ fn take_store_leases(
 /// lock every placement takes, which is what makes the fence atomic with
 /// respect to a stale owner's next write.
 fn take_store_leases_locked(
-    held: &mut std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>,
-    txn: &crate::server::transactions::TxnId,
+    held: &mut Option<TransactionLeases>,
     store: &StoreRange,
     revoke: bool,
 ) -> Vec<((usize, usize), Vec<HeadLease>)> {
-    let Some(leases) = held.get_mut(txn) else {
+    let Some(leases) = held.as_mut() else {
         return Vec::new();
     };
     if revoke && !leases.revoked.contains(store) {
@@ -639,7 +637,7 @@ fn take_store_leases_locked(
         .filter_map(|key| leases.per_chunk.remove(&key).map(|heads| (key, heads)))
         .collect();
     if leases.per_chunk.is_empty() && leases.live_scopes == 0 {
-        held.remove(txn);
+        held.take();
     }
     taken
 }
@@ -901,8 +899,8 @@ pub fn release_transaction_leases(
     store: &StoreRange,
 ) -> Result<usize, LeaseExitError> {
     let leases = {
-        let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-        let open = held.get(txn).and_then(|leases| {
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+        let open = held.as_ref().and_then(|leases| {
             leases
                 .per_chunk
                 .iter()
@@ -923,7 +921,7 @@ pub fn release_transaction_leases(
             );
             return Err(LeaseExitError::OpenBracket(refused));
         }
-        take_store_leases_locked(&mut held, txn, store, false)
+        take_store_leases_locked(&mut held, store, false)
     };
     let mut first_error = None;
     let mut released = 0usize;
@@ -954,17 +952,13 @@ pub fn transactions_with_idle_leases(
     store: &StoreRange,
 ) -> Vec<crate::server::transactions::TxnId> {
     let now = std::time::Instant::now();
-    TXN_LEASES
-        .iter()
-        .flat_map(|shard| {
-            let held = crate::profile_lock!(H01, shard.lock());
-            held.iter()
-                .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
-                .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
-                .map(|(txn, _)| *txn)
-                .collect::<Vec<_>>()
+    TXN_LEASES.keys().filter(|txn| {
+        let held = crate::profile_lock!(H01, TXN_LEASES.entry(txn));
+        held.as_ref().is_some_and(|leases| {
+            now.saturating_duration_since(leases.opened_at) >= idle
+                && leases.per_chunk.keys().any(|key| store.contains(&key.0))
         })
-        .collect()
+    }).collect()
 }
 
 /// Reclaim leases whose transaction has been silent longer than `idle`.
@@ -1166,8 +1160,8 @@ pub fn transaction_manifest(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<crate::ram::bracket::ManifestEntry> {
-    let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-    let Some(leases) = held.get(txn) else {
+    let held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+    let Some(leases) = held.as_ref() else {
         return Vec::new();
     };
     let mut manifest: Vec<_> = leases
@@ -1212,8 +1206,8 @@ pub fn transaction_has_leases(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> bool {
-    crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
-        .get(txn)
+    crate::profile_lock!(H01, TXN_LEASES.entry(&txn))
+        .as_ref()
         .is_some_and(|leases| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
 }
 
@@ -1222,8 +1216,8 @@ pub fn transaction_leased_segments(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<AArc<Segment>> {
-    let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-    held.get(txn)
+    let held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+    held.as_ref()
         .map(|leases| {
             leases
                 .per_chunk
@@ -1241,8 +1235,8 @@ pub fn transaction_lease_count(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> usize {
-    crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
-        .get(txn)
+    crate::profile_lock!(H01, TXN_LEASES.entry(&txn))
+        .as_ref()
         .map(|leases| {
             leases
                 .per_chunk
@@ -2230,8 +2224,8 @@ impl Chunk {
             // Being reclaimed underneath us: do not lease it.
             return false;
         }
-        let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-        let leases = held.entry(txn).or_insert_with(TransactionLeases::new);
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+        let leases = held.get_or_insert_with(TransactionLeases::new);
         if leases.is_revoked_in(self.lease_key().0) {
             drop(held);
             head.decr_references();
@@ -2288,9 +2282,9 @@ impl Chunk {
         manifest: &[crate::ram::bracket::ManifestEntry],
     ) -> Result<(), WriteError> {
         let heads: Vec<AArc<Segment>> = {
-            let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
+            let held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
             match held
-                .get(txn)
+                .as_ref()
                 .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             {
                 Some(heads) => heads.iter().map(|lease| lease.seg.clone()).collect(),
@@ -2494,8 +2488,8 @@ impl Chunk {
         let Some(txn) = current_txn() else {
             return false;
         };
-        crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
-            .get(&txn)
+        crate::profile_lock!(H01, TXN_LEASES.entry(&txn))
+            .as_ref()
             .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             .map(|heads| {
                 heads
@@ -2513,8 +2507,8 @@ impl Chunk {
             return LeasedPlacement::NoLease;
         };
         let head = {
-            let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
-            let Some(leases) = held.get(&txn) else {
+            let held = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
+            let Some(leases) = held.as_ref() else {
                 return LeasedPlacement::NoLease;
             };
             // The fence. Checked under the lock that ending the leases takes,
@@ -8119,9 +8113,9 @@ mod tests {
         // Where the transaction found the cursor. Its BEGIN is the first
         // thing in the run, so the span to disown starts at the BEGIN.
         let before = {
-            let leases = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
+            let leases = crate::profile_lock!(H01, TXN_LEASES.entry(&txn));
             leases
-                .get(&txn)
+                .as_ref()
                 .unwrap()
                 .per_chunk
                 .get(&chunk.lease_key())
@@ -8339,8 +8333,8 @@ mod tests {
         );
         drop(scope);
         assert!(
-            crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
-                .get(&txn)
+            crate::profile_lock!(H01, TXN_LEASES.entry(&txn))
+                .as_ref()
                 .is_none(),
             "the fence record lives only while a scope can still write"
         );
@@ -8501,13 +8495,10 @@ mod tests {
     }
 
     #[test]
-    fn independent_transaction_scopes_do_not_wait_for_other_lease_shards() {
+    fn independent_transaction_scopes_do_not_wait_for_other_leases() {
         let first = test_txn_id(99001);
-        let second = (99002..100002)
-            .map(test_txn_id)
-            .find(|id| !std::ptr::eq(TXN_LEASES.shard(&first), TXN_LEASES.shard(id)))
-            .unwrap();
-        let held = TXN_LEASES.shard(&first).lock();
+        let second = test_txn_id(99002);
+        let held = TXN_LEASES.entry(&first);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let scope = TransactionScope::enter(second);
@@ -8519,14 +8510,14 @@ mod tests {
         thread.join().unwrap();
         assert!(
             result.is_ok(),
-            "an unrelated lease partition must make progress"
+            "an unrelated transaction must make progress"
         );
     }
 
     #[test]
-    fn the_same_transaction_scope_waits_for_its_lease_shard() {
+    fn the_same_transaction_scope_waits_for_its_lease_state() {
         let txn = test_txn_id(99003);
-        let held = TXN_LEASES.shard(&txn).lock();
+        let held = TXN_LEASES.entry(&txn);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -8566,11 +8557,11 @@ mod tests {
         }
         assert_eq!(current_txn(), None);
         assert!(!is_in_transaction());
-        assert!(crate::profile_lock!(H01, TXN_LEASES.shard(&outer).lock())
-            .get(&outer)
+        assert!(crate::profile_lock!(H01, TXN_LEASES.entry(&outer))
+            .as_ref()
             .is_none());
-        assert!(crate::profile_lock!(H01, TXN_LEASES.shard(&inner).lock())
-            .get(&inner)
+        assert!(crate::profile_lock!(H01, TXN_LEASES.entry(&inner))
+            .as_ref()
             .is_none());
     }
 
