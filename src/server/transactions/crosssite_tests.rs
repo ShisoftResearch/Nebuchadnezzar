@@ -2638,3 +2638,117 @@ async fn a_lost_end_answer_is_reported_as_outcome_unknown() {
     );
     cluster.shutdown().await;
 }
+
+/// A site refusal does not undo another site's commit (D33).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_commit_outcome_store_full_can_already_be_committed() {
+    use crate::client::transaction::{Transaction, TxnError};
+    use std::cell::Cell;
+    let (cluster, client) = Cluster::start("client_commit_store_full").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let read_id = Id::from_parts(THERE as u64, 40_001);
+    client
+        .write_cell(cell_of(read_id, 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let manager = coordinator(&cluster).await;
+    for (seq, reader) in [(40_002, true), (40_003, false)] {
+        let tid = manager.begin().await.unwrap().unwrap();
+        let write_id = Id::from_parts(HERE as u64, seq);
+        if reader {
+            manager.read(tid, read_id).await.unwrap().unwrap();
+        }
+        manager
+            .write(tid, cell_of(write_id, seq))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        let txn = Transaction {
+            tid,
+            state: Cell::new(TxnState::Prepared),
+            client: manager.clone(),
+        };
+        let result = txn.commit().await;
+        if reader {
+            assert!(
+                matches!(result, Err(TxnError::OutcomeUnknown)),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "single writer control: {result:?}");
+        }
+        assert_eq!(score_on(cluster.site(A), &write_id), Some(seq));
+        assert_eq!(
+            data_site(&cluster, A).txn_outcome(&tid),
+            TxnOutcome::Committed
+        );
+    }
+    cluster.shutdown().await;
+}
+
+/// The automatic transaction wrapper must not replay an uncertain commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_commit_outcome_wrapper_does_not_retry_or_abort() {
+    use crate::client::transaction::TxnError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (cluster, client) = Cluster::start("client_commit_no_replay").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    // The wrapper chooses any coordinator. Refresh each coordinator's route table.
+    for server in cluster.servers.iter().flatten() {
+        assert!(server.refresh_slot_placement().await);
+    }
+    let waiting = data_site(&cluster, A);
+    let prepared_site = cluster.site(A).clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let result = client
+        .transaction(move |txn| {
+            let seen = seen.clone();
+            let waiting = waiting.clone();
+            let prepared_site = prepared_site.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                txn.write(cell_of(Id::from_parts(HERE as u64, 40_004), 8))
+                    .await?;
+                txn.write(cell_of(Id::from_parts(THERE as u64, 40_004), 9))
+                    .await?;
+                txn.prepare().await?;
+                assert_eq!(
+                    score_on(&prepared_site, &Id::from_parts(HERE as u64, 40_004)),
+                    Some(8)
+                );
+                assert_eq!(waiting.txn_outcome(&txn.tid), TxnOutcome::InDoubt);
+                let limit = super::manager::stop_end_fanout_after_commit_point(txn.tid);
+                let result = txn.commit().await;
+                drop(limit);
+                assert_eq!(waiting.txn_outcome(&txn.tid), TxnOutcome::InDoubt);
+                assert_eq!(txn.state.get(), TxnState::Committed);
+                // A second call cannot turn the first uncertain result into a definite error.
+                assert!(matches!(txn.commit().await, Err(TxnError::OutcomeUnknown)));
+                result
+            }
+        })
+        .await;
+    assert!(
+        matches!(result, Err(TxnError::OutcomeUnknown)),
+        "{result:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        score_on(cluster.site(B), &Id::from_parts(THERE as u64, 40_004)),
+        Some(9)
+    );
+    // An abort would rewind A. The wrapper leaves it in doubt for peer resolution.
+    assert_eq!(
+        score_on(cluster.site(A), &Id::from_parts(HERE as u64, 40_004)),
+        Some(8)
+    );
+    cluster.shutdown().await;
+}
