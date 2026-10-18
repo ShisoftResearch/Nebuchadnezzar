@@ -4,10 +4,11 @@
 def check_transaction(request, result, observed):
     assert len(observed) == len(request['keys']), 'incomplete read set'
     present = []
-    for item in observed:
+    for index, item in enumerate(observed):
         assert 'value' in item or item == {'absent': True}, ('unreadable', item)
         if 'value' in item:
-            assert item['value'] == request['value'], ('wrong value', item, request)
+            expected = request['values'][index] if 'values' in request else request['value']
+            assert item['value'] == expected, ('wrong value', item, request)
         present.append('value' in item)
     assert len(set(present)) <= 1, ('D19 torn transaction', request, observed)
     outcome = result['outcome']

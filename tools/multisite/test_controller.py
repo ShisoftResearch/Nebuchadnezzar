@@ -25,6 +25,13 @@ class LedgerTests(unittest.TestCase):
 
 
 class BatchAndProtocolTests(unittest.TestCase):
+    def test_per_key_values(self):
+        request = {'keys':[[91,1],[92,1]],'values':[5,6],'value':0}
+        check_transaction(request, {'outcome':'ack'}, [{'value':5},{'value':6}])
+        for observed in ([{'value':5},{'absent':True}], [{'value':6},{'value':5}]):
+            with self.assertRaises(AssertionError):
+                check_transaction(request, {'outcome':'ack'}, observed)
+
     def test_batch_controls(self):
         requests = [{'keys':[[91,1],[92,1]],'value':v} for v in (1,2,3)]
         results = [{'outcome':'ack'},{'outcome':'prepare_error'},{'outcome':'unknown'}]

@@ -217,13 +217,12 @@ async fn run_txn(peers: &[String], group: &str, req: &Value) -> Value {
             }
         }
     }
-    for key in req["keys"].as_array().unwrap() {
+    for (index, key) in req["keys"].as_array().unwrap().iter().enumerate() {
         let id = Id::from_parts(key[0].as_u64().unwrap(), key[1].as_u64().unwrap());
-        let cell = OwnedCell::new_with_id(
-            SchemaVid(4343),
-            &id,
-            OwnedValue::U64(req["value"].as_u64().unwrap()),
-        );
+        let value = req["values"][index]
+            .as_u64()
+            .unwrap_or_else(|| req["value"].as_u64().unwrap());
+        let cell = OwnedCell::new_with_id(SchemaVid(4343), &id, OwnedValue::U64(value));
         let written = if req["create"].as_bool().unwrap_or(false) {
             txn.write(cell).await
         } else {

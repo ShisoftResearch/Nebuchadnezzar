@@ -296,6 +296,7 @@ class Gate:
 
     # ---- mixed schedule ----
     WORKLOADS = ['s1','s2','s3','abort','conflict1','conflict8','conflict64']
+    EXTRA_WORKLOADS = ['graph']
     FAULTS = ['point-kill','point-graceful','time-kill','time-graceful','cut','delay','drop']
     SINGLE_POINTS = ['before_p0','after_p0','during_end','coordinator_before_end']
     MULTI_POINTS = ['before_p0','after_p0','during_end','before_status_record','after_status_record',
@@ -311,6 +312,15 @@ class Gate:
             requests = [{'op':'txn','id':f'{event}.{i}','keys':keys,'value':event*1000+i+1,'durable':durable,
                          'coordinator':rng.randrange(members)} for i in range(count)]
             return {'op':'batch','requests':requests,'id':str(event)}, sites
+        if workload == 'graph':
+            # A list cell at one site refers to a body cell at another site. A one-sided
+            # edge or a dangling reference shows as one cell without the other (D19).
+            list_site, body_site = rng.sample(range(members), 2)
+            low = 100000+event
+            keys = [[91+list_site, low], [91+body_site, low]]
+            request = {'op':'txn','id':f'{event}.0','keys':keys,'values':[((91+body_site) << 48) | low, 0xB0D1000+event],
+                       'value':0,'durable':durable,'coordinator':rng.randrange(members)}
+            return request, [list_site, body_site]
         count = min({'s1':1,'s2':2,'s3':3,'abort':2}[workload], members)
         sites = rng.sample(range(members), count)
         keys = [[91+m, 100000+event] for m in sites]
