@@ -94,7 +94,7 @@ pub struct TieredMemoryManager {
     shared_pool: Arc<SharedMemoryPool>,
 
     /// Registered chunk collections participating in global eviction.
-    registered_chunks: parking_lot::RwLock<Vec<Weak<Chunks>>>,
+    registered_chunks: arc_swap::ArcSwap<Vec<Weak<Chunks>>>,
 
     /// Per-chunk reconciliation and CLOCK state keyed by chunk address.
     chunk_states: lightning::map::PtrHashMap<usize, Arc<ChunkTierState>>,
@@ -144,7 +144,7 @@ pub struct TieredMemoryManager {
 
     /// Rate limiter for the "could not free anything" warning: last emission,
     /// and how many attempts have been folded into the next one.
-    stall_warn_at: parking_lot::Mutex<Instant>,
+    stall_warn_after_ms: AtomicU64,
     stall_suppressed: AtomicU64,
 
     /// Metrics counters
@@ -202,7 +202,7 @@ impl TieredMemoryManager {
     pub fn new(shared_pool: Arc<SharedMemoryPool>) -> Self {
         TieredMemoryManager {
             shared_pool,
-            registered_chunks: parking_lot::RwLock::new(Vec::new()),
+            registered_chunks: arc_swap::ArcSwap::from_pointee(Vec::new()),
             chunk_states: lightning::map::PtrHashMap::with_capacity(64),
             eviction_cursor: AtomicUsize::new(0),
             eviction_locks: (0..EVICTION_SHARDS)
@@ -210,7 +210,7 @@ impl TieredMemoryManager {
                 .collect(),
             started_at: Instant::now(),
             eviction_backoff_until_ms: AtomicU64::new(0),
-            stall_warn_at: parking_lot::Mutex::new(Instant::now() - STALL_WARN_INTERVAL),
+            stall_warn_after_ms: AtomicU64::new(0),
             stall_suppressed: AtomicU64::new(0),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
@@ -296,17 +296,13 @@ impl TieredMemoryManager {
     }
 
     pub fn register_chunks(&self, chunks: &Arc<Chunks>) {
-        {
-            let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
-            let already_registered = registered.iter().any(|weak| {
-                weak.upgrade()
-                    .map(|existing| Arc::ptr_eq(&existing, chunks))
-                    .unwrap_or(false)
-            });
-            if !already_registered {
-                registered.push(Arc::downgrade(chunks));
+        self.registered_chunks.rcu(|current| {
+            let mut next = (**current).clone();
+            if !next.iter().any(|weak| weak.as_ptr() == Arc::as_ptr(chunks)) {
+                next.push(Arc::downgrade(chunks));
             }
-        }
+            next
+        });
 
         for chunk in &chunks.list {
             self.ensure_chunk_state(chunk);
@@ -320,14 +316,13 @@ impl TieredMemoryManager {
             .map(|chunk| self.count_hot_segments(chunk))
             .sum();
 
-        {
-            let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
-            registered.retain(|weak| {
-                weak.upgrade()
-                    .map(|existing| !Arc::ptr_eq(&existing, chunks))
-                    .unwrap_or(false)
-            });
-        }
+        self.registered_chunks.rcu(|current| {
+            current
+                .iter()
+                .filter(|weak| weak.strong_count() > 0 && weak.as_ptr() != Arc::as_ptr(chunks))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
 
         for key in chunks.list.iter().map(Self::chunk_key) {
             lightning::map::Map::remove(&self.chunk_states, &key);
@@ -349,17 +344,18 @@ impl TieredMemoryManager {
     }
 
     fn collect_registered_chunk_sets(&self) -> Vec<Arc<Chunks>> {
-        let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
-        let mut live = Vec::with_capacity(registered.len());
-        registered.retain(|weak| {
-            if let Some(chunks) = weak.upgrade() {
-                live.push(chunks);
-                true
-            } else {
-                false
-            }
-        });
-        drop(registered);
+        let snapshot = self.registered_chunks.load();
+        let live: Vec<_> = snapshot.iter().filter_map(Weak::upgrade).collect();
+        if live.len() != snapshot.len() {
+            self.registered_chunks.rcu(|current| {
+                current
+                    .iter()
+                    .filter(|weak| weak.strong_count() > 0)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        }
+        drop(snapshot);
         self.prune_chunk_states(&live);
         live
     }
@@ -1030,32 +1026,32 @@ impl TieredMemoryManager {
             Ordering::Relaxed,
         );
         self.stall_suppressed.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "lock_profile")]
-        let warning_wait = crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::C13_warning);
-        if let Some(mut last_warn) = self.stall_warn_at.try_lock() {
-            #[cfg(feature = "lock_profile")]
-            let mut last_warn = warning_wait.acquired(last_warn);
-            if last_warn.elapsed() >= STALL_WARN_INTERVAL {
-                *last_warn = Instant::now();
-                let folded = self.stall_suppressed.swap(0, Ordering::Relaxed);
-                warn!(
-                    "Global eviction freed nothing on {} attempt(s) in the last {}s: hot segments \
-                     are held by active references. Hot memory stays above the threshold until \
-                     they drain.",
-                    folded,
-                    STALL_WARN_INTERVAL.as_secs()
-                );
-            }
+        let now = self.elapsed_ms();
+        let next = self.stall_warn_after_ms.load(Ordering::Relaxed);
+        if now >= next
+            && self
+                .stall_warn_after_ms
+                .compare_exchange(
+                    next,
+                    now.saturating_add(STALL_WARN_INTERVAL.as_millis() as u64),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let folded = self.stall_suppressed.swap(0, Ordering::Relaxed);
+            warn!("Global eviction freed nothing on {} attempt(s) in the last {}s: hot segments are held by active references. Hot memory stays above the threshold until they drain.", folded, STALL_WARN_INTERVAL.as_secs());
         }
     }
 
     /// Lower a chunk's reconcile baseline by `by`, saturating at zero.
     fn retreat_known_count(state: &ChunkTierState, by: usize) {
-        let _ = state.last_known_count.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(by)),
-        );
+        let _ =
+            state
+                .last_known_count
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(by))
+                });
     }
 
     /// Decrement the server-wide hot-segment count by `by`, saturating at zero.
@@ -1142,17 +1138,16 @@ impl TieredMemoryManager {
     /// bytes that may be larger than the budget itself.
     #[inline]
     fn cold_budget_check_interval(&self) -> usize {
-        (self.shared_pool.physical_memory_limit / 8)
-            .clamp(COLD_BUDGET_CHECK_INTERVAL_MIN, COLD_BUDGET_CHECK_INTERVAL_MAX)
+        (self.shared_pool.physical_memory_limit / 8).clamp(
+            COLD_BUDGET_CHECK_INTERVAL_MIN,
+            COLD_BUDGET_CHECK_INTERVAL_MAX,
+        )
     }
 
     /// Reclaim faulted-in cold blocks if they have pushed resident memory past
     /// the limit. Called from the read path, batched and single-flight.
     fn enforce_cold_budget(&self) {
-        if self
-            .cold_sweep_running
-            .swap(true, Ordering::AcqRel)
-        {
+        if self.cold_sweep_running.swap(true, Ordering::AcqRel) {
             return;
         }
         let hot_segments = self.shared_hot_segments();
@@ -1171,12 +1166,8 @@ impl TieredMemoryManager {
                 let scan_limit = (over / SEGMENT_SIZE)
                     .saturating_mul(2)
                     .clamp(RECLAIM_SCAN_LIMIT, OVER_BUDGET_SCAN_LIMIT);
-                let freed = self.reclaim_cold_residency_bounded(
-                    &chunks,
-                    over,
-                    scan_limit,
-                    chunks.len(),
-                );
+                let freed =
+                    self.reclaim_cold_residency_bounded(&chunks, over, scan_limit, chunks.len());
                 if freed >= over {
                     debug!(
                         "cold budget: {} over limit, reclaimed {} from faulted-in blocks",
@@ -1206,11 +1197,11 @@ impl TieredMemoryManager {
         if bytes == 0 {
             return;
         }
-        let _ = self.cold_resident_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(bytes)),
-        );
+        let _ = self
+            .cold_resident_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes))
+            });
     }
 
     /// Bytes currently held by partially-resident cold segments.
@@ -1289,6 +1280,35 @@ mod tests {
             physical_memory_limit: limit,
             promotion_cooldown_ms: 2000,
         })
+    }
+
+    #[test]
+    fn a_registry_snapshot_does_not_block_another_chunk_registration() {
+        let manager = Arc::new(TieredMemoryManager::new(make_pool(0.8, 64 * 1024 * 1024)));
+        let first = Chunks::new_dummy(1, 32 * 1024 * 1024);
+        let second = Chunks::new_dummy(1, 32 * 1024 * 1024);
+        manager.register_chunks(&first);
+        let before = manager.registered_chunks.load();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.register_chunks(&second_copy);
+            worker.register_chunks(&second_copy);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(before.len(), 1);
+        drop(before);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(manager.collect_registered_chunk_sets().len(), 2);
+        manager.unregister_chunks(&first);
+        assert_eq!(manager.collect_registered_chunk_sets().len(), 1);
+        manager.unregister_chunks(&second);
+        assert!(manager.collect_registered_chunk_sets().is_empty());
+        first.stop_background();
+        second.stop_background();
     }
 
     #[test]
