@@ -11,6 +11,7 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument('--workspace', required=True)
 parser.add_argument('--output', required=True)
+parser.add_argument('--release', action='store_true')
 args = parser.parse_args()
 workspace = Path(args.workspace).resolve()
 output = Path(args.output).resolve()
@@ -29,7 +30,7 @@ for repo in ('Nebuchadnezzar','Morpheus','bifrost','Dovahkiin'):
 (output/'source.json').write_text(json.dumps(receipt,indent=2))
 with (output/'cargo.jsonl').open('w') as stdout, (output/'cargo.stderr').open('w') as stderr:
     result = subprocess.run(['flock','/mnt/ext/morpheus-fixes/cargo.lock','cargo','build',
-            '--example','multisite_endpoint','--message-format=json','-j','10'],
+            '--example','multisite_endpoint','--message-format=json','-j','10'] + (['--release'] if args.release else []),
             cwd=workspace/'Nebuchadnezzar',env=env,stdout=stdout,stderr=stderr)
 (output/'exit').write_text(str(result.returncode)+'\n')
 if result.returncode:
