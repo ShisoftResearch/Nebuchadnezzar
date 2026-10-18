@@ -1635,6 +1635,9 @@ impl NebRPCService {
         proc: &Expr,
         checks: &[crate::index::verification::IndexCheck],
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        if !checks.is_empty() {
+            crate::index::verification::record_verified_cell_reads(keys.len());
+        }
         let filter_empty = filter.is_empty();
         let proc_empty = proc.is_empty();
         let mut interpreter = if !filter_empty || !proc_empty {

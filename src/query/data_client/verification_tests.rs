@@ -856,3 +856,81 @@ async fn idcontract_count_contains_true_matches() {
     assert_eq!(super::read::cells_read_count(), before);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn idcontract_explicit_exists_refuses_value_dependent_shapes() {
+    let (server, client, _dir) = fixture("idcontract_refusals", IndexType::Hashed).await;
+    client
+        .write_cell(cell(Id::from_parts(3, 990), 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let indexed = server.indexed_data_client();
+    for func in [
+        AggregateFunction::CountField,
+        AggregateFunction::Sum,
+        AggregateFunction::Avg,
+        AggregateFunction::Min,
+        AggregateFunction::Max,
+    ] {
+        let query = AggregateQuery {
+            selection: selection(1),
+            group_by_fields: vec![],
+            aggregates: vec![AggregateSpec {
+                func,
+                field_id: Some(hash_str(FIELD)),
+                alias: "n".into(),
+            }],
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        assert!(
+            matches!(indexed.aggregate(SchemaUid(SCHEMA),query,vec![],Verify::Exists).await,
+            Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+        );
+    }
+    let grouped = AggregateQuery {
+        selection: selection(1),
+        group_by_fields: vec![hash_str(FIELD)],
+        aggregates: vec![AggregateSpec {
+            func: AggregateFunction::CountStar,
+            field_id: None,
+            alias: "n".into(),
+        }],
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    assert!(
+        matches!(indexed.aggregate(SchemaUid(SCHEMA),grouped,vec![],Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        matches!(indexed.query_ids_resumable(SchemaUid(SCHEMA),selection(1),10,None,Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        matches!(indexed.query_ids_with_options(SchemaUid(SCHEMA),selection(1),QueryOrdering::Asc,None,Some(vec![hash_str(FIELD)]),None,None,Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    for raw in [
+        "(= missing 1)",
+        "(and (= price 1) (= missing 2))",
+        "(text-match price \"one\")",
+    ] {
+        let expression = dovahkiin::integrated::lisp::parse_to_serde_expr(raw)
+            .unwrap()
+            .remove(0);
+        let capability = indexed
+            .id_query_capability(SchemaUid(SCHEMA), &expression, None, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(capability.verify(), Verify::Predicate);
+        assert!(
+            matches!(indexed.query_ids(SchemaUid(SCHEMA),expression,QueryOrdering::Asc,Verify::Exists).await,
+            Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+        );
+    }
+    server.shutdown().await;
+}

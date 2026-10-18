@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod aggregate;
+mod capability;
 pub mod cursor;
 mod execute;
 mod ids;
@@ -32,9 +33,11 @@ use aggregate::{
     collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
     AggregateGroupState,
 };
+pub use capability::{IdQueryCapability, PredicateRequirement};
 pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor, ScanPage};
 use ids::sort_ids_by_query_order;
 pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
+pub use read::{cells_read_count, ScalarSelection, UnsupportedScalarSelection};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
 

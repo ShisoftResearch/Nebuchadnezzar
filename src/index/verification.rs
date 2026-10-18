@@ -11,6 +11,25 @@ use crate::ram::{
 };
 use serde::{Deserialize, Serialize};
 
+static VERIFIED_READ_BATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static VERIFIED_CELL_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Candidate cell reads requested for index verification, including cache hits.
+pub fn verified_cell_reads() -> usize {
+    VERIFIED_CELL_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RPC batches used for index verification.
+pub fn verified_read_batches() -> usize {
+    VERIFIED_READ_BATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn record_verified_cell_reads(count: usize) {
+    VERIFIED_READ_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    VERIFIED_CELL_READS.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Verification for hash and range index candidates.
 /// Existence permits stale predicates but never returns a missing cell.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
