@@ -40,7 +40,6 @@
 
 use crate::ram::cell::WriteError;
 use crate::ram::schema::SchemaUid;
-use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -114,6 +113,11 @@ pub enum KeyedFamily {
     Unknown,
 }
 
+struct PublishedProtection {
+    protection: Arc<Protection>,
+    engaged: bool,
+}
+
 pub struct WriteFence {
     /// Odd while a fence is engaged, even otherwise, and it only ever goes up:
     /// engaging adds one (even -> odd), releasing adds one (odd -> even). A flag
@@ -125,7 +129,7 @@ pub struct WriteFence {
     shards: Box<[Shard; SHARDS]>,
     /// The families being protected. Written before `gate` turns odd and read
     /// only after it is seen odd, so the gate's ordering publishes it.
-    protected: RwLock<Arc<Protection>>,
+    protected: arc_swap::ArcSwap<PublishedProtection>,
     refused: AtomicU64,
     #[cfg(test)]
     trace: trace::Trace,
@@ -236,6 +240,13 @@ impl Drop for FenceHold {
         }
         #[cfg(not(test))]
         let _ = gate;
+        let previous = self.fence.protected.load_full();
+        // Keep the previous set visible to a writer that observed the old
+        // odd gate. The next engagement can claim publication after this.
+        self.fence.protected.store(Arc::new(PublishedProtection {
+            protection: previous.protection.clone(),
+            engaged: false,
+        }));
     }
 }
 
@@ -256,7 +267,10 @@ impl WriteFence {
         Self {
             gate: AtomicU64::new(0),
             shards: Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0)))),
-            protected: RwLock::new(Arc::new(Protection::Only(HashSet::new()))),
+            protected: arc_swap::ArcSwap::from_pointee(PublishedProtection {
+                protection: Arc::new(Protection::Only(HashSet::new())),
+                engaged: false,
+            }),
             refused: AtomicU64::new(0),
             #[cfg(test)]
             trace: Default::default(),
@@ -344,7 +358,7 @@ impl WriteFence {
         // cache and retries, so admitting it unguarded would let a write to a
         // protected family through the retry.
         let protected = match family() {
-            Some(uid) => crate::profile_lock!(C06, self.protected.read()).covers(uid),
+            Some(uid) => self.protected.load().protection.covers(uid),
             None => true,
         };
         #[cfg(test)]
@@ -449,7 +463,7 @@ impl WriteFence {
     /// a fence is engaged; for use inside the `family` lookup of [`Self::enter`],
     /// which runs only then.
     pub fn protects(&self, family: SchemaUid) -> bool {
-        crate::profile_lock!(C06, self.protected.read()).covers(family)
+        self.protected.load().protection.covers(family)
     }
 
     /// Engage the fence over `protected` and wait for writes already in flight
@@ -460,7 +474,8 @@ impl WriteFence {
         protected: HashSet<SchemaUid>,
         drain_timeout: Duration,
     ) -> Result<FenceHold, FenceError> {
-        self.engage_with(Protection::Only(protected), drain_timeout).await
+        self.engage_with(Protection::Only(protected), drain_timeout)
+            .await
     }
 
     /// [`Self::engage`] with any [`Protection`].
@@ -469,25 +484,32 @@ impl WriteFence {
         protected: Protection,
         drain_timeout: Duration,
     ) -> Result<FenceHold, FenceError> {
-        // Decide and publish under the write lock, so a second `engage` that is
-        // refused cannot overwrite the protected set of the fence already up.
-        let published = {
-            let mut set = crate::profile_lock!(C06, self.protected.write());
-            let current = self.gate.load(Ordering::SeqCst);
-            if current & 1 == 1 {
-                return Err(FenceError::AlreadyEngaged);
-            }
-            *set = Arc::new(protected);
-            // The set is in place before the gate turns odd.
-            self.gate
-                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .map_err(|_| FenceError::AlreadyEngaged)?;
-            current + 1
-        };
+        // Only a publisher that claims the current immutable snapshot can
+        // replace the set. A refused engagement cannot overwrite it.
+        let before = self.protected.load_full();
+        if before.engaged {
+            return Err(FenceError::AlreadyEngaged);
+        }
+        let current = self.gate.load(Ordering::SeqCst);
+        let next = Arc::new(PublishedProtection {
+            protection: Arc::new(protected),
+            engaged: true,
+        });
+        let previous = self.protected.compare_and_swap(&before, next);
+        if !Arc::ptr_eq(&previous, &before) {
+            return Err(FenceError::AlreadyEngaged);
+        }
+        self.gate
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .expect("the claimed fence publisher owns the gate transition");
+        let published = current + 1;
         #[cfg(test)]
         {
             let tick = self.trace.tick();
-            self.trace.push(trace::Event::Published { gate: published, tick });
+            self.trace.push(trace::Event::Published {
+                gate: published,
+                tick,
+            });
         }
         let hold = FenceHold {
             fence: Arc::clone(self),
@@ -499,7 +521,10 @@ impl WriteFence {
                 #[cfg(test)]
                 {
                     let tick = self.trace.tick();
-                    self.trace.push(trace::Event::Returned { gate: published, tick });
+                    self.trace.push(trace::Event::Returned {
+                        gate: published,
+                        tick,
+                    });
                 }
                 return Ok(hold);
             }
@@ -522,6 +547,41 @@ mod tests {
 
     fn protect(ids: &[u32]) -> HashSet<SchemaUid> {
         ids.iter().map(|id| SchemaUid(*id)).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_fence_publishers_do_not_overwrite_the_winner() {
+        let fence = Arc::new(WriteFence::new());
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for uid in 1..=8 {
+            let fence = fence.clone();
+            let start = start.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                (
+                    uid,
+                    fence
+                        .engage(
+                            [SchemaUid(uid)].into_iter().collect(),
+                            Duration::from_secs(1),
+                        )
+                        .await,
+                )
+            }));
+        }
+        let results = futures::future::join_all(tasks).await;
+        let winners: Vec<_> = results
+            .into_iter()
+            .map(Result::unwrap)
+            .filter_map(|(uid, hold)| hold.ok().map(|hold| (uid, hold)))
+            .collect();
+        assert_eq!(winners.len(), 1);
+        for uid in 1..=8 {
+            assert_eq!(fence.protects(SchemaUid(uid)), uid == winners[0].0);
+        }
+        drop(winners);
+        assert!(!fence.is_engaged());
     }
 
     #[tokio::test]
@@ -562,8 +622,14 @@ mod tests {
             .await
             .unwrap();
         // Known or not, every family is refused...
-        assert_eq!(fence.enter(|| Some(SchemaUid(7))).err(), Some(WriteError::DatabaseFenced));
-        assert_eq!(fence.enter(|| Some(SchemaUid(12345))).err(), Some(WriteError::DatabaseFenced));
+        assert_eq!(
+            fence.enter(|| Some(SchemaUid(7))).err(),
+            Some(WriteError::DatabaseFenced)
+        );
+        assert_eq!(
+            fence.enter(|| Some(SchemaUid(12345))).err(),
+            Some(WriteError::DatabaseFenced)
+        );
         assert!(fence.would_refuse(Some(SchemaUid(7))));
         // ...but the exempt ones.
         assert!(fence.enter(|| Some(SchemaUid(9))).is_ok());
@@ -573,7 +639,10 @@ mod tests {
     #[tokio::test]
     async fn a_keyed_write_on_a_missing_cell_is_answered_not_performed() {
         let fence = Arc::new(WriteFence::new());
-        let _hold = fence.engage(protect(&[7]), Duration::from_secs(1)).await.unwrap();
+        let _hold = fence
+            .engage(protect(&[7]), Duration::from_secs(1))
+            .await
+            .unwrap();
         // Missing: the write does not run, and says so the way it would have.
         assert_eq!(
             fence.enter_keyed(1, || KeyedFamily::Missing).err(),
@@ -585,13 +654,19 @@ mod tests {
             Some(WriteError::DatabaseFenced)
         );
         assert_eq!(
-            fence.enter_keyed(1, || KeyedFamily::Family(SchemaUid(7))).err(),
+            fence
+                .enter_keyed(1, || KeyedFamily::Family(SchemaUid(7)))
+                .err(),
             Some(WriteError::DatabaseFenced)
         );
-        assert!(fence.enter_keyed(1, || KeyedFamily::Family(SchemaUid(8))).is_ok());
+        assert!(fence
+            .enter_keyed(1, || KeyedFamily::Family(SchemaUid(8)))
+            .is_ok());
         // The lookup is not consulted when nothing is engaged.
         drop(_hold);
-        assert!(fence.enter_keyed(1, || panic!("no lookup without a fence")).is_ok());
+        assert!(fence
+            .enter_keyed(1, || panic!("no lookup without a fence"))
+            .is_ok());
     }
 
     #[tokio::test]
@@ -600,7 +675,10 @@ mod tests {
         let guard = fence.count_if_open().expect("no fence");
         assert_eq!(fence.in_flight(), 1);
         drop(guard);
-        let _hold = fence.engage(protect(&[7]), Duration::from_secs(1)).await.unwrap();
+        let _hold = fence
+            .engage(protect(&[7]), Duration::from_secs(1))
+            .await
+            .unwrap();
         assert!(fence.count_if_open().is_none());
         assert_eq!(fence.in_flight(), 0);
         assert_eq!(fence.refused_writes(), 0, "never a refusal");
@@ -616,7 +694,10 @@ mod tests {
         };
         // Give the fencer time to set the flag and start draining.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!engaging.is_finished(), "must wait for the writer in flight");
+        assert!(
+            !engaging.is_finished(),
+            "must wait for the writer in flight"
+        );
         assert_eq!(
             fence.enter(|| Some(SchemaUid(7))).err(),
             Some(WriteError::DatabaseFenced),
@@ -637,7 +718,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, FenceError::DrainTimeout { .. }));
-        assert!(!fence.is_engaged(), "a failed engage must not leave the fence up");
+        assert!(
+            !fence.is_engaged(),
+            "a failed engage must not leave the fence up"
+        );
     }
 
     #[tokio::test]
@@ -648,7 +732,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fence.engage(protect(&[1]), Duration::from_secs(1)).await.err(),
+            fence
+                .engage(protect(&[1]), Duration::from_secs(1))
+                .await
+                .err(),
             Some(FenceError::AlreadyEngaged)
         );
     }
@@ -711,10 +798,18 @@ mod tests {
                 .await
                 .unwrap();
             // The moment engage returns, nothing may be mid-write.
-            assert_eq!(writing.load(Ordering::SeqCst), 0, "a writer survived the drain");
+            assert_eq!(
+                writing.load(Ordering::SeqCst),
+                0,
+                "a writer survived the drain"
+            );
             hold_active.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_micros(300)).await;
-            assert_eq!(writing.load(Ordering::SeqCst), 0, "a writer slipped in while held");
+            assert_eq!(
+                writing.load(Ordering::SeqCst),
+                0,
+                "a writer slipped in while held"
+            );
             hold_active.store(false, Ordering::SeqCst);
             drop(hold);
             tokio::time::sleep(Duration::from_micros(100)).await;
