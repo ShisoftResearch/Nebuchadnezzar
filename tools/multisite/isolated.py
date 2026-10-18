@@ -24,7 +24,7 @@ else:
         members = int(os.environ.get('MULTISITE_MEMBERS', '2'))
         args[args.index('--members')+1] = str(members)
         args += ['--probe','restart','--victim',os.environ.get('MULTISITE_VICTIM','1'),
-                 '--kind',os.environ.get('MULTISITE_KIND','graceful')]
+                 '--kind',os.environ.get('MULTISITE_KIND','graceful'),'--steps',os.environ.get('MULTISITE_STEPS','')]
     if name == 'multisite_readonly_e2e':
         args += ['--probe','readonly-e2e']
     elif name.startswith('multisite_readonly'):

@@ -517,9 +517,13 @@ class Gate:
             result = client.command(request)
             assert result['outcome'] == 'ack', result
             report = {'before':client.command({'op':'owners'}),'victim':self.args.victim,'kind':self.args.kind}
-            self.servers[self.args.victim].stop(abrupt=self.args.kind == 'kill')
-            self.start(self.args.victim)
-            time.sleep(self.args.settle)
+            steps = self.args.steps.split(',') if self.args.steps else [f'{self.args.victim}:{self.args.kind}']
+            for step in steps:
+                member, kind = step.split(':')
+                self.servers[int(member)].stop(abrupt=kind == 'kill')
+                self.start(int(member))
+                append(self.root/'events.jsonl', {'step':step})
+                time.sleep(self.args.settle)
             client.stop(abrupt=True)
             client = self.client()
             report['after'] = client.command({'op':'owners'})
@@ -602,6 +606,7 @@ def main():
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
     parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
+    parser.add_argument('--steps', default='')
     parser.add_argument('--victim', type=int, default=1)
     parser.add_argument('--kind', choices=['kill','graceful'], default='graceful')
     parser.add_argument('--settle', type=float, default=5)
