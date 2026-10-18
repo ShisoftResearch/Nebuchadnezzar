@@ -1,3 +1,4 @@
+use crate::utils::sharded::Sharded;
 use crate::client::{AsyncClient, NebClientError};
 use crate::query::data_client::IndexedDataClient;
 use crate::server::transactions::manager::TransactionManager;
@@ -1366,9 +1367,9 @@ pub struct NebServer {
     /// It is not on any request path -- a request reaches its runtime through the
     /// scoped RPC service that already holds it -- so there is no lock-free
     /// requirement here to trade away.
-    database_runtimes: parking_lot::RwLock<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
+    database_runtimes: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
-    runtime_init_lock: tokio::sync::Mutex<()>,
+    runtime_initializers: Sharded<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
     /// `None` when tiered memory is disabled.
@@ -2001,15 +2002,20 @@ impl NebServer {
     /// Every runtime this server hosts, snapshotted so callers do not hold the
     /// lock while touching a runtime.
     fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
-        crate::profile_lock!(C01_registry, self.database_runtimes.read()).values().cloned().collect()
+        self.database_runtimes.load().values().cloned().collect()
     }
 
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        crate::profile_lock!(C01_registry, self.database_runtimes.read()).get(database_name).cloned()
+        self.database_runtimes.load().get(database_name).cloned()
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
         self.database_runtime.clone()
+    }
+
+    fn runtime_initializer(&self, database: &str) -> Arc<tokio::sync::Mutex<()>> {
+        crate::profile_lock!(C01_registry, self.runtime_initializers.shard(database).lock())
+            .entry(database.to_owned()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
     pub async fn ensure_database_runtime(
@@ -2020,7 +2026,8 @@ impl NebServer {
             return Ok(runtime);
         }
 
-        let _guard = crate::profile_lock!(C01_init, self.runtime_init_lock.lock().await);
+        let initializer = self.runtime_initializer(database_name);
+        let _guard = crate::profile_lock!(C01_init, initializer.lock().await);
         if let Some(runtime) = self.database(database_name) {
             return Ok(runtime);
         }
@@ -2053,9 +2060,11 @@ impl NebServer {
                 .insert(database_name.to_string());
         }
 
-        crate::profile_lock!(C01_registry, self.database_runtimes
-            .write())
-            .insert(database_name.to_string(), database_runtime.clone());
+        self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(database_name.to_string(), database_runtime.clone());
+            next
+        });
 
         Ok(database_runtime)
     }
@@ -2070,7 +2079,12 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime = crate::profile_lock!(C01_registry, self.database_runtimes.write()).remove(database_name);
+        let previous = self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(database_name);
+            next
+        });
+        let runtime = previous.get(database_name).cloned();
 
         let Some(runtime) = runtime else {
             return false;
@@ -2246,7 +2260,7 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        crate::profile_lock!(C01_registry, self.database_runtimes.read()).keys().cloned().collect()
+        self.database_runtimes.load().keys().cloned().collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -2486,9 +2500,7 @@ impl NebServer {
         // FlyWire connectome databases: after a SIGTERM restart the recently
         // written sidecar cells were unreadable while older, already-evicted
         // cells read fine.
-        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = crate::profile_lock!(C01_registry, self
-            .database_runtimes
-            .read())
+        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self.database_runtimes.load()
             .iter()
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();
@@ -2679,7 +2691,7 @@ impl NebServer {
             database_runtimes: {
                 let mut runtimes = std::collections::HashMap::with_capacity(16);
                 runtimes.insert(database_name.to_string(), database_runtime.clone());
-                let runtimes = parking_lot::RwLock::new(runtimes);
+                let runtimes = arc_swap::ArcSwap::from_pointee(runtimes);
                 runtimes
             },
             registered_schema_services: {
@@ -2697,7 +2709,7 @@ impl NebServer {
                 }
                 registered
             },
-            runtime_init_lock: tokio::sync::Mutex::new(()),
+            runtime_initializers: Sharded::default(),
             host_options: opts.clone(),
             shared_memory_pool,
             shared_tiered_manager,
