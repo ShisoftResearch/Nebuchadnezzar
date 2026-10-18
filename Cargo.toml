@@ -12,6 +12,7 @@ libc = "*"
 log = "*"
 lazy_static = "*"
 ahash = "0.8"
+arc-swap = "1.9"
 bifrost = { path = "../bifrost" }
 bifrost_plugins = { path = "../bifrost/src/plugins" }
 bifrost_proc_macro = { path = "../bifrost/src/proc_macro" }

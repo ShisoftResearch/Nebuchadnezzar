@@ -8,7 +8,6 @@ use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::state_machine::master::ExecError};
 use futures::future::BoxFuture;
 use futures::prelude::*;
-use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::io;
 use std::ops::Bound::*;
@@ -44,12 +43,41 @@ pub(super) fn migration_retry_delay_ms(retried: i32, key: &EntryKey) -> u64 {
     (base + jitter).min(RETRY_BACKOFF_MS)
 }
 
+type PlacementMap = BTreeMap<EntryKey, (TreePlacement, EntryKey)>;
+
+#[derive(Default)]
+struct PlacementCache(arc_swap::ArcSwap<PlacementMap>);
+
+impl PlacementCache {
+    fn load(&self) -> arc_swap::Guard<Arc<PlacementMap>> {
+        self.0.load()
+    }
+
+    fn remove(&self, lower: &EntryKey) {
+        self.0.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(lower);
+            next
+        });
+    }
+
+    fn insert(&self, lower: EntryKey, value: (TreePlacement, EntryKey)) {
+        // Network lookup finishes before publication. Retry only the immutable
+        // map copy, so concurrent refreshes cannot discard each other's keys.
+        self.0.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(lower.clone(), value.clone());
+            next
+        });
+    }
+}
+
 pub struct RangedIndexerClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
     group_name: String,
     database_name: String,
-    placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
+    placement: PlacementCache,
 }
 
 /// The three outcomes of asking for the tree after a key. See
@@ -75,7 +103,7 @@ impl RangedIndexerClient {
             sm: Arc::new(sm),
             group_name: String::new(),
             database_name: String::new(),
-            placement: RwLock::new(BTreeMap::new()),
+            placement: PlacementCache::default(),
         }
     }
 
@@ -95,7 +123,7 @@ impl RangedIndexerClient {
             sm: Arc::new(sm),
             group_name: group_name.to_string(),
             database_name: database_name.to_string(),
-            placement: RwLock::new(BTreeMap::new()),
+            placement: PlacementCache::default(),
         }
     }
 
@@ -283,7 +311,11 @@ impl RangedIndexerClient {
             if let OpResult::Successful(audit) = tree_client.audit(placement.id).await? {
                 res.push(audit);
             }
-            match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
+            match self
+                .next_tree(&lower, Ordering::Forward)
+                .await
+                .map_err(exec_err)?
+            {
                 NextTree::Found(next_lower, next_placement) => {
                     lower = next_lower;
                     placement = next_placement;
@@ -343,7 +375,11 @@ impl RangedIndexerClient {
                     );
                 }
             }
-            match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
+            match self
+                .next_tree(&lower, Ordering::Forward)
+                .await
+                .map_err(exec_err)?
+            {
                 NextTree::Found(next_lower, next_placement) => {
                     lower = next_lower;
                     placement = next_placement;
@@ -565,7 +601,7 @@ impl RangedIndexerClient {
         let mut tree_prop = None;
         if !ensure_updated {
             if let Some((lower, (placement, upper))) =
-                crate::profile_lock!(H58, self.placement.read()).range(..key.clone()).last()
+                self.placement.load().range(..key.clone()).last()
             {
                 if key >= lower && key < upper {
                     tree_prop = Some((lower.clone(), placement.clone(), upper.clone()));
@@ -631,8 +667,7 @@ impl RangedIndexerClient {
             lower,
             upper
         );
-        crate::profile_lock!(H58, self.placement
-            .write())
+        self.placement
             .insert(lower.clone(), (placement.clone(), upper.clone()));
         return Ok(Some((lower, placement, upper)));
     }
@@ -658,7 +693,7 @@ impl RangedIndexerClient {
         // !Send and un-spawnable (the guard was dynamically dead -- the
         // explicit drop -- but the generator still carried its slot).
         let cached_origin = {
-            let placement = crate::profile_lock!(H58, self.placement.read());
+            let placement = self.placement.load();
             placement
                 .range(..=origin_key.clone())
                 .last()
@@ -676,7 +711,7 @@ impl RangedIndexerClient {
         };
 
         {
-            let placement = crate::profile_lock!(H58, self.placement.read());
+            let placement = self.placement.load();
             let (_origin_place, origin_upper) = match placement.get(&origin_lower) {
                 Some(t) => t,
                 None => {
@@ -721,12 +756,107 @@ impl RangedIndexerClient {
         // a scan.
         Ok(match self.sm.next_tree(&origin_lower, &ordering).await? {
             Some(next) => {
-                crate::profile_lock!(H58, self.placement
-                    .write())
+                self.placement
                     .insert(next.lower.clone(), (next.placement.clone(), next.upper));
                 NextTree::Found(next.lower, next.placement)
             }
             None => NextTree::End,
         })
+    }
+}
+
+#[cfg(test)]
+mod placement_cache_tests {
+    use super::*;
+
+    fn entry(n: u64) -> (EntryKey, (TreePlacement, EntryKey)) {
+        let id = Id::from_parts(1, n);
+        (
+            EntryKey::from_id(&id),
+            (
+                TreePlacement { id, epoch: n },
+                EntryKey::from_id(&Id::from_parts(1, n + 1)),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_held_placement_snapshot_does_not_block_publication() {
+        let cache = Arc::new(PlacementCache::default());
+        let before = cache.load();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = cache.clone();
+        let thread = std::thread::spawn(move || {
+            let (key, value) = entry(1);
+            worker.insert(key, value);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        assert!(before.is_empty());
+        drop(before);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "a reader must not block publication");
+        assert_eq!(cache.load().len(), 1);
+    }
+
+    #[test]
+    fn placement_invalidation_preserves_concurrent_refreshes() {
+        let cache = Arc::new(PlacementCache::default());
+        for n in 1..=64 {
+            let (key, value) = entry(n);
+            cache.insert(key, value);
+        }
+        let before = cache.load();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                for n in 1..=64 {
+                    cache.remove(&entry(n).0);
+                }
+            });
+            scope.spawn(move || {
+                start.wait();
+                for n in 65..=128 {
+                    let (key, value) = entry(n);
+                    cache.insert(key, value);
+                }
+            });
+        });
+        assert_eq!(before.len(), 64);
+        let after = cache.load();
+        assert_eq!(after.len(), 64);
+        for n in 1..=64 {
+            assert!(before.contains_key(&entry(n).0));
+            assert!(!after.contains_key(&entry(n).0));
+            assert!(after.contains_key(&entry(n + 64).0));
+        }
+    }
+
+    #[test]
+    fn concurrent_placement_refreshes_preserve_every_entry() {
+        let cache = Arc::new(PlacementCache::default());
+        let start = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for writer in 0..8u64 {
+                let cache = cache.clone();
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    for offset in 0..64 {
+                        let (key, value) = entry(1 + writer * 64 + offset);
+                        cache.insert(key, value);
+                    }
+                });
+            }
+        });
+        let snapshot = cache.load();
+        assert_eq!(snapshot.len(), 512);
+        for n in 1..=512 {
+            let (key, _) = entry(n);
+            assert_eq!(snapshot[&key].0.epoch, n);
+        }
     }
 }
