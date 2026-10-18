@@ -3696,13 +3696,13 @@ impl SegmentReferenceGuard {
         Some(Self { segment })
     }
 
-    /// Keep the segment in progress for the cleaner until `receipts` are synced.
+    /// Keep the segment in progress for the cleaner until `tokens` are synced.
     pub(crate) fn pin_until_covered(
         &self,
         txn: &crate::server::transactions::TxnId,
-        receipts: std::sync::Arc<Vec<crate::ram::durability::Receipt>>,
+        tokens: std::sync::Arc<Vec<crate::ram::durability::Receipt>>,
     ) {
-        self.segment.protection.pin_until_covered(txn, receipts);
+        self.segment.protection.pin_until_covered(txn, tokens);
     }
 
     /// Get the segment ID
