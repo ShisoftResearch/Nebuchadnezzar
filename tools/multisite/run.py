@@ -589,6 +589,7 @@ class Gate:
             report['observed_after_second'] = client.command({'op':'read','keys':[[91,5000]]})['values']
             (self.root/'probe-cut-prepare.json').write_text(json.dumps(report,indent=2))
             check_transaction(request, first, observed)
+            assert report['txn_read']['outcome'] == 'ack', ('transactional read of an aborted cell is blocked', report)
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
