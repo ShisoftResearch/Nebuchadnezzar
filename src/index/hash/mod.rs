@@ -1,4 +1,4 @@
-use crate::utils::sharded::Sharded;
+use crate::utils::keyed_state::KeyedState;
 use crate::ram::cell::{Cell, ReadError, WriteError, MAX_CELL_SIZE};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -12,7 +12,7 @@ use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
 use bifrost_hasher::hash_str;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -124,7 +124,7 @@ pub struct HashIndexer {
     /// process-wide: bucket ids derive from (schema, field, value) and so can
     /// repeat across databases, and folding two databases' inserts into one
     /// apply would write them through the wrong client.
-    buckets: Sharded<Mutex<HashMap<Id, Arc<Bucket>>>>,
+    buckets: KeyedState<Id, Arc<Bucket>>,
 }
 
 impl HashIndexer {
@@ -150,17 +150,14 @@ impl HashIndexer {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         HashIndexer {
             neb_client: neb_client.clone(),
-            buckets: Sharded::default(),
+            buckets: KeyedState::default(),
         }
     }
 
     /// Coalescing slot for one bucket, created on demand.
     fn bucket(&self, index_id: &Id) -> Arc<Bucket> {
-        crate::profile_lock!(H19, self.buckets.shard(index_id)
-            .lock())
-            .entry(*index_id)
-            .or_insert_with(|| Arc::new(Bucket::default()))
-            .clone()
+        crate::profile_lock!(H19, self.buckets.entry(index_id))
+            .get_or_insert_with(|| Arc::new(Bucket::default())).clone()
     }
 
     /// Drop a bucket's slot once nothing is queued on it, so the map does not
@@ -170,12 +167,12 @@ impl HashIndexer {
     /// means the map is the last owner. Racing a newcomer is harmless -- it
     /// gets a fresh slot, coalesces with nobody, and its CAS still applies.
     fn release_bucket(&self, index_id: &Id) {
-        let mut buckets = crate::profile_lock!(H19, self.buckets.shard(index_id).lock());
+        let mut buckets = crate::profile_lock!(H19, self.buckets.entry(index_id));
         let drop_it = buckets
-            .get(index_id)
+            .as_ref()
             .is_some_and(|b| Arc::strong_count(b) == 1 && b.pending.lock().is_empty());
         if drop_it {
-            buckets.remove(index_id);
+            buckets.take();
         }
     }
 
@@ -1137,14 +1134,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_bucket_shards_keep_their_own_coalescing_slots() {
+    async fn independent_buckets_keep_their_own_coalescing_slots() {
         let (server, client) = create_test_server("bucket_registry_shards").await;
         let indexer = Arc::new(HashIndexer::new(&client));
         let first = Id::from_parts(1, 1);
-        let second = (2..1000).map(|n| Id::from_parts(1, n)).find(|id| {
-            !std::ptr::eq(indexer.buckets.shard(&first), indexer.buckets.shard(id))
-        }).unwrap();
-        let held = indexer.buckets.shard(&first).lock();
+        let second = Id::from_parts(1, 2);
+        let held = indexer.buckets.entry(&first);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = indexer.clone();
         let thread = std::thread::spawn(move || {
@@ -1155,7 +1150,7 @@ mod tests {
             drop(one);
             drop(two);
             worker.release_bucket(&second);
-            assert!(worker.buckets.shard(&second).lock().is_empty());
+            assert!(worker.buckets.entry(&second).is_none());
             done_tx.send(()).unwrap();
         });
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
