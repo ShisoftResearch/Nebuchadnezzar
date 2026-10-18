@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from check import check_transaction
+from check import check_transaction, check_batch, check_protocol_events
 from run import Proxy
 
 
@@ -22,6 +22,30 @@ class LedgerTests(unittest.TestCase):
                                 ('commit_error',all_absent)]:
             with self.assertRaises(AssertionError):
                 check_transaction(request, {'outcome':outcome}, values)
+
+
+class BatchAndProtocolTests(unittest.TestCase):
+    def test_batch_controls(self):
+        requests = [{'keys':[[91,1],[92,1]],'value':v} for v in (1,2,3)]
+        results = [{'outcome':'ack'},{'outcome':'prepare_error'},{'outcome':'unknown'}]
+        check_batch(requests, results, [{'value':1}]*2)
+        check_batch(requests, results, [{'value':3}]*2)
+        for observed in ([{'value':2}]*2, [{'value':1},{'value':3}], [{'absent':True}]*2, [{'value':1},{'absent':True}]):
+            with self.assertRaises(AssertionError):
+                check_batch(requests, results, observed)
+        check_batch(requests, [{'outcome':'unknown'}]*3, [{'absent':True}]*2)
+        with self.assertRaises(AssertionError):
+            check_batch(requests, [{'outcome':'commit_error','error':'StoreFull'}]*3, [{'absent':True}]*2)
+
+    def test_protocol_controls(self):
+        good = [{'point':'before_status_release','detail':{'participants':[1,2],'synced_peers':[2],'self_synced':True}},
+                {'point':'status_answer','detail':{'self_synced':True}}]
+        self.assertEqual(check_protocol_events(good)['status_release'], 1)
+        for bad in ({'point':'before_status_release','detail':{'participants':[1,2],'synced_peers':[],'self_synced':True}},
+                    {'point':'before_status_release','detail':{'participants':[1,2],'synced_peers':[2],'self_synced':False}},
+                    {'point':'status_answer','detail':{'self_synced':False}}):
+            with self.assertRaises(AssertionError):
+                check_protocol_events([bad])
 
 
 class ProxyTests(unittest.TestCase):

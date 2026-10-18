@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e']
+names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -33,6 +33,10 @@ else:
         args.append('--no-faults')
     if os.environ.get('MULTISITE_DURABLE') == '1':
         args.append('--durable')
+    if name.startswith('multisite_mixed'):
+        args += ['--schedule','mixed']
+    if 'MULTISITE_SEED' in os.environ:
+        args += ['--seed',os.environ['MULTISITE_SEED']]
     if 'MULTISITE_SCHEDULE' in os.environ:
         args += ['--schedule',os.environ['MULTISITE_SCHEDULE']]
     os.execv(sys.executable,args)

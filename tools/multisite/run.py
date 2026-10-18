@@ -15,7 +15,7 @@ import struct
 import subprocess
 import threading
 import time
-from check import check_transaction
+from check import check_transaction, check_batch, check_protocol_events, is_transport_error
 
 
 def append(path, value):
@@ -159,6 +159,8 @@ class Process:
         append(self.log, event)
         if event.get('event') in ('begin','prepared'):
             append(self.gate.root/'ledger.jsonl',event)
+            if event['event'] == 'begin':
+                self.gate.tids[str(event['id'])] = event['tid']
         return event
 
     def wait_event(self, kind, timeout=90):
@@ -206,6 +208,7 @@ class Gate:
         assert self.binary.is_file() and os.access(self.binary, os.X_OK), self.binary
         self.children, self.proxies, self.generations, self.servers = [], {}, {}, {}
         self.pause_offsets = {}
+        self.tids = {}
         self.port_lock = open(f'/mnt/ext/morpheus-fixes/multisite/ports-{args.port}.lock', 'w')
         fcntl.flock(self.port_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         count = args.members
@@ -284,6 +287,198 @@ class Gate:
             time.sleep(.01)
         raise TimeoutError(f'point {point} was not reached on {index}')
 
+    # ---- mixed schedule ----
+    WORKLOADS = ['s1','s2','s3','abort','conflict1','conflict8','conflict64']
+    FAULTS = ['point-kill','point-graceful','time-kill','time-graceful','cut','delay','drop']
+    SINGLE_POINTS = ['before_p0','after_p0','during_end','coordinator_before_end']
+    MULTI_POINTS = ['before_p0','after_p0','during_end','before_status_record','after_status_record',
+                    'before_status_release','coordinator_before_end','coordinator_after_end']
+
+    def build_request(self, rng, event, workload):
+        members = self.args.members
+        durable = self.args.durable
+        if workload.startswith('conflict'):
+            count = int(workload[len('conflict'):])
+            sites = rng.sample(range(members), 2)
+            keys = [[91+m, 100000+event] for m in sites]
+            requests = [{'op':'txn','id':f'{event}.{i}','keys':keys,'value':event*1000+i+1,'durable':durable,
+                         'coordinator':rng.randrange(members)} for i in range(count)]
+            return {'op':'batch','requests':requests,'id':str(event)}, sites
+        count = min({'s1':1,'s2':2,'s3':3,'abort':2}[workload], members)
+        sites = rng.sample(range(members), count)
+        keys = [[91+m, 100000+event] for m in sites]
+        request = {'op':'txn','id':f'{event}.0','keys':keys,'value':event*1000+1,'durable':durable,
+                   'coordinator':rng.randrange(members)}
+        if workload == 'abort':
+            request['abort'] = True
+        return request, sites
+
+    def set_links(self, victim, **fault):
+        for (source, target), proxy in self.proxies.items():
+            if victim in (source, target) and source != target:
+                for name, value in fault.items():
+                    setattr(proxy, name, value)
+
+    def run_event(self, event, rng, client, counters):
+        workload = self.WORKLOADS[event % len(self.WORKLOADS)]
+        if workload == 's3' and self.args.members < 3:
+            workload = 's2'
+        fault = self.FAULTS[(event + event//len(self.WORKLOADS)) % len(self.FAULTS)]
+        request, sites = self.build_request(rng, event, workload)
+        singles = [request] if request['op'] == 'txn' else request['requests']
+        victim = rng.choice(sites)
+        point = None
+        if fault.startswith('point'):
+            if workload == 'abort':
+                fault = 'time-' + fault.split('-')[1]
+            else:
+                point = rng.choice(self.SINGLE_POINTS if workload == 's1' else self.MULTI_POINTS)
+                if point.startswith('coordinator_'):
+                    victim = rng.randrange(self.args.members)
+                    for single in singles:
+                        single['coordinator'] = victim
+        record = {'event':event,'workload':workload,'fault':fault,'victim':victim,'point':point,'sites':sites}
+        if point:
+            self.arm(victim, point)
+            client.send(request)
+            try:
+                self.wait_pause(victim, point)
+            except TimeoutError:
+                (self.root/f'control-{victim}'/'arm').unlink(missing_ok=True)
+                record['skipped'] = 'point not reached'
+                counters['skipped'] += 1
+                append(self.root/'events.jsonl', record)
+                return request, self.collect(client, request, record)
+            kind = fault.split('-')[1]
+            append(self.root/'events.jsonl', record | {'kind':kind})
+            if kind == 'graceful':
+                process = self.servers[victim]
+                append(self.root/'pids.jsonl', {'event':'signal','pid':process.proc.pid,'signal':15,'point':point})
+                process.proc.terminate()
+                (self.root/f'control-{victim}'/'resume').touch()
+                process.stop()
+            else:
+                self.servers[victim].stop(abrupt=True)
+            (self.root/f'control-{victim}'/'arm').unlink(missing_ok=True)
+            self.start(victim)
+        elif fault.startswith('time'):
+            kind = fault.split('-')[1]
+            client.send(request)
+            time.sleep(rng.uniform(0, .3))
+            append(self.root/'events.jsonl', record | {'kind':kind})
+            self.servers[victim].stop(abrupt=kind == 'kill')
+            self.start(victim)
+        else:
+            client.send(request)
+            time.sleep(rng.uniform(0, .1))
+            append(self.root/'events.jsonl', record | {'kind':fault})
+            if fault == 'cut':
+                self.set_links(victim, cut=True)
+                time.sleep(rng.uniform(2, 6))
+            elif fault == 'delay':
+                self.set_links(victim, delay=.1)
+                time.sleep(rng.uniform(2, 6))
+            else:
+                self.set_links(victim, drop=3)
+                time.sleep(1)
+            self.set_links(victim, cut=False, delay=0, drop=0)
+        counters['events'] += 1
+        counters[fault] += 1
+        return request, self.collect(client, request, record)
+
+    def collect(self, client, request, record):
+        try:
+            return client.result(240)
+        except (TimeoutError, RuntimeError) as error:
+            # The client call did not return. The outcome is unknown (D33).
+            append(self.root/'events.jsonl', record | {'client_lost':repr(error)})
+            lost = {'outcome':'unknown','client_lost':True}
+            if request['op'] == 'txn':
+                return lost
+            return {'results':[lost for _ in request['requests']]}
+
+    def read_all(self, client, keysets, deadline=150):
+        """Read each key set. Retry locked or unreachable reads: an in-doubt cell may resolve."""
+        end = time.monotonic()+deadline
+        while True:
+            observed = [client.command({'op':'read','keys':keys}, 120)['values'] for keys in keysets]
+            if not any('error' in item for values in observed for item in values) or time.monotonic() > end:
+                return observed
+            time.sleep(5)
+
+    def verify(self, client, operations):
+        observed = self.read_all(client, [op['keys'] for op in operations])
+        for op, values in zip(operations, observed):
+            if op['kind'] == 'batch':
+                check_batch(op['requests'], op['results'], values)
+            else:
+                check_transaction(op['requests'][0], op['results'][0], values)
+
+    def audit(self, client, tids, label):
+        """Stuck locks, brackets and in-doubt transactions after a heal. Waits one lease period first."""
+        time.sleep(35)
+        report = {'label':label,'transactions':len(tids),'problems':[]}
+        for index in range(self.args.members):
+            control = self.root/f'control-{index}'
+            for name in ('stats','stats.tmp'):
+                (control/name).unlink(missing_ok=True)
+            (control/'inspect.tmp').write_text(json.dumps(tids))
+            (control/'inspect.tmp').rename(control/'inspect')
+            deadline = time.monotonic()+60
+            while not (control/'stats').exists():
+                assert time.monotonic() < deadline, f'member {index} did not answer inspect'
+                time.sleep(.1)
+            stats = json.loads((control/'stats').read_text())
+            if stats['unresolved'] or stats['pinned_segments']:
+                report['problems'].append({'member':index,'unresolved':stats['unresolved'],'pinned':stats['pinned_segments']})
+            for item in stats['transactions']:
+                if item['leases'] or item['bracket_status'] == 'Prepared':
+                    report['problems'].append({'member':index,'tid':item['tid'],'leases':item['leases'],'bracket':item['bracket_status']})
+        for tid in tids:
+            statuses = {index: client.command({'op':'status','site':index,'tid':tid}, 60)['status']
+                        for index in range(self.args.members)}
+            if any(v in ('Committing','InDoubt') for v in statuses.values()):
+                report['problems'].append({'tid':tid,'stuck_status':statuses})
+            if 'Committed' in statuses.values() and 'Aborted' in statuses.values():
+                report['problems'].append({'tid':tid,'split_decision':statuses})
+        append(self.root/'audits.jsonl', report)
+        assert not report['problems'], ('stuck state after heal', report['problems'][:5])
+
+    def run_mixed(self, client):
+        rng = random.Random(self.args.seed)
+        operations, audited = [], 0
+        counters = {'events':0,'skipped':0, **{name:0 for name in self.FAULTS}}
+        event = 0
+        while counters['events'] < self.args.events and event < self.args.events*3:
+            request, result = self.run_event(event, rng, client, counters)
+            requests = request['requests'] if request['op'] == 'batch' else [request]
+            results = result['results'] if request['op'] == 'batch' else [result]
+            operations.append({'kind':request['op'],'requests':requests,'results':results,'keys':requests[0]['keys']})
+            append(self.root/'ledger.jsonl', {'event':'outcome','id':event,'outcomes':[r['outcome'] for r in results]})
+            client.stop(abrupt=True)
+            client = self.client()
+            self.verify(client, operations if (event+1) % 50 == 0 else operations[-25:])
+            append(self.root/'checks.jsonl', {'event':event,'counted':counters['events'],'result':'pass'})
+            event += 1
+            if counters['events'] and counters['events'] % 50 == 0 and counters['events'] != audited:
+                audited = counters['events']
+                self.audit(client, list(self.tids.values())[-200:], f'after {audited} events')
+        self.audit(client, list(self.tids.values())[-400:], 'final')
+        self.verify(client, operations)
+        events = [json.loads(line) for index in range(self.args.members)
+                  if (self.root/f'protocol-{index}.jsonl').exists()
+                  for line in (self.root/f'protocol-{index}.jsonl').read_text().splitlines()]
+        counters['protocol'] = check_protocol_events(events)
+        outcomes = {}
+        for op in operations:
+            for r in op['results']:
+                name = 'commit_error_transport' if is_transport_error(r) else r['outcome']
+                outcomes[name] = outcomes.get(name,0)+1
+        counters['outcomes'] = outcomes
+        (self.root/'summary.json').write_text(json.dumps(counters, indent=2))
+        assert counters['events'] >= self.args.events, ('too few events', counters)
+        (self.root/'PASS').write_text('mixed campaign passed\n')
+
     def run(self):
         for index in range(self.args.members):
             self.start(index)
@@ -333,6 +528,8 @@ class Gate:
             check_transaction(request, result, report['values'])
             (self.root/'PASS').write_text('restart probe passed\n')
             return
+        if self.args.schedule == 'mixed':
+            return self.run_mixed(client)
         rng = random.Random(self.args.seed)
         operations = []
         points = ['after_p0','during_end','before_status_record','after_status_record',
@@ -408,7 +605,7 @@ def main():
     parser.add_argument('--victim', type=int, default=1)
     parser.add_argument('--kind', choices=['kill','graceful'], default='graceful')
     parser.add_argument('--settle', type=float, default=5)
-    parser.add_argument('--schedule', choices=['baseline','protocol'], default='baseline')
+    parser.add_argument('--schedule', choices=['baseline','protocol','mixed'], default='baseline')
     args = parser.parse_args()
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}')
