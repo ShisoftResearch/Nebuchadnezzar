@@ -619,3 +619,31 @@ async fn compose_durable_receipts_preserve_verified_reads() {
     assert_covered(&server);
     server.shutdown().await;
 }
+
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cell_scan_cursors_progress_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    rpc.write_cell(cell(1, 1)).await.unwrap();
+    let first = rpc.cell_scan_open().await;
+    let second = rpc.cell_scan_open().await;
+    let first_scan = rpc.cell_scans.get(first).unwrap();
+    let held = first_scan.lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = rpc.clone();
+    let thread = std::thread::spawn(move || {
+        let page = futures::executor::block_on(worker.cell_scan_next(second, 100)).unwrap();
+        assert!(page.ids.contains(&cell(1, 1).id()));
+        assert!(page.done);
+        assert!(futures::executor::block_on(worker.cell_scan_next(second, 100)).is_err());
+        done_tx.send(()).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    rpc.cell_scan_close(first).await;
+    assert!(rpc.cell_scan_next(first, 100).await.is_err());
+    server.shutdown().await;
+}

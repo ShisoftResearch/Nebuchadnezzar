@@ -1,3 +1,4 @@
+use crate::utils::sharded::Sharded;
 use crate::index::scrub::{ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
@@ -191,6 +192,7 @@ struct CellScan {
     ids: Vec<u64>,
     position: usize,
     last_used: std::time::Instant,
+    closed: bool,
 }
 
 /// A scan abandoned by a vanished client is dropped after this long without a
@@ -218,7 +220,34 @@ pub struct FenceLeases {
 #[derive(Default)]
 pub struct CellScans {
     next_id: std::sync::atomic::AtomicU64,
-    open: parking_lot::Mutex<std::collections::HashMap<u64, CellScan>>,
+    open: Sharded<parking_lot::Mutex<std::collections::HashMap<u64, Arc<parking_lot::Mutex<CellScan>>>>>,
+}
+
+impl CellScans {
+    fn create(&self) -> u64 {
+        for shard in self.open.iter() {
+            crate::profile_lock!(H23, shard.lock()).retain(|_, scan| {
+                let Some(mut scan) = scan.try_lock() else { return true };
+                if scan.last_used.elapsed() < CELL_SCAN_IDLE { return true }
+                scan.closed = true;
+                false
+            });
+        }
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::profile_lock!(H23, self.open.shard(&id).lock()).insert(id, Arc::new(parking_lot::Mutex::new(CellScan {
+            next_chunk: 0, ids: Vec::new(), position: 0,
+            last_used: std::time::Instant::now(), closed: false,
+        })));
+        id
+    }
+
+    fn get(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
+        crate::profile_lock!(H23, self.open.shard(&cursor).lock()).get(&cursor).cloned()
+    }
+
+    fn remove(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
+        crate::profile_lock!(H23, self.open.shard(&cursor).lock()).remove(&cursor)
+    }
 }
 
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
@@ -1069,40 +1098,25 @@ impl Service for NebRPCService {
     }
 
     fn cell_scan_open(&self) -> BoxFuture<'_, u64> {
-        let scans = &self.cell_scans;
-        let mut open = crate::profile_lock!(H23, scans.open.lock());
-        open.retain(|_, scan| scan.last_used.elapsed() < CELL_SCAN_IDLE);
-        let id = scans
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        open.insert(
-            id,
-            CellScan {
-                next_chunk: 0,
-                ids: Vec::new(),
-                position: 0,
-                last_used: std::time::Instant::now(),
-            },
-        );
-        future::ready(id).boxed()
+        future::ready(self.cell_scans.create()).boxed()
     }
 
     fn cell_scan_next(&self, cursor: u64, max: u32) -> BoxFuture<'_, Result<CellScanPage, String>> {
         let max = (max as usize).max(1);
         let result = (|| {
             let chunks = self.database_runtime.chunks();
-            let mut open = crate::profile_lock!(H23, self.cell_scans.open.lock());
-            let scan = open
-                .get_mut(&cursor)
-                .ok_or_else(|| format!("cell scan {cursor} is not open (expired or closed)"))?;
+            let missing = || format!("cell scan {cursor} is not open (expired or closed)");
+            let scan = self.cell_scans.get(cursor).ok_or_else(missing)?;
+            let mut scan = scan.lock();
+            if scan.closed { return Err(missing()) }
             scan.last_used = std::time::Instant::now();
             // Skip exhausted chunks until one has ids. The previous chunk's ids
             // are dropped before the next chunk's are built, so at most one
             // chunk is ever resident.
             while scan.position >= scan.ids.len() {
                 if scan.next_chunk >= chunks.chunk_count() {
-                    open.remove(&cursor);
+                    scan.closed = true;
+                    self.cell_scans.remove(cursor);
                     return Ok(CellScanPage {
                         ids: Vec::new(),
                         done: true,
@@ -1122,7 +1136,8 @@ impl Service for NebRPCService {
             let exhausted =
                 scan.position >= scan.ids.len() && scan.next_chunk >= chunks.chunk_count();
             if exhausted {
-                open.remove(&cursor);
+                scan.closed = true;
+                self.cell_scans.remove(cursor);
             }
             Ok(CellScanPage {
                 ids,
@@ -1217,7 +1232,7 @@ impl Service for NebRPCService {
     }
 
     fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
-        crate::profile_lock!(H23, self.cell_scans.open.lock()).remove(&cursor);
+        if let Some(scan) = self.cell_scans.remove(cursor) { scan.lock().closed = true; }
         future::ready(()).boxed()
     }
 
