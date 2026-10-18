@@ -547,7 +547,7 @@ class Gate:
                 time.sleep(5)
                 self.set_links(0, cut=False)
             first = client.result(240)
-            time.sleep(70)
+            time.sleep(self.args.wait)
             observed = client.command({'op':'read','keys':[[91,5000]]})['values']
             tids = list(self.tids.values())
             report = {'first':first,'after_70s':observed,'tids':tids}
@@ -688,6 +688,7 @@ def main():
     parser.add_argument('--cut-point', default='')
     parser.add_argument('--cut-hold', type=float, default=5)
     parser.add_argument('--cut-member', type=int, default=0)
+    parser.add_argument('--wait', type=float, default=70)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
