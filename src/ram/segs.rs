@@ -73,14 +73,14 @@ pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
-/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
-/// dedicated thread fsyncs the whole set every `wal_sync_interval_ms` —
+/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). A
+/// dispatcher schedules independent segment jobs every `wal_sync_interval_ms`,
 /// replacing per-segment inline timer syncs (6,302 blocking fsyncs/s across an
-/// import's ~63 active segments) with O(dirty) syncs per tick on one thread.
+/// import's ~63 active segments) with O(dirty) independent jobs per tick.
 /// Entries hold `AArc`s, so segment lifecycle is a non-issue: an archived
 /// segment syncs as a no-op (its WAL file handle is gone) and drops.
-static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
-    parking_lot::Mutex::new(Vec::new());
+static WAL_DIRTY: crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>> =
+    crossbeam::queue::SegQueue::new();
 
 #[cfg(test)]
 static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
@@ -241,14 +241,13 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
     if !enqueue {
         return;
     }
-    crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
+    WAL_DIRTY.push(seg.clone());
 
     static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SYNCER.get_or_init(|| {
         std::thread::Builder::new()
             .name("wal-syncer".into())
             .spawn(|| {
-                use rayon::prelude::*;
                 // Fsyncs for independent segments can run together, as they
                 // do for committing writers. A single sync thread otherwise
                 // becomes the throughput limit.
@@ -261,26 +260,54 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
                     std::thread::sleep(std::time::Duration::from_millis(
                         wal_sync_interval_ms().max(1) as u64,
                     ));
-                    let dirty = std::mem::take(&mut *crate::profile_lock!(H20, WAL_DIRTY.lock()));
-                    pool.install(|| dirty.into_par_iter().for_each(sync_dirty_segment));
+                    dispatch_dirty_segments(&WAL_DIRTY, &pool);
                 }
             })
             .expect("spawn wal-syncer");
     });
 }
+fn dispatch_dirty_segments(
+    dirty: &crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>>,
+    pool: &rayon::ThreadPool,
+) {
+    // A retry goes to the next pass. Independent segments need not wait for
+    // every sync from the previous pass to finish.
+    for _ in 0..dirty.len() {
+        let Some(seg) = dirty.pop() else { break };
+        if seg
+            .wal_sync_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            dirty.push(seg);
+            continue;
+        }
+        pool.spawn(move || {
+            struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Running<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _running = Running(&seg.wal_sync_running);
+            sync_dirty_segment(seg.clone());
+        });
+    }
+}
+
 fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     let Some(_job) = seg.protection.job() else {
-        crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
+        WAL_DIRTY.push(seg.clone());
         return;
     };
-    // Bytes journaled during this sync must enqueue another pass.
-    seg.wal_sync_queued.store(false, Ordering::Release);
     #[cfg(test)]
     if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
-        seg.wal_sync_queued.store(true, Ordering::Release);
-        crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
+        WAL_DIRTY.push(seg.clone());
         return;
     }
+    // Bytes journaled during this sync must enqueue another pass. The
+    // dispatcher keeps that pass queued until this segment's job finishes.
+    seg.wal_sync_queued.store(false, Ordering::Release);
     if seg.wal_pending_bytes() > 0 {
         if let Err(e) = seg.sync_wal(false) {
             error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
@@ -658,7 +685,8 @@ struct ArchiveStagingPool {
 impl ArchiveStagingPool {
     fn acquire(&self) -> ArchiveStagingGuard<'_> {
         #[cfg(feature = "lock_profile")]
-        let capacity_wait = crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
+        let capacity_wait =
+            crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
         // During snapshot, compression, and write, holders take no lock and wait for no thread.
         let mut state = crate::profile_lock!(H43_mutex, self.state.lock());
         loop {
@@ -857,6 +885,7 @@ pub struct Segment {
     /// Set while this segment sits in the WAL syncer's dirty registry, so a
     /// segment is enqueued at most once per syncer pass.
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
+    wal_sync_running: std::sync::atomic::AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
     /// Entries that have taken space in this segment but have not yet written
@@ -1165,6 +1194,7 @@ impl Segment {
             wal_bytes_synced: AtomicUsize::new(0),
             wal_bytes_written: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_running: std::sync::atomic::AtomicBool::new(false),
             // A segment born cold has no image in its mapping either: the
             // backup is all there is until something promotes it.
             block_residency: parking_lot::RwLock::new(BlockResidency {
@@ -4437,6 +4467,61 @@ mod tests {
     }
 
     #[test]
+    fn wal_dispatch_does_not_wait_for_an_unrelated_segments_io() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let first = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        let second = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        for seg in [&first, &second] {
+            Segment::store_padding_header(seg.addr, 8);
+            seg.write_wal(seg.addr, 8, false).unwrap();
+            seg.wal_sync_queued.store(true, Ordering::Release);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let queue = crossbeam::queue::SegQueue::new();
+        let held = first.file_state.lock();
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert!(first.wal_sync_running.load(Ordering::Acquire));
+        // A newly dirty segment belongs to a later pass. It must complete
+        // while the preceding pass still waits for another segment's I/O.
+        queue.push(second.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while second.wal_sync_running.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let independent_finished = second.wal_pending_bytes() == 0;
+        assert_eq!(first.wal_pending_bytes(), 8);
+        // A new request for the blocked segment stays queued, without
+        // consuming a second worker or creating an unbounded job backlog.
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert_eq!(queue.len(), 1);
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while first.wal_sync_running.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            independent_finished,
+            "another segment must sync before the blocked segment is released"
+        );
+        assert_eq!(first.wal_pending_bytes(), 0);
+        assert!(!first.wal_sync_running.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn wal_sync_leaves_later_appends_dirty_and_replays_them_after_the_next_sync() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(SegmentFileManager::new(
@@ -4539,7 +4624,10 @@ mod tests {
         result.unwrap();
         crate::ram::durability::wait(receipts).await.unwrap();
         let high = seg.durable_file().unwrap().watermark();
-        assert!(high > retract_to, "test setup: the watermark covers the long frame");
+        assert!(
+            high > retract_to,
+            "test setup: the watermark covers the long frame"
+        );
         seg.truncate_wal_to(retract_to).unwrap();
         seg.write_wal(seg.addr + 8, 8, false).unwrap();
         assert!(
