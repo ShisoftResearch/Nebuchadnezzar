@@ -214,7 +214,7 @@ struct LeasedFence {
 #[derive(Default)]
 pub struct FenceLeases {
     next_token: std::sync::atomic::AtomicU64,
-    holds: parking_lot::Mutex<std::collections::HashMap<u64, LeasedFence>>,
+    holds: Sharded<parking_lot::Mutex<std::collections::HashMap<u64, LeasedFence>>>,
 }
 
 #[derive(Default)]
@@ -1177,7 +1177,7 @@ impl Service for NebRPCService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let lease = std::time::Duration::from_millis(lease_ms.max(1));
-            crate::profile_lock!(C05, leases.holds.lock()).insert(
+            crate::profile_lock!(C05, leases.holds.shard(&token).lock()).insert(
                 token,
                 LeasedFence {
                     _hold: hold,
@@ -1189,7 +1189,7 @@ impl Service for NebRPCService {
             tokio::spawn(async move {
                 loop {
                     let wait = {
-                        let holds = crate::profile_lock!(C05, leases.holds.lock());
+                        let holds = crate::profile_lock!(C05, leases.holds.shard(&token).lock());
                         match holds.get(&token) {
                             None => return,
                             Some(held) => held
@@ -1198,7 +1198,7 @@ impl Service for NebRPCService {
                         }
                     };
                     if wait.is_zero() {
-                        if crate::profile_lock!(C05, leases.holds.lock()).remove(&token).is_some() {
+                        if crate::profile_lock!(C05, leases.holds.shard(&token).lock()).remove(&token).is_some() {
                             warn!(
                                 "write fence lease {token} lapsed without a renewal; fence lifted"
                             );
@@ -1214,7 +1214,7 @@ impl Service for NebRPCService {
     }
 
     fn fence_renew(&self, token: u64, lease_ms: u64) -> BoxFuture<'_, bool> {
-        let mut holds = crate::profile_lock!(C05, self.fence_leases.holds.lock());
+        let mut holds = crate::profile_lock!(C05, self.fence_leases.holds.shard(&token).lock());
         let renewed = match holds.get_mut(&token) {
             Some(held) => {
                 held.expires =
@@ -1227,7 +1227,7 @@ impl Service for NebRPCService {
     }
 
     fn fence_release(&self, token: u64) -> BoxFuture<'_, ()> {
-        crate::profile_lock!(C05, self.fence_leases.holds.lock()).remove(&token);
+        crate::profile_lock!(C05, self.fence_leases.holds.shard(&token).lock()).remove(&token);
         future::ready(()).boxed()
     }
 

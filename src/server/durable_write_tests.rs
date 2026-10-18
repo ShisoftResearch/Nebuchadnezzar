@@ -647,3 +647,37 @@ async fn cell_scan_cursors_progress_independently() {
     assert!(rpc.cell_scan_next(first, 100).await.is_err());
     server.shutdown().await;
 }
+
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_lease_shards_allow_independent_renewals() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let first = rpc.fence_engage(&vec![], 1000, 10000).await.unwrap();
+    let second = (first + 1..first + 1000)
+        .find(|token| {
+            !std::ptr::eq(
+                rpc.fence_leases.holds.shard(&first),
+                rpc.fence_leases.holds.shard(token),
+            )
+        })
+        .unwrap();
+    let held = rpc.fence_leases.holds.shard(&first).lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = rpc.clone();
+    let thread = std::thread::spawn(move || {
+        assert!(!futures::executor::block_on(
+            worker.fence_renew(second, 10000)
+        ));
+        done_tx.send(()).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    rpc.fence_release(first).await;
+    let next = rpc.fence_engage(&vec![], 1000, 10000).await.unwrap();
+    assert!(rpc.fence_renew(next, 10000).await);
+    rpc.fence_release(next).await;
+    server.shutdown().await;
+}
