@@ -532,11 +532,20 @@ class Gate:
             self.refresh_tables()
         if self.args.probe == 'cut-prepare':
             request = {'op':'txn','id':'cut-prepare','keys':[[91,5000]],'value':5,'coordinator':1,'durable':self.args.durable}
-            client.send(request)
-            time.sleep(self.args.cut_after)
-            self.set_links(0, cut=True)
-            time.sleep(5)
-            self.set_links(0, cut=False)
+            if self.args.cut_point:
+                self.arm(0, self.args.cut_point)
+                client.send(request)
+                self.wait_pause(0, self.args.cut_point)
+                self.set_links(0, cut=True)
+                (self.root/'control-0'/'resume').touch()
+                time.sleep(self.args.cut_hold)
+                self.set_links(0, cut=False)
+            else:
+                client.send(request)
+                time.sleep(self.args.cut_after)
+                self.set_links(0, cut=True)
+                time.sleep(5)
+                self.set_links(0, cut=False)
             first = client.result(240)
             time.sleep(70)
             observed = client.command({'op':'read','keys':[[91,5000]]})['values']
@@ -676,6 +685,8 @@ def main():
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')
     parser.add_argument('--cut-after', type=float, default=.05)
+    parser.add_argument('--cut-point', default='')
+    parser.add_argument('--cut-hold', type=float, default=5)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
