@@ -614,25 +614,30 @@ class Gate:
         if self.args.probe == 'point-stop':
             victim, point = self.args.victim, self.args.cut_point
             other = 1 if victim == 0 else 0
-            request = {'op':'txn','id':'point-stop','keys':[[91+victim,9000],[91+other,9000]],'value':9,
-                       'coordinator':other if self.args.coordinator < 0 else self.args.coordinator,'durable':self.args.durable}
-            self.arm(victim, point)
-            client.send(request)
-            self.wait_pause(victim, point)
-            if self.args.kind == 'graceful':
-                self.servers[victim].proc.terminate()
-                (self.root/f'control-{victim}'/'resume').touch()
-                self.servers[victim].stop()
-            else:
-                self.servers[victim].stop(abrupt=True)
-            (self.root/f'control-{victim}'/'arm').unlink(missing_ok=True)
-            self.start(victim)
-            result = client.result(240)
+            done = []
+            for round_ in range(self.args.rounds):
+                request = {'op':'txn','id':f'point-stop-{round_}','keys':[[91+victim,9000+round_],[91+other,9000+round_]],'value':9+round_,
+                           'coordinator':other if self.args.coordinator < 0 else self.args.coordinator,'durable':self.args.durable}
+                self.arm(victim, point)
+                client.send(request)
+                self.wait_pause(victim, point)
+                if self.args.kind == 'graceful':
+                    self.servers[victim].proc.terminate()
+                    (self.root/f'control-{victim}'/'resume').touch()
+                    self.servers[victim].stop()
+                else:
+                    self.servers[victim].stop(abrupt=True)
+                (self.root/f'control-{victim}'/'arm').unlink(missing_ok=True)
+                self.start(victim)
+                done.append((request, client.result(240)))
             time.sleep(self.args.lease_secs+30)
-            observed = client.command({'op':'read','keys':request['keys']})['values']
-            report = {'result':result,'observed':observed,'request':request}
+            report = []
+            for request, result in done:
+                observed = client.command({'op':'read','keys':request['keys']})['values']
+                report.append({'result':result,'observed':observed,'request':request})
             (self.root/'probe-point-stop.json').write_text(json.dumps(report,indent=2))
-            check_transaction(request, result, observed)
+            for item in report:
+                check_transaction(item['request'], item['result'], item['observed'])
             (self.root/'PASS').write_text('point-stop probe passed\n')
             return
         if self.args.probe == 'partial-abort':
@@ -810,6 +815,7 @@ def main():
     parser.add_argument('--keep-going', action='store_true')
     parser.add_argument('--seed-stop-only', action='store_true')
     parser.add_argument('--coordinator', type=int, default=-1)
+    parser.add_argument('--rounds', type=int, default=1)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
