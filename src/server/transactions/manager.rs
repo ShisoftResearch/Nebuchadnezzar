@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::sharded::Sharded;
 use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
@@ -346,7 +347,7 @@ pub struct TransactionManager {
     self_ref: Weak<TransactionManager>,
     deps: Arc<TransactionManagerDeps>,
     transactions: LFMap<TxnId, TxnMutex>,
-    txn_ids: parking_lot::Mutex<BTreeSet<TxnId>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
+    txn_ids: Sharded<parking_lot::Mutex<BTreeSet<TxnId>>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
@@ -384,7 +385,7 @@ impl TransactionManager {
             self_ref: self_ref.clone(),
             deps,
             transactions: LFMap::with_capacity(128),
-            txn_ids: parking_lot::Mutex::new(BTreeSet::new()),
+            txn_ids: Sharded::default(),
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
@@ -657,7 +658,7 @@ impl Service for TransactionManager {
             error!("Transaction id existed: {:?}", id);
             future::ready(Err(TMError::TransactionIdExisted)).boxed()
         } else {
-            crate::profile_lock!(H16, self.txn_ids.lock()).insert(id.clone());
+            crate::profile_lock!(H16, self.txn_ids.shard(&id).lock()).insert(id.clone());
             future::ready(Ok(id)).boxed()
         }
     }
@@ -2056,7 +2057,7 @@ impl TransactionManager {
         txn.state = TxnState::Cleanup;
         txn.last_activity = get_time();
         let _ = self.transactions.remove(tid);
-        crate::profile_lock!(H16, self.txn_ids.lock()).remove(tid);
+        crate::profile_lock!(H16, self.txn_ids.shard(tid).lock()).remove(tid);
     }
 
     fn cleanup_transaction(&self, tid: &TxnId) {
@@ -2064,7 +2065,7 @@ impl TransactionManager {
             let mut txn_guard = txn.lock_blocking();
             self.cleanup_transaction_guarded(tid, &mut txn_guard);
         } else {
-            crate::profile_lock!(H16, self.txn_ids.lock()).remove(tid);
+            crate::profile_lock!(H16, self.txn_ids.shard(tid).lock()).remove(tid);
         }
     }
 
@@ -2081,28 +2082,17 @@ impl TransactionManager {
         let mut cleaned = 0;
 
         // Collect stale transaction IDs
-        let stale_txns: Vec<TxnId> = {
-            let txn_ids = crate::profile_lock!(H16, self.txn_ids.lock());
-            txn_ids
-                .iter()
-                .filter_map(|tid| {
-                    if let Some(txn_mutex) = self.transactions.get(tid) {
-                        // Try to get the lock without blocking
-                        if let Some(txn_guard) = txn_mutex.try_lock() {
-                            // Only Started transactions can be abandoned safely.
-                            // Prepared transactions need a commit/abort decision, and
-                            // Aborted transactions may still need rollback retries.
-                            if txn_guard.last_activity < cutoff
-                                && txn_guard.state == TxnState::Started
-                            {
-                                return Some(tid.clone());
-                            }
-                        }
-                    }
-                    None
+        let transaction_ids: Vec<TxnId> = self.txn_ids.iter().flat_map(|shard| {
+            crate::profile_lock!(H16, shard.lock()).iter().cloned().collect::<Vec<_>>()
+        }).collect();
+        let stale_txns: Vec<TxnId> = transaction_ids.into_iter().filter(|tid| {
+            self.transactions.get(tid).is_some_and(|txn_mutex| {
+                // Drop the shard guard before inspecting transaction state.
+                txn_mutex.try_lock().is_some_and(|txn| {
+                    txn.last_activity < cutoff && txn.state == TxnState::Started
                 })
-                .collect()
-        };
+            })
+        }).collect();
 
         // Remove the stale transactions
         for tid in stale_txns {
@@ -2392,6 +2382,36 @@ mod tests {
         assert!(!TransactionManager::abort_cleanup_complete(&Ok(
             AbortResult::Success(Some(vec![]))
         )));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transaction_id_shards_allow_unrelated_cleanup() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_manager_test_server(&address, "txn_id_shards").await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let first = <TransactionManager as super::Service>::begin(&manager).await.unwrap();
+        let mut created = vec![first.clone()];
+        let second = loop {
+            let tid = <TransactionManager as super::Service>::begin(&manager).await.unwrap();
+            created.push(tid.clone());
+            if !std::ptr::eq(manager.txn_ids.shard(&first), manager.txn_ids.shard(&tid)) {
+                break tid;
+            }
+        };
+        let held = manager.txn_ids.shard(&first).lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let thread = std::thread::spawn(move || {
+            worker.cleanup_transaction(&second);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "another transaction shard must allow cleanup");
+        for tid in created { manager.cleanup_transaction(&tid); }
+        assert_eq!(manager.transaction_count(), 0);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
