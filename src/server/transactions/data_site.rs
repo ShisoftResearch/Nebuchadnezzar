@@ -483,7 +483,7 @@ pub struct DataManager {
     /// is down. So a commit with other participants is also kept in the
     /// store's decision evidence (`crate::ram::evidence`), durably and until
     /// no participant holds it open; this map is the fast path.
-    decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
+    decided: Sharded<Mutex<BTreeMap<TxnId, TxnOutcome>>>,
 }
 
 /// How often a site asks the participants that did not report their COMMIT
@@ -513,6 +513,8 @@ enum CloseOutcome {
 
 /// How many finished transactions a site remembers the fate of. Sized to
 /// outlast the in-doubt window by orders of magnitude rather than tuned.
+/// Each transaction shard retains an equal part of this cache. Durable status
+/// and fence records remain authoritative after a cache entry is evicted.
 const DECISION_MEMORY: usize = 64 * 1024;
 
 service! {
@@ -577,7 +579,7 @@ impl DataManager {
             txns_sorted: Sharded::default(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
-            decided: Mutex::new(BTreeMap::new()),
+            decided: Sharded::default(),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -1527,7 +1529,7 @@ impl DataManager {
     /// cannot be fenced: it was told to commit, or the fence could not be
     /// made durable; the asker waits.
     pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
-        let decided = crate::profile_lock!(H18, self.decided.lock()).get(tid).copied();
+        let decided = crate::profile_lock!(H18, self.decided.shard(tid).lock()).get(tid).copied();
         match decided {
             Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
             Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
@@ -1809,9 +1811,9 @@ impl DataManager {
     /// commit point answers a transaction it never decided. Bounded: see
     /// `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
-        let mut decided = crate::profile_lock!(H18, self.decided.lock());
+        let mut decided = crate::profile_lock!(H18, self.decided.shard(tid).lock());
         decided.insert(tid.clone(), outcome);
-        while decided.len() > DECISION_MEMORY {
+        while decided.len() > DECISION_MEMORY / crate::utils::sharded::SHARD_COUNT {
             let Some(oldest) = decided.keys().next().cloned() else {
                 break;
             };
@@ -1819,12 +1821,20 @@ impl DataManager {
         }
     }
 
-    /// Test hook: record as many later, unrelated decisions as the decision
-    /// memory holds, the way that many finished transactions would.
+    /// Test hook: evict earlier decisions from every shard with later decisions.
     #[cfg(test)]
     pub(crate) fn fill_decision_memory_with_later_decisions(&self) {
-        for _ in 0..DECISION_MEMORY {
-            self.record_decision(&self.hlc.now(), TxnOutcome::Aborted);
+        let mut counts: HashMap<usize, usize> = self.decided.iter()
+            .map(|shard| (shard as *const _ as usize, 0)).collect();
+        let limit = DECISION_MEMORY / crate::utils::sharded::SHARD_COUNT;
+        while counts.values().any(|count| *count < limit) {
+            let tid = self.hlc.now();
+            let key = self.decided.shard(&tid) as *const _ as usize;
+            let count = counts.get_mut(&key).unwrap();
+            if *count < limit {
+                self.record_decision(&tid, TxnOutcome::Aborted);
+                *count += 1;
+            }
         }
     }
 
@@ -1859,7 +1869,7 @@ impl DataManager {
         // A finished multi-site commit is answered from its status cell
         // above until every participant is synced; a single-site one is never
         // asked about.
-        if let Some(outcome) = crate::profile_lock!(H18, self.decided.lock()).get(tid) {
+        if let Some(outcome) = crate::profile_lock!(H18, self.decided.shard(tid).lock()).get(tid) {
             return *outcome;
         }
         TxnOutcome::Unknown
@@ -6828,6 +6838,34 @@ mod tests {
             1
         );
         abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decision_shards_allow_unrelated_publication() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_transaction_test_server(&address, "decision_shards").await;
+        let manager = data_manager_for_database(&server, &address, "decision_shards").await;
+        let first = test_hlc(1, 1);
+        let second = (2..1000).map(|n| test_hlc(n, 1)).find(|tid| {
+            !std::ptr::eq(manager.decided.shard(&first), manager.decided.shard(tid))
+        }).unwrap();
+        let held = manager.decided.shard(&first).lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.record_decision(&second_copy, TxnOutcome::Aborted);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "another decision shard must allow publication");
+        assert_eq!(manager.txn_outcome(&second), TxnOutcome::Aborted);
+        manager.fill_decision_memory_with_later_decisions();
+        assert_eq!(manager.txn_outcome(&second), TxnOutcome::Unknown);
+        assert_eq!(manager.decided.iter().map(|s| s.lock().len()).sum::<usize>(), DECISION_MEMORY);
         server.shutdown().await;
     }
 
