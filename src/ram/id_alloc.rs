@@ -15,7 +15,7 @@
 //! per-lane atomic cursor and an immutable upper bound per durable block.
 //! A lane has one refill in flight. Different lanes lease independently.
 
-use crate::utils::sharded::Sharded;
+use crate::utils::keyed_state::KeyedState;
 use dovahkiin::types::custom_types::id::{Id, ID_ORIGIN_MASK, ID_SEQUENCE_MASK};
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -74,7 +74,7 @@ pub trait LeaseStore: Send + Sync {
 /// can reference me" buys nothing and would add a mode.
 #[derive(Default)]
 pub struct VolatileLeaseStore {
-    state: Sharded<parking_lot::Mutex<std::collections::HashMap<u16, (u64, u64)>>>, // origin -> (epoch, end)
+    state: KeyedState<u16, (u64, u64)>, // origin -> (epoch, end)
 }
 
 impl VolatileLeaseStore {
@@ -85,8 +85,8 @@ impl VolatileLeaseStore {
         floor: u64,
         span: u64,
     ) -> io::Result<BlockLease> {
-        let mut state = crate::profile_lock!(C12, self.state.shard(&origin).lock());
-        let entry = state.entry(origin).or_insert((epoch, 0));
+        let mut state = crate::profile_lock!(C12, self.state.entry(&origin));
+        let entry = state.get_or_insert((epoch, 0));
         if epoch < entry.0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -131,9 +131,9 @@ impl LeaseStore for VolatileLeaseStore {
     fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>> {
         future::ready(Ok(crate::profile_lock!(
             C12,
-            self.state.shard(&origin).lock()
+            self.state.entry(&origin)
         )
-        .get(&origin)
+        .as_ref()
         .map(|(_, end)| *end)))
         .boxed()
     }
@@ -148,8 +148,8 @@ impl LeaseStore for VolatileLeaseStore {
                 ),
             ))
         } else {
-            let mut state = crate::profile_lock!(C12, self.state.shard(&origin).lock());
-            let entry = state.entry(origin).or_insert((0, 0));
+            let mut state = crate::profile_lock!(C12, self.state.entry(&origin));
+            let entry = state.get_or_insert((0, 0));
             entry.1 = entry.1.max(floor);
             Ok(entry.1)
         };
@@ -439,10 +439,8 @@ mod tests {
     fn volatile_lease_origins_do_not_share_one_gate() {
         let store = Arc::new(VolatileLeaseStore::default());
         let first = 1u16;
-        let second = (2..1000u16)
-            .find(|origin| !std::ptr::eq(store.state.shard(&first), store.state.shard(origin)))
-            .unwrap();
-        let held = store.state.shard(&first).lock();
+        let second = 2u16;
+        let held = store.state.entry(&first);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = store.clone();
         let thread = std::thread::spawn(move || {
