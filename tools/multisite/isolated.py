@@ -50,6 +50,8 @@ else:
         args += ['--workloads',os.environ['MULTISITE_WORKLOADS']]
     if os.environ.get('MULTISITE_AUDIT_EVERY'):
         args += ['--audit-every',os.environ['MULTISITE_AUDIT_EVERY']]
+    if os.environ.get('MULTISITE_KEEP_GOING') == '1':
+        args.append('--keep-going')
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
     if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':
