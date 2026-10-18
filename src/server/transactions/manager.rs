@@ -343,6 +343,31 @@ dispatch_rpc_service_functions!(TransactionManager);
 
 service_with_id!(TransactionManager, DEFAULT_SERVICE_ID);
 
+#[derive(Default)]
+struct PinReleaseQueue {
+    pending: crossbeam::queue::SegQueue<TxnId>,
+    flushing: AtomicBool,
+}
+
+struct PinReleaseBatch {
+    queue: Arc<PinReleaseQueue>,
+    tids: Vec<TxnId>,
+}
+
+impl PinReleaseQueue {
+    fn try_batch(self: &Arc<Self>) -> Option<PinReleaseBatch> {
+        if self.pending.is_empty() || self.flushing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return None;
+        }
+        let tids = (0..self.pending.len()).filter_map(|_| self.pending.pop()).collect();
+        Some(PinReleaseBatch { queue: self.clone(), tids })
+    }
+}
+
+impl Drop for PinReleaseBatch {
+    fn drop(&mut self) { self.queue.flushing.store(false, Ordering::Release); }
+}
+
 pub struct TransactionManager {
     self_ref: Weak<TransactionManager>,
     deps: Arc<TransactionManagerDeps>,
@@ -352,11 +377,11 @@ pub struct TransactionManager {
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
     // Completed transactions whose read pins await release, queued here so the
-    // commit/abort paths pay only a lock+push; a periodic background flusher
+    // commit/abort paths only look up a peer and enqueue; a periodic background flusher
     // sends the batched release RPCs. A per-commit `tokio::spawn` was measured
     // at 15-40us of worker-unpark overhead at low concurrency in this codebase,
     // which a queue push avoids entirely.
-    pending_pin_releases: parking_lot::Mutex<Vec<(TxnId, HashSet<u64>)>>,
+    pending_pin_releases: Sharded<parking_lot::Mutex<HashMap<u64, Arc<PinReleaseQueue>>>>,
 }
 
 /// How often the background flusher sends queued read-pin releases. Pins are
@@ -389,7 +414,7 @@ impl TransactionManager {
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
-            pending_pin_releases: parking_lot::Mutex::new(Vec::new()),
+            pending_pin_releases: Sharded::default(),
         });
 
         // Periodically flush queued read-pin releases in batches, so completing
@@ -403,7 +428,7 @@ impl TransactionManager {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(PIN_RELEASE_FLUSH_INTERVAL_MS)).await;
-                flusher.flush_pin_releases().await;
+                flusher.flush_pin_releases();
             }
         });
 
@@ -1971,48 +1996,38 @@ impl TransactionManager {
     /// logged at debug and ignored — the participant's stale cleanup remains the
     /// backstop, and a release must never fail commit/abort.
     /// Queue a completed transaction's read pins for release by the periodic
-    /// flusher. Costs one lock+push on the commit/abort path; a lost release is
+    /// flusher. Each participant has a lock-free queue; a lost release is
     /// reclaimed by the participant's stale cleanup.
     fn queue_pin_release(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
         if pinned_servers.is_empty() {
             return;
         }
-        crate::profile_lock!(H15, self.pending_pin_releases.lock()).push((tid, pinned_servers));
-    }
-    /// Drain the queued releases and send one batched RPC per participant.
-    /// Best-effort: individual failures are logged and dropped; the
-    /// participant's stale cleanup remains the backstop.
-    async fn flush_pin_releases(&self) {
-        let pending: Vec<(TxnId, HashSet<u64>)> = {
-            let mut queue = crate::profile_lock!(H15, self.pending_pin_releases.lock());
-            if queue.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *queue)
-        };
-        let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
-        for (tid, servers) in pending {
-            for server_id in servers {
-                tids_by_server
-                    .entry(server_id)
-                    .or_default()
-                    .push(tid.clone());
-            }
+        for server in pinned_servers {
+            let queue = crate::profile_lock!(H15, self.pending_pin_releases.shard(&server).lock())
+                .entry(server).or_insert_with(|| Arc::new(PinReleaseQueue::default())).clone();
+            queue.pending.push(tid.clone());
         }
-        for (server_id, tids) in tids_by_server {
-            match self.get_data_site(server_id).await {
-                Ok(data_site) => match data_site.release_read_pins(tids).await {
-                    Ok(response) => self.merge_clock(response.clock),
-                    Err(error) => debug!(
-                        "batched release_read_pins RPC to server {} failed: {:?}",
-                        server_id, error
-                    ),
-                },
-                Err(error) => debug!(
-                    "cannot locate server {} to release read pins: {:?}",
-                    server_id, error
-                ),
-            }
+    }
+    /// Each participant has at most one release RPC in flight. A slow peer
+    /// does not delay releases to another peer. Failed releases remain best effort.
+    fn flush_pin_releases(self: &Arc<Self>) {
+        let queues: Vec<_> = self.pending_pin_releases.iter().flat_map(|shard| {
+            crate::profile_lock!(H15, shard.lock()).iter().map(|(id, queue)| (*id, queue.clone())).collect::<Vec<_>>()
+        }).collect();
+        for (server_id, queue) in queues {
+            let Some(mut batch) = queue.try_batch() else { continue };
+            let manager = self.clone();
+            tokio::spawn(async move {
+                let tids = std::mem::take(&mut batch.tids);
+                match manager.get_data_site(server_id).await {
+                    Ok(data_site) => match data_site.release_read_pins(tids).await {
+                        Ok(response) => manager.merge_clock(response.clock),
+                        Err(error) => debug!("batched release_read_pins RPC to server {} failed: {:?}", server_id, error),
+                    },
+                    Err(error) => debug!("cannot locate server {} to release read pins: {:?}", server_id, error),
+                }
+                drop(batch);
+            });
         }
     }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
@@ -2191,6 +2206,31 @@ mod tests {
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::Map;
     use futures::future::join_all;
+
+    #[test]
+    fn read_pin_release_batches_have_independent_participant_owners() {
+        let busy = Arc::new(PinReleaseQueue::default());
+        let other = Arc::new(PinReleaseQueue::default());
+        busy.pending.push(test_hlc(1, 1));
+        let held = busy.try_batch().unwrap();
+        std::thread::scope(|scope| {
+            for producer in 0..8 {
+                let queue = &other;
+                scope.spawn(move || {
+                    for n in 0..64 { queue.pending.push(test_hlc(1 + n + producer * 64, 2)); }
+                });
+            }
+        });
+        busy.pending.push(test_hlc(2, 1));
+        assert!(busy.try_batch().is_none(), "one participant owns its in-flight batch");
+        let batch = other.try_batch().unwrap();
+        let unique: BTreeSet<_> = batch.tids.iter().cloned().collect();
+        assert_eq!(batch.tids.len(), 512);
+        assert_eq!(unique.len(), 512);
+        assert_eq!(held.tids, vec![test_hlc(1, 1)]);
+        drop(held);
+        assert_eq!(busy.try_batch().unwrap().tids, vec![test_hlc(2, 1)]);
+    }
 
     #[test]
     fn scoped_transaction_manager_service_ids_differ_between_databases() {
