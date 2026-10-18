@@ -1,4 +1,3 @@
-use crate::utils::sharded::Sharded;
 use super::*;
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
@@ -483,7 +482,8 @@ pub struct DataManager {
     /// is down. So a commit with other participants is also kept in the
     /// store's decision evidence (`crate::ram::evidence`), durably and until
     /// no participant holds it open; this map is the fast path.
-    decided: Sharded<Mutex<BTreeMap<TxnId, TxnOutcome>>>,
+    decided: LFMap<TxnId, TxnOutcome>,
+    decision_order: SkipSet<TxnId>,
 }
 
 /// How often a site asks the participants that did not report their COMMIT
@@ -513,8 +513,8 @@ enum CloseOutcome {
 
 /// How many finished transactions a site remembers the fate of. Sized to
 /// outlast the in-doubt window by orders of magnitude rather than tuned.
-/// Each transaction shard retains an equal part of this cache. Durable status
-/// and fence records remain authoritative after a cache entry is evicted.
+/// An ordered side index selects the globally oldest remembered transaction.
+/// Durable status and fence records remain authoritative after eviction.
 const DECISION_MEMORY: usize = 64 * 1024;
 
 service! {
@@ -579,7 +579,8 @@ impl DataManager {
             txns_sorted: SkipSet::new(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
-            decided: Sharded::default(),
+            decided: LFMap::with_capacity(128),
+            decision_order: SkipSet::new(),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -1521,7 +1522,7 @@ impl DataManager {
     /// cannot be fenced: it was told to commit, or the fence could not be
     /// made durable; the asker waits.
     pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
-        let decided = crate::profile_lock!(H18, self.decided.shard(tid).lock()).get(tid).copied();
+        let decided = self.decided.get(tid);
         match decided {
             Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
             Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
@@ -1803,30 +1804,21 @@ impl DataManager {
     /// commit point answers a transaction it never decided. Bounded: see
     /// `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
-        let mut decided = crate::profile_lock!(H18, self.decided.shard(tid).lock());
-        decided.insert(tid.clone(), outcome);
-        while decided.len() > DECISION_MEMORY / crate::utils::sharded::SHARD_COUNT {
-            let Some(oldest) = decided.keys().next().cloned() else {
-                break;
-            };
-            decided.remove(&oldest);
+        self.decided.insert(tid.clone(), outcome);
+        self.decision_order.insert(tid.clone());
+        while self.decision_order.len() > DECISION_MEMORY {
+            let Some(oldest) = self.decision_order.front() else { break };
+            if oldest.remove() {
+                self.decided.remove(oldest.value());
+            }
         }
     }
 
-    /// Test hook: evict earlier decisions from every shard with later decisions.
+    /// Test hook: evict earlier decisions with later decisions.
     #[cfg(test)]
     pub(crate) fn fill_decision_memory_with_later_decisions(&self) {
-        let mut counts: HashMap<usize, usize> = self.decided.iter()
-            .map(|shard| (shard as *const _ as usize, 0)).collect();
-        let limit = DECISION_MEMORY / crate::utils::sharded::SHARD_COUNT;
-        while counts.values().any(|count| *count < limit) {
-            let tid = self.hlc.now();
-            let key = self.decided.shard(&tid) as *const _ as usize;
-            let count = counts.get_mut(&key).unwrap();
-            if *count < limit {
-                self.record_decision(&tid, TxnOutcome::Aborted);
-                *count += 1;
-            }
+        for _ in 0..DECISION_MEMORY {
+            self.record_decision(&self.hlc.now(), TxnOutcome::Aborted);
         }
     }
 
@@ -1861,8 +1853,8 @@ impl DataManager {
         // A finished multi-site commit is answered from its status cell
         // above until every participant is synced; a single-site one is never
         // asked about.
-        if let Some(outcome) = crate::profile_lock!(H18, self.decided.shard(tid).lock()).get(tid) {
-            return *outcome;
+        if let Some(outcome) = self.decided.get(tid) {
+            return outcome;
         }
         TxnOutcome::Unknown
     }
@@ -6831,15 +6823,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn decision_shards_allow_unrelated_publication() {
+    async fn decision_iteration_allows_unrelated_publication() {
         let address = crate::utils::test_port::unique_localhost_addr();
         let server = start_transaction_test_server(&address, "decision_shards").await;
         let manager = data_manager_for_database(&server, &address, "decision_shards").await;
         let first = test_hlc(1, 1);
-        let second = (2..1000).map(|n| test_hlc(n, 1)).find(|tid| {
-            !std::ptr::eq(manager.decided.shard(&first), manager.decided.shard(tid))
-        }).unwrap();
-        let held = manager.decided.shard(&first).lock();
+        let second = test_hlc(2, 1);
+        manager.record_decision(&first, TxnOutcome::Aborted);
+        let held = manager.decision_order.get(&first).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = manager.clone();
         let second_copy = second.clone();
@@ -6850,11 +6841,11 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2));
         drop(held);
         thread.join().unwrap();
-        assert!(result.is_ok(), "another decision shard must allow publication");
+        assert!(result.is_ok(), "a held ordered entry must allow decision publication");
         assert_eq!(manager.txn_outcome(&second), TxnOutcome::Aborted);
         manager.fill_decision_memory_with_later_decisions();
         assert_eq!(manager.txn_outcome(&second), TxnOutcome::Unknown);
-        assert_eq!(manager.decided.iter().map(|s| s.lock().len()).sum::<usize>(), DECISION_MEMORY);
+        assert_eq!(manager.decision_order.len(), DECISION_MEMORY);
         server.shutdown().await;
     }
 
