@@ -1,3 +1,4 @@
+use crate::utils::sharded::Sharded;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -541,7 +542,7 @@ pub struct InvertedIndexer {
 
     // Dirty field-stats keys pending persistence.
     // PtrHashMap doesn't support iteration, so we keep the original tuple here.
-    dirty_field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>, // hash -> (schema_id, field_id)
+    dirty_field_stats_keys: Arc<Sharded<Mutex<HashMap<u64, (u32, u64)>>>>, // hash -> (schema_id, field_id)
 
     // Background sync for stats
     flush_interval: Duration,
@@ -573,7 +574,7 @@ impl InvertedIndexer {
             neb_client,
             field_stats: Arc::new(PtrHashMap::with_capacity(64)),
             doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
-            dirty_field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
+            dirty_field_stats_keys: Arc::new(Sharded::default()),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -612,7 +613,7 @@ impl InvertedIndexer {
 
     fn mark_field_stats_dirty(&self, schema_id: SchemaUid, field_id: u64) -> u64 {
         let stats_key = Self::stats_key(schema_id, field_id);
-        crate::profile_lock!(H59, self.dirty_field_stats_keys
+        crate::profile_lock!(H59, self.dirty_field_stats_keys.shard(&stats_key)
             .lock())
             .insert(stats_key, (schema_id.get(), field_id));
         stats_key
@@ -623,7 +624,9 @@ impl InvertedIndexer {
             return;
         }
 
-        crate::profile_lock!(H59, self.dirty_field_stats_keys.lock()).extend(dirty_keys);
+        for (key, value) in dirty_keys {
+            crate::profile_lock!(H59, self.dirty_field_stats_keys.shard(&key).lock()).insert(key, value);
+        }
     }
 
     /// Add a document to the index
@@ -987,10 +990,10 @@ impl InvertedIndexer {
     /// Note: Posting lists are written directly to Chunks during add_document,
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
-        let dirty_keys = {
-            let mut keys = crate::profile_lock!(H59, self.dirty_field_stats_keys.lock());
+        let dirty_keys: HashMap<_, _> = self.dirty_field_stats_keys.iter().flat_map(|shard| {
+            let mut keys = crate::profile_lock!(H59, shard.lock());
             std::mem::take(&mut *keys)
-        };
+        }).collect();
 
         if dirty_keys.is_empty() {
             debug!("No dirty field stats to flush");
@@ -2173,6 +2176,38 @@ mod tests {
         info!("Add and search test passed");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dirty_field_statistics_shards_accept_independent_updates() {
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 64 * 1024 * 1024, db_size: 64 * 1024 * 1024,
+                tiered_config: None, backup_storage: None, wal_storage: None, raft_storage: None,
+                index_enabled: true, services: vec![crate::server::Service::Cell],
+                enable_recovery: false, disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(), "field_stats_shards", async |_| {},
+        ).await.unwrap();
+        let indexer = server.indexer().unwrap().clients.fulltext_indexer().unwrap().clone();
+        let first = InvertedIndexer::stats_key(SchemaUid(100), 1);
+        let second_field = (2..1000).find(|field| {
+            let key = InvertedIndexer::stats_key(SchemaUid(100), *field);
+            !std::ptr::eq(indexer.dirty_field_stats_keys.shard(&first), indexer.dirty_field_stats_keys.shard(&key))
+        }).unwrap();
+        let held = indexer.dirty_field_stats_keys.shard(&first).lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = indexer.clone();
+        let thread = std::thread::spawn(move || {
+            let key = worker.mark_field_stats_dirty(SchemaUid(100), second_field);
+            assert_eq!(worker.dirty_field_stats_keys.shard(&key).lock().get(&key), Some(&(100, second_field)));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_remove_document() {
         let _ = env_logger::try_init();
@@ -2240,7 +2275,7 @@ mod tests {
 
         assert!(
             crate::profile_lock!(H59, indexer
-                .dirty_field_stats_keys
+                .dirty_field_stats_keys.shard(&stats_key)
                 .lock())
                 .contains_key(&stats_key),
             "add should mark field stats dirty"
@@ -2248,7 +2283,7 @@ mod tests {
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            crate::profile_lock!(H59, indexer.dirty_field_stats_keys.lock()).is_empty(),
+            indexer.dirty_field_stats_keys.iter().all(|shard| shard.lock().is_empty()),
             "successful flush should clear dirty field stats"
         );
 
@@ -2261,7 +2296,7 @@ mod tests {
 
         assert!(
             crate::profile_lock!(H59, indexer
-                .dirty_field_stats_keys
+                .dirty_field_stats_keys.shard(&stats_key)
                 .lock())
                 .contains_key(&stats_key),
             "remove should mark field stats dirty again"
@@ -2269,7 +2304,7 @@ mod tests {
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            crate::profile_lock!(H59, indexer.dirty_field_stats_keys.lock()).is_empty(),
+            indexer.dirty_field_stats_keys.iter().all(|shard| shard.lock().is_empty()),
             "successful flush should clear dirty field stats after remove"
         );
 
