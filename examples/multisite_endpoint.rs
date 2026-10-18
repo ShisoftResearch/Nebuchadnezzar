@@ -172,77 +172,89 @@ async fn command(client: &Arc<AsyncClient>, peers: &[String], group: &str, req: 
             }
             json!({"values":values})
         }
-        "txn" => {
-            let coordinator = req["coordinator"].as_u64().unwrap_or(0) as usize;
-            let svc =
-                transactions::new_async_client_for_database(&peers[coordinator], group, group)
-                    .await
-                    .unwrap();
-            let tid = match svc.begin().await {
-                Ok(Ok(tid)) => tid,
-                other => return json!({"outcome":"begin_error", "error":format!("{:?}",other)}),
-            };
-            emit(json!({"event":"begin", "id":req["id"], "tid":tid}));
-            let txn = Transaction {
-                tid,
-                state: Cell::new(TxnState::Started),
-                client: svc,
-            };
-            if let Some(reads) = req["reads"].as_array() {
-                for key in reads {
-                    let id = Id::from_parts(key[0].as_u64().unwrap(), key[1].as_u64().unwrap());
-                    if let Err(error) = txn.read(id).await {
-                        let _ = txn.abort().await;
-                        return json!({"outcome":"read_error", "error":format!("{error:?}")});
-                    }
-                }
-            }
-            for key in req["keys"].as_array().unwrap() {
-                let id = Id::from_parts(key[0].as_u64().unwrap(), key[1].as_u64().unwrap());
-                let cell = OwnedCell::new_with_id(
-                    SchemaVid(4343),
-                    &id,
-                    OwnedValue::U64(req["value"].as_u64().unwrap()),
-                );
-                if let Err(error) = txn.write(cell).await {
-                    let _ = txn.abort().await;
-                    return json!({"outcome":"write_error","error":format!("{:?}",error)});
-                }
-            }
-            if req["abort"].as_bool().unwrap_or(false) {
-                return json!({"outcome":"abort", "result":format!("{:?}",txn.abort().await)});
-            }
-            if let Err(error) = txn.prepare().await {
-                let _ = txn.abort().await;
-                return json!({"outcome":"prepare_error","error":format!("{:?}",error)});
-            }
-            emit(json!({"event":"prepared", "id":req["id"], "tid":txn.tid}));
-            if let Some(index) = req["end_site"].as_u64() {
-                let rpc = rpc::DEFAULT_CLIENT_POOL
-                    .get(&peers[index as usize])
-                    .await
-                    .unwrap();
-                let site = transactions::data_site::AsyncServiceClient::new_with_service_id(
-                    transactions::data_site::generate_scoped_service_id(group, group),
-                    &rpc,
-                );
-                let end = site.end(txn.tid, txn.tid, false).await.unwrap().payload;
-                let abort = site.abort(txn.tid, txn.tid).await.unwrap().payload;
-                return json!({"outcome":"end_probe", "tid":txn.tid, "end":format!("{end:?}"), "abort":format!("{abort:?}")});
-            }
-            let outcome = if req["durable"].as_bool().unwrap_or(false) {
-                txn.commit_durable().await
-            } else {
-                txn.commit().await
-            };
-            match outcome {
-                Ok(()) => json!({"outcome":"ack"}),
-                Err(neb::client::transaction::TxnError::OutcomeUnknown) => {
-                    json!({"outcome":"unknown"})
-                }
-                Err(error) => json!({"outcome":"commit_error","error":format!("{:?}",error)}),
-            }
+        "txn" => run_txn(peers, group, req).await,
+        "batch" => {
+            let results = futures::future::join_all(
+                req["requests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|request| run_txn(peers, group, request)),
+            )
+            .await;
+            json!({"results":results})
         }
         _ => panic!("unknown command"),
+    }
+}
+
+async fn run_txn(peers: &[String], group: &str, req: &Value) -> Value {
+    let coordinator = req["coordinator"].as_u64().unwrap_or(0) as usize;
+    let svc = transactions::new_async_client_for_database(&peers[coordinator], group, group)
+        .await
+        .unwrap();
+    let tid = match svc.begin().await {
+        Ok(Ok(tid)) => tid,
+        other => return json!({"outcome":"begin_error", "error":format!("{:?}",other)}),
+    };
+    emit(json!({"event":"begin", "id":req["id"], "tid":tid}));
+    let txn = Transaction {
+        tid,
+        state: Cell::new(TxnState::Started),
+        client: svc,
+    };
+    if let Some(reads) = req["reads"].as_array() {
+        for key in reads {
+            let id = Id::from_parts(key[0].as_u64().unwrap(), key[1].as_u64().unwrap());
+            if let Err(error) = txn.read(id).await {
+                let _ = txn.abort().await;
+                return json!({"outcome":"read_error", "error":format!("{error:?}")});
+            }
+        }
+    }
+    for key in req["keys"].as_array().unwrap() {
+        let id = Id::from_parts(key[0].as_u64().unwrap(), key[1].as_u64().unwrap());
+        let cell = OwnedCell::new_with_id(
+            SchemaVid(4343),
+            &id,
+            OwnedValue::U64(req["value"].as_u64().unwrap()),
+        );
+        if let Err(error) = txn.write(cell).await {
+            let _ = txn.abort().await;
+            return json!({"outcome":"write_error","error":format!("{:?}",error)});
+        }
+    }
+    if req["abort"].as_bool().unwrap_or(false) {
+        return json!({"outcome":"abort", "result":format!("{:?}",txn.abort().await)});
+    }
+    if let Err(error) = txn.prepare().await {
+        let _ = txn.abort().await;
+        return json!({"outcome":"prepare_error","error":format!("{:?}",error)});
+    }
+    emit(json!({"event":"prepared", "id":req["id"], "tid":txn.tid}));
+    if let Some(index) = req["end_site"].as_u64() {
+        let rpc = rpc::DEFAULT_CLIENT_POOL
+            .get(&peers[index as usize])
+            .await
+            .unwrap();
+        let site = transactions::data_site::AsyncServiceClient::new_with_service_id(
+            transactions::data_site::generate_scoped_service_id(group, group),
+            &rpc,
+        );
+        let end = site.end(txn.tid, txn.tid, false).await.unwrap().payload;
+        let abort = site.abort(txn.tid, txn.tid).await.unwrap().payload;
+        return json!({"outcome":"end_probe", "tid":txn.tid, "end":format!("{end:?}"), "abort":format!("{abort:?}")});
+    }
+    let outcome = if req["durable"].as_bool().unwrap_or(false) {
+        txn.commit_durable().await
+    } else {
+        txn.commit().await
+    };
+    match outcome {
+        Ok(()) => json!({"outcome":"ack"}),
+        Err(neb::client::transaction::TxnError::OutcomeUnknown) => {
+            json!({"outcome":"unknown"})
+        }
+        Err(error) => json!({"outcome":"commit_error","error":format!("{:?}",error)}),
     }
 }

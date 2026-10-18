@@ -9,6 +9,15 @@ use std::{
 static EVENTS: Mutex<()> = Mutex::new(());
 
 pub fn point(name: &str, detail: impl std::fmt::Debug) {
+    record(name, serde_json::Value::String(format!("{detail:?}")));
+}
+
+/// Like `point`, with a structured detail the controller can check.
+pub fn point_json(name: &str, detail: serde_json::Value) {
+    record(name, detail);
+}
+
+fn record(name: &str, detail: serde_json::Value) {
     let Ok(path) = std::env::var("MULTISITE_EVENTS") else {
         return;
     };
@@ -29,7 +38,7 @@ pub fn point(name: &str, detail: impl std::fmt::Debug) {
             file,
             "{}",
             serde_json::json!({
-                "pid": std::process::id(), "point": name, "detail": format!("{detail:?}"),
+                "pid": std::process::id(), "point": name, "detail": detail,
                 "ns": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().to_string(),
                 "paused": armed,
             })

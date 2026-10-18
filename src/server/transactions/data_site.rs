@@ -1253,7 +1253,7 @@ impl DataManager {
             }
         };
         #[cfg(multisite_test)]
-        crate::utils::multisite::point("commit_closed", (tid, synced));
+        crate::utils::multisite::point_json("commit_closed", serde_json::json!({"tid":tid,"synced":synced}));
         txn.decided_commit = true;
         txn.commit_durable = true;
         if let Some((chunk, id)) = status {
@@ -1791,7 +1791,7 @@ impl DataManager {
                 continue;
             };
             #[cfg(multisite_test)]
-            crate::utils::multisite::point("before_status_release", (&txn, &entry.participants, &entry.synced_peers, entry.self_synced));
+            crate::utils::multisite::point_json("before_status_release", serde_json::json!({"tid":txn,"participants":entry.participants,"synced_peers":entry.synced_peers,"self_synced":entry.self_synced}));
             match chunk.remove_status_cell(&entry.id) {
                 Ok(()) => {
                     registry.remove(&txn);
@@ -1841,6 +1841,8 @@ impl DataManager {
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(entry) = self.chunks().txn_status().get(tid) {
             return if self.status_entry_synced(tid, &entry) {
+                #[cfg(multisite_test)]
+                crate::utils::multisite::point_json("status_answer", serde_json::json!({"tid":tid,"outcome":"Committed","self_synced":entry.self_synced}));
                 TxnOutcome::Committed
             } else {
                 TxnOutcome::Committing
