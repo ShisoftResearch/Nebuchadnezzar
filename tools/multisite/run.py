@@ -580,6 +580,9 @@ class Gate:
             self.start(index)
         for proxy in self.proxies.values():
             proxy.delay = 0
+        if self.args.probe.startswith('raft-'):
+            from raft_probe import run
+            return run(self)
         client = self.client()
         assert client.command({'op':'setup'})['ok']
         if not self.args.no_refresh:
@@ -835,7 +838,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring'], default='none')
+    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')

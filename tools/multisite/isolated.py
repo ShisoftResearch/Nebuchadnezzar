@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring']
+names = ['multisite_raft_seed', 'multisite_raft_heartbeat', 'multisite_raft_roster', 'multisite_raft_rejoin', 'multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -20,6 +20,11 @@ else:
             '--head',os.environ['MULTISITE_HEAD'],'--output',str(Path(os.environ['MULTISITE_OUTPUT'])/name),
             '--members',str(members),'--events',os.environ.get('MULTISITE_EVENTS_COUNT','2'),
             '--port',os.environ.get('MULTISITE_PORT','46100')]
+    if name.startswith('multisite_raft_'):
+        args += ['--probe', name.replace('multisite_', '').replace('_', '-'),
+                 '--kind', os.environ.get('MSRAFT_ARM', 'kill'), '--no-orphan-adoption']
+        if name == 'multisite_raft_seed':
+            args[args.index('--members')+1] = '2'
     if name == 'multisite_restart_probe':
         members = int(os.environ.get('MULTISITE_MEMBERS', '2'))
         args[args.index('--members')+1] = str(members)
