@@ -1,9 +1,9 @@
-use crate::utils::sharded::Sharded;
 use crate::index::scrub::{ScrubMode, ScrubReport};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
+use crate::utils::sharded::Sharded;
 use crate::{
     client::AsyncClient,
     index::builder::IndexBuilder,
@@ -220,29 +220,46 @@ pub struct FenceLeases {
 #[derive(Default)]
 pub struct CellScans {
     next_id: std::sync::atomic::AtomicU64,
-    open: Sharded<parking_lot::Mutex<std::collections::HashMap<u64, Arc<parking_lot::Mutex<CellScan>>>>>,
+    open: Sharded<
+        parking_lot::Mutex<std::collections::HashMap<u64, Arc<parking_lot::Mutex<CellScan>>>>,
+    >,
 }
 
 impl CellScans {
     fn create(&self) -> u64 {
         for shard in self.open.iter() {
             crate::profile_lock!(H23, shard.lock()).retain(|_, scan| {
-                let Some(mut scan) = scan.try_lock() else { return true };
-                if scan.last_used.elapsed() < CELL_SCAN_IDLE { return true }
+                let Some(mut scan) = scan.try_lock() else {
+                    return true;
+                };
+                if scan.last_used.elapsed() < CELL_SCAN_IDLE {
+                    return true;
+                }
                 scan.closed = true;
                 false
             });
         }
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        crate::profile_lock!(H23, self.open.shard(&id).lock()).insert(id, Arc::new(parking_lot::Mutex::new(CellScan {
-            next_chunk: 0, ids: Vec::new(), position: 0,
-            last_used: std::time::Instant::now(), closed: false,
-        })));
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        crate::profile_lock!(H23, self.open.shard(&id).lock()).insert(
+            id,
+            Arc::new(parking_lot::Mutex::new(CellScan {
+                next_chunk: 0,
+                ids: Vec::new(),
+                position: 0,
+                last_used: std::time::Instant::now(),
+                closed: false,
+            })),
+        );
         id
     }
 
     fn get(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
-        crate::profile_lock!(H23, self.open.shard(&cursor).lock()).get(&cursor).cloned()
+        crate::profile_lock!(H23, self.open.shard(&cursor).lock())
+            .get(&cursor)
+            .cloned()
     }
 
     fn remove(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
@@ -276,19 +293,19 @@ tokio::task_local! {
     static RPC_CAPTURE: std::cell::RefCell<Vec<crate::ram::durability::Receipt>>;
 }
 
+type CapturedReceiptEntry = (
+    crate::ram::durability::Receipt,
+    std::time::Instant,
+    bool,
+    bool,
+);
+
 struct CapturedReceipts {
     incarnation: u64,
-    next: u64,
-    entries: std::collections::HashMap<
-        Id,
-        (
-            crate::ram::durability::Receipt,
-            std::time::Instant,
-            bool,
-            bool,
-        ),
-    >,
-    last_cleanup: Option<std::time::Instant>,
+    next: std::sync::atomic::AtomicU64,
+    entries: Sharded<parking_lot::Mutex<std::collections::HashMap<Id, CapturedReceiptEntry>>>,
+    started: std::time::Instant,
+    cleanup_period: std::sync::atomic::AtomicU64,
 }
 impl Default for CapturedReceipts {
     fn default() -> Self {
@@ -301,55 +318,104 @@ impl Default for CapturedReceipts {
         };
         Self {
             incarnation,
-            next: 0,
+            next: std::sync::atomic::AtomicU64::new(0),
             entries: Default::default(),
-            last_cleanup: None,
+            started: std::time::Instant::now(),
+            cleanup_period: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 impl CapturedReceipts {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.iter().all(|shard| shard.lock().is_empty())
+    }
+
     // Abandoned RPC replies must not pin descriptors indefinitely. An expired
     // token is an error at certification, so expiry cannot produce success.
     fn store(
-        &mut self,
+        &self,
         receipts: Vec<crate::ram::durability::Receipt>,
         derived: bool,
         acknowledge: bool,
     ) -> Vec<Id> {
         let now = std::time::Instant::now();
+        let period = self.started.elapsed().as_secs() / 600;
         if self
-            .last_cleanup
-            .is_none_or(|last| now.duration_since(last).as_secs() >= 600)
+            .cleanup_period
+            .fetch_max(period, atomic::Ordering::Relaxed)
+            < period
         {
-            self.entries
-                .retain(|_, (_, at, _, _)| now.duration_since(*at).as_secs() < 600);
-            self.last_cleanup = Some(now);
+            for shard in self.entries.iter() {
+                let expired = {
+                    let mut entries = crate::profile_lock!(H24, shard.lock());
+                    let expired: Vec<_> = entries
+                        .iter()
+                        .filter_map(|(token, (_, at, _, _))| {
+                            (now.duration_since(*at).as_secs() >= 600).then_some(*token)
+                        })
+                        .collect();
+                    expired
+                        .into_iter()
+                        .filter_map(|token| entries.remove(&token))
+                        .collect::<Vec<_>>()
+                };
+                drop(expired);
+            }
         }
         receipts
             .into_iter()
             .enumerate()
             .map(|(index, receipt)| {
-                self.next = self
+                let next = self
                     .next
-                    .checked_add(1)
-                    .expect("receipt token space exhausted");
-                let token = Id::from_parts(self.incarnation, self.next);
-                self.entries
+                    .fetch_update(
+                        atomic::Ordering::Relaxed,
+                        atomic::Ordering::Relaxed,
+                        |next| next.checked_add(1),
+                    )
+                    .expect("receipt token space exhausted")
+                    + 1;
+                let token = Id::from_parts(self.incarnation, next);
+                crate::profile_lock!(H24, self.entries.shard(&token).lock())
                     .insert(token, (receipt, now, derived, acknowledge && index == 0));
                 token
             })
             .collect()
     }
     fn take(
-        &mut self,
+        &self,
         tokens: Vec<Id>,
     ) -> Result<(Vec<crate::ram::durability::Receipt>, bool, u64), WriteError> {
         let mut receipts: Vec<crate::ram::durability::Receipt> = Vec::new();
         let mut missing = false;
         let mut derived = false;
         let mut acknowledged = 0;
-        for token in tokens {
-            let Some((receipt, at, has_indices, acknowledge)) = self.entries.remove(&token) else {
+        // Claim a request's tokens together. Order the involved partitions to
+        // preserve batch consumption when concurrent requests overlap.
+        let mut partitions: Vec<_> = tokens
+            .iter()
+            .map(|token| self.entries.shard(token))
+            .collect();
+        partitions.sort_unstable_by_key(|partition| *partition as *const _ as usize);
+        partitions.dedup_by_key(|partition| *partition as *const _ as usize);
+        let mut guards: Vec<_> = partitions
+            .iter()
+            .map(|partition| crate::profile_lock!(H24, partition.lock()))
+            .collect();
+        let claimed: Vec<_> = tokens
+            .iter()
+            .map(|token| {
+                let partition = self.entries.shard(token) as *const _ as usize;
+                let index = partitions
+                    .binary_search_by_key(&partition, |p| *p as *const _ as usize)
+                    .unwrap();
+                guards[index].remove(token)
+            })
+            .collect();
+        drop(guards);
+        for entry in claimed {
+            let Some((receipt, at, has_indices, acknowledge)) = entry else {
                 missing = true;
                 continue;
             };
@@ -387,7 +453,7 @@ pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
     cell_scans: CellScans,
-    captured_receipts: parking_lot::Mutex<CapturedReceipts>,
+    captured_receipts: CapturedReceipts,
     fence_leases: Arc<FenceLeases>,
 }
 
@@ -1108,7 +1174,9 @@ impl Service for NebRPCService {
             let missing = || format!("cell scan {cursor} is not open (expired or closed)");
             let scan = self.cell_scans.get(cursor).ok_or_else(missing)?;
             let mut scan = scan.lock();
-            if scan.closed { return Err(missing()) }
+            if scan.closed {
+                return Err(missing());
+            }
             scan.last_used = std::time::Instant::now();
             // Skip exhausted chunks until one has ids. The previous chunk's ids
             // are dropped before the next chunk's are built, so at most one
@@ -1198,7 +1266,10 @@ impl Service for NebRPCService {
                         }
                     };
                     if wait.is_zero() {
-                        if crate::profile_lock!(C05, leases.holds.shard(&token).lock()).remove(&token).is_some() {
+                        if crate::profile_lock!(C05, leases.holds.shard(&token).lock())
+                            .remove(&token)
+                            .is_some()
+                        {
                             warn!(
                                 "write fence lease {token} lapsed without a renewal; fence lifted"
                             );
@@ -1232,7 +1303,9 @@ impl Service for NebRPCService {
     }
 
     fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
-        if let Some(scan) = self.cell_scans.remove(cursor) { scan.lock().closed = true; }
+        if let Some(scan) = self.cell_scans.remove(cursor) {
+            scan.lock().closed = true;
+        }
         future::ready(()).boxed()
     }
 
@@ -1512,7 +1585,7 @@ impl Service for NebRPCService {
         commit: bool,
     ) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let (receipts, derived, acknowledged) = crate::profile_lock!(H24, self.captured_receipts.lock()).take(tokens)?;
+            let (receipts, derived, acknowledged) = self.captured_receipts.take(tokens)?;
             if !commit {
                 return Ok(());
             }
@@ -1768,7 +1841,7 @@ impl NebRPCService {
             database_runtime,
             neb_client,
             cell_scans: CellScans::default(),
-            captured_receipts: parking_lot::Mutex::new(CapturedReceipts::default()),
+            captured_receipts: CapturedReceipts::default(),
             fence_leases: Arc::new(FenceLeases::default()),
         })
     }
@@ -2045,10 +2118,9 @@ impl NebRPCService {
                             .unwrap();
                     }
                     let derived = RPC_CAPTURE_HAS_INDICES.with(|flag| flag.get());
-                    let tokens =
-                        crate::profile_lock!(H24, self.captured_receipts
-                            .lock())
-                            .store(receipts, derived, result.is_ok());
+                    let tokens = self
+                        .captured_receipts
+                        .store(receipts, derived, result.is_ok());
                     (result, tokens)
                 }),
             )
