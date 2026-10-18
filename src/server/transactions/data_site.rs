@@ -1273,11 +1273,18 @@ impl DataManager {
         let receipts = receipts.filter(|_| !PIN_DISABLED.load(std::sync::atomic::Ordering::Relaxed));
         if let Some(receipts) = receipts.filter(|receipts| !receipts.is_empty()) {
             let tokens = Arc::new(receipts.iter().map(|receipt| receipt.token()).collect::<Vec<_>>());
-            let mut pinned = std::collections::HashSet::new();
-            for guard in &txn.segment_guards {
-                if pinned.insert((guard.chunk_id(), guard.segment_id())) {
-                    guard.pin_until_covered(tid, tokens.clone());
-                }
+            // One pin for each segment, however many cells the transaction
+            // took from it.
+            let mut keyed: Vec<((usize, u64), usize)> = txn
+                .segment_guards
+                .iter()
+                .enumerate()
+                .map(|(n, guard)| ((guard.chunk_id(), guard.segment_id()), n))
+                .collect();
+            keyed.sort_unstable();
+            keyed.dedup_by_key(|(key, _)| *key);
+            for (_, n) in keyed {
+                txn.segment_guards[n].pin_until_covered(tid, tokens.clone());
             }
         }
         #[cfg(test)]

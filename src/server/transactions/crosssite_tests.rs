@@ -2839,6 +2839,11 @@ impl PinWindow {
         // durable transaction writes them.
         let first = txn.begin().await.unwrap().unwrap();
         if self.old_in == OldVersionIn::SealPending {
+            // The test calls the combiner itself. The background cleaner
+            // would take the mostly dead segment before the update.
+            for site in &self.sites {
+                cluster.site(*site).current_database().cleaner().pause();
+            }
             for (n, (id, site)) in ids.iter().zip(self.sites.iter()).enumerate() {
                 let chunks = cluster.site(*site).chunks();
                 let junk: Vec<Id> = (0..30)
