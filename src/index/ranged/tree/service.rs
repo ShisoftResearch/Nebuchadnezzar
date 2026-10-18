@@ -1269,7 +1269,7 @@ impl TreeService {
         // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
         // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
         // B-tree pages that haven't been persisted yet, causing "CellDoesNotExisted" on recovery
-        let barrier = super::btree::storage::wait_until_updated().await;
+        let barrier = super::btree::storage::hub_for(&self.client).wait_until_updated().await;
         if barrier {
             info!("All B-tree nodes persisted, now marking migrations");
             // Now it's safe to update the LSM tree cells with the new head IDs
@@ -1298,7 +1298,7 @@ impl TreeService {
         // during to_cell), so re-drain before stopping the hub: the reset
         // DISCARDS whatever is still queued, and anything discarded here is
         // a page some durable head may already name.
-        if !super::btree::storage::wait_until_updated().await {
+        if !super::btree::storage::hub_for(&self.client).wait_until_updated().await {
             error!("flush_all_trees: post-publish drain barrier NOT established");
         }
 
@@ -1501,23 +1501,7 @@ impl TreeService {
                 checkpoint_counter = checkpoint_counter.wrapping_add(1);
                 let do_checkpoint = checkpoint_counter % CHECKPOINT_INTERVAL_LOOPS == 0;
 
-                // Head publishes below are gated on the drain barrier: a
-                // checkpoint over an unestablished barrier would point tree
-                // metadata at pages that never became durable.
-                let mut checkpoint_barrier = false;
-                if do_checkpoint {
-                    // Ensure all pending B-tree node writes are flushed, then update
-                    // tree root cells. This limits the recovery window to ~60 seconds
-                    // of writes even if the server is killed without a clean shutdown.
-                    checkpoint_barrier = storage::wait_until_updated().await;
-                    if !checkpoint_barrier {
-                        error!(
-                            "balancer checkpoint: write-back barrier NOT established; \
-                             skipping this round's head publishes"
-                        );
-                    }
-                }
-
+                // A checkpoint depends only on the page locality of that tree.
                 // No per-tree merge pass. `merge_levels` was an LSM-era
                 // no-op that always returned false -- so the whole
                 // post-merge publish below it was dead code -- but it still
@@ -1526,10 +1510,11 @@ impl TreeService {
                 // waits per pass, and under a real backlog each one blocks
                 // until the whole queue lands, which is why split cadence
                 // collapsed exactly when the store got busy. Checkpoints
-                // gate on their own barrier, taken once above.
+                // gate on the affected locality before each publication.
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    if do_checkpoint && checkpoint_barrier {
+                    if do_checkpoint && storage::hub_for(&client)
+                        .wait_for_locality(dist_tree.tree.head_id().locality()).await {
                         // Periodic checkpoint: update tree root cell to reflect current state
                         if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
@@ -1711,7 +1696,12 @@ impl TreeService {
                         // an oversized tree during rebalancing, where that
                         // cost is acceptable; a failed barrier rolls the split
                         // back rather than committing over undrained pages.
-                        if !storage::wait_until_updated().await {
+                        let hub = storage::hub_for(&client);
+                        let (source_ready, target_ready) = futures::join!(
+                            hub.wait_for_locality(dist_tree.tree.head_id().locality()),
+                            hub.wait_for_locality(migration_tree.tree.head_id().locality()),
+                        );
+                        if !source_ready || !target_ready {
                             error!(
                                 "Seam barrier for split of {:?} NOT established; rolling back",
                                 dist_tree.id

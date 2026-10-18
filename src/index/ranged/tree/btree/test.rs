@@ -76,6 +76,32 @@ fn init() {
     assert_eq!(cursor.current().unwrap().id(), id);
 }
 
+#[test]
+fn copy_split_pages_keep_the_target_writeback_locality() {
+    let tree = LevelBPlusTree::new(&deletion_set());
+    for i in 0..100u64 {
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i + 1)));
+    }
+    let target = Id::from_parts(1234, 1);
+    let copy = super::split_off::copy_off(&tree, &MIN_ENTRY_KEY, &target).unwrap();
+    let copied = LevelBPlusTree::from_root(
+        copy.new_root, copy.new_head_id, copy.moved_len, copy.new_height,
+        &deletion_set(),
+    );
+    let mut cursor = copied.seek(&MIN_ENTRY_KEY, Ordering::Forward);
+    let mut count = 0;
+    loop {
+        if let Some(page) = &cursor.page {
+            assert_eq!(page.deref::<KeySlice, PtrSlice>().writeback_locality,
+                target.locality());
+        }
+        if cursor.next().is_none() { break; }
+        count += 1;
+    }
+    assert_eq!(count, 100);
+
+}
+
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
     let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
     let mut last_key = cursor.next().unwrap(); // Get first item

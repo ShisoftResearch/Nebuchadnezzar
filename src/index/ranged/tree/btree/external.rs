@@ -28,6 +28,7 @@ enum NeighborStep {
 }
 
 pub struct NodeModified {
+    pub locality: u16,
     pub node: NodeCellRef,
     pub deletion: Arc<DeletionSet>,
     pub client: Arc<AsyncClient>,
@@ -490,6 +491,7 @@ where
         return;
     }
     let modified = ChangingNode::Modified(NodeModified {
+        locality: node.deref::<KS, PS>().writeback_locality,
         node: node.clone(),
         deletion: tree.deletion.clone(),
         client: client.clone(),

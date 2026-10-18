@@ -368,6 +368,8 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     cc: AtomicUsize,
+    // Immutable even after detachment; queue selection cannot take the page latch.
+    pub(super) writeback_locality: u16,
     // Write-back coalescing flag: set on the false->true transition when the
     // node is queued for persistence, cleared by persist under the write
     // latch before it snapshots the page (docs/tla/DirtyCoalesce.tla).
@@ -400,7 +402,12 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(data: NodeData<KS, PS>) -> Self {
+        let writeback_locality = match &data {
+            NodeData::External(page) => page.id.locality(),
+            _ => 0,
+        };
         Node {
+            writeback_locality,
             data: UnsafeCell::new(data),
             cc: AtomicUsize::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
