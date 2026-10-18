@@ -458,7 +458,7 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: parking_lot::RwLock<HashMap<Id, CellMetaMutex>>,
+    cells: crate::utils::sharded::Sharded<parking_lot::RwLock<HashMap<Id, CellMetaMutex>>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
@@ -570,7 +570,7 @@ impl DataManager {
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: parking_lot::RwLock::new(HashMap::with_capacity(256)),
+            cells: Default::default(),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
@@ -707,14 +707,14 @@ impl DataManager {
     }
 
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
-        crate::profile_lock!(H07, self.cells.read()).get(id).cloned()
+        crate::profile_lock!(H07, self.cells.shard(id).read()).get(id).cloned()
     }
 
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         if let Some(meta) = self.existing_cell_meta_mutex(id) {
             return meta;
         }
-        let mut cells = crate::profile_lock!(H07, self.cells.write());
+        let mut cells = crate::profile_lock!(H07, self.cells.shard(id).write());
         cells
             .entry(*id)
             .or_insert_with(|| {
@@ -1900,7 +1900,7 @@ impl DataManager {
                 }
             }
             let meta = cell_meta.lock();
-            let mut cells = crate::profile_lock!(H07, self.cells.write());
+            let mut cells = crate::profile_lock!(H07, self.cells.shard(&cell_id).write());
             let same_meta = cells
                 .get(&cell_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &cell_meta));
@@ -5085,7 +5085,7 @@ mod tests {
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
-        assert_eq!(crate::profile_lock!(H07, manager.cells.read()).len(), 0);
+        assert!(manager.cells.iter().all(|shard| crate::profile_lock!(H07, shard.read()).is_empty()));
         server.shutdown().await;
     }
 
@@ -6826,6 +6826,32 @@ mod tests {
             1
         );
         abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelated_cell_metadata_lookups_do_not_share_a_write_gate() {
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_metadata_shards";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let first = Id::allocated(0, 0, 99001);
+        let second = (99002..100002).map(|n| Id::allocated(0, 0, n)).find(|id| {
+            !std::ptr::eq(manager.cells.shard(&first), manager.cells.shard(id))
+        }).unwrap();
+        let held = manager.cells.shard(&first).write();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let thread = std::thread::spawn(move || {
+            let one = worker.cell_meta_mutex(&second);
+            let two = worker.cell_meta_mutex(&second);
+            assert!(Arc::ptr_eq(&one, &two));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "an unrelated metadata shard must make progress");
         server.shutdown().await;
     }
 
