@@ -1426,6 +1426,10 @@ pub async fn init_conshash(
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client, membership).await {
         Ok(ch) => {
             ch.set_weight(address, memory_size).await.unwrap();
+            // A start has no notice to wait for. Raise the client cursor to the
+            // leader's log position first, so that the read of the group cannot
+            // come from a member that lags behind it (RC8).
+            let _ = raft_client.refresh_leader(0).await;
             if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
