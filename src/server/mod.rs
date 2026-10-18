@@ -74,6 +74,21 @@ fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
 }
 
 /// Check if Raft state exists on disk at the given path
+fn raft_storage_for_layout(layout: &database::DatabaseStorageLayout) -> raft::Storage {
+    if let Some(ref raft_path) = layout.raft_storage {
+        raft::Storage::DISK(DiskOptions {
+            path: raft_path.clone(),
+            take_snapshots: true,
+            append_logs: true,
+            trim_logs: true,
+            snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
+            log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
+        })
+    } else {
+        raft::Storage::MEMORY
+    }
+}
+
 fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
     if let Some(ref path) = raft_storage {
         has_recoverable_raft_state_at(Path::new(path))
@@ -925,6 +940,8 @@ pub enum ServerError {
     CannotInitMemberTable,
     CannotSetServerWeight,
     CannotInitConsistentHashTable(String),
+    /// The explicit restore of a store under a new address failed.
+    CannotRestoreStore(String),
     CannotLoadMetaClient,
     CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
@@ -962,6 +979,9 @@ impl std::fmt::Display for ServerError {
             ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
             ServerError::CannotInitConsistentHashTable(error) => {
                 write!(f, "cannot initialize consistent hash table: {error}")
+            }
+            ServerError::CannotRestoreStore(error) => {
+                write!(f, "cannot restore the store under a new address: {error}")
             }
             ServerError::CannotLoadMetaClient => write!(f, "cannot load meta client"),
             ServerError::CannotAcquireStorageLock(error) => write!(f, "{error}"),
@@ -1434,71 +1454,10 @@ pub async fn init_conshash(
             match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
                 Ok((owners, applied_index)) => {
                     let has_table = owners.is_some();
-                    // A table whose every placed slot is owned by an
-                    // identity this ring does not know describes a cluster
-                    // that no longer exists: the store was reopened under a
-                    // new identity and the data came with the files. Re-point
-                    // those slots at this member, durably, so every consumer
-                    // sees one answer -- see `slots::adopt_orphaned_slots` for
-                    // why this is a reassignment rather than a routing-time
-                    // fallback.
-                    #[cfg(multisite_test)]
-                    crate::utils::multisite::point("adopt_check", (ch.server_count(), address));
-                    // Campaign knob (test builds only): continue past the open
-                    // startup-adoption defect, see multisite FIX_orphan_adoption.
-                    let skip_adoption = cfg!(multisite_test)
-                        && std::env::var_os("MULTISITE_NO_ORPHAN_ADOPTION").is_some();
-                    let owners = match owners {
-                        Some(table) if skip_adoption => Some(table),
-                        Some(table) => {
-                            match crate::slots::adopt_orphaned_slots(
-                                group_name,
-                                &ch,
-                                raft_client,
-                                SLOTS_SM_ID,
-                                &table,
-                            )
-                            .await
-                            {
-                                Ok(0) => Some(table),
-                                Ok(moved) => {
-                                    warn!(
-                                        "re-pointed {} orphaned slot(s) at this member: the \
-                                         placement table named identities this ring does not \
-                                         know, which is what reopening a store under a new \
-                                         address leaves behind",
-                                        moved
-                                    );
-                                    match crate::slots::load_owner_vec(
-                                        group_name,
-                                        raft_client,
-                                        SLOTS_SM_ID,
-                                    )
-                                    .await
-                                    {
-                                        Ok((refreshed, _)) => refreshed,
-                                        Err(reason) => {
-                                            warn!(
-                                                "could not re-read the placement table after \
-                                                 adopting orphaned slots ({}); routing by the ring",
-                                                reason
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    warn!(
-                                        "could not adopt orphaned slots ({}); those slots stay \
-                                         unreachable until placement is reconciled",
-                                        reason
-                                    );
-                                    Some(table)
-                                }
-                            }
-                        }
-                        None => None,
-                    };
+                    // No automatic adoption of orphaned slots: no view of the
+                    // live ring can prove that an owner is gone. A store that
+                    // is reopened under a new address goes through the
+                    // explicit restore (`NebServer::restore_from_opts`).
                     ch.set_slot_overrides(owners, applied_index);
                     if !has_table {
                         debug!("no slot placement table for this group; routing by the ring");
@@ -2742,6 +2701,62 @@ impl NebServer {
         .await
     }
 
+    /// Explicit restore: start a server on a store that was written under
+    /// another address. The stored raft configuration names the old address,
+    /// so the new address is made the only voter first (`restore_sole_voter`,
+    /// an operator step that cuts the old voters off on purpose). After the
+    /// start, the old identities leave the roster and the slots they owned are
+    /// re-pointed at this server. Nothing of this runs on a normal start.
+    pub async fn restore_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        group_name: &'a str,
+        prepare_raft_service: F,
+    ) -> Result<Arc<NebServer>, ServerError> {
+        let group = String::from(group_name);
+        let layout = database::DatabaseStorageLayout::from_options(opts, &group, &group);
+        let storage = raft_storage_for_layout(&layout);
+        let restored = raft::restore_sole_voter(storage, server_addr, raft::DEFAULT_SERVICE_ID)
+            .await
+            .map_err(|e| ServerError::CannotRestoreStore(e.to_string()))?;
+        let old_owners: Vec<u64> = restored
+            .iter()
+            .filter(|plane| plane.plane_id == raft::PlaneId::type1())
+            .flat_map(|plane| plane.removed.iter().map(|address| hash_str(address)))
+            .collect();
+        let server = Self::new_from_opts(opts, server_addr, group_name, prepare_raft_service).await?;
+        let membership = bifrost::membership::raft::client::SMClient::new(
+            bifrost::membership::DEFAULT_SERVICE_ID,
+            &server.raft_client,
+        );
+        for old in &old_owners {
+            if let Err(error) = membership.leave(old).await {
+                warn!("restore: old member {} could not leave the roster: {:?}", old, error);
+            }
+        }
+        match crate::slots::load_owner_vec(&server.group_name, &server.raft_client, SLOTS_SM_ID)
+            .await
+        {
+            Ok((Some(table), _)) => {
+                let moved = crate::slots::restore_slot_owners(
+                    &server.group_name,
+                    &server.raft_client,
+                    SLOTS_SM_ID,
+                    &table,
+                    &old_owners,
+                    hash_str(server_addr),
+                )
+                .await
+                .map_err(ServerError::CannotRestoreStore)?;
+                info!("restore: re-pointed {} slot(s) at {}", moved, server_addr);
+            }
+            Ok((None, _)) => debug!("restore: no slot placement table"),
+            Err(reason) => return Err(ServerError::CannotRestoreStore(reason)),
+        }
+        server.refresh_slot_placement().await;
+        Ok(server)
+    }
+
     pub async fn new_from_opts_in_database<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
@@ -2802,18 +2817,7 @@ impl NebServer {
             .filter(|n| *n != server_addr)
             .cloned()
             .collect();
-        let storage = if let Some(ref raft_path) = storage_layout.raft_storage {
-            raft::Storage::DISK(DiskOptions {
-                path: raft_path.clone(),
-                take_snapshots: true,
-                append_logs: true,
-                trim_logs: true,
-                snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
-                log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
-            })
-        } else {
-            raft::Storage::MEMORY
-        };
+        let storage = raft_storage_for_layout(&storage_layout);
         let raft_service = raft::RaftService::new(raft::Options {
             storage,
             address: server_addr.to_owned(),
@@ -2953,17 +2957,25 @@ impl NebServer {
         self.consh.get_server_id_for_slot(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
-        self.member_pool
-            .get_by_id(server_id, |_| self.consh.try_server_name(server_id))
-            .await
+        self.get_member_by_server_id_async(server_id).await
     }
     pub async fn get_member_by_server_id_async(
         &self,
         server_id: u64,
     ) -> Result<Arc<RPCClient>, io::Error> {
-        let cons_hash = self.consh.clone();
+        // The ring answers at once for a known server. Only a miss searches
+        // the roster and the raft configuration.
+        let address = match self.consh.try_server_name(server_id) {
+            Some(address) => Some(address),
+            None => Some(
+                self.consh
+                    .resolve_address(server_id)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?,
+            ),
+        };
         self.member_pool
-            .get_by_id(server_id, move |_| cons_hash.try_server_name(server_id))
+            .get_by_id(server_id, move |_| address)
             .await
     }
     pub fn conshash(&self) -> &ConsistentHashing {

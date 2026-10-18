@@ -253,9 +253,19 @@ impl TransactionManagerDeps {
     }
 
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
-        let consh = self.consh.clone();
+        // The ring answers at once for a known server. Only a miss searches
+        // the roster and the raft configuration.
+        let address = match self.consh.try_server_name(server_id) {
+            Some(address) => Some(address),
+            None => Some(
+                self.consh
+                    .resolve_address(server_id)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?,
+            ),
+        };
         self.member_pool
-            .get_by_id(server_id, move |_| consh.try_server_name(server_id))
+            .get_by_id(server_id, move |_| address)
             .await
     }
 

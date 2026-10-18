@@ -1278,11 +1278,12 @@ pub async fn schema_persistence_multiple_restarts() {
 
     let server_group = String::from("multi_restart_test");
 
+    // The store belongs to one address; reopening it under another address
+    // is the explicit restore (`NebServer::restore_from_opts`).
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     for restart_num in 1..=3 {
         info!("=== RESTART CYCLE {} ===", restart_num);
 
-        // Use a unique port for each cycle to avoid "Address already in use" errors
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1353,7 +1354,6 @@ pub async fn schema_persistence_multiple_restarts() {
     // Final verification: restart one more time and check all schemas exist
     info!("=== FINAL VERIFICATION ===");
     {
-        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -2184,7 +2184,11 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
     drop(dynamic);
     drop(server);
 
-    let server = NebServer::new_from_opts(
+    // The second start uses another address. That is the explicit restore: it
+    // makes the new address the only voter of the stored configuration and
+    // re-points the slots of the old identity (nothing of this runs
+    // automatically).
+    let server = NebServer::restore_from_opts(
         &opts,
         &crate::utils::test_port::unique_localhost_addr(),
         group,
@@ -2290,9 +2294,10 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2380,7 +2385,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2507,9 +2512,10 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2569,7 +2575,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )

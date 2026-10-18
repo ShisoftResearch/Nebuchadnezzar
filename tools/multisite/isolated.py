@@ -22,7 +22,7 @@ else:
             '--port',os.environ.get('MULTISITE_PORT','46100')]
     if name.startswith('multisite_raft_'):
         args += ['--probe', name.replace('multisite_', '').replace('_', '-'),
-                 '--kind', os.environ.get('MSRAFT_ARM', 'kill'), '--no-orphan-adoption']
+                 '--kind', os.environ.get('MSRAFT_ARM', 'kill')]
         if name == 'multisite_raft_seed':
             args[args.index('--members')+1] = '2'
     if name == 'multisite_restart_probe':
@@ -68,8 +68,6 @@ else:
         args.append('--seed-stop-only')
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
-    if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':
-        args.append('--no-orphan-adoption')
     if os.environ.get('MULTISITE_NO_REFRESH') == '1':
         args.append('--no-refresh')
     if os.environ.get('MULTISITE_NO_SEED_STOP') == '1':

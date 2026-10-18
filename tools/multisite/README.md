@@ -52,7 +52,7 @@ Faults: `point-kill`, `point-graceful`, `time-kill`, `time-graceful`, `cut`, `de
 A named point fault pauses a member at a protocol point, then stops it. A time fault stops it at a random time during the transaction.
 A link fault applies to all links of one member for 1 s to 6 s.
 Options: `--faults`, `--workloads`, `--keep-going` (record violations and continue), `--no-seed-stop`, `--seed-stop-only`,
-`--safe-stops`, `--no-orphan-adoption` (test knob, see `FIX_orphan_adoption.md`), `--no-refresh`, `--lease-secs` (default 20), `--audit-every`.
+`--safe-stops`, `--no-refresh`, `--lease-secs` (default 20), `--audit-every`.
 The checks are: D19 per operation and per batch, D33 outcome classes, F1 and F4 from structured protocol events,
 and an audit of leases, `Prepared` brackets, unresolved transactions, pinned segments and status answers after one lease period.
 A violation is retried for one settle period (`lease + 70 s`) before it counts, because a prepared write is visible to a plain read until the decision.

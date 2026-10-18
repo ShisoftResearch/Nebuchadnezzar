@@ -131,8 +131,6 @@ class Process:
         self.stderr = (gate.root / f'{role}-{index}-{generation}.stderr').open('w')
         env = os.environ.copy()
         env['NEB_TXN_LEASE_TIMEOUT_SECS'] = str(gate.args.lease_secs)
-        if gate.args.no_orphan_adoption:
-            env['MULTISITE_NO_ORPHAN_ADOPTION'] = '1'
         env.update(MULTISITE_ROUTES=gate.routes(index), NEB_DISABLE_JOIN_FILL='1',
                    RUST_BACKTRACE='1', RUST_LOG=os.environ.get('RUST_LOG','warn'), MULTISITE_EVENTS=str(gate.root / f'protocol-{index}.jsonl'),
                    MULTISITE_CONTROL=str(gate.root / f'control-{index}'))
@@ -861,7 +859,6 @@ def main():
     parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring','torn'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
-    parser.add_argument('--no-orphan-adoption', action='store_true')
     parser.add_argument('--cut-after', type=float, default=.05)
     parser.add_argument('--cut-point', default='')
     parser.add_argument('--cut-hold', type=float, default=5)
