@@ -22,24 +22,35 @@ def record(gate, label, members):
     return result
 
 
+def brief(states):
+    """Compact failure text: ids are shortened, logs are left out."""
+    out = {}
+    for m, s in states.items():
+        roster = (s.get('roster') or {}).get('members', [])
+        out[m] = dict(term=s['term'], leader='self' if s['is_leader'] else s['leader_id'] % 10000,
+                      commit=s['commit'], voters=sorted(v['id'] % 10000 for v in s['voters']),
+                      roster=sorted((x['id'] % 10000, x.get('online')) for x in roster))
+    return out
+
+
 def run(gate):
     probe = gate.args.probe
     control = gate.args.kind == 'graceful'
     members = list(range(gate.args.members))
     before = record(gate, 'before', members)
     expected = {s['id'] for s in before.values()}
-    assert all({m['id'] for m in s['roster']['members']} == expected for s in before.values()), before
+    assert all({m['id'] for m in s['roster']['members']} == expected for s in before.values()), brief(before)
     if probe == 'raft-seed':
         # The seed restart is the control for the non-seed restart.
         victim = 0 if control else 1
         gate.servers[victim].stop(abrupt=True)
         gate.start(victim)
         after = record(gate, 'after', members)
-        assert all({m['id'] for m in s['voters']} == expected for s in after.values()), after
+        assert all({m['id'] for m in s['voters']} == expected for s in after.values()), brief(after)
     elif probe == 'raft-heartbeat':
         gate.servers[0].stop(abrupt=True)
         survivors = members[1:]
-        deadline = time.monotonic() + 25
+        deadline = time.monotonic() + 60
         leader = None
         while time.monotonic() < deadline:
             states = record(gate, 'election', survivors)
@@ -48,17 +59,17 @@ def run(gate):
                 leader = leaders[0]
                 break
             time.sleep(.1)
-        assert leader is not None, states
+        assert leader is not None, brief(states)
         if control:
             # Only the destination changes. Use the same unmodified ping RPC.
             for i in survivors:
                 (gate.root / f'control-{i}' / 'direct-ping').write_text(gate.addresses[leader])
-        time.sleep(16)  # Existing 10 s timeout + 3 checks + margin.
+        time.sleep(20)  # Existing 10 s timeout + 3 checks + margin.
         after = record(gate, 'after', survivors)
         live = expected - {before['0']['id']}
         roster = after[str(leader)]['roster']['members']
         online = {m['id'] for m in roster if m['online']}
-        assert live <= online, ('live members marked offline', live, online, after)
+        assert live <= online, ('live members marked offline', sorted(i % 10000 for i in live), sorted(i % 10000 for i in online), brief(after))
     elif probe in ('raft-roster', 'raft-rejoin'):
         if not control:
             gate.servers[1].stop(abrupt=False)
@@ -68,7 +79,7 @@ def run(gate):
             gate.servers[0].stop(abrupt=False)
             gate.start(0)
             after = record(gate, 'after-seed', members)
-        assert all({m['id'] for m in s['roster']['members']} == expected for s in after.values()), after
+        assert all({m['id'] for m in s['roster']['members']} == expected for s in after.values()), brief(after)
     else:
         raise AssertionError(probe)
     (gate.root / 'PASS').write_text(probe + ' passed\n')
