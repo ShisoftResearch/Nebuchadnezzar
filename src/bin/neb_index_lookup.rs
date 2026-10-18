@@ -19,6 +19,13 @@ use neb::{
 use std::time::Instant;
 
 const SCHEMA: u32 = 4931;
+fn verify() -> neb::index::verification::Verify {
+    match std::env::var("INDEX_LOOKUP_VERIFY").as_deref() {
+        Ok("exists") => neb::index::verification::Verify::Exists,
+        Ok("predicate") | Err(_) => neb::index::verification::Verify::Predicate,
+        Ok(mode) => panic!("invalid INDEX_LOOKUP_VERIFY: {mode}"),
+    }
+}
 fn eq(field: &str, value: u64) -> Expr {
     Expr::List(vec![
         Expr::Symbol(hash_str("="), "=".into()),
@@ -36,6 +43,7 @@ async fn ids(client: &IndexedDataClient, field: &str, limit: Option<usize>) -> u
             None,
             limit,
             None,
+            verify(),
         )
         .await
         .unwrap();
@@ -128,6 +136,7 @@ async fn main() {
                 SchemaUid(SCHEMA),
                 hash_str("sku"),
                 &OwnedValue::U64(n as u64),
+                verify(),
             )
             .await
             .unwrap()
@@ -149,6 +158,7 @@ async fn main() {
                     Some(&feature),
                     ScanOrder::Forward,
                     64,
+                    verify(),
                 )
                 .await
                 .unwrap()
@@ -197,6 +207,7 @@ async fn main() {
                         alias: "count".into(),
                         output_name: None,
                     }],
+                    verify(),
                 )
                 .await
                 .unwrap();
