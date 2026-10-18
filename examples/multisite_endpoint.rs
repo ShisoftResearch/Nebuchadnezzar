@@ -62,6 +62,17 @@ async fn main() {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = interval.tick() => {
+                    if let Ok(data) = std::fs::read(control.join("ring")) {
+                        let addresses: Vec<String> = serde_json::from_slice(&data).unwrap();
+                        let known: Vec<Value> = addresses.iter().map(|address| json!({
+                            "address":address,
+                            "known":server.consh.try_server_name(bifrost_hasher::hash_str(address)).is_some(),
+                        })).collect();
+                        let result = json!({"server_count":server.consh.server_count(),"members":known});
+                        std::fs::write(control.join("ring.out.tmp"), result.to_string()).unwrap();
+                        std::fs::rename(control.join("ring.out.tmp"), control.join("ring.out")).unwrap();
+                        std::fs::remove_file(control.join("ring")).unwrap();
+                    }
                     if control.join("refresh").exists() {
                         let refreshed = server.refresh_slot_placement().await;
                         std::fs::write(control.join("refreshed"), refreshed.to_string()).unwrap();

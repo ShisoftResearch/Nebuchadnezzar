@@ -611,6 +611,25 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
+        if self.args.probe == 'ring':
+            time.sleep(self.args.settle)
+            report = {}
+            for index in range(self.args.members):
+                control = self.root/f'control-{index}'
+                (control/'ring.out').unlink(missing_ok=True)
+                (control/'ring.tmp').write_text(json.dumps(self.addresses))
+                (control/'ring.tmp').rename(control/'ring')
+                deadline = time.monotonic()+30
+                while not (control/'ring.out').exists():
+                    assert time.monotonic() < deadline, f'member {index} did not answer ring'
+                    time.sleep(.1)
+                report[index] = json.loads((control/'ring.out').read_text())
+            (self.root/'probe-ring.json').write_text(json.dumps(report,indent=2))
+            holes = {i:[m['address'] for m in r['members'] if not m['known']] for i,r in report.items()}
+            holes = {i:h for i,h in holes.items() if h}
+            assert not holes, ('member view incomplete after start', holes)
+            (self.root/'PASS').write_text('ring probe passed\n')
+            return
         if self.args.probe == 'point-stop':
             victim, point = self.args.victim, self.args.cut_point
             other = 1 if victim == 0 else 0
@@ -811,7 +830,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')

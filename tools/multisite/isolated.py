@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop']
+names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -28,6 +28,8 @@ else:
     if name == 'multisite_cut_prepare':
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
                  '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','-1'),'--wait',os.environ.get('MULTISITE_WAIT','0')]
+    if name == 'multisite_ring':
+        args += ['--probe','ring','--members',os.environ.get('MULTISITE_MEMBERS','3'),'--settle',os.environ.get('MULTISITE_SETTLE','20')]
     if name == 'multisite_point_stop':
         args += ['--probe','point-stop','--victim',os.environ.get('MULTISITE_VICTIM','0'),'--kind',os.environ.get('MULTISITE_KIND','kill'),
                  '--cut-point',os.environ.get('MULTISITE_POINT','during_end'),'--coordinator',os.environ.get('MULTISITE_COORDINATOR','-1'),'--rounds',os.environ.get('MULTISITE_ROUNDS','1'),'--batch',os.environ.get('MULTISITE_BATCH','1')]
