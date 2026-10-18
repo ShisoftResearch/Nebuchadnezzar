@@ -2638,3 +2638,182 @@ async fn a_lost_end_answer_is_reported_as_outcome_unknown() {
     );
     cluster.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// The old version of an updated cell between `end` and the COMMIT sync
+// ---------------------------------------------------------------------------
+
+/// How the update commits, and what the test does before the cleaner runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinWindowMode {
+    /// Default commit. The COMMIT sync stays queued and unsynced.
+    DefaultUnsynced,
+    /// Default commit. The test waits until the COMMIT is synced.
+    DefaultThenSynced,
+    /// Durable commit: the COMMIT is synced before `end`.
+    Durable,
+}
+
+/// Update a cell whose old version sits in a sealed segment. The update
+/// commits and ends. The cleaner then compacts the segment of the old
+/// version. A power loss follows. Return the score that recovery reads.
+async fn update_then_compact_old_then_power_loss(group: &str, mode: PinWindowMode) -> Option<u64> {
+    crate::ram::segs::power_loss_model::enable();
+    let (mut cluster, client) = Cluster::start(group).await;
+    place_slot(&cluster, &client, HERE, A).await;
+    drop(client);
+    let id = Id::from_parts(HERE as u64, 77);
+    let txn = coordinator(&cluster).await;
+
+    // The old version, committed durably.
+    let tid = txn.begin().await.unwrap().unwrap();
+    txn.write(tid.clone(), cell_of(id, 100)).await.unwrap().unwrap();
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+    assert!(matches!(
+        txn.commit_durable(tid.clone()).await,
+        Ok(Ok(EndResult::Success))
+    ));
+    wait_until("the old version is unheld", 10, || {
+        held_for(&cluster, A, &tid) == 0
+    })
+    .await;
+
+    // Seal the segment of the old version so that the cleaner may take it.
+    let chunks = cluster.site(A).chunks();
+    let chunk = &chunks.list[HERE as usize % chunks.list.len()];
+    let old_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("segment of the old version")
+        .id;
+    if chunk.is_active_head(old_segment) {
+        rotate_out(chunk, old_segment);
+    }
+    chunk
+        .segments()
+        .iter()
+        .find(|segment| segment.id == old_segment)
+        .unwrap()
+        .force_wal_sync()
+        .unwrap();
+
+    // A sealed second segment for the combiner, made before any sync is paused.
+    let locality = (0u16..u16::MAX)
+        .find(|l| *l as usize % chunks.list.len() == chunk.id)
+        .unwrap();
+    let filler = Id::from_parts(locality as u64, 910_001);
+    chunks.write_cell(&mut cell_of(filler, 1)).expect("filler");
+    let filler_segment = chunk
+        .locate_segment(chunks.address_of(&filler))
+        .expect("filler segment")
+        .id;
+    assert_ne!(filler_segment, old_segment);
+    if chunk.is_active_head(filler_segment) {
+        rotate_out(chunk, filler_segment);
+    }
+    chunk
+        .segments()
+        .iter()
+        .find(|segment| segment.id == filler_segment)
+        .unwrap()
+        .force_wal_sync()
+        .unwrap();
+
+    // The update.
+    let a_dir = cluster.temp[A].path().to_path_buf();
+    if mode == PinWindowMode::DefaultUnsynced {
+        crate::ram::segs::power_loss_model::pause_group_sync(true);
+        crate::ram::durability::pause_receipt_syncs_under(&a_dir, true);
+    }
+    let update = txn.begin().await.unwrap().unwrap();
+    txn.update(update.clone(), cell_of(id, 200)).await.unwrap().unwrap();
+    txn.prepare(update.clone()).await.unwrap().unwrap();
+    let committed = if mode == PinWindowMode::Durable {
+        txn.commit_durable(update.clone()).await
+    } else {
+        txn.commit(update.clone()).await
+    };
+    assert!(matches!(committed, Ok(Ok(EndResult::Success))), "{:?}", committed);
+    if mode == PinWindowMode::DefaultThenSynced {
+        wait_until("the COMMIT sync", 20, || held_for(&cluster, A, &update) == 0).await;
+    }
+    if mode == PinWindowMode::DefaultUnsynced {
+        assert!(
+            held_for(&cluster, A, &update) > 0,
+            "test setup: the COMMIT of the update must be unsynced"
+        );
+    }
+    assert_eq!(score_on(cluster.site(A), &id), Some(200));
+
+    // The cleaner compacts the segment of the old version.
+    let mut reduced = 0;
+    for _ in 0..50 {
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|segment| segment.id == old_segment || segment.id == filler_segment)
+            .collect();
+        if candidates.len() < 2 {
+            reduced = 1;
+            break;
+        }
+        reduced = crate::ram::cleaner::combine::CombinedCleaner::combine_segments(
+            chunk,
+            &candidates,
+        )
+        .1;
+        if reduced > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    warn!("PINWIN {:?}: compaction reduced {} bytes", mode, reduced);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while chunk
+        .retired_segment_files
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        assert!(std::time::Instant::now() < deadline, "sources never retired");
+        chunk.drain_retired_segments();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let old_segment_gone = !chunk.segments().iter().any(|segment| segment.id == old_segment);
+    warn!("PINWIN {:?}: old segment gone: {}", mode, old_segment_gone);
+    assert!(
+        old_segment_gone,
+        "test setup: the cleaner must have reclaimed the segment of the old version"
+    );
+
+    cluster.power_loss_restart(A).await;
+    crate::ram::segs::power_loss_model::pause_group_sync(false);
+    crate::ram::durability::pause_receipt_syncs_under(&a_dir, false);
+    let seen = score_on(cluster.site(A), &id);
+    cluster.shutdown().await;
+    seen
+}
+
+/// Default commit, `end`, cleaner on the old segment, power loss before the
+/// COMMIT sync. D19: the cell holds the old or the new value, never none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_updated_cell_survives_compaction_of_its_old_version_before_the_commit_sync() {
+    let seen = update_then_compact_old_then_power_loss("pinwin_default", PinWindowMode::DefaultUnsynced).await;
+    assert!(
+        matches!(seen, Some(100) | Some(200)),
+        "the cell must hold the old or the new value after the power loss, read {:?}",
+        seen
+    );
+}
+
+/// Control: the COMMIT is synced before the cleaner runs. The new value stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_synced_commit_keeps_the_cell_after_compaction() {
+    let seen = update_then_compact_old_then_power_loss("pinwin_synced", PinWindowMode::DefaultThenSynced).await;
+    assert_eq!(seen, Some(200));
+}
+
+/// Control: a durable commit syncs the COMMIT before `end`.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_durable_commit_keeps_the_cell_after_compaction() {
+    let seen = update_then_compact_old_then_power_loss("pinwin_durable", PinWindowMode::Durable).await;
+    assert_eq!(seen, Some(200));
+}
