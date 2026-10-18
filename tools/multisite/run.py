@@ -565,6 +565,22 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
+        if self.args.probe == 'partial-abort':
+            seed = client.command({'op':'txn','id':'seed','keys':[[93,7100]],'value':1,'durable':True})
+            assert seed['outcome'] == 'ack', seed
+            if self.args.cut_member >= 0:
+                self.set_links(self.args.cut_member, cut=True)
+            result = client.command({'op':'txn','id':'partial','reads':[[93,7100]],'keys':[[92,7101]],'value':2,
+                                     'coordinator':2,'create':True,'durable':True}, 240)
+            self.set_links(max(self.args.cut_member, 0), cut=False)
+            time.sleep(self.args.lease_secs+30)
+            tid = self.tids['partial']
+            report = {'result':result,'status':{index:client.command({'op':'status','site':index,'tid':tid},60)['status']
+                                                for index in range(self.args.members)}}
+            (self.root/'probe-partial-abort.json').write_text(json.dumps(report,indent=2))
+            assert not any(v in ('InDoubt','Committing') for v in report['status'].values()), ('object remains', report)
+            (self.root/'PASS').write_text('partial-abort probe passed\n')
+            return
         if self.args.probe == 'abandon':
             seed = client.command({'op':'txn','id':'seed','keys':[[91,7000],[92,7000],[93,7000]],'value':1,'durable':True})
             assert seed['outcome'] == 'ack', seed
@@ -709,7 +725,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')
