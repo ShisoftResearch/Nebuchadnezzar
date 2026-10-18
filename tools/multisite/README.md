@@ -42,3 +42,22 @@ This does not modify the host clock.
 
 The current baseline schedule checks acknowledged values after each stop or link event.
 It is not the complete D19/F1/F4/D33 campaign. The report records the remaining qualification work.
+
+## Schedules, probes and options (added after the first baseline)
+
+Schedules (`--schedule`): `baseline`, `protocol`, `mixed`.
+`mixed` runs seven workloads (`s1`, `s2`, `s3`, `abort`, `conflict1`, `conflict8`, `conflict64`) plus `graph`.
+`graph` writes a list cell at one site that holds the id of a body cell at another site.
+Faults: `point-kill`, `point-graceful`, `time-kill`, `time-graceful`, `cut`, `delay`, `drop`, `none`.
+A named point fault pauses a member at a protocol point, then stops it. A time fault stops it at a random time during the transaction.
+A link fault applies to all links of one member for 1 s to 6 s.
+Options: `--faults`, `--workloads`, `--keep-going` (record violations and continue), `--no-seed-stop`, `--seed-stop-only`,
+`--safe-stops`, `--no-orphan-adoption` (test knob, see `FIX_orphan_adoption.md`), `--no-refresh`, `--lease-secs` (default 20), `--audit-every`.
+The checks are: D19 per operation and per batch, D33 outcome classes, F1 and F4 from structured protocol events,
+and an audit of leases, `Prepared` brackets, unresolved transactions, pinned segments and status answers after one lease period.
+A violation is retried for one settle period (`lease + 70 s`) before it counts, because a prepared write is visible to a plain read until the decision.
+
+Probes (`--probe`): `restart` (step list `member:graceful|kill`), `readonly`, `readonly-control`, `readonly-e2e`,
+`cut-prepare`, `abandon`, `partial-abort`, `point-stop` (pause, stop, restart, verify; optional batch).
+Each probe has a test name in `isolated.py` and runs through `./run_tests_isolated.sh`.
+Ports must stay below 32768 (the range above is used by outgoing connections).
