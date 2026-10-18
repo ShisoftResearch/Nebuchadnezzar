@@ -483,7 +483,7 @@ class Gate:
     def run_mixed(self, client):
         rng = random.Random(self.args.seed)
         operations, audited = [], 0
-        counters = {'events':0,'skipped':0, **{name:0 for name in self.FAULTS}}
+        counters = {'events':0,'skipped':0, 'none':0, **{name:0 for name in self.FAULTS}}
         event = 0
         while counters['events'] < self.args.events and event < self.args.events*3:
             request, result = self.run_event(event, rng, client, counters)
@@ -540,10 +540,10 @@ class Gate:
                 self.arm(0, self.args.cut_point)
                 client.send(request)
                 self.wait_pause(0, self.args.cut_point)
-                self.set_links(self.args.cut_member, cut=True)
+                self.set_links(max(self.args.cut_member, 0), cut=True)
                 (self.root/'control-0'/'resume').touch()
                 time.sleep(self.args.cut_hold)
-                self.set_links(self.args.cut_member, cut=False)
+                self.set_links(max(self.args.cut_member, 0), cut=False)
             else:
                 client.send(request)
                 time.sleep(self.args.cut_after)
@@ -573,9 +573,13 @@ class Gate:
                      'write-only':{'reads':[],'keys':[[91,7002]]}}
             tids = {}
             for name, spec in cases.items():
-                result = client.command({'op':'txn','id':name,'value':2,'coordinator':1,'abandon':True,'create':True,**spec})
+                result = client.command({'op':'txn','id':name,'value':2,'coordinator':0,'abandon':True,'create':True,**spec})
                 assert result['outcome'] == 'abandon', result
                 tids[name] = result['tid']
+            if self.args.cut_member >= 0:
+                self.set_links(self.args.cut_member, cut=True)
+                time.sleep(self.args.lease_secs+10)
+                self.set_links(self.args.cut_member, cut=False)
             time.sleep(self.args.lease_secs+30)
             report = {name:{index:client.command({'op':'status','site':index,'tid':tid},60)['status']
                             for index in range(self.args.members)} for name, tid in tids.items()}
@@ -712,7 +716,7 @@ def main():
     parser.add_argument('--cut-after', type=float, default=.05)
     parser.add_argument('--cut-point', default='')
     parser.add_argument('--cut-hold', type=float, default=5)
-    parser.add_argument('--cut-member', type=int, default=0)
+    parser.add_argument('--cut-member', type=int, default=-1)
     parser.add_argument('--wait', type=float, default=0)
     parser.add_argument('--lease-secs', type=int, default=20)
     parser.add_argument('--workloads', default='')
