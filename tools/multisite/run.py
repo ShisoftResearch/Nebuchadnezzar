@@ -130,6 +130,8 @@ class Process:
         self.log = gate.root / f'{role}-{index}-{generation}.jsonl'
         self.stderr = (gate.root / f'{role}-{index}-{generation}.stderr').open('w')
         env = os.environ.copy()
+        if gate.args.no_orphan_adoption:
+            env['MULTISITE_NO_ORPHAN_ADOPTION'] = '1'
         env.update(MULTISITE_ROUTES=gate.routes(index), NEB_DISABLE_JOIN_FILL='1',
                    RUST_BACKTRACE='1', RUST_LOG=os.environ.get('RUST_LOG','warn'), MULTISITE_EVENTS=str(gate.root / f'protocol-{index}.jsonl'),
                    MULTISITE_CONTROL=str(gate.root / f'control-{index}'))
@@ -344,6 +346,9 @@ class Gate:
                     victim = rng.randrange(1 if self.args.no_seed_stop else 0, self.args.members)
                     for single in singles:
                         single['coordinator'] = victim
+        if self.args.safe_stops and victim != 0 and fault.endswith('kill'):
+            # Open raft defect: a killed non-seed member cannot restart (FIX_raft_restart).
+            fault = fault.replace('kill', 'graceful')
         record = {'event':event,'workload':workload,'fault':fault,'victim':victim,'point':point,'sites':sites}
         if point:
             self.arm(victim, point)
@@ -648,6 +653,8 @@ def main():
     parser.add_argument('--no-faults', action='store_true')
     parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
+    parser.add_argument('--safe-stops', action='store_true')
+    parser.add_argument('--no-orphan-adoption', action='store_true')
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')

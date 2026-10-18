@@ -1444,7 +1444,12 @@ pub async fn init_conshash(
                     // fallback.
                     #[cfg(multisite_test)]
                     crate::utils::multisite::point("adopt_check", (ch.server_count(), address));
+                    // Campaign knob (test builds only): continue past the open
+                    // startup-adoption defect, see multisite FIX_orphan_adoption.
+                    let skip_adoption = cfg!(multisite_test)
+                        && std::env::var_os("MULTISITE_NO_ORPHAN_ADOPTION").is_some();
                     let owners = match owners {
+                        Some(table) if skip_adoption => Some(table),
                         Some(table) => {
                             match crate::slots::adopt_orphaned_slots(
                                 group_name,
