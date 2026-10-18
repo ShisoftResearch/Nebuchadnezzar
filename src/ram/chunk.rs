@@ -434,12 +434,10 @@ impl TransactionLeases {
 }
 
 lazy_static! {
-    /// Leases of in-flight transactions. Global and keyed by transaction id
-    /// because a lease outlives the apply burst: writes land in one
-    /// synchronous region, but the decision that releases them arrives in a
-    /// LATER RPC, on another thread. Thread-locals cannot express that.
-    static ref TXN_LEASES: Mutex<std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>> =
-        Mutex::new(std::collections::HashMap::new());
+    /// A transaction keeps its lease state in one hash partition. Placement
+    /// and revocation use the same partition, including across stores.
+    static ref TXN_LEASES: crate::utils::sharded::Sharded<Mutex<std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>>> =
+        Default::default();
 }
 
 /// Guard acquisitions abandoned at the deadline. Non-zero means a cell index
@@ -558,8 +556,7 @@ impl TransactionScope {
         txn: crate::server::transactions::TxnId,
         participants: Vec<u64>,
     ) -> Self {
-        crate::profile_lock!(H01, TXN_LEASES
-            .lock())
+        crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
             .entry(txn.clone())
             .or_insert_with(TransactionLeases::new)
             .live_scopes += 1;
@@ -576,7 +573,7 @@ impl Drop for TransactionScope {
         let previous_participants = std::mem::take(&mut self.previous_participants);
         CURRENT_PARTICIPANTS.with(|p| p.replace(previous_participants));
         if let Some(txn) = set_transaction_id(self.previous.take()) {
-            let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
+            let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
             if let Some(leases) = held.get_mut(&txn) {
                 leases.live_scopes = leases.live_scopes.saturating_sub(1);
                 if leases.live_scopes == 0 && leases.per_chunk.is_empty() {
@@ -610,7 +607,7 @@ fn take_store_leases(
     store: &StoreRange,
     revoke: bool,
 ) -> Vec<((usize, usize), Vec<HeadLease>)> {
-    let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
+    let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
     take_store_leases_locked(&mut held, txn, store, revoke)
 }
 
@@ -903,7 +900,7 @@ pub fn release_transaction_leases(
     store: &StoreRange,
 ) -> Result<usize, LeaseExitError> {
     let leases = {
-        let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
         let open = held.get(txn).and_then(|leases| {
             leases
                 .per_chunk
@@ -956,12 +953,14 @@ pub fn transactions_with_idle_leases(
     store: &StoreRange,
 ) -> Vec<crate::server::transactions::TxnId> {
     let now = std::time::Instant::now();
-    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
-    held.iter()
-        .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
-        .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
-        .map(|(txn, _)| txn.clone())
-        .collect()
+    TXN_LEASES.iter().flat_map(|shard| {
+        let held = crate::profile_lock!(H01, shard.lock());
+        held.iter()
+            .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
+            .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
+            .map(|(txn, _)| *txn)
+            .collect::<Vec<_>>()
+    }).collect()
 }
 
 /// Reclaim leases whose transaction has been silent longer than `idle`.
@@ -1161,7 +1160,7 @@ pub fn transaction_manifest(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<crate::ram::bracket::ManifestEntry> {
-    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
+    let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
     let Some(leases) = held.get(txn) else {
         return Vec::new();
     };
@@ -1192,6 +1191,7 @@ pub fn transaction_manifest(
                 })
         })
         .collect();
+    drop(held);
     // Sorted so the same transaction produces the same manifest bytes in
     // every chunk it wrote; a reader comparing two parts should not have to
     // treat ordering as meaningful.
@@ -1206,8 +1206,7 @@ pub fn transaction_has_leases(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> bool {
-    crate::profile_lock!(H01, TXN_LEASES
-        .lock())
+    crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
         .get(txn)
         .is_some_and(|leases| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
 }
@@ -1217,7 +1216,7 @@ pub fn transaction_leased_segments(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<AArc<Segment>> {
-    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
+    let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
     held.get(txn)
         .map(|leases| {
             leases
@@ -1236,8 +1235,7 @@ pub fn transaction_lease_count(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> usize {
-    crate::profile_lock!(H01, TXN_LEASES
-        .lock())
+    crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
         .get(txn)
         .map(|leases| {
             leases
@@ -2141,7 +2139,7 @@ impl Chunk {
             // Being reclaimed underneath us: do not lease it.
             return false;
         }
-        let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
         let leases = held.entry(txn).or_insert_with(TransactionLeases::new);
         if leases.is_revoked_in(self.lease_key().0) {
             drop(held);
@@ -2199,7 +2197,7 @@ impl Chunk {
         manifest: &[crate::ram::bracket::ManifestEntry],
     ) -> Result<(), WriteError> {
         let heads: Vec<AArc<Segment>> = {
-            let held = crate::profile_lock!(H01, TXN_LEASES.lock());
+            let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
             match held
                 .get(txn)
                 .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
@@ -2405,8 +2403,7 @@ impl Chunk {
         let Some(txn) = current_txn() else {
             return false;
         };
-        crate::profile_lock!(H01, TXN_LEASES
-            .lock())
+        crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock())
             .get(&txn)
             .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             .map(|heads| {
@@ -2425,7 +2422,7 @@ impl Chunk {
             return LeasedPlacement::NoLease;
         };
         let head = {
-            let held = crate::profile_lock!(H01, TXN_LEASES.lock());
+            let held = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
             let Some(leases) = held.get(&txn) else {
                 return LeasedPlacement::NoLease;
             };
@@ -8009,7 +8006,7 @@ mod tests {
         // Where the transaction found the cursor. Its BEGIN is the first
         // thing in the run, so the span to disown starts at the BEGIN.
         let before = {
-            let leases = crate::profile_lock!(H01, TXN_LEASES.lock());
+            let leases = crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock());
             leases
                 .get(&txn)
                 .unwrap()
@@ -8227,7 +8224,7 @@ mod tests {
         );
         drop(scope);
         assert!(
-            crate::profile_lock!(H01, TXN_LEASES.lock()).get(&txn).is_none(),
+            crate::profile_lock!(H01, TXN_LEASES.shard(&txn).lock()).get(&txn).is_none(),
             "the fence record lives only while a scope can still write"
         );
     }
@@ -8329,6 +8326,45 @@ mod tests {
     /// INVARIANT B at context exit: a scope restores what was named before,
     /// on a normal exit and on an unwind alike.
     #[test]
+    fn independent_transaction_scopes_do_not_wait_for_other_lease_shards() {
+        let first = test_txn_id(99001);
+        let second = (99002..100002).map(test_txn_id).find(|id| {
+            !std::ptr::eq(TXN_LEASES.shard(&first), TXN_LEASES.shard(id))
+        }).unwrap();
+        let held = TXN_LEASES.shard(&first).lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let scope = TransactionScope::enter(second);
+            drop(scope);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "an unrelated lease partition must make progress");
+    }
+
+    #[test]
+    fn the_same_transaction_scope_waits_for_its_lease_shard() {
+        let txn = test_txn_id(99003);
+        let held = TXN_LEASES.shard(&txn).lock();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let scope = TransactionScope::enter(txn);
+            drop(scope);
+            done_tx.send(()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let result = done_rx.recv_timeout(std::time::Duration::from_millis(50));
+        drop(held);
+        thread.join().unwrap();
+        assert!(matches!(result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        done_rx.recv().unwrap();
+    }
+
+    #[test]
     fn a_transaction_scope_never_outlives_its_region() {
         let outer = test_txn_id(85);
         let inner = test_txn_id(86);
@@ -8348,8 +8384,8 @@ mod tests {
         }
         assert_eq!(current_txn(), None);
         assert!(!is_in_transaction());
-        assert!(crate::profile_lock!(H01, TXN_LEASES.lock()).get(&outer).is_none());
-        assert!(crate::profile_lock!(H01, TXN_LEASES.lock()).get(&inner).is_none());
+        assert!(crate::profile_lock!(H01, TXN_LEASES.shard(&outer).lock()).get(&outer).is_none());
+        assert!(crate::profile_lock!(H01, TXN_LEASES.shard(&inner).lock()).get(&inner).is_none());
     }
 
     /// The commit reserve: a part whose write set runs it to the last bytes
