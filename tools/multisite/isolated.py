@@ -27,7 +27,7 @@ else:
                  '--kind',os.environ.get('MULTISITE_KIND','graceful'),'--steps',os.environ.get('MULTISITE_STEPS','')]
     if name == 'multisite_cut_prepare':
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
-                 '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','0'),'--wait',os.environ.get('MULTISITE_WAIT','70')]
+                 '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','0'),'--wait',os.environ.get('MULTISITE_WAIT','0')]
     if name == 'multisite_readonly_e2e':
         args += ['--probe','readonly-e2e']
     elif name.startswith('multisite_readonly'):
@@ -40,6 +40,8 @@ else:
         args += ['--schedule','mixed']
     if os.environ.get('MULTISITE_FAULTS'):
         args += ['--faults',os.environ['MULTISITE_FAULTS']]
+    if os.environ.get('MULTISITE_LEASE_SECS'):
+        args += ['--lease-secs',os.environ['MULTISITE_LEASE_SECS']]
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
     if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':

@@ -130,6 +130,7 @@ class Process:
         self.log = gate.root / f'{role}-{index}-{generation}.jsonl'
         self.stderr = (gate.root / f'{role}-{index}-{generation}.stderr').open('w')
         env = os.environ.copy()
+        env['NEB_TXN_LEASE_TIMEOUT_SECS'] = str(gate.args.lease_secs)
         if gate.args.no_orphan_adoption:
             env['MULTISITE_NO_ORPHAN_ADOPTION'] = '1'
         env.update(MULTISITE_ROUTES=gate.routes(index), NEB_DISABLE_JOIN_FILL='1',
@@ -418,11 +419,11 @@ class Gate:
                 return observed
             time.sleep(5)
 
-    def verify(self, client, operations, settle=90):
+    def verify(self, client, operations, settle=None):
         """Check each operation. A violation may be an in-flight transaction that the
         lease sweeper has not resolved yet, so retry for one settle period before it counts."""
         pending = list(operations)
-        deadline = time.monotonic()+settle
+        deadline = time.monotonic()+(settle or self.args.lease_secs+70)
         waited = 0
         while True:
             observed = self.read_all(client, [op['keys'] for op in pending])
@@ -448,7 +449,7 @@ class Gate:
 
     def audit(self, client, tids, label):
         """Stuck locks, brackets and in-doubt transactions after a heal. Waits one lease period first."""
-        time.sleep(35)
+        time.sleep(self.args.lease_secs+15)
         report = {'label':label,'transactions':len(tids),'problems':[]}
         for index in range(self.args.members):
             control = self.root/f'control-{index}'
@@ -547,7 +548,7 @@ class Gate:
                 time.sleep(5)
                 self.set_links(0, cut=False)
             first = client.result(240)
-            time.sleep(self.args.wait)
+            time.sleep(self.args.wait or self.args.lease_secs+30)
             observed = client.command({'op':'read','keys':[[91,5000]]})['values']
             tids = list(self.tids.values())
             report = {'first':first,'after_70s':observed,'tids':tids}
@@ -564,7 +565,7 @@ class Gate:
             assert initial['outcome'] == 'ack', initial
             first = client.command({'op':'txn','id':'reader-writer','keys':[[91,901]],'reads':[[92,900]],
                                     'value':2,'durable':self.args.durable})
-            time.sleep(35)
+            time.sleep(self.args.lease_secs+15)
             second = client.command({'op':'txn','id':'conflicting-write','keys':[[92,900]],'value':3,'durable':True})
             report = {'first':first,'second':second}
             (self.root/'probe-e2e.json').write_text(json.dumps(report,indent=2))
@@ -579,7 +580,7 @@ class Gate:
             result = client.command({'op':'txn','id':'readonly-probe','keys':keys,'reads':[[92,900]],
                                      'value':2,'end_site':1})
             (self.root/'probe-result.json').write_text(json.dumps(result,indent=2))
-            time.sleep(35)
+            time.sleep(self.args.lease_secs+15)
             status = client.command({'op':'status','site':1,'tid':result['tid']})
             (self.root/'probe-status.json').write_text(json.dumps(status,indent=2))
             assert result['end'] == 'Success', ('read-only end must finish', result, status)
@@ -640,7 +641,7 @@ class Gate:
                 self.start(victim)
                 result = client.result()
                 # The protocol lease timeout is 30 s. This is a correctness bound, not timing data.
-                time.sleep(35)
+                time.sleep(self.args.lease_secs+15)
             else:
                 result = client.command(request)
                 assert result['outcome'] == 'ack', result
@@ -688,7 +689,8 @@ def main():
     parser.add_argument('--cut-point', default='')
     parser.add_argument('--cut-hold', type=float, default=5)
     parser.add_argument('--cut-member', type=int, default=0)
-    parser.add_argument('--wait', type=float, default=70)
+    parser.add_argument('--wait', type=float, default=0)
+    parser.add_argument('--lease-secs', type=int, default=20)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
