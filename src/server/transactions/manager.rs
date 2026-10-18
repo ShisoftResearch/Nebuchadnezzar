@@ -1,5 +1,4 @@
 use super::*;
-use crate::utils::sharded::Sharded;
 use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
@@ -381,7 +380,8 @@ pub struct TransactionManager {
     // sends the batched release RPCs. A per-commit `tokio::spawn` was measured
     // at 15-40us of worker-unpark overhead at low concurrency in this codebase,
     // which a queue push avoids entirely.
-    pending_pin_releases: Sharded<parking_lot::Mutex<HashMap<u64, Arc<PinReleaseQueue>>>>,
+    pending_pin_releases: LFMap<u64, Arc<PinReleaseQueue>>,
+    pin_release_peers: crossbeam_skiplist::SkipSet<u64>,
 }
 
 /// How often the background flusher sends queued read-pin releases. Pins are
@@ -414,7 +414,8 @@ impl TransactionManager {
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
-            pending_pin_releases: Sharded::default(),
+            pending_pin_releases: LFMap::with_capacity(16),
+            pin_release_peers: crossbeam_skiplist::SkipSet::new(),
         });
 
         // Periodically flush queued read-pin releases in batches, so completing
@@ -2003,18 +2004,21 @@ impl TransactionManager {
             return;
         }
         for server in pinned_servers {
-            let queue = crate::profile_lock!(H15, self.pending_pin_releases.shard(&server).lock())
-                .entry(server).or_insert_with(|| Arc::new(PinReleaseQueue::default())).clone();
+            let queue = self.pending_pin_releases.get(&server).unwrap_or_else(|| {
+                let queue = crate::utils::keyed_state::get_or_insert(
+                    &self.pending_pin_releases, server, || Arc::new(PinReleaseQueue::default()));
+                self.pin_release_peers.insert(server);
+                queue
+            });
             queue.pending.push(tid.clone());
         }
     }
     /// Each participant has at most one release RPC in flight. A slow peer
     /// does not delay releases to another peer. Failed releases remain best effort.
     fn flush_pin_releases(self: &Arc<Self>) {
-        let queues: Vec<_> = self.pending_pin_releases.iter().flat_map(|shard| {
-            crate::profile_lock!(H15, shard.lock()).iter().map(|(id, queue)| (*id, queue.clone())).collect::<Vec<_>>()
-        }).collect();
-        for (server_id, queue) in queues {
+        for peer in self.pin_release_peers.iter() {
+            let server_id = *peer.value();
+            let Some(queue) = self.pending_pin_releases.get(&server_id) else { continue };
             let Some(mut batch) = queue.try_batch() else { continue };
             let manager = self.clone();
             tokio::spawn(async move {
