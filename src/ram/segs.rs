@@ -665,7 +665,7 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// At most 32 MiB of staging, including inline and shutdown archives.
+/// At most 32 MiB of staging per chunk, including inline and shutdown archives.
 /// Lightning's slab allocator prefaults a 64 MiB range per calling thread.
 /// A shared buffer pool keeps this cost independent of the thread count.
 const ARCHIVE_STAGING_LIMIT: usize = 4;
@@ -677,13 +677,13 @@ struct ArchiveStagingState {
 }
 
 #[derive(Default)]
-struct ArchiveStagingPool {
+pub(crate) struct ArchiveStagingPool {
     state: parking_lot::Mutex<ArchiveStagingState>,
     available: parking_lot::Condvar,
 }
 
 impl ArchiveStagingPool {
-    fn acquire(&self) -> ArchiveStagingGuard<'_> {
+    fn acquire(self: &Arc<Self>) -> ArchiveStagingGuard {
         #[cfg(feature = "lock_profile")]
         let capacity_wait =
             crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
@@ -692,7 +692,7 @@ impl ArchiveStagingPool {
         loop {
             if let Some(buffer) = state.idle.pop() {
                 return ArchiveStagingGuard {
-                    pool: self,
+                    pool: self.clone(),
                     #[cfg(feature = "lock_profile")]
                     _profile: capacity_wait.acquired(()),
                     buffer: Some(buffer),
@@ -702,7 +702,7 @@ impl ArchiveStagingPool {
                 state.allocated += 1;
                 drop(state);
                 return ArchiveStagingGuard {
-                    pool: self,
+                    pool: self.clone(),
                     #[cfg(feature = "lock_profile")]
                     _profile: capacity_wait.acquired(()),
                     buffer: Some(vec![0; SEGMENT_SIZE]),
@@ -716,20 +716,15 @@ impl ArchiveStagingPool {
     }
 }
 
-fn archive_staging_pool() -> &'static ArchiveStagingPool {
-    static POOL: std::sync::OnceLock<ArchiveStagingPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(ArchiveStagingPool::default)
-}
-
 /// Return the buffer on success, an I/O error, or a panic.
-struct ArchiveStagingGuard<'a> {
+struct ArchiveStagingGuard {
     #[cfg(feature = "lock_profile")]
     _profile: crate::utils::lock_profile::Guard<()>,
-    pool: &'a ArchiveStagingPool,
+    pool: Arc<ArchiveStagingPool>,
     buffer: Option<Vec<u8>>,
 }
 
-impl ArchiveStagingGuard<'_> {
+impl ArchiveStagingGuard {
     fn snapshot(&mut self, data: &[u8]) -> &[u8] {
         let buffer = self.buffer.as_mut().unwrap();
         buffer.copy_from_slice(data);
@@ -737,7 +732,7 @@ impl ArchiveStagingGuard<'_> {
     }
 }
 
-impl Drop for ArchiveStagingGuard<'_> {
+impl Drop for ArchiveStagingGuard {
     fn drop(&mut self) {
         crate::profile_lock!(H43_mutex, self.pool.state.lock())
             .idle
@@ -2248,7 +2243,8 @@ impl Segment {
             ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
             return Ok(ArchiveOutcome::Refused);
         }
-        let staging = archive_staging_pool().acquire();
+        let manager = self.file_state.lock().manager.clone();
+        let staging = manager.archive_staging_pool(self.chunk_id).acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -4300,6 +4296,26 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_staging_capacity_is_independent_between_chunks_and_stores() {
+        let first_store = Arc::new(SegmentFileManager::new(None, None));
+        let second_store = Arc::new(SegmentFileManager::new(None, None));
+        let saturated = first_store.archive_staging_pool(0);
+        let held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| saturated.acquire()).collect();
+        assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool(0)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = first_store.clone();
+        let thread = std::thread::spawn(move || {
+            let _other_chunk = worker.archive_staging_pool(1).acquire();
+            let _other_store = second_store.archive_staging_pool(0).acquire();
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "unrelated chunks must have independent archive capacity");
+    }
 
     #[test]
     fn archive_staging_buffers_are_bounded_across_threads() {
