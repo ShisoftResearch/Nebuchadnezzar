@@ -6,15 +6,15 @@
 //! bifrost decides WHICH slots move; this module answers what they weigh,
 //! whether the recipient will take them, and actually moves them.
 
-type JoiningMembers =
-    crate::utils::sharded::Sharded<std::sync::Mutex<std::collections::HashSet<u64>>>;
+use lightning::map::{Map, PtrHashMap};
+type JoiningMembers = PtrHashMap<u64, bool>;
 
 fn claim_joiner(inflight: &JoiningMembers, member: u64) -> bool {
-    crate::profile_lock!(C30, inflight.shard(&member).lock().unwrap()).insert(member)
+    inflight.try_insert(member, true).is_none()
 }
 
 fn release_joiner(inflight: &JoiningMembers, member: u64) {
-    crate::profile_lock!(C30, inflight.shard(&member).lock().unwrap()).remove(&member);
+    inflight.remove(&member);
 }
 
 use crate::client::AsyncClient;
@@ -256,7 +256,7 @@ impl crate::server::NebServer {
         // "committed to None". A duplicate event during the stability window
         // coalesces into the pending fill, which reads the placement fresh
         // when it fires anyway.
-        let inflight: Arc<JoiningMembers> = Default::default();
+        let inflight = Arc::new(JoiningMembers::with_capacity(16));
         let subscription = self
             .membership
             .on_group_member_joined(
@@ -352,13 +352,27 @@ mod join_partition_tests {
     use super::*;
 
     #[test]
+    fn simultaneous_join_claims_have_one_owner() {
+        let members = JoiningMembers::with_capacity(16);
+        let start = std::sync::Barrier::new(8);
+        let winners = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                start.wait();
+                claim_joiner(&members, 42)
+            })).collect();
+            threads.into_iter().map(|thread| usize::from(thread.join().unwrap())).sum::<usize>()
+        });
+        assert_eq!(winners, 1);
+        release_joiner(&members, 42);
+        assert!(claim_joiner(&members, 42));
+    }
+
+    #[test]
     fn join_fill_claims_coalesce_only_the_same_member() {
-        let members = Arc::new(JoiningMembers::default());
+        let members = Arc::new(JoiningMembers::with_capacity(16));
         let first = 1u64;
-        let second = (2..1000)
-            .find(|member| !std::ptr::eq(members.shard(&first), members.shard(member)))
-            .unwrap();
-        let held = members.shard(&first).lock().unwrap();
+        let second = 2;
+        assert!(claim_joiner(&members, first));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = members.clone();
         let thread = std::thread::spawn(move || {
@@ -370,7 +384,7 @@ mod join_partition_tests {
             done_tx.send(()).unwrap();
         });
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
-        drop(held);
+        release_joiner(&members, first);
         thread.join().unwrap();
         assert!(result.is_ok());
     }
