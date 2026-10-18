@@ -530,6 +530,26 @@ class Gate:
         assert client.command({'op':'setup'})['ok']
         if not self.args.no_refresh:
             self.refresh_tables()
+        if self.args.probe == 'cut-prepare':
+            request = {'op':'txn','id':'cut-prepare','keys':[[91,5000]],'value':5,'coordinator':1,'durable':self.args.durable}
+            client.send(request)
+            time.sleep(self.args.cut_after)
+            self.set_links(0, cut=True)
+            time.sleep(5)
+            self.set_links(0, cut=False)
+            first = client.result(240)
+            time.sleep(70)
+            observed = client.command({'op':'read','keys':[[91,5000]]})['values']
+            tids = list(self.tids.values())
+            report = {'first':first,'after_70s':observed,'tids':tids}
+            second = client.command({'op':'txn','id':'conflict','keys':[[91,5000]],'value':6,'coordinator':1,'durable':True})
+            report['second'] = second
+            report['observed_after_second'] = client.command({'op':'read','keys':[[91,5000]]})['values']
+            (self.root/'probe-cut-prepare.json').write_text(json.dumps(report,indent=2))
+            check_transaction(request, first, observed)
+            assert second['outcome'] == 'ack', ('cell stays locked', report)
+            (self.root/'PASS').write_text('cut-prepare probe passed\n')
+            return
         if self.args.probe == 'readonly-e2e':
             initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
             assert initial['outcome'] == 'ack', initial
@@ -651,10 +671,11 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')
+    parser.add_argument('--cut-after', type=float, default=.05)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')

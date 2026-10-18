@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5']
+names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -25,6 +25,8 @@ else:
         args[args.index('--members')+1] = str(members)
         args += ['--probe','restart','--victim',os.environ.get('MULTISITE_VICTIM','1'),
                  '--kind',os.environ.get('MULTISITE_KIND','graceful'),'--steps',os.environ.get('MULTISITE_STEPS','')]
+    if name == 'multisite_cut_prepare':
+        args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05')]
     if name == 'multisite_readonly_e2e':
         args += ['--probe','readonly-e2e']
     elif name.startswith('multisite_readonly'):
