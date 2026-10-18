@@ -71,11 +71,12 @@ def run(gate):
         online = {m['id'] for m in roster if m['online']}
         assert live <= online, ('live members marked offline', sorted(i % 10000 for i in live), sorted(i % 10000 for i in online), brief(after))
     elif probe in ('raft-roster', 'raft-rejoin'):
+        # Control: no member restarts. Every restart loses the roster of the restarted member.
         if not control:
             gate.servers[1].stop(abrupt=False)
             gate.start(1)
         after = record(gate, 'after-member', members)
-        if probe == 'raft-rejoin':
+        if probe == 'raft-rejoin' and not control:
             gate.servers[0].stop(abrupt=False)
             gate.start(0)
             after = record(gate, 'after-seed', members)
