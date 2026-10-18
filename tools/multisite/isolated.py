@@ -44,6 +44,10 @@ else:
         args += ['--faults',os.environ['MULTISITE_FAULTS']]
     if os.environ.get('MULTISITE_LEASE_SECS'):
         args += ['--lease-secs',os.environ['MULTISITE_LEASE_SECS']]
+    if os.environ.get('MULTISITE_WORKLOADS'):
+        args += ['--workloads',os.environ['MULTISITE_WORKLOADS']]
+    if os.environ.get('MULTISITE_AUDIT_EVERY'):
+        args += ['--audit-every',os.environ['MULTISITE_AUDIT_EVERY']]
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
     if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':

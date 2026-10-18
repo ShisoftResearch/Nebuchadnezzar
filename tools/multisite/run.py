@@ -323,11 +323,12 @@ class Gate:
                     setattr(proxy, name, value)
 
     def run_event(self, event, rng, client, counters):
-        workload = self.WORKLOADS[event % len(self.WORKLOADS)]
+        workloads = self.args.workloads.split(',') if self.args.workloads else self.WORKLOADS
+        workload = workloads[event % len(workloads)]
         if workload == 's3' and self.args.members < 3:
             workload = 's2'
         faults = self.args.faults.split(',') if self.args.faults else self.FAULTS
-        fault = faults[(event + event//len(self.WORKLOADS)) % len(faults)]
+        fault = faults[(event + event//len(workloads)) % len(faults)]
         request, sites = self.build_request(rng, event, workload)
         singles = [request] if request['op'] == 'txn' else request['requests']
         victim = rng.choice(sites)
@@ -493,7 +494,7 @@ class Gate:
             self.verify(client, operations if (event+1) % 50 == 0 else operations[-25:])
             append(self.root/'checks.jsonl', {'event':event,'counted':counters['events'],'result':'pass'})
             event += 1
-            if counters['events'] and counters['events'] % 50 == 0 and counters['events'] != audited:
+            if counters['events'] and counters['events'] % self.args.audit_every == 0 and counters['events'] != audited:
                 audited = counters['events']
                 self.audit(client, list(self.tids.values())[-200:], f'after {audited} events')
         self.audit(client, list(self.tids.values())[-400:], 'final')
@@ -712,6 +713,8 @@ def main():
     parser.add_argument('--cut-member', type=int, default=0)
     parser.add_argument('--wait', type=float, default=0)
     parser.add_argument('--lease-secs', type=int, default=20)
+    parser.add_argument('--workloads', default='')
+    parser.add_argument('--audit-every', type=int, default=50)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
