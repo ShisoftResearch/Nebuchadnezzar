@@ -136,6 +136,17 @@ async fn command(client: &Arc<AsyncClient>, peers: &[String], group: &str, req: 
             }
             json!({"ok":true})
         }
+        "owners" => {
+            client.reload_slot_owners().await;
+            let owners: Vec<Value> = (0..peers.len() as u64)
+                .map(|index| {
+                    let id = Id::from_parts(91 + index, 1);
+                    json!({"slot":91 + index,"owner":client.locate_server_id(&id).ok(),
+                           "expected":bifrost_hasher::hash_str(&peers[index as usize])})
+                })
+                .collect();
+            json!({"owners":owners})
+        }
         "status" => {
             let index = req["site"].as_u64().unwrap() as usize;
             let tid: transactions::TxnId = serde_json::from_value(req["tid"].clone()).unwrap();

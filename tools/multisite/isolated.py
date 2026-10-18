@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2']
+names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -20,6 +20,11 @@ else:
             '--head',os.environ['MULTISITE_HEAD'],'--output',str(Path(os.environ['MULTISITE_OUTPUT'])/name),
             '--members',str(members),'--events',os.environ.get('MULTISITE_EVENTS_COUNT','2'),
             '--port',os.environ.get('MULTISITE_PORT','46100')]
+    if name == 'multisite_restart_probe':
+        members = int(os.environ.get('MULTISITE_MEMBERS', '2'))
+        args[args.index('--members')+1] = str(members)
+        args += ['--probe','restart','--victim',os.environ.get('MULTISITE_VICTIM','1'),
+                 '--kind',os.environ.get('MULTISITE_KIND','graceful')]
     if name.startswith('multisite_readonly'):
         args += ['--probe','readonly-control' if name.endswith('_control') else 'readonly']
     if os.environ.get('MULTISITE_NO_FAULTS') == '1':

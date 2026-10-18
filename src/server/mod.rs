@@ -1442,6 +1442,8 @@ pub async fn init_conshash(
                     // sees one answer -- see `slots::adopt_orphaned_slots` for
                     // why this is a reassignment rather than a routing-time
                     // fallback.
+                    #[cfg(multisite_test)]
+                    crate::utils::multisite::point("adopt_check", (ch.server_count(), address));
                     let owners = match owners {
                         Some(table) => {
                             match crate::slots::adopt_orphaned_slots(

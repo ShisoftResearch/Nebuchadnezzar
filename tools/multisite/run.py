@@ -303,6 +303,23 @@ class Gate:
             assert status['status'] != 'Committing', ('end remains stuck',status)
             (self.root/'PASS').write_text('read-only end probe passed\n')
             return
+        if self.args.probe == 'restart':
+            request = {'op':'txn','id':'restart-probe','keys':[[91+i,1] for i in range(self.args.members)],
+                       'value':77,'durable':True}
+            result = client.command(request)
+            assert result['outcome'] == 'ack', result
+            report = {'before':client.command({'op':'owners'}),'victim':self.args.victim,'kind':self.args.kind}
+            self.servers[self.args.victim].stop(abrupt=self.args.kind == 'kill')
+            self.start(self.args.victim)
+            time.sleep(self.args.settle)
+            client.stop(abrupt=True)
+            client = self.client()
+            report['after'] = client.command({'op':'owners'})
+            report['values'] = client.command({'op':'read','keys':request['keys']})['values']
+            (self.root/'probe-restart.json').write_text(json.dumps(report,indent=2))
+            check_transaction(request, result, report['values'])
+            (self.root/'PASS').write_text('restart probe passed\n')
+            return
         rng = random.Random(self.args.seed)
         operations = []
         points = ['after_p0','during_end','before_status_record','after_status_record',
@@ -374,7 +391,10 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','restart'], default='none')
+    parser.add_argument('--victim', type=int, default=1)
+    parser.add_argument('--kind', choices=['kill','graceful'], default='graceful')
+    parser.add_argument('--settle', type=float, default=5)
     parser.add_argument('--schedule', choices=['baseline','protocol'], default='baseline')
     args = parser.parse_args()
     def interrupted(signum, frame):
