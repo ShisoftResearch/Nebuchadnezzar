@@ -562,6 +562,25 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
+        if self.args.probe == 'abandon':
+            seed = client.command({'op':'txn','id':'seed','keys':[[91,7000],[92,7000],[93,7000]],'value':1,'durable':True})
+            assert seed['outcome'] == 'ack', seed
+            cases = {'read-only':{'reads':[[92,7000]],'keys':[]},
+                     'read-and-write':{'reads':[[92,7000]],'keys':[[91,7001]]},
+                     'write-only':{'reads':[],'keys':[[91,7002]]}}
+            tids = {}
+            for name, spec in cases.items():
+                result = client.command({'op':'txn','id':name,'value':2,'coordinator':1,'abandon':True,'create':True,**spec})
+                assert result['outcome'] == 'abandon', result
+                tids[name] = result['tid']
+            time.sleep(self.args.lease_secs+30)
+            report = {name:{index:client.command({'op':'status','site':index,'tid':tid},60)['status']
+                            for index in range(self.args.members)} for name, tid in tids.items()}
+            (self.root/'probe-abandon.json').write_text(json.dumps(report,indent=2))
+            bad = {name:sites for name, sites in report.items() if any(v in ('InDoubt','Committing') for v in sites.values())}
+            assert not bad, ('abandoned transaction object remains', bad)
+            (self.root/'PASS').write_text('abandon probe passed\n')
+            return
         if self.args.probe == 'readonly-e2e':
             initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
             assert initial['outcome'] == 'ack', initial
@@ -683,7 +702,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')

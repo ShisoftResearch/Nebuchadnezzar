@@ -234,6 +234,10 @@ async fn run_txn(peers: &[String], group: &str, req: &Value) -> Value {
             return json!({"outcome":"write_error","error":format!("{:?}",error)});
         }
     }
+    if req["abandon"].as_bool().unwrap_or(false) {
+        // The client vanishes: no prepare, no abort.
+        return json!({"outcome":"abandon", "tid":txn.tid});
+    }
     if req["abort"].as_bool().unwrap_or(false) {
         return json!({"outcome":"abort", "result":format!("{:?}",txn.abort().await)});
     }
