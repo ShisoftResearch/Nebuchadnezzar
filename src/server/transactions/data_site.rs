@@ -1169,6 +1169,8 @@ impl DataManager {
             // the same sync (D31).
             let first_attempt = !txn.status_cell_attempted;
             txn.status_cell_attempted = true;
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("before_status_record", tid);
             match self.write_status_cell(tid, &txn.participants, &store, first_attempt) {
                 Ok(placed) => status = Some(placed),
                 Err(error) => {
@@ -1181,6 +1183,8 @@ impl DataManager {
                 }
             }
         }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_status_record", tid);
         let segments: Vec<crate::ram::txn_status::SegmentRef> =
             crate::ram::chunk::transaction_leased_segments(tid, &store)
                 .iter()
@@ -1248,6 +1252,8 @@ impl DataManager {
             };
             }
         };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("commit_closed", (tid, synced));
         txn.decided_commit = true;
         txn.commit_durable = true;
         if let Some((chunk, id)) = status {
@@ -1692,6 +1698,8 @@ impl DataManager {
                 .is_some_and(|segment| segment.protection.holds_transaction(txn))
         });
         if !pending {
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("status_synced", txn);
             chunks.txn_status().mark_self_synced(txn);
         }
         !pending
@@ -1782,6 +1790,8 @@ impl DataManager {
             let Some(chunk) = chunks.list.get(entry.chunk) else {
                 continue;
             };
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("before_status_release", (&txn, &entry.participants, &entry.synced_peers, entry.self_synced));
             match chunk.remove_status_cell(&entry.id) {
                 Ok(()) => {
                     registry.remove(&txn);
@@ -2437,6 +2447,8 @@ impl DataManager {
         } else {
             entry_segments
         };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("before_p0", tid);
         for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -2481,6 +2493,8 @@ impl DataManager {
             return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
         }
 
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_p0", tid);
         // NO commit marker here, deliberately.
         //
         // Despite its name, this runs in the coordinator's PREPARE phase
@@ -7346,6 +7360,8 @@ impl Service for DataManager {
         tid: TxnId,
         durable: bool,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("during_end", &tid);
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);

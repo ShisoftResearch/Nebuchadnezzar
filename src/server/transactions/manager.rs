@@ -1837,6 +1837,8 @@ impl TransactionManager {
             );
             return Err(TMError::OutcomeUnknown);
         }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_before_end", tid);
         let participants: Vec<u64> = changed_objs
             .iter()
             .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
@@ -1863,6 +1865,8 @@ impl TransactionManager {
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_after_end", tid);
         let mut committed = false;
         // A participant that refused but keeps the transaction decided (a
         // refused close: store full, WAL error) commits it later.
