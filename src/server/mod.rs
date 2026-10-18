@@ -1,4 +1,3 @@
-use crate::utils::sharded::Sharded;
 use crate::client::{AsyncClient, NebClientError};
 use crate::query::data_client::IndexedDataClient;
 use crate::server::transactions::manager::TransactionManager;
@@ -1369,7 +1368,7 @@ pub struct NebServer {
     /// requirement here to trade away.
     database_runtimes: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
-    runtime_initializers: Sharded<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    runtime_initializers: lightning::map::PtrHashMap<String, Arc<tokio::sync::Mutex<()>>>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
     /// `None` when tiered memory is disabled.
@@ -2014,8 +2013,9 @@ impl NebServer {
     }
 
     fn runtime_initializer(&self, database: &str) -> Arc<tokio::sync::Mutex<()>> {
-        crate::profile_lock!(C01_registry, self.runtime_initializers.shard(database).lock())
-            .entry(database.to_owned()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        crate::utils::keyed_state::get_or_insert(&self.runtime_initializers, database.to_owned(), || {
+            Arc::new(tokio::sync::Mutex::new(()))
+        })
     }
 
     pub async fn ensure_database_runtime(
@@ -2709,7 +2709,7 @@ impl NebServer {
                 }
                 registered
             },
-            runtime_initializers: Sharded::default(),
+            runtime_initializers: lightning::map::PtrHashMap::with_capacity(16),
             host_options: opts.clone(),
             shared_memory_pool,
             shared_tiered_manager,
