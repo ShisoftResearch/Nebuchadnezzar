@@ -2220,6 +2220,78 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
     server.shutdown().await;
 }
 
+/// B part 1: a store reopened under another address does not start by itself
+/// (no automatic adoption of its slots), and it does not start empty. The start
+/// ends with a typed error. The explicit restore starts it, and the cell that
+/// was written under the old address reads back.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_reopened_under_a_new_address_needs_the_explicit_restore() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "restore_new_address_group";
+    const SCHEMA: u32 = 9181;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA,
+            "restore_new_address_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        )
+    };
+    let id = Id::allocated(1, 7, 1);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    server.meta().schemas.register_internal_schema(schema());
+    let mut cell = {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(77);
+        OwnedCell::new_with_id(SchemaVid(SCHEMA), &id, value)
+    };
+    server.chunks().write_cell(&mut cell).expect("write");
+    server.shutdown().await;
+    drop(server);
+
+    let other = crate::utils::test_port::unique_localhost_addr();
+    // Control: without the restore the start fails with an error. It is not an
+    // empty start and not a silent re-pointing of the slots.
+    let refused = NebServer::new_from_opts(&opts, &other, group, async |_| {}).await;
+    assert!(
+        refused.is_err(),
+        "a store of another address started without the explicit restore"
+    );
+    drop(refused);
+
+    let restored = NebServer::restore_from_opts(&opts, &other, group, async |_| {})
+        .await
+        .expect("the explicit restore starts the store under the new address");
+    restored.meta().schemas.register_internal_schema(schema());
+    let value = restored.chunks().read_cell(&id).expect("the cell reads back").to_owned();
+    assert_eq!(value.data["DATA"].u64().copied(), Some(77));
+    restored.shutdown().await;
+}
+
 /// The indexed sibling of the restart test above: the RANGED INDEX of a
 /// dynamically-loaded database must also survive a graceful restart, so a
 /// schema scan finds every cell afterwards.

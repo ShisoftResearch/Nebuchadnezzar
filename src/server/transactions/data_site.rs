@@ -3706,9 +3706,10 @@ mod tests {
         assert_eq!(source.references_count(), 0);
         runtime.chunks().sync_all().unwrap();
         server.shutdown().await;
+        // The store belongs to one address; the restart reuses it.
         let recovered = NebServer::new_from_opts(
             &opts,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &address,
             group,
             async |_| {},
         )

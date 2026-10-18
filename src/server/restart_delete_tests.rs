@@ -117,6 +117,21 @@ struct Store {
     tiered_config: Option<crate::ram::tiered::TieredConfig>,
 }
 
+/// One address per store directory: a restart reuses it (reopening a store
+/// under another address is the explicit restore, not a restart).
+fn store_address(dir: &std::path::Path) -> String {
+    static ADDRESSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    ADDRESSES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(dir.to_path_buf())
+        .or_insert_with(crate::utils::test_port::unique_localhost_addr)
+        .clone()
+}
+
 impl Store {
     async fn start(dir: &std::path::Path, group: &str, mode: Mode) -> Store {
         Store::start_in(dir, group, mode, chunk_mb()).await
@@ -134,7 +149,7 @@ impl Store {
         chunk_mb: usize,
         tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Store {
-        let addr = crate::utils::test_port::unique_localhost_addr();
+        let addr = store_address(dir);
         let mut opts = options(dir, chunk_mb);
         opts.tiered_config = tiered_config.clone();
         let server = NebServer::new_from_opts(&opts, &addr, group, async |_| {})

@@ -4500,7 +4500,7 @@ mod tests {
             opts.index_enabled = index_enabled;
             let result = NebServer::new_from_opts(
                 &opts,
-                &crate::utils::test_port::unique_localhost_addr(),
+                &addr,
                 &group,
                 async |_| {},
             )
@@ -4794,7 +4794,7 @@ mod tests {
                 opts.index_enabled = index_enabled;
                 let result = NebServer::new_from_opts(
                     &opts,
-                    &crate::utils::test_port::unique_localhost_addr(),
+                    &addr,
                     &group,
                     async |_| {},
                 )
@@ -4881,7 +4881,7 @@ mod tests {
         opts.services = vec![Service::Cell, Service::RangedIndexer];
         let result = NebServer::new_from_opts(
             &opts,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             &group,
             async |_| {},
         )
