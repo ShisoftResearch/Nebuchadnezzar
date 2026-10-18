@@ -574,8 +574,20 @@ class Gate:
         if self.args.link_delay:
             for proxy in self.proxies.values():
                 proxy.delay = self.args.link_delay
-        for index in range(self.args.members):
-            self.start(index)
+        if self.args.probe == 'ring-stale':
+            # Test arm (kind kill): the first reads of the group after a notice
+            # answer an older version, as a member that lags behind. Control arm
+            # (kind graceful): no injection. The last member joins afterwards.
+            for index in range(self.args.members - 1):
+                self.start(index)
+            if self.args.kind == 'kill':
+                for index in range(self.args.members - 1):
+                    (self.root/f'control-{index}'/'stale-ring-reads').write_text('3')
+                time.sleep(1)
+            self.start(self.args.members - 1)
+        else:
+            for index in range(self.args.members):
+                self.start(index)
         for proxy in self.proxies.values():
             proxy.delay = 0
         if self.args.probe.startswith('raft-'):
@@ -617,7 +629,7 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
-        if self.args.probe == 'ring':
+        if self.args.probe in ('ring', 'ring-stale'):
             time.sleep(self.args.settle)
             report = {}
             for index in range(self.args.members):
@@ -856,7 +868,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring','torn'], default='none')
+    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','ring-stale','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring','torn'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--cut-after', type=float, default=.05)
