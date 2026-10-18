@@ -616,8 +616,15 @@ class Gate:
             other = 1 if victim == 0 else 0
             done = []
             for round_ in range(self.args.rounds):
-                request = {'op':'txn','id':f'point-stop-{round_}','keys':[[91+victim,9000+round_],[91+other,9000+round_]],'value':9+round_,
-                           'coordinator':other if self.args.coordinator < 0 else self.args.coordinator,'durable':self.args.durable}
+                keys = [[91+victim,9000+round_],[91+other,9000+round_]]
+                coordinator = other if self.args.coordinator < 0 else self.args.coordinator
+                request = {'op':'txn','id':f'point-stop-{round_}','keys':keys,'value':9+round_,
+                           'coordinator':coordinator,'durable':self.args.durable}
+                if self.args.batch > 1:
+                    request = {'op':'batch','id':f'point-stop-{round_}','requests':[
+                        {'op':'txn','id':f'point-stop-{round_}.{i}','keys':keys,'value':1000*(round_+1)+i,
+                         'coordinator':(coordinator+i) % self.args.members if self.args.coordinator < 0 else coordinator,
+                         'durable':self.args.durable} for i in range(self.args.batch)]}
                 self.arm(victim, point)
                 client.send(request)
                 self.wait_pause(victim, point)
@@ -633,11 +640,15 @@ class Gate:
             time.sleep(self.args.lease_secs+30)
             report = []
             for request, result in done:
-                observed = client.command({'op':'read','keys':request['keys']})['values']
+                keys = request['keys'] if request['op'] == 'txn' else request['requests'][0]['keys']
+                observed = client.command({'op':'read','keys':keys})['values']
                 report.append({'result':result,'observed':observed,'request':request})
             (self.root/'probe-point-stop.json').write_text(json.dumps(report,indent=2))
             for item in report:
-                check_transaction(item['request'], item['result'], item['observed'])
+                if item['request']['op'] == 'batch':
+                    check_batch(item['request']['requests'], item['result']['results'], item['observed'])
+                else:
+                    check_transaction(item['request'], item['result'], item['observed'])
             (self.root/'PASS').write_text('point-stop probe passed\n')
             return
         if self.args.probe == 'partial-abort':
@@ -816,6 +827,7 @@ def main():
     parser.add_argument('--seed-stop-only', action='store_true')
     parser.add_argument('--coordinator', type=int, default=-1)
     parser.add_argument('--rounds', type=int, default=1)
+    parser.add_argument('--batch', type=int, default=1)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
