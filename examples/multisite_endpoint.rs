@@ -224,7 +224,12 @@ async fn run_txn(peers: &[String], group: &str, req: &Value) -> Value {
             &id,
             OwnedValue::U64(req["value"].as_u64().unwrap()),
         );
-        if let Err(error) = txn.upsert(cell).await {
+        let written = if req["create"].as_bool().unwrap_or(false) {
+            txn.write(cell).await
+        } else {
+            txn.upsert(cell).await
+        };
+        if let Err(error) = written {
             let _ = txn.abort().await;
             return json!({"outcome":"write_error","error":format!("{:?}",error)});
         }

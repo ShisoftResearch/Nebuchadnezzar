@@ -552,6 +552,8 @@ class Gate:
             observed = client.command({'op':'read','keys':[[91,5000]]})['values']
             tids = list(self.tids.values())
             report = {'first':first,'after_70s':observed,'tids':tids}
+            report['txn_read'] = client.command({'op':'txn','id':'txn-read','reads':[[91,5000]],'keys':[[91,5001]],'value':7,'coordinator':1,'durable':True})
+            report['create'] = client.command({'op':'txn','id':'create','keys':[[91,5000]],'value':8,'create':True,'coordinator':1,'durable':True})
             second = client.command({'op':'txn','id':'conflict','keys':[[91,5000]],'value':6,'coordinator':1,'durable':True})
             report['second'] = second
             report['observed_after_second'] = client.command({'op':'read','keys':[[91,5000]]})['values']
