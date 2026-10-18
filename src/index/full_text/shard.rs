@@ -612,8 +612,8 @@ impl InvertedIndexer {
 
     fn mark_field_stats_dirty(&self, schema_id: SchemaUid, field_id: u64) -> u64 {
         let stats_key = Self::stats_key(schema_id, field_id);
-        self.dirty_field_stats_keys
-            .lock()
+        crate::profile_lock!(H59, self.dirty_field_stats_keys
+            .lock())
             .insert(stats_key, (schema_id.get(), field_id));
         stats_key
     }
@@ -623,7 +623,7 @@ impl InvertedIndexer {
             return;
         }
 
-        self.dirty_field_stats_keys.lock().extend(dirty_keys);
+        crate::profile_lock!(H59, self.dirty_field_stats_keys.lock()).extend(dirty_keys);
     }
 
     /// Add a document to the index
@@ -988,7 +988,7 @@ impl InvertedIndexer {
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
         let dirty_keys = {
-            let mut keys = self.dirty_field_stats_keys.lock();
+            let mut keys = crate::profile_lock!(H59, self.dirty_field_stats_keys.lock());
             std::mem::take(&mut *keys)
         };
 
@@ -2239,16 +2239,16 @@ mod tests {
         indexer.update_stats_for_add(&meta);
 
         assert!(
-            indexer
+            crate::profile_lock!(H59, indexer
                 .dirty_field_stats_keys
-                .lock()
+                .lock())
                 .contains_key(&stats_key),
             "add should mark field stats dirty"
         );
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            indexer.dirty_field_stats_keys.lock().is_empty(),
+            crate::profile_lock!(H59, indexer.dirty_field_stats_keys.lock()).is_empty(),
             "successful flush should clear dirty field stats"
         );
 
@@ -2260,16 +2260,16 @@ mod tests {
         indexer.remove_document(&meta).unwrap();
 
         assert!(
-            indexer
+            crate::profile_lock!(H59, indexer
                 .dirty_field_stats_keys
-                .lock()
+                .lock())
                 .contains_key(&stats_key),
             "remove should mark field stats dirty again"
         );
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            indexer.dirty_field_stats_keys.lock().is_empty(),
+            crate::profile_lock!(H59, indexer.dirty_field_stats_keys.lock()).is_empty(),
             "successful flush should clear dirty field stats after remove"
         );
 

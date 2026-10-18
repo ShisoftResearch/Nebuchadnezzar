@@ -211,8 +211,8 @@ pub fn publish_local_tree_service(
     database_name: &str,
     service: std::sync::Arc<TreeService>,
 ) {
-    LOCAL_TREE_SERVICES
-        .write()
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
+        .write())
         .insert(local_tree_service_key(group_name, database_name), service);
 }
 
@@ -222,8 +222,8 @@ pub fn publish_local_tree_service(
 /// -- and every page its trees hold -- outlives the database that owned it, for
 /// the life of the process.
 pub fn retire_local_tree_service(group_name: &str, database_name: &str) -> bool {
-    LOCAL_TREE_SERVICES
-        .write()
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
+        .write())
         .remove(&local_tree_service_key(group_name, database_name))
         .is_some()
 }
@@ -233,8 +233,8 @@ pub fn local_tree_service(
     group_name: &str,
     database_name: &str,
 ) -> Option<std::sync::Arc<TreeService>> {
-    LOCAL_TREE_SERVICES
-        .read()
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
+        .read())
         .get(&local_tree_service_key(group_name, database_name))
         .cloned()
 }

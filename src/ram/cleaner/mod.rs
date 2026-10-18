@@ -48,13 +48,13 @@ impl CleanerWake {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(thread) = self.thread.lock().as_ref() {
+        if let Some(thread) = crate::profile_lock!(H41, self.thread.lock()).as_ref() {
             thread.unpark();
         }
     }
 
     fn register(&self, thread: thread::Thread) {
-        *self.thread.lock() = Some(thread);
+        *crate::profile_lock!(H41, self.thread.lock()) = Some(thread);
     }
 
     fn take_pending(&self) -> bool {

@@ -86,7 +86,7 @@ impl VolatileLeaseStore {
         floor: u64,
         span: u64,
     ) -> io::Result<BlockLease> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(C12, self.state.lock());
         let entry = state.entry(origin).or_insert((epoch, 0));
         if epoch < entry.0 {
             return Err(io::Error::new(
@@ -131,7 +131,7 @@ impl LeaseStore for VolatileLeaseStore {
     }
 
     fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>> {
-        future::ready(Ok(self.state.lock().get(&origin).map(|(_, end)| *end))).boxed()
+        future::ready(Ok(crate::profile_lock!(C12, self.state.lock()).get(&origin).map(|(_, end)| *end))).boxed()
     }
 
     fn reserve_floor(&self, origin: u16, floor: u64) -> BoxFuture<'_, io::Result<u64>> {
@@ -141,7 +141,7 @@ impl LeaseStore for VolatileLeaseStore {
                 format!("floor {} exceeds the sequence space of origin {}", floor, origin),
             ))
         } else {
-            let mut state = self.state.lock();
+            let mut state = crate::profile_lock!(C12, self.state.lock());
             let entry = state.entry(origin).or_insert((0, 0));
             entry.1 = entry.1.max(floor);
             Ok(entry.1)
@@ -250,7 +250,7 @@ impl IdAllocator {
     }
 
     async fn refill(&self) -> io::Result<()> {
-        let _serialized = self.refill.lock().await;
+        let _serialized = crate::profile_lock!(H40, self.refill.lock().await);
         let end = self.end.load(Ordering::Relaxed);
         let next = self.next.load(Ordering::Relaxed);
         if next < end {

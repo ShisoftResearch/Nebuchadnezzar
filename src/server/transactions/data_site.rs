@@ -655,7 +655,7 @@ impl DataManager {
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
-                self.txns_sorted.lock().insert(tid.clone());
+                crate::profile_lock!(H17, self.txns_sorted.lock()).insert(tid.clone());
                 return txn;
             }
         }
@@ -663,7 +663,7 @@ impl DataManager {
     /// Prepared transactions that carry at least one write. A fencer drains
     /// these before it reports the fence engaged, because each can still commit.
     pub fn prepared_writer_count(&self) -> usize {
-        let tids: Vec<TxnId> = self.txns_sorted.lock().iter().cloned().collect();
+        let tids: Vec<TxnId> = crate::profile_lock!(H17, self.txns_sorted.lock()).iter().cloned().collect();
         tids.iter()
             .filter(|tid| {
                 self.find_transaction(tid).is_some_and(|txn| {
@@ -707,14 +707,14 @@ impl DataManager {
     }
 
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
-        self.cells.read().get(id).cloned()
+        crate::profile_lock!(H07, self.cells.read()).get(id).cloned()
     }
 
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         if let Some(meta) = self.existing_cell_meta_mutex(id) {
             return meta;
         }
-        let mut cells = self.cells.write();
+        let mut cells = crate::profile_lock!(H07, self.cells.write());
         cells
             .entry(*id)
             .or_insert_with(|| {
@@ -917,7 +917,7 @@ impl DataManager {
             drop(pins);
         }
         let _ = self.txns.remove(tid);
-        self.txns_sorted.lock().remove(tid);
+        crate::profile_lock!(H17, self.txns_sorted.lock()).remove(tid);
     }
 
     /// Restore the cell index, pad the spans, then release the leased heads.
@@ -1520,7 +1520,7 @@ impl DataManager {
     /// cannot be fenced: it was told to commit, or the fence could not be
     /// made durable; the asker waits.
     pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
-        let decided = self.decided.lock().get(tid).copied();
+        let decided = crate::profile_lock!(H18, self.decided.lock()).get(tid).copied();
         match decided {
             Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
             Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
@@ -1802,7 +1802,7 @@ impl DataManager {
     /// commit point answers a transaction it never decided. Bounded: see
     /// `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
-        let mut decided = self.decided.lock();
+        let mut decided = crate::profile_lock!(H18, self.decided.lock());
         decided.insert(tid.clone(), outcome);
         while decided.len() > DECISION_MEMORY {
             let Some(oldest) = decided.keys().next().cloned() else {
@@ -1852,7 +1852,7 @@ impl DataManager {
         // A finished multi-site commit is answered from its status cell
         // above until every participant is synced; a single-site one is never
         // asked about.
-        if let Some(outcome) = self.decided.lock().get(tid) {
+        if let Some(outcome) = crate::profile_lock!(H18, self.decided.lock()).get(tid) {
             return *outcome;
         }
         TxnOutcome::Unknown
@@ -1860,8 +1860,8 @@ impl DataManager {
 
     async fn cell_meta_cleanup(&self) {
         let oldest_transaction = {
-            self.txns_sorted
-                .lock()
+            crate::profile_lock!(H17, self.txns_sorted
+                .lock())
                 .iter()
                 .next()
                 .cloned()
@@ -1900,7 +1900,7 @@ impl DataManager {
                 }
             }
             let meta = cell_meta.lock();
-            let mut cells = self.cells.write();
+            let mut cells = crate::profile_lock!(H07, self.cells.write());
             let same_meta = cells
                 .get(&cell_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &cell_meta));
@@ -4873,7 +4873,7 @@ mod tests {
             "release_read_pins must wipe a pin-only participant transaction"
         );
         assert!(
-            !manager.txns_sorted.lock().contains(&tid),
+            !crate::profile_lock!(H17, manager.txns_sorted.lock()).contains(&tid),
             "release_read_pins must drop the txns_sorted entry too"
         );
 
@@ -5085,7 +5085,7 @@ mod tests {
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
-        assert_eq!(manager.cells.read().len(), 0);
+        assert_eq!(crate::profile_lock!(H07, manager.cells.read()).len(), 0);
         server.shutdown().await;
     }
 
@@ -5494,7 +5494,7 @@ mod tests {
             "all concurrent lookups of the same txn id should return the same transaction entry"
         );
         assert_eq!(manager.txns.len(), 1);
-        assert_eq!(manager.txns_sorted.lock().len(), 1);
+        assert_eq!(crate::profile_lock!(H17, manager.txns_sorted.lock()).len(), 1);
         assert!(manager.txns.get(&tid).is_some());
 
         server.shutdown().await;
@@ -5521,7 +5521,7 @@ mod tests {
         assert!(matches!(response, TxnExecResult::Accepted(_)));
         assert!(manager.find_transaction(&tid).is_none());
         assert_eq!(manager.txns.len(), 0);
-        assert!(manager.txns_sorted.lock().is_empty());
+        assert!(crate::profile_lock!(H17, manager.txns_sorted.lock()).is_empty());
 
         server.shutdown().await;
     }
@@ -5540,7 +5540,7 @@ mod tests {
             txn.lock().state = TxnState::Committed;
         }
         assert_eq!(manager.txns.len(), tids.len());
-        assert_eq!(manager.txns_sorted.lock().len(), tids.len());
+        assert_eq!(crate::profile_lock!(H17, manager.txns_sorted.lock()).len(), tids.len());
 
         let results = join_all(tids.iter().cloned().map(|tid| {
             let manager = manager.clone();
@@ -5556,7 +5556,7 @@ mod tests {
             assert_eq!(result, EndResult::Success);
         }
         assert_eq!(manager.txns.len(), 0);
-        assert!(manager.txns_sorted.lock().is_empty());
+        assert!(crate::profile_lock!(H17, manager.txns_sorted.lock()).is_empty());
 
         server.shutdown().await;
     }
@@ -5586,14 +5586,14 @@ mod tests {
                 .payload;
         assert_eq!(end_result, EndResult::Success);
         assert!(default_manager.txns.get(&shared_tid).is_none());
-        assert!(!default_manager.txns_sorted.lock().contains(&shared_tid));
+        assert!(!crate::profile_lock!(H17, default_manager.txns_sorted.lock()).contains(&shared_tid));
 
         assert!(
             analytics_manager.txns.get(&shared_tid).is_some(),
             "ending one database transaction must not remove another database's transaction entry"
         );
         assert!(
-            analytics_manager.txns_sorted.lock().contains(&shared_tid),
+            crate::profile_lock!(H17, analytics_manager.txns_sorted.lock()).contains(&shared_tid),
             "ending one database transaction must not remove another database's sorted bookkeeping"
         );
 
@@ -5606,7 +5606,7 @@ mod tests {
         .payload;
         assert_eq!(analytics_end, EndResult::Success);
         assert!(analytics_manager.txns.get(&shared_tid).is_none());
-        assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
+        assert!(!crate::profile_lock!(H17, analytics_manager.txns_sorted.lock()).contains(&shared_tid));
 
         server.shutdown().await;
     }
@@ -5658,7 +5658,7 @@ mod tests {
         }
 
         assert!(manager.txns.get(&tid).is_none());
-        assert!(!manager.txns_sorted.lock().contains(&tid));
+        assert!(!crate::profile_lock!(H17, manager.txns_sorted.lock()).contains(&tid));
 
         server.shutdown().await;
     }

@@ -558,8 +558,8 @@ impl TransactionScope {
         txn: crate::server::transactions::TxnId,
         participants: Vec<u64>,
     ) -> Self {
-        TXN_LEASES
-            .lock()
+        crate::profile_lock!(H01, TXN_LEASES
+            .lock())
             .entry(txn.clone())
             .or_insert_with(TransactionLeases::new)
             .live_scopes += 1;
@@ -576,7 +576,7 @@ impl Drop for TransactionScope {
         let previous_participants = std::mem::take(&mut self.previous_participants);
         CURRENT_PARTICIPANTS.with(|p| p.replace(previous_participants));
         if let Some(txn) = set_transaction_id(self.previous.take()) {
-            let mut held = TXN_LEASES.lock();
+            let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
             if let Some(leases) = held.get_mut(&txn) {
                 leases.live_scopes = leases.live_scopes.saturating_sub(1);
                 if leases.live_scopes == 0 && leases.per_chunk.is_empty() {
@@ -610,7 +610,7 @@ fn take_store_leases(
     store: &StoreRange,
     revoke: bool,
 ) -> Vec<((usize, usize), Vec<HeadLease>)> {
-    let mut held = TXN_LEASES.lock();
+    let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
     take_store_leases_locked(&mut held, txn, store, revoke)
 }
 
@@ -903,7 +903,7 @@ pub fn release_transaction_leases(
     store: &StoreRange,
 ) -> Result<usize, LeaseExitError> {
     let leases = {
-        let mut held = TXN_LEASES.lock();
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
         let open = held.get(txn).and_then(|leases| {
             leases
                 .per_chunk
@@ -956,7 +956,7 @@ pub fn transactions_with_idle_leases(
     store: &StoreRange,
 ) -> Vec<crate::server::transactions::TxnId> {
     let now = std::time::Instant::now();
-    let held = TXN_LEASES.lock();
+    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
     held.iter()
         .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
         .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
@@ -1161,7 +1161,7 @@ pub fn transaction_manifest(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<crate::ram::bracket::ManifestEntry> {
-    let held = TXN_LEASES.lock();
+    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
     let Some(leases) = held.get(txn) else {
         return Vec::new();
     };
@@ -1206,8 +1206,8 @@ pub fn transaction_has_leases(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> bool {
-    TXN_LEASES
-        .lock()
+    crate::profile_lock!(H01, TXN_LEASES
+        .lock())
         .get(txn)
         .is_some_and(|leases| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
 }
@@ -1217,7 +1217,7 @@ pub fn transaction_leased_segments(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> Vec<AArc<Segment>> {
-    let held = TXN_LEASES.lock();
+    let held = crate::profile_lock!(H01, TXN_LEASES.lock());
     held.get(txn)
         .map(|leases| {
             leases
@@ -1236,8 +1236,8 @@ pub fn transaction_lease_count(
     txn: &crate::server::transactions::TxnId,
     store: &StoreRange,
 ) -> usize {
-    TXN_LEASES
-        .lock()
+    crate::profile_lock!(H01, TXN_LEASES
+        .lock())
         .get(txn)
         .map(|leases| {
             leases
@@ -1347,7 +1347,7 @@ impl SealQueue {
     }
     /// True if accepted; false means the caller must do the work inline.
     fn enqueue(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> bool {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H42, self.state.lock());
         if state.pending.len() + state.refused.len() >= SEAL_QUEUE_LIMIT {
             return false;
         }
@@ -1368,7 +1368,7 @@ impl SealQueue {
         );
     }
     fn requeue(&self, chunk_id: usize, seg_id: u64, seq_id: u64, counter: &AtomicU64) {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H42, self.state.lock());
         let job = (chunk_id, seg_id, seq_id);
         if !state.pending.contains(&job) && !state.refused.iter().any(|(held, _)| *held == job) {
             state.refused.push((job, std::time::Instant::now()));
@@ -1377,14 +1377,14 @@ impl SealQueue {
     }
     /// Every queued job, including refused jobs that are not yet due.
     pub fn drain(&self) -> Vec<SealJob> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H42, self.state.lock());
         let mut jobs = std::mem::take(&mut state.pending);
         jobs.extend(state.refused.drain(..).map(|(job, _)| job));
         jobs
     }
     /// The oldest job that is due, so each archiver takes one job at a time.
     fn pop(&self) -> Option<SealJob> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H42, self.state.lock());
         let SealQueueState { pending, refused } = &mut *state;
         refused.retain(|(job, refused_at)| {
             let due = refused_at.elapsed() >= SEAL_RETRY_INTERVAL;
@@ -1396,7 +1396,7 @@ impl SealQueue {
         (!pending.is_empty()).then(|| pending.remove(0))
     }
     pub fn len(&self) -> usize {
-        let state = self.state.lock();
+        let state = crate::profile_lock!(H42, self.state.lock());
         state.pending.len() + state.refused.len()
     }
 }
@@ -2141,7 +2141,7 @@ impl Chunk {
             // Being reclaimed underneath us: do not lease it.
             return false;
         }
-        let mut held = TXN_LEASES.lock();
+        let mut held = crate::profile_lock!(H01, TXN_LEASES.lock());
         let leases = held.entry(txn).or_insert_with(TransactionLeases::new);
         if leases.is_revoked_in(self.lease_key().0) {
             drop(held);
@@ -2199,7 +2199,7 @@ impl Chunk {
         manifest: &[crate::ram::bracket::ManifestEntry],
     ) -> Result<(), WriteError> {
         let heads: Vec<AArc<Segment>> = {
-            let held = TXN_LEASES.lock();
+            let held = crate::profile_lock!(H01, TXN_LEASES.lock());
             match held
                 .get(txn)
                 .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
@@ -2405,8 +2405,8 @@ impl Chunk {
         let Some(txn) = current_txn() else {
             return false;
         };
-        TXN_LEASES
-            .lock()
+        crate::profile_lock!(H01, TXN_LEASES
+            .lock())
             .get(&txn)
             .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             .map(|heads| {
@@ -2425,7 +2425,7 @@ impl Chunk {
             return LeasedPlacement::NoLease;
         };
         let head = {
-            let held = TXN_LEASES.lock();
+            let held = crate::profile_lock!(H01, TXN_LEASES.lock());
             let Some(leases) = held.get(&txn) else {
                 return LeasedPlacement::NoLease;
             };
@@ -5733,7 +5733,7 @@ impl Chunks {
                     bracket.cells.iter().map(|cell| cell.id_bits()).collect(),
                 );
         }
-        *self.recovered_brackets.lock() = brackets;
+        *crate::profile_lock!(C07_recovered, self.recovered_brackets.lock()) = brackets;
     }
 
     /// The status cells and in-doubt transactions of this store.
@@ -5762,20 +5762,20 @@ impl Chunks {
 
     /// Keep an in-doubt transaction that waits for its participants.
     pub fn park_unresolved(&self, bracket: crate::ram::recovery::InDoubtBracket) {
-        self.unresolved.lock().insert(bracket.txn.clone(), bracket);
+        crate::profile_lock!(C07_unresolved, self.unresolved.lock()).insert(bracket.txn.clone(), bracket);
     }
 
     pub fn take_unresolved(
         &self,
         txn: &crate::server::transactions::TxnId,
     ) -> Option<crate::ram::recovery::InDoubtBracket> {
-        self.unresolved.lock().remove(txn)
+        crate::profile_lock!(C07_unresolved, self.unresolved.lock()).remove(txn)
     }
 
     /// The parked transactions and their participant sets.
     pub fn unresolved_transactions(&self) -> Vec<(crate::server::transactions::TxnId, Vec<u64>)> {
-        self.unresolved
-            .lock()
+        crate::profile_lock!(C07_unresolved, self.unresolved
+            .lock())
             .iter()
             .map(|(txn, bracket)| (txn.clone(), bracket.participants.clone()))
             .collect()
@@ -5783,7 +5783,7 @@ impl Chunks {
 
     /// Take the transactions recovery could not decide, for resolution.
     pub fn take_in_doubt_brackets(&self) -> Vec<crate::ram::recovery::InDoubtBracket> {
-        std::mem::take(&mut self.recovered_brackets.lock().in_doubt)
+        std::mem::take(&mut crate::profile_lock!(C07_recovered, self.recovered_brackets.lock()).in_doubt)
     }
 
     /// See [`stop_background`]. Observable so a test can assert the teardown
@@ -6167,9 +6167,9 @@ impl Chunks {
             .fences
             .load(enable_recovery)
             .unwrap_or_else(|error| panic!("cannot read the fence log, refusing to start: {error}"));
-        let in_doubt: std::collections::BTreeSet<_> = chunks_arc
+        let in_doubt: std::collections::BTreeSet<_> = crate::profile_lock!(C07_recovered, chunks_arc
             .recovered_brackets
-            .lock()
+            .lock())
             .in_doubt
             .iter()
             .map(|bracket| bracket.txn.clone())
@@ -8009,7 +8009,7 @@ mod tests {
         // Where the transaction found the cursor. Its BEGIN is the first
         // thing in the run, so the span to disown starts at the BEGIN.
         let before = {
-            let leases = TXN_LEASES.lock();
+            let leases = crate::profile_lock!(H01, TXN_LEASES.lock());
             leases
                 .get(&txn)
                 .unwrap()
@@ -8227,7 +8227,7 @@ mod tests {
         );
         drop(scope);
         assert!(
-            TXN_LEASES.lock().get(&txn).is_none(),
+            crate::profile_lock!(H01, TXN_LEASES.lock()).get(&txn).is_none(),
             "the fence record lives only while a scope can still write"
         );
     }
@@ -8348,8 +8348,8 @@ mod tests {
         }
         assert_eq!(current_txn(), None);
         assert!(!is_in_transaction());
-        assert!(TXN_LEASES.lock().get(&outer).is_none());
-        assert!(TXN_LEASES.lock().get(&inner).is_none());
+        assert!(crate::profile_lock!(H01, TXN_LEASES.lock()).get(&outer).is_none());
+        assert!(crate::profile_lock!(H01, TXN_LEASES.lock()).get(&inner).is_none());
     }
 
     /// The commit reserve: a part whose write set runs it to the last bytes

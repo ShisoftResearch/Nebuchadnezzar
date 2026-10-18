@@ -344,7 +344,7 @@ impl WriteFence {
         // cache and retries, so admitting it unguarded would let a write to a
         // protected family through the retry.
         let protected = match family() {
-            Some(uid) => self.protected.read().covers(uid),
+            Some(uid) => crate::profile_lock!(C06, self.protected.read()).covers(uid),
             None => true,
         };
         #[cfg(test)]
@@ -449,7 +449,7 @@ impl WriteFence {
     /// a fence is engaged; for use inside the `family` lookup of [`Self::enter`],
     /// which runs only then.
     pub fn protects(&self, family: SchemaUid) -> bool {
-        self.protected.read().covers(family)
+        crate::profile_lock!(C06, self.protected.read()).covers(family)
     }
 
     /// Engage the fence over `protected` and wait for writes already in flight
@@ -472,7 +472,7 @@ impl WriteFence {
         // Decide and publish under the write lock, so a second `engage` that is
         // refused cannot overwrite the protected set of the fence already up.
         let published = {
-            let mut set = self.protected.write();
+            let mut set = crate::profile_lock!(C06, self.protected.write());
             let current = self.gate.load(Ordering::SeqCst);
             if current & 1 == 1 {
                 return Err(FenceError::AlreadyEngaged);

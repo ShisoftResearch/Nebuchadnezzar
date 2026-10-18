@@ -226,7 +226,7 @@ impl TxnStatusRegistry {
     }
 
     pub fn register(&self, txn: TxnId, entry: StatusEntry) {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H09, self.state.lock());
         state.ids.insert(entry.id.bits());
         if let Some(old) = state.live.insert(txn, entry) {
             if !state.live.values().any(|other| other.id == old.id) {
@@ -236,11 +236,11 @@ impl TxnStatusRegistry {
     }
 
     pub fn get(&self, txn: &TxnId) -> Option<StatusEntry> {
-        self.state.lock().live.get(txn).cloned()
+        crate::profile_lock!(H09, self.state.lock()).live.get(txn).cloned()
     }
 
     pub fn remove(&self, txn: &TxnId) -> Option<StatusEntry> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H09, self.state.lock());
         let entry = state.live.remove(txn)?;
         state.ids.remove(&entry.id.bits());
         Some(entry)
@@ -249,31 +249,31 @@ impl TxnStatusRegistry {
     /// Whether `id` is a status cell of this store: scans and migration skip
     /// it.
     pub fn is_status_id(&self, id: u64) -> bool {
-        let state = self.state.lock();
+        let state = crate::profile_lock!(H09, self.state.lock());
         !state.ids.is_empty() && state.ids.contains(&id)
     }
 
     pub fn note_peer_synced(&self, txn: &TxnId, peer: u64) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
             entry.synced_peers.insert(peer);
         }
     }
 
     pub fn mark_self_synced(&self, txn: &TxnId) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
             entry.self_synced = true;
         }
     }
 
     pub fn mark_announced(&self, txn: &TxnId) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
             entry.announced = true;
         }
     }
 
     pub fn entries(&self) -> Vec<(TxnId, StatusEntry)> {
-        self.state
-            .lock()
+        crate::profile_lock!(H09, self.state
+            .lock())
             .live
             .iter()
             .map(|(txn, entry)| (txn.clone(), entry.clone()))
@@ -285,7 +285,7 @@ impl TxnStatusRegistry {
     pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>, mut cells: Vec<u64>) {
         cells.sort_unstable();
         cells.dedup();
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H09, self.state.lock());
         state.resolving.insert(txn.clone(), participants);
         for id in &cells {
             *state.in_doubt_cells.entry(*id).or_insert(0) += 1;
@@ -298,7 +298,7 @@ impl TxnStatusRegistry {
     }
 
     pub fn end_resolving(&self, txn: &TxnId) {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H09, self.state.lock());
         state.resolving.remove(txn);
         if let Some(cells) = state.resolving_cells.remove(txn) {
             Self::forget_cells(&mut state, &cells);
@@ -328,7 +328,7 @@ impl TxnStatusRegistry {
         {
             return None;
         }
-        let state = self.state.lock();
+        let state = crate::profile_lock!(H09, self.state.lock());
         for (txn, cells) in &state.resolving_cells {
             for id in cells {
                 let slot = Id::from_bits(*id).locality();
@@ -353,20 +353,20 @@ impl TxnStatusRegistry {
         {
             return false;
         }
-        self.state.lock().in_doubt_cells.contains_key(&id)
+        crate::profile_lock!(H09, self.state.lock()).in_doubt_cells.contains_key(&id)
     }
 
     pub fn resolving(&self) -> Vec<TxnId> {
-        self.state.lock().resolving.keys().cloned().collect()
+        crate::profile_lock!(H09, self.state.lock()).resolving.keys().cloned().collect()
     }
 
     pub fn resolving_participants(&self, txn: &TxnId) -> Option<Vec<u64>> {
-        self.state.lock().resolving.get(txn).cloned()
+        crate::profile_lock!(H09, self.state.lock()).resolving.get(txn).cloned()
     }
 
     /// `(status cells, resolving)` counts.
     pub fn counts(&self) -> (usize, usize) {
-        let state = self.state.lock();
+        let state = crate::profile_lock!(H09, self.state.lock());
         (state.live.len(), state.resolving.len())
     }
 }

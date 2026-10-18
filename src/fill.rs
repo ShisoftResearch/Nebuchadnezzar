@@ -255,7 +255,7 @@ impl crate::server::NebServer {
                     let inflight = inflight.clone();
                     async move {
                         let Some(server) = weak.upgrade() else { return };
-                        if !inflight.lock().unwrap().insert(member.id) {
+                        if !crate::profile_lock!(C30, inflight.lock().unwrap()).insert(member.id) {
                             debug!(
                                 "join fill for {} already pending; coalescing the duplicate \
                                  join event",
@@ -274,7 +274,7 @@ impl crate::server::NebServer {
                             );
                             impl Drop for Release {
                                 fn drop(&mut self) {
-                                    self.0.lock().unwrap().remove(&self.1);
+                                    crate::profile_lock!(C30, self.0.lock().unwrap()).remove(&self.1);
                                 }
                             }
                             let _release = Release(inflight.clone(), member.id);

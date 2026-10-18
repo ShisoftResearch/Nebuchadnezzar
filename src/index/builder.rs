@@ -562,7 +562,7 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
         task.await
     });
     let t0 = std::time::Instant::now();
-    let mut guard = PENDING_INDEX_TASKS.lock();
+    let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
     INDEX_GLOBAL_WAIT_NANOS.fetch_add(
         t0.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -746,10 +746,10 @@ impl IndexBuilder {
                 .unwrap_or(64);
             tokio::sync::Semaphore::new(n)
         });
-        let _permit = permits
+        let _permit = crate::profile_lock!(H21, permits
             .acquire()
             .await
-            .expect("scannable permit semaphore is never closed");
+            .expect("scannable permit semaphore is never closed"));
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
             cell_id,
@@ -859,7 +859,7 @@ impl IndexBuilder {
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
         async move {
             let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-                let mut guard = PENDING_INDEX_TASKS.lock();
+                let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
                 std::mem::take(&mut *guard)
             };
             tasks
@@ -961,7 +961,7 @@ impl IndexBuilder {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-                    let mut guard = PENDING_INDEX_TASKS.lock();
+                    let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
                     std::mem::take(&mut *guard)
                 };
                 if tasks.is_empty() {
@@ -1046,7 +1046,7 @@ impl IndexBuilder {
     // This ensures all index tasks from all threads are completed before shutdown
     pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
         let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-            let mut guard = PENDING_INDEX_TASKS.lock();
+            let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
             std::mem::take(&mut *guard)
         };
 
@@ -1517,7 +1517,7 @@ mod tests {
         });
 
         let drained_tasks = {
-            let mut guard = PENDING_INDEX_TASKS.lock();
+            let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
             std::mem::take(&mut *guard)
         };
         assert_eq!(

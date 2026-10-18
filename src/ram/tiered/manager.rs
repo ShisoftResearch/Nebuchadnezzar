@@ -297,7 +297,7 @@ impl TieredMemoryManager {
 
     pub fn register_chunks(&self, chunks: &Arc<Chunks>) {
         {
-            let mut registered = self.registered_chunks.write();
+            let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
             let already_registered = registered.iter().any(|weak| {
                 weak.upgrade()
                     .map(|existing| Arc::ptr_eq(&existing, chunks))
@@ -321,7 +321,7 @@ impl TieredMemoryManager {
             .sum();
 
         {
-            let mut registered = self.registered_chunks.write();
+            let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
             registered.retain(|weak| {
                 weak.upgrade()
                     .map(|existing| !Arc::ptr_eq(&existing, chunks))
@@ -349,7 +349,7 @@ impl TieredMemoryManager {
     }
 
     fn collect_registered_chunk_sets(&self) -> Vec<Arc<Chunks>> {
-        let mut registered = self.registered_chunks.write();
+        let mut registered = crate::profile_lock!(C13_registry, self.registered_chunks.write());
         let mut live = Vec::with_capacity(registered.len());
         registered.retain(|weak| {
             if let Some(chunks) = weak.upgrade() {
@@ -1030,7 +1030,11 @@ impl TieredMemoryManager {
             Ordering::Relaxed,
         );
         self.stall_suppressed.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "lock_profile")]
+        let warning_wait = crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::C13_warning);
         if let Some(mut last_warn) = self.stall_warn_at.try_lock() {
+            #[cfg(feature = "lock_profile")]
+            let mut last_warn = warning_wait.acquired(last_warn);
             if last_warn.elapsed() >= STALL_WARN_INTERVAL {
                 *last_warn = Instant::now();
                 let folded = self.stall_suppressed.swap(0, Ordering::Relaxed);

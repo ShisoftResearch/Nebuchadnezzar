@@ -1992,11 +1992,11 @@ impl NebServer {
     /// Every runtime this server hosts, snapshotted so callers do not hold the
     /// lock while touching a runtime.
     fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().values().cloned().collect()
+        crate::profile_lock!(C01_registry, self.database_runtimes.read()).values().cloned().collect()
     }
 
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().get(database_name).cloned()
+        crate::profile_lock!(C01_registry, self.database_runtimes.read()).get(database_name).cloned()
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
@@ -2011,7 +2011,7 @@ impl NebServer {
             return Ok(runtime);
         }
 
-        let _guard = self.runtime_init_lock.lock().await;
+        let _guard = crate::profile_lock!(C01_init, self.runtime_init_lock.lock().await);
         if let Some(runtime) = self.database(database_name) {
             return Ok(runtime);
         }
@@ -2044,8 +2044,8 @@ impl NebServer {
                 .insert(database_name.to_string());
         }
 
-        self.database_runtimes
-            .write()
+        crate::profile_lock!(C01_registry, self.database_runtimes
+            .write())
             .insert(database_name.to_string(), database_runtime.clone());
 
         Ok(database_runtime)
@@ -2061,7 +2061,7 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime = self.database_runtimes.write().remove(database_name);
+        let runtime = crate::profile_lock!(C01_registry, self.database_runtimes.write()).remove(database_name);
 
         let Some(runtime) = runtime else {
             return false;
@@ -2237,7 +2237,7 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        self.database_runtimes.read().keys().cloned().collect()
+        crate::profile_lock!(C01_registry, self.database_runtimes.read()).keys().cloned().collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -2472,9 +2472,9 @@ impl NebServer {
         // FlyWire connectome databases: after a SIGTERM restart the recently
         // written sidecar cells were unreadable while older, already-evicted
         // cells read fine.
-        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self
+        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = crate::profile_lock!(C01_registry, self
             .database_runtimes
-            .read()
+            .read())
             .iter()
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();

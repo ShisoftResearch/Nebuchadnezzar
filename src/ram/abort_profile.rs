@@ -35,7 +35,7 @@ pub fn guard(phase: Phase) -> Guard {
 }
 
 pub fn record(phase: Phase, nanos: u64) {
-    SAMPLES[phase as usize].lock().push(nanos);
+    crate::profile_lock!(C29, SAMPLES[phase as usize].lock()).push(nanos);
 }
 
 impl Drop for Guard {
@@ -48,7 +48,7 @@ impl Drop for Guard {
 pub fn take() -> Vec<(Phase, Vec<u64>)> {
     PHASES
         .into_iter()
-        .map(|phase| (phase, std::mem::take(&mut *SAMPLES[phase as usize].lock())))
+        .map(|phase| (phase, std::mem::take(&mut *crate::profile_lock!(C29, SAMPLES[phase as usize].lock()))))
         .collect()
 }
 

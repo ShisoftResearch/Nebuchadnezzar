@@ -272,10 +272,10 @@ impl DictionaryColumn {
     pub async fn refresh(&self) -> Result<(), RPCError> {
         match self.client.read_cell(self.cell_id).await? {
             Ok(cell) => {
-                *self.cached.write() = Dictionary::from_cell(&cell);
+                *crate::profile_lock!(C11, self.cached.write()) = Dictionary::from_cell(&cell);
             }
             Err(ReadError::CellDoesNotExisted) => {
-                *self.cached.write() = Dictionary::default();
+                *crate::profile_lock!(C11, self.cached.write()) = Dictionary::default();
             }
             Err(_) => {}
         }
@@ -284,20 +284,20 @@ impl DictionaryColumn {
 
     /// Decode from the cache. `None` for unset or unknown codes.
     pub fn decode(&self, code: u32) -> Option<String> {
-        self.cached.read().decode(code).map(str::to_owned)
+        crate::profile_lock!(C11, self.cached.read()).decode(code).map(str::to_owned)
     }
 
     /// Encode from the cache without extending it.
     pub fn encode_known(&self, value: &str) -> u32 {
-        self.cached.read().encode(value)
+        crate::profile_lock!(C11, self.cached.read()).encode(value)
     }
 
     pub fn len(&self) -> usize {
-        self.cached.read().len()
+        crate::profile_lock!(C11, self.cached.read()).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cached.read().is_empty()
+        crate::profile_lock!(C11, self.cached.read()).is_empty()
     }
 
     /// Extend the vocabulary with `values` and persist it, then return their
@@ -313,25 +313,25 @@ impl DictionaryColumn {
     ) -> Result<Vec<u32>, DictionaryError> {
         self.refresh().await.map_err(DictionaryError::Rpc)?;
         let needs_extend = {
-            let cached = self.cached.read();
+            let cached = crate::profile_lock!(C11, self.cached.read());
             values
                 .iter()
                 .any(|v| !v.is_empty() && cached.encode(v) == DICTIONARY_UNSET)
         };
 
         if needs_extend {
-            let mut extended = self.cached.read().clone();
+            let mut extended = crate::profile_lock!(C11, self.cached.read()).clone();
             extended.merge(values.iter().cloned());
             let cell = extended.to_cell(&self.cell_id);
             match self.client.upsert_cell(cell).await.map_err(DictionaryError::Rpc)? {
                 Ok(_) => {
-                    *self.cached.write() = extended;
+                    *crate::profile_lock!(C11, self.cached.write()) = extended;
                 }
                 Err(e) => return Err(DictionaryError::Write(e)),
             }
         }
 
-        let cached = self.cached.read();
+        let cached = crate::profile_lock!(C11, self.cached.read());
         Ok(values.iter().map(|v| cached.encode(v)).collect())
     }
 }

@@ -521,24 +521,24 @@ impl BracketLedger {
     }
 
     fn note_late_loser(&self, cell: PendingBracketCell) {
-        self.late_losers.lock().push(cell);
+        crate::profile_lock!(C08_late_losers, self.late_losers.lock()).push(cell);
     }
 
     fn note_plain_delete(&self, chunk_id: usize, hash: u64, mark: DeleteMark) {
         // A flat list while the scan runs: one entry per tombstone in the
         // store, so it must not pay for a hash table's growth spikes. It is
         // indexed once the scan's per-chunk version maps are gone.
-        self.plain_deletes.lock().push(((chunk_id, hash), mark));
+        crate::profile_lock!(C08_plain_deletes, self.plain_deletes.lock()).push(((chunk_id, hash), mark));
     }
 
     /// A second cell entry with the very same version as the one installed.
     fn note_tie(&self, chunk_id: usize, hash: u64) {
-        *self.ties.lock().entry((chunk_id, hash)).or_insert(0) += 1;
+        *crate::profile_lock!(C08_ties, self.ties.lock()).entry((chunk_id, hash)).or_insert(0) += 1;
     }
 
     fn note_pending(&self, txn: &crate::server::transactions::TxnId, cell: PendingBracketCell) {
-        self.pending
-            .lock()
+        crate::profile_lock!(C08_pending, self.pending
+            .lock())
             .entry(txn.clone())
             .or_insert_with(Vec::new)
             .push(cell);
@@ -549,14 +549,14 @@ impl BracketLedger {
         txn: &crate::server::transactions::TxnId,
         manifest: Vec<crate::ram::bracket::ManifestEntry>,
     ) {
-        self.commits.lock().insert(txn.clone(), manifest);
+        crate::profile_lock!(C08_commits, self.commits.lock()).insert(txn.clone(), manifest);
     }
 
     /// Every part of a transaction names the same set; the first one seen
     /// is kept.
     fn note_participants(&self, txn: &crate::server::transactions::TxnId, participants: Vec<u64>) {
-        self.participants
-            .lock()
+        crate::profile_lock!(C08_participants, self.participants
+            .lock())
             .entry(txn.clone())
             .or_insert(participants);
     }
@@ -574,8 +574,8 @@ impl BracketLedger {
     /// told to commit. Both halves are handed back so the store can ask its
     /// peers before deciding: see [`RecoveredBrackets`].
     pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, SettleError> {
-        let mut commits = std::mem::take(&mut *self.commits.lock());
-        let mut participants = std::mem::take(&mut *self.participants.lock());
+        let mut commits = std::mem::take(&mut *crate::profile_lock!(C08_commits, self.commits.lock()));
+        let mut participants = std::mem::take(&mut *crate::profile_lock!(C08_participants, self.participants.lock()));
         // An open bracket of a transaction whose status cell this store holds
         // is committed (D31): a status cell in the index came from a
         // committed bracket, and it survives the compaction that drops the
@@ -585,14 +585,14 @@ impl BracketLedger {
         // it only after the transaction is decided COMMIT (the coordinator's
         // `end`, or a participant's `Committed`), and a fenced site never
         // writes it.
-        let status_ids: std::collections::HashSet<(usize, u64)> = self
+        let status_ids: std::collections::HashSet<(usize, u64)> = crate::profile_lock!(C08_status_cells, self
             .status_cells
-            .lock()
+            .lock())
             .iter()
             .map(|(chunk_id, id)| (*chunk_id, id.bits()))
             .collect();
         if !status_ids.is_empty() {
-            for (txn, cells) in self.pending.lock().iter() {
+            for (txn, cells) in crate::profile_lock!(C08_pending, self.pending.lock()).iter() {
                 let own_status_cell = cells.iter().any(|cell| {
                     !cell.tombstone
                         && status_ids.contains(&(cell.chunk_id, cell.hash))
@@ -612,7 +612,7 @@ impl BracketLedger {
             }
         }
         for found in &found_before {
-            if !commits.contains_key(&found.txn) && self.pending.lock().contains_key(&found.txn) {
+            if !commits.contains_key(&found.txn) && crate::profile_lock!(C08_pending, self.pending.lock()).contains_key(&found.txn) {
                 info!(
                     "transaction {:?} has an open bracket here and its status cell; it is \
                      committed",
@@ -621,9 +621,9 @@ impl BracketLedger {
                 commits.insert(found.txn.clone(), Vec::new());
             }
         }
-        let closed = self.closed_parts.lock();
+        let closed = crate::profile_lock!(C08_closed_parts, self.closed_parts.lock());
         let mut incomplete = std::collections::HashSet::new();
-        for (txn, parts) in self.parts.lock().iter() {
+        for (txn, parts) in crate::profile_lock!(C08_parts, self.parts.lock()).iter() {
             // A missing local decision cannot be replaced by lease absence.
             // Keep every part, including the surviving COMMIT, until settlement.
             if !parts
@@ -639,8 +639,8 @@ impl BracketLedger {
             }
         }
         drop(closed);
-        let parts = self.parts.lock();
-        let mut pending = std::mem::take(&mut *self.pending.lock());
+        let parts = crate::profile_lock!(C08_parts, self.parts.lock());
+        let mut pending = std::mem::take(&mut *crate::profile_lock!(C08_pending, self.pending.lock()));
         // Floors count physical tombstones, including undecided brackets.
         // Their versions constrain a future create without deciding the bracket.
         for cells in pending.values() {
@@ -688,7 +688,7 @@ impl BracketLedger {
                 );
             }
             if incomplete.contains(&txn) {
-                self.resolved_rewrites.lock().push(InDoubtBracket {
+                crate::profile_lock!(C08_resolved_rewrites, self.resolved_rewrites.lock()).push(InDoubtBracket {
                     txn: txn.clone(),
                     chunks: cells.iter().map(|cell| cell.chunk_id).collect(),
                     cells: cells.clone(),
@@ -705,8 +705,8 @@ impl BracketLedger {
         // back) and a re-create before the delete it follows (the id was
         // lost).
         let mut plain_deletes = DeleteBook::from_scan(
-            std::mem::take(&mut *self.plain_deletes.lock()),
-            std::mem::take(&mut *self.ties.lock()),
+            std::mem::take(&mut *crate::profile_lock!(C08_plain_deletes, self.plain_deletes.lock())),
+            std::mem::take(&mut *crate::profile_lock!(C08_ties, self.ties.lock())),
         );
         for &((chunk_id, hash), mark) in &plain_deletes.plain {
             chunks[chunk_id].note_deleted_version(hash, mark.version);
@@ -715,7 +715,7 @@ impl BracketLedger {
         apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes))?;
         // A late loser comes back only if it is provably a re-create (see
         // `DeleteMark::kills`); otherwise the version rule keeps it out.
-        let late_losers = std::mem::take(&mut *self.late_losers.lock());
+        let late_losers = std::mem::take(&mut *crate::profile_lock!(C08_late_losers, self.late_losers.lock()));
         apply_bracketed_cells(chunks, late_losers, Some(&mut plain_deletes))?;
         // What is left has no COMMIT anywhere, and that now means exactly one
         // thing: the transaction was in flight when the store stopped.
@@ -766,7 +766,7 @@ impl BracketLedger {
     ) -> Result<Vec<crate::ram::txn_status::FoundStatusCell>, SettleError> {
         let mut seen = std::collections::HashSet::new();
         let mut found = Vec::new();
-        for (chunk_id, id) in self.status_cells.lock().iter() {
+        for (chunk_id, id) in crate::profile_lock!(C08_status_cells, self.status_cells.lock()).iter() {
             if !seen.insert((*chunk_id, id.bits())) {
                 continue;
             }
@@ -1897,9 +1897,9 @@ fn scan_segment_from_data(
                 match crate::ram::bracket::decode_begin(content) {
                     Ok(begin) => {
                         ledger.note_participants(&begin.txn, begin.participants);
-                        ledger
+                        crate::profile_lock!(C08_parts, ledger
                             .parts
-                            .lock()
+                            .lock())
                             .entry(begin.txn.clone())
                             .or_default()
                             .insert((chunk.id, seg_id));
@@ -1933,9 +1933,9 @@ fn scan_segment_from_data(
                         // not decided in this segment: a cross-chunk
                         // transaction is committed as a whole, so the ledger
                         // settles it once every COMMIT is known.
-                        ledger
+                        crate::profile_lock!(C08_closed_parts, ledger
                             .closed_parts
-                            .lock()
+                            .lock())
                             .entry(commit_txn.clone())
                             .or_default()
                             .insert((chunk.id, seg_id));
@@ -1993,7 +1993,7 @@ fn scan_segment_from_data(
                     &mut first_missing_schema_id,
                 )?;
                 if cell_header.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
-                    ledger.status_cells.lock().push((chunk.id, cell_header.id));
+                    crate::profile_lock!(C08_status_cells, ledger.status_cells.lock()).push((chunk.id, cell_header.id));
                 }
                 // The id floor is raised even for a transaction that turns
                 // out uncommitted: the id reached disk, so reissuing it would
@@ -2051,7 +2051,7 @@ fn scan_segment_from_data(
                 &mut first_missing_schema_id,
             )?;
             if cell_header.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
-                ledger.status_cells.lock().push((chunk.id, cell_header.id));
+                crate::profile_lock!(C08_status_cells, ledger.status_cells.lock()).push((chunk.id, cell_header.id));
             }
             let hash = cell_header.id.bits();
             let new_version = cell_header.version;
@@ -2652,8 +2652,8 @@ pub fn recover_chunks(
                         .unwrap_or(false);
 
                     let undecided_wal = !file_info.is_backup && {
-                        let parts = bracket_ledger.parts.lock();
-                        let closed = bracket_ledger.closed_parts.lock();
+                        let parts = crate::profile_lock!(C08_parts, bracket_ledger.parts.lock());
+                        let closed = crate::profile_lock!(C08_closed_parts, bracket_ledger.closed_parts.lock());
                         parts.iter().any(|(txn, members)| {
                             members.contains(&(chunk_id, file_info.seg_id))
                                 && !closed.get(txn).is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id)))
@@ -2758,7 +2758,7 @@ pub fn recover_chunks(
                 }
 
                 if !local_stashed.is_empty() {
-                    all_stashed_tombstones.lock().extend(local_stashed);
+                    crate::profile_lock!(C09, all_stashed_tombstones.lock()).extend(local_stashed);
                 }
                 Ok(())
             },
@@ -2806,7 +2806,7 @@ pub fn recover_chunks(
         chunk.reset_write_heads_after_recovery()?;
     }
 
-    for bracket in std::mem::take(&mut *bracket_ledger.resolved_rewrites.lock()) {
+    for bracket in std::mem::take(&mut *crate::profile_lock!(C08_resolved_rewrites, bracket_ledger.resolved_rewrites.lock())) {
         rewrite_resolved_entries(chunks, &bracket.cells).map_err(|error| {
             io::Error::other(format!("resolved transaction rewrite failed: {error:?}"))
         })?;

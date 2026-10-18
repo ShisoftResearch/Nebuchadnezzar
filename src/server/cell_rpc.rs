@@ -1070,7 +1070,7 @@ impl Service for NebRPCService {
 
     fn cell_scan_open(&self) -> BoxFuture<'_, u64> {
         let scans = &self.cell_scans;
-        let mut open = scans.open.lock();
+        let mut open = crate::profile_lock!(H23, scans.open.lock());
         open.retain(|_, scan| scan.last_used.elapsed() < CELL_SCAN_IDLE);
         let id = scans
             .next_id
@@ -1092,7 +1092,7 @@ impl Service for NebRPCService {
         let max = (max as usize).max(1);
         let result = (|| {
             let chunks = self.database_runtime.chunks();
-            let mut open = self.cell_scans.open.lock();
+            let mut open = crate::profile_lock!(H23, self.cell_scans.open.lock());
             let scan = open
                 .get_mut(&cursor)
                 .ok_or_else(|| format!("cell scan {cursor} is not open (expired or closed)"))?;
@@ -1162,7 +1162,7 @@ impl Service for NebRPCService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let lease = std::time::Duration::from_millis(lease_ms.max(1));
-            leases.holds.lock().insert(
+            crate::profile_lock!(C05, leases.holds.lock()).insert(
                 token,
                 LeasedFence {
                     _hold: hold,
@@ -1174,7 +1174,7 @@ impl Service for NebRPCService {
             tokio::spawn(async move {
                 loop {
                     let wait = {
-                        let holds = leases.holds.lock();
+                        let holds = crate::profile_lock!(C05, leases.holds.lock());
                         match holds.get(&token) {
                             None => return,
                             Some(held) => held
@@ -1183,7 +1183,7 @@ impl Service for NebRPCService {
                         }
                     };
                     if wait.is_zero() {
-                        if leases.holds.lock().remove(&token).is_some() {
+                        if crate::profile_lock!(C05, leases.holds.lock()).remove(&token).is_some() {
                             warn!(
                                 "write fence lease {token} lapsed without a renewal; fence lifted"
                             );
@@ -1199,7 +1199,7 @@ impl Service for NebRPCService {
     }
 
     fn fence_renew(&self, token: u64, lease_ms: u64) -> BoxFuture<'_, bool> {
-        let mut holds = self.fence_leases.holds.lock();
+        let mut holds = crate::profile_lock!(C05, self.fence_leases.holds.lock());
         let renewed = match holds.get_mut(&token) {
             Some(held) => {
                 held.expires =
@@ -1212,12 +1212,12 @@ impl Service for NebRPCService {
     }
 
     fn fence_release(&self, token: u64) -> BoxFuture<'_, ()> {
-        self.fence_leases.holds.lock().remove(&token);
+        crate::profile_lock!(C05, self.fence_leases.holds.lock()).remove(&token);
         future::ready(()).boxed()
     }
 
     fn cell_scan_close(&self, cursor: u64) -> BoxFuture<'_, ()> {
-        self.cell_scans.open.lock().remove(&cursor);
+        crate::profile_lock!(H23, self.cell_scans.open.lock()).remove(&cursor);
         future::ready(()).boxed()
     }
 
@@ -1497,7 +1497,7 @@ impl Service for NebRPCService {
         commit: bool,
     ) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let (receipts, derived, acknowledged) = self.captured_receipts.lock().take(tokens)?;
+            let (receipts, derived, acknowledged) = crate::profile_lock!(H24, self.captured_receipts.lock()).take(tokens)?;
             if !commit {
                 return Ok(());
             }
@@ -2031,8 +2031,8 @@ impl NebRPCService {
                     }
                     let derived = RPC_CAPTURE_HAS_INDICES.with(|flag| flag.get());
                     let tokens =
-                        self.captured_receipts
-                            .lock()
+                        crate::profile_lock!(H24, self.captured_receipts
+                            .lock())
                             .store(receipts, derived, result.is_ok());
                     (result, tokens)
                 }),

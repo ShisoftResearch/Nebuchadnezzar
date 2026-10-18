@@ -20,3 +20,6 @@ pub fn upper_power_of_2(mut v: usize) -> usize {
 pub fn thread_id() -> u64 {
     thread::current().id().as_u64().get()
 }
+
+#[macro_use]
+pub mod lock_profile;

@@ -32,7 +32,7 @@ pub static INDEX_PAGE_IMAGES_WRITTEN: std::sync::atomic::AtomicU64 =
 
 pub struct WriteBackHub {
     // Page upserts. Drained in batches by any worker.
-    queue: SegQueue<(usize, external::ChangingNode)>,
+    queue: SegQueue<QueuedChange>,
     // Page deletions, fenced: a deletion enqueued at id D executes only
     // once progress covers every id before D — i.e. every modification
     // (and earlier deletion) enqueued before it is durable. Without the
@@ -80,6 +80,13 @@ pub struct WriteBackHub {
     completions: Mutex<BTreeSet<usize>>,
 }
 
+struct QueuedChange {
+    id: usize,
+    changing: external::ChangingNode,
+    #[cfg(feature = "lock_profile")]
+    queued: crate::utils::lock_profile::Wait,
+}
+
 // Bounded so a permanently failing store cannot wedge shutdown: ~200
 // attempts at 100ms is ~20s of genuine transient-failure tolerance.
 const WRITE_BACK_MAX_ATTEMPTS: u32 = 200;
@@ -108,7 +115,7 @@ fn write_back_worker_count() -> usize {
 
 /// The hub owning write-back state for the server behind `client`.
 pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
-    let mut hubs = HUBS.lock().expect("write-back hub registry poisoned");
+    let mut hubs = crate::profile_lock!(C14, HUBS.lock().expect("write-back hub registry poisoned"));
     hubs.retain(|(c, _)| c.strong_count() > 0);
     for (c, hub) in hubs.iter() {
         if let Some(existing) = c.upgrade() {
@@ -135,8 +142,8 @@ pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
 }
 
 fn all_hubs() -> Vec<Arc<WriteBackHub>> {
-    HUBS.lock()
-        .expect("write-back hub registry poisoned")
+    crate::profile_lock!(C14, HUBS.lock()
+        .expect("write-back hub registry poisoned"))
         .iter()
         .map(|(_, hub)| hub.clone())
         .collect()
@@ -176,16 +183,19 @@ impl WriteBackHub {
                 // Ids for deletions are drawn from the same counter as
                 // modifications, so "progress reached id-1" means every
                 // change enqueued before this deletion is durable.
-                let mut deletions = self
+                let mut deletions = crate::profile_lock!(H06_deletions, self
                     .deletions
                     .lock()
-                    .expect("write-back deletion lane poisoned");
+                    .expect("write-back deletion lane poisoned"));
                 let id = self.counter.fetch_add(1, Ordering::Relaxed);
                 deletions.push_back((id, cid, cl));
             }
             changing => {
                 let id = self.counter.fetch_add(1, Ordering::Relaxed);
-                self.queue.push((id, changing));
+                self.queue.push(QueuedChange { id, changing,
+                    #[cfg(feature = "lock_profile")]
+                    queued: crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H06_worker),
+                });
             }
         }
     }
@@ -195,10 +205,10 @@ impl WriteBackHub {
         &self,
     ) -> Vec<(usize, crate::ram::types::Id, Arc<client::AsyncClient>)> {
         let progress = self.progress.load(Ordering::Acquire);
-        let mut deletions = self
+        let mut deletions = crate::profile_lock!(H06_deletions, self
             .deletions
             .lock()
-            .expect("write-back deletion lane poisoned");
+            .expect("write-back deletion lane poisoned"));
         let mut ready = Vec::new();
         while let Some(&(id, _, _)) = deletions.front() {
             let fenced = id == 0 || (progress != usize::MAX && progress >= id - 1);
@@ -211,10 +221,10 @@ impl WriteBackHub {
     }
 
     fn record_completed(&self, id: usize) {
-        let mut completions = self
+        let mut completions = crate::profile_lock!(H06_completions, self
             .completions
             .lock()
-            .expect("write-back completion lock poisoned");
+            .expect("write-back completion lock poisoned"));
         let current = self.progress.load(Ordering::Acquire);
         let expected = if current == usize::MAX {
             0
@@ -280,6 +290,8 @@ impl WriteBackHub {
                     // progress chain still advances even if the task is
                     // cancelled mid-flush (drop records the id).
                     let mut guards: Vec<CompletionGuard> = Vec::new();
+                    #[cfg(feature = "lock_profile")]
+                    let mut worker_profiles = Vec::new();
                     let mut cells: Vec<crate::ram::cell::OwnedCell> = Vec::new();
                     let mut batch_client: Option<Arc<client::AsyncClient>> = None;
                     // Node addresses already serialized into THIS batch. Any
@@ -290,9 +302,13 @@ impl WriteBackHub {
                         std::collections::HashSet::new();
                     let mut built_refs: Vec<super::NodeCellRef> = Vec::new();
                     for _ in 0..BATCH {
-                        let Some((id, changing)) = hub.queue.pop() else {
+                        let Some(queued) = hub.queue.pop() else {
                             break;
                         };
+                        let id = queued.id;
+                        let changing = queued.changing;
+                        #[cfg(feature = "lock_profile")]
+                        worker_profiles.push(queued.queued.acquired(()));
                         let guard = CompletionGuard {
                             hub: hub.clone(),
                             id,
@@ -503,9 +519,9 @@ impl WriteBackHub {
                                     // again and relieve the chunk that caused
                                     // this in the first place.
                                     let requeued = retry.len();
-                                    hub.retry_lane
+                                    crate::profile_lock!(H06_retry, hub.retry_lane
                                         .lock()
-                                        .expect("write-back retry lane poisoned")
+                                        .expect("write-back retry lane poisoned"))
                                         .push((client.clone(), std::mem::take(&mut retry)));
                                     warn!(
                                         "write-back worker {} re-queued {} abandoned cell(s) for a \
@@ -534,6 +550,8 @@ impl WriteBackHub {
                     }
                     // Modification ids complete here, advancing the fence.
                     drop(guards);
+                    #[cfg(feature = "lock_profile")]
+                    drop(worker_profiles);
 
                     // Deletions run only once every change enqueued before
                     // them is durable, so a crash can never persist a page
@@ -585,10 +603,10 @@ impl WriteBackHub {
     /// any page is missing.
     async fn retry_abandoned(self: &Arc<Self>, worker_id: usize) {
         let batches = {
-            let mut lane = self
+            let mut lane = crate::profile_lock!(H06_retry, self
                 .retry_lane
                 .lock()
-                .expect("write-back retry lane poisoned");
+                .expect("write-back retry lane poisoned"));
             if lane.is_empty() {
                 return;
             }
@@ -639,10 +657,10 @@ impl WriteBackHub {
         }
         let drained = still_failing.is_empty();
         if !drained {
-            let mut lane = self
+            let mut lane = crate::profile_lock!(H06_retry, self
                 .retry_lane
                 .lock()
-                .expect("write-back retry lane poisoned");
+                .expect("write-back retry lane poisoned"));
             lane.extend(still_failing);
         }
         if landed > 0 {
@@ -718,18 +736,18 @@ impl WriteBackHub {
         self.should_stop.store(true, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(150)).await;
         self.progress.store(usize::MAX, Ordering::SeqCst);
-        self.completions
+        crate::profile_lock!(H06_completions, self.completions
             .lock()
-            .expect("write-back completion lock poisoned")
+            .expect("write-back completion lock poisoned"))
             .clear();
         self.counter.store(0, Ordering::SeqCst);
         self.barrier_failed.store(false, Ordering::SeqCst);
         self.permanent_loss.store(false, Ordering::SeqCst);
         let abandoned = {
-            let mut lane = self
+            let mut lane = crate::profile_lock!(H06_retry, self
                 .retry_lane
                 .lock()
-                .expect("write-back retry lane poisoned");
+                .expect("write-back retry lane poisoned"));
             let count: usize = lane.iter().map(|(_, cells)| cells.len()).sum();
             lane.clear();
             count
@@ -751,10 +769,10 @@ impl WriteBackHub {
             discarded_pages += 1;
         }
         let discarded_deletes = {
-            let mut deletions = self
+            let mut deletions = crate::profile_lock!(H06_deletions, self
                 .deletions
                 .lock()
-                .expect("write-back deletion lane poisoned");
+                .expect("write-back deletion lane poisoned"));
             let n = deletions.len();
             deletions.clear();
             n
@@ -796,8 +814,8 @@ pub async fn reset_write_back_state() {
     for hub in all_hubs() {
         hub.reset().await;
     }
-    HUBS.lock()
-        .expect("write-back hub registry poisoned")
+    crate::profile_lock!(C14, HUBS.lock()
+        .expect("write-back hub registry poisoned"))
         .clear();
     debug!("B-tree write-back state reset");
 }
@@ -868,7 +886,7 @@ mod tests {
         // A worker gave up on a page it could not place: the barrier is down
         // and stays down while the image is outstanding.
         hub.barrier_failed.store(true, Ordering::SeqCst);
-        hub.retry_lane.lock().unwrap().push((
+        crate::profile_lock!(H06_retry, hub.retry_lane.lock().unwrap()).push((
             client.clone(),
             vec![page_cell_for_test(Id::from_parts(7, 7))],
         ));
@@ -881,13 +899,13 @@ mod tests {
         // barrier must come back -- otherwise no tree can ever split again.
         for _ in 0..40 {
             hub.retry_abandoned(0).await;
-            if hub.retry_lane.lock().unwrap().is_empty() {
+            if crate::profile_lock!(H06_retry, hub.retry_lane.lock().unwrap()).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
-            hub.retry_lane.lock().unwrap().is_empty(),
+            crate::profile_lock!(H06_retry, hub.retry_lane.lock().unwrap()).is_empty(),
             "the abandoned image should have been placed once the store could take it"
         );
         assert!(

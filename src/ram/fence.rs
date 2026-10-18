@@ -170,7 +170,7 @@ impl FenceLog {
     /// Keep `fences` and only those: write them to a new log, sync it, and
     /// put it in place of the old one.
     pub fn reset(&self, fences: BTreeSet<TxnId>) -> io::Result<()> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H14, self.state.lock());
         if let Some(path) = &self.path {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -203,7 +203,7 @@ impl FenceLog {
     /// Record a fence of `txn`, synced. Returns only when a power loss can
     /// no longer drop it.
     pub fn record(&self, txn: &TxnId) -> io::Result<()> {
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H14, self.state.lock());
         if state.fenced.contains(txn) {
             return Ok(());
         }
@@ -246,7 +246,7 @@ impl FenceLog {
         if self.count.load(Ordering::Acquire) == 0 {
             return false;
         }
-        self.state.lock().fenced.contains(txn)
+        crate::profile_lock!(H14, self.state.lock()).fenced.contains(txn)
     }
 
     pub fn len(&self) -> usize {

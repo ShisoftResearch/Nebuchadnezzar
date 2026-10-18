@@ -1941,7 +1941,7 @@ impl LocalSchemasMap {
     }
 
     fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
-        let _writer = self.writer.lock();
+        let _writer = crate::profile_lock!(C10, self.writer.lock());
         let Some(existing) = self.schema_map.get(&vid) else {
             return false;
         };
@@ -1996,7 +1996,7 @@ impl LocalSchemasMap {
     }
 
     fn new_schema(&self, schema: Schema) {
-        let _writer = self.writer.lock();
+        let _writer = crate::profile_lock!(C10, self.writer.lock());
         self.new_schema_locked(schema);
         self.advance_epoch();
     }
@@ -2075,7 +2075,7 @@ impl LocalSchemasMap {
     /// believes is current, in that order: a moment with no current generation
     /// would make every write to the family fail to resolve.
     fn evolve_schema(&self, evolved: Schema) {
-        let _writer = self.writer.lock();
+        let _writer = crate::profile_lock!(C10, self.writer.lock());
         let uid = evolved.uid;
         let new_vid = evolved.vid;
         let previous = self.handles.get(&uid);
@@ -2099,7 +2099,7 @@ impl LocalSchemasMap {
     }
 
     fn rename_schema(&self, uid: SchemaUid, new_name: &str) {
-        let _writer = self.writer.lock();
+        let _writer = crate::profile_lock!(C10, self.writer.lock());
         let Some(current_vid) = self.handles.get(&uid) else {
             debug!(
                 "Ignoring rename of unknown schema family {} to {}",
@@ -2131,7 +2131,7 @@ impl LocalSchemasMap {
     }
 
     fn del_schema(&self, name: &str) {
-        let _writer = self.writer.lock();
+        let _writer = crate::profile_lock!(C10, self.writer.lock());
         let Some(uid) = self.name_map.remove(&(name.to_owned())) else {
             return;
         };

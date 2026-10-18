@@ -657,7 +657,7 @@ impl Service for TransactionManager {
             error!("Transaction id existed: {:?}", id);
             future::ready(Err(TMError::TransactionIdExisted)).boxed()
         } else {
-            self.txn_ids.lock().insert(id.clone());
+            crate::profile_lock!(H16, self.txn_ids.lock()).insert(id.clone());
             future::ready(Ok(id)).boxed()
         }
     }
@@ -1976,14 +1976,14 @@ impl TransactionManager {
         if pinned_servers.is_empty() {
             return;
         }
-        self.pending_pin_releases.lock().push((tid, pinned_servers));
+        crate::profile_lock!(H15, self.pending_pin_releases.lock()).push((tid, pinned_servers));
     }
     /// Drain the queued releases and send one batched RPC per participant.
     /// Best-effort: individual failures are logged and dropped; the
     /// participant's stale cleanup remains the backstop.
     async fn flush_pin_releases(&self) {
         let pending: Vec<(TxnId, HashSet<u64>)> = {
-            let mut queue = self.pending_pin_releases.lock();
+            let mut queue = crate::profile_lock!(H15, self.pending_pin_releases.lock());
             if queue.is_empty() {
                 return;
             }
@@ -2056,7 +2056,7 @@ impl TransactionManager {
         txn.state = TxnState::Cleanup;
         txn.last_activity = get_time();
         let _ = self.transactions.remove(tid);
-        self.txn_ids.lock().remove(tid);
+        crate::profile_lock!(H16, self.txn_ids.lock()).remove(tid);
     }
 
     fn cleanup_transaction(&self, tid: &TxnId) {
@@ -2064,7 +2064,7 @@ impl TransactionManager {
             let mut txn_guard = txn.lock_blocking();
             self.cleanup_transaction_guarded(tid, &mut txn_guard);
         } else {
-            self.txn_ids.lock().remove(tid);
+            crate::profile_lock!(H16, self.txn_ids.lock()).remove(tid);
         }
     }
 
@@ -2082,7 +2082,7 @@ impl TransactionManager {
 
         // Collect stale transaction IDs
         let stale_txns: Vec<TxnId> = {
-            let txn_ids = self.txn_ids.lock();
+            let txn_ids = crate::profile_lock!(H16, self.txn_ids.lock());
             txn_ids
                 .iter()
                 .filter_map(|tid| {

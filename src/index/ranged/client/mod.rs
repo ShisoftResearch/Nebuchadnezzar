@@ -565,7 +565,7 @@ impl RangedIndexerClient {
         let mut tree_prop = None;
         if !ensure_updated {
             if let Some((lower, (placement, upper))) =
-                self.placement.read().range(..key.clone()).last()
+                crate::profile_lock!(H58, self.placement.read()).range(..key.clone()).last()
             {
                 if key >= lower && key < upper {
                     tree_prop = Some((lower.clone(), placement.clone(), upper.clone()));
@@ -631,8 +631,8 @@ impl RangedIndexerClient {
             lower,
             upper
         );
-        self.placement
-            .write()
+        crate::profile_lock!(H58, self.placement
+            .write())
             .insert(lower.clone(), (placement.clone(), upper.clone()));
         return Ok(Some((lower, placement, upper)));
     }
@@ -658,7 +658,7 @@ impl RangedIndexerClient {
         // !Send and un-spawnable (the guard was dynamically dead -- the
         // explicit drop -- but the generator still carried its slot).
         let cached_origin = {
-            let placement = self.placement.read();
+            let placement = crate::profile_lock!(H58, self.placement.read());
             placement
                 .range(..=origin_key.clone())
                 .last()
@@ -676,7 +676,7 @@ impl RangedIndexerClient {
         };
 
         {
-            let placement = self.placement.read();
+            let placement = crate::profile_lock!(H58, self.placement.read());
             let (_origin_place, origin_upper) = match placement.get(&origin_lower) {
                 Some(t) => t,
                 None => {
@@ -721,8 +721,8 @@ impl RangedIndexerClient {
         // a scan.
         Ok(match self.sm.next_tree(&origin_lower, &ordering).await? {
             Some(next) => {
-                self.placement
-                    .write()
+                crate::profile_lock!(H58, self.placement
+                    .write())
                     .insert(next.lower.clone(), (next.placement.clone(), next.upper));
                 NextTree::Found(next.lower, next.placement)
             }

@@ -155,8 +155,8 @@ impl HashIndexer {
 
     /// Coalescing slot for one bucket, created on demand.
     fn bucket(&self, index_id: &Id) -> Arc<Bucket> {
-        self.buckets
-            .lock()
+        crate::profile_lock!(H19, self.buckets
+            .lock())
             .entry(*index_id)
             .or_insert_with(|| Arc::new(Bucket::default()))
             .clone()
@@ -169,7 +169,7 @@ impl HashIndexer {
     /// means the map is the last owner. Racing a newcomer is harmless -- it
     /// gets a fresh slot, coalesces with nobody, and its CAS still applies.
     fn release_bucket(&self, index_id: &Id) {
-        let mut buckets = self.buckets.lock();
+        let mut buckets = crate::profile_lock!(H19, self.buckets.lock());
         let drop_it = buckets
             .get(index_id)
             .is_some_and(|b| Arc::strong_count(b) == 1 && b.pending.lock().is_empty());

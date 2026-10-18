@@ -241,7 +241,7 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
     if !enqueue {
         return;
     }
-    WAL_DIRTY.lock().push(seg.clone());
+    crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
 
     static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SYNCER.get_or_init(|| {
@@ -261,7 +261,7 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
                     std::thread::sleep(std::time::Duration::from_millis(
                         wal_sync_interval_ms().max(1) as u64,
                     ));
-                    let dirty = std::mem::take(&mut *WAL_DIRTY.lock());
+                    let dirty = std::mem::take(&mut *crate::profile_lock!(H20, WAL_DIRTY.lock()));
                     pool.install(|| dirty.into_par_iter().for_each(sync_dirty_segment));
                 }
             })
@@ -270,7 +270,7 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
 }
 fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     let Some(_job) = seg.protection.job() else {
-        WAL_DIRTY.lock().push(seg.clone());
+        crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
         return;
     };
     // Bytes journaled during this sync must enqueue another pass.
@@ -278,7 +278,7 @@ fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     #[cfg(test)]
     if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
         seg.wal_sync_queued.store(true, Ordering::Release);
-        WAL_DIRTY.lock().push(seg.clone());
+        crate::profile_lock!(H20, WAL_DIRTY.lock()).push(seg.clone());
         return;
     }
     if seg.wal_pending_bytes() > 0 {
@@ -657,12 +657,16 @@ struct ArchiveStagingPool {
 
 impl ArchiveStagingPool {
     fn acquire(&self) -> ArchiveStagingGuard<'_> {
+        #[cfg(feature = "lock_profile")]
+        let capacity_wait = crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
         // During snapshot, compression, and write, holders take no lock and wait for no thread.
-        let mut state = self.state.lock();
+        let mut state = crate::profile_lock!(H43_mutex, self.state.lock());
         loop {
             if let Some(buffer) = state.idle.pop() {
                 return ArchiveStagingGuard {
                     pool: self,
+                    #[cfg(feature = "lock_profile")]
+                    _profile: capacity_wait.acquired(()),
                     buffer: Some(buffer),
                 };
             }
@@ -671,9 +675,14 @@ impl ArchiveStagingPool {
                 drop(state);
                 return ArchiveStagingGuard {
                     pool: self,
+                    #[cfg(feature = "lock_profile")]
+                    _profile: capacity_wait.acquired(()),
                     buffer: Some(vec![0; SEGMENT_SIZE]),
                 };
             }
+            #[cfg(feature = "lock_profile")]
+            state.suspend(|guard| self.available.wait(guard));
+            #[cfg(not(feature = "lock_profile"))]
             self.available.wait(&mut state);
         }
     }
@@ -686,6 +695,8 @@ fn archive_staging_pool() -> &'static ArchiveStagingPool {
 
 /// Return the buffer on success, an I/O error, or a panic.
 struct ArchiveStagingGuard<'a> {
+    #[cfg(feature = "lock_profile")]
+    _profile: crate::utils::lock_profile::Guard<()>,
     pool: &'a ArchiveStagingPool,
     buffer: Option<Vec<u8>>,
 }
@@ -700,9 +711,7 @@ impl ArchiveStagingGuard<'_> {
 
 impl Drop for ArchiveStagingGuard<'_> {
     fn drop(&mut self) {
-        self.pool
-            .state
-            .lock()
+        crate::profile_lock!(H43_mutex, self.pool.state.lock())
             .idle
             .push(self.buffer.take().unwrap());
         self.pool.available.notify_one();
