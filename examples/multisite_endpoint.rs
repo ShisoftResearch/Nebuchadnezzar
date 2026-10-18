@@ -71,6 +71,10 @@ async fn main() {
                             std::fs::rename(control.join("raft-state.out.tmp"), control.join("raft-state.out")).unwrap();
                             std::fs::remove_file(control.join("raft-state")).unwrap();
                         }
+                        if let Ok(count) = std::fs::read_to_string(control.join("stale-ring-reads")) {
+                            server.conshash().inject_stale_reads(count.trim().parse().unwrap());
+                            std::fs::remove_file(control.join("stale-ring-reads")).unwrap();
+                        }
                         if let Ok(target) = std::fs::read_to_string(control.join("direct-ping")) {
                             bifrost::membership::msraft_ping(&target, server.server_id).await;
                         }
