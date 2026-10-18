@@ -15,7 +15,7 @@ static VERIFIED_READ_BATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static VERIFIED_CELL_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Candidate cell reads requested for index verification, including cache hits.
+/// Candidate cell reads requested for index verification.
 pub fn verified_cell_reads() -> usize {
     VERIFIED_CELL_READS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -58,6 +58,10 @@ pub(crate) fn matches<C: Cell>(
 where
     <C::Value as Value>::Out: ToOwnedValue,
 {
+    #[cfg(test)]
+    if control("NEB_TEST_IDCONTRACT_SKIP_VERIFY") {
+        return Ok(());
+    }
     if checks
         .iter()
         .any(|check| matches!(check, IndexCheck::Schema(uid) if schema.uid != *uid))
@@ -153,7 +157,12 @@ pub(crate) fn query_schema(schema: &Schema, checks: &[IndexCheck]) -> Schema {
 #[inline]
 pub(crate) fn control(name: &str) -> bool {
     #[cfg(test)]
-    { std::env::var_os(name).is_some() }
+    {
+        std::env::var_os(name).is_some()
+    }
     #[cfg(not(test))]
-    { let _ = name; false }
+    {
+        let _ = name;
+        false
+    }
 }
