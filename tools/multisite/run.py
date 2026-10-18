@@ -611,6 +611,30 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
+        if self.args.probe == 'point-stop':
+            victim, point = self.args.victim, self.args.cut_point
+            other = 1 if victim == 0 else 0
+            request = {'op':'txn','id':'point-stop','keys':[[91+victim,9000],[91+other,9000]],'value':9,
+                       'coordinator':other if self.args.coordinator < 0 else self.args.coordinator,'durable':self.args.durable}
+            self.arm(victim, point)
+            client.send(request)
+            self.wait_pause(victim, point)
+            if self.args.kind == 'graceful':
+                self.servers[victim].proc.terminate()
+                (self.root/f'control-{victim}'/'resume').touch()
+                self.servers[victim].stop()
+            else:
+                self.servers[victim].stop(abrupt=True)
+            (self.root/f'control-{victim}'/'arm').unlink(missing_ok=True)
+            self.start(victim)
+            result = client.result(240)
+            time.sleep(self.args.lease_secs+30)
+            observed = client.command({'op':'read','keys':request['keys']})['values']
+            report = {'result':result,'observed':observed,'request':request}
+            (self.root/'probe-point-stop.json').write_text(json.dumps(report,indent=2))
+            check_transaction(request, result, observed)
+            (self.root/'PASS').write_text('point-stop probe passed\n')
+            return
         if self.args.probe == 'partial-abort':
             seed = client.command({'op':'txn','id':'seed','keys':[[93,7100]],'value':1,'durable':True})
             assert seed['outcome'] == 'ack', seed
@@ -771,7 +795,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')
@@ -785,6 +809,7 @@ def main():
     parser.add_argument('--audit-every', type=int, default=50)
     parser.add_argument('--keep-going', action='store_true')
     parser.add_argument('--seed-stop-only', action='store_true')
+    parser.add_argument('--coordinator', type=int, default=-1)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
