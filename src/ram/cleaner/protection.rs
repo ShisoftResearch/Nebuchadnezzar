@@ -43,6 +43,21 @@ impl Protection {
         self.transactions.lock().insert(txn.clone(), Some(receipts));
     }
 
+    /// The receipts of the decision of `txn` on this segment, if it is decided.
+    pub fn decided_receipts(&self, txn: &TxnId) -> Option<Arc<Vec<Receipt>>> {
+        self.transactions.lock().get(txn).cloned().flatten()
+    }
+
+    /// Keep this segment in progress until `receipts` are covered by a sync.
+    ///
+    /// Used for the segment of an OLD version that `txn` replaced or removed.
+    /// If the COMMIT of `txn` is lost in a power loss, recovery rolls the
+    /// transaction back, and the old version is the cell. The entry stays
+    /// until the COMMIT is durable.
+    pub fn pin_until_covered(&self, txn: &TxnId, receipts: Arc<Vec<Receipt>>) {
+        self.transactions.lock().insert(txn.clone(), Some(receipts));
+    }
+
     pub fn abort_transaction(&self, txn: &TxnId) {
         self.transactions.lock().remove(txn);
     }

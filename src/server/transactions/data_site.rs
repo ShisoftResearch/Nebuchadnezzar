@@ -1250,6 +1250,23 @@ impl DataManager {
         };
         txn.decided_commit = true;
         txn.commit_durable = true;
+        // The COMMIT of a default transaction is only queued for a sync. A
+        // power loss before the sync rolls the transaction back, and then the
+        // OLD versions of its updated and removed cells are the cells. The
+        // guards below hold their segments only until `end`. So pin each of
+        // them in progress for the cleaner until the COMMIT receipts are
+        // synced (D20). The pin covers the old version, which is marked dead
+        // just below. If no receipt exists, the sync was forced: nothing to pin.
+        if !txn.segment_guards.is_empty() {
+            let receipts = crate::ram::chunk::transaction_leased_segments(tid, &store)
+                .iter()
+                .find_map(|segment| segment.protection.decided_receipts(tid));
+            if let Some(receipts) = receipts {
+                for guard in &txn.segment_guards {
+                    guard.pin_until_covered(tid, receipts.clone());
+                }
+            }
+        }
         if let Some((chunk, id)) = status {
             // Answered `Committing` until this site's COMMIT is synced, then
             // `Committed` until every participant's is (TLA+ F1, F4).

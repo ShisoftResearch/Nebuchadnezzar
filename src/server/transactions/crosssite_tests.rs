@@ -2779,9 +2779,11 @@ async fn update_then_compact_old_then_power_loss(group: &str, mode: PinWindowMod
     }
     let old_segment_gone = !chunk.segments().iter().any(|segment| segment.id == old_segment);
     warn!("PINWIN {:?}: old segment gone: {}", mode, old_segment_gone);
+    // With the COMMIT unsynced the pin keeps the old segment. With the COMMIT
+    // synced the cleaner must reclaim it: the pin does not outlive the sync.
     assert!(
-        old_segment_gone,
-        "test setup: the cleaner must have reclaimed the segment of the old version"
+        old_segment_gone || mode == PinWindowMode::DefaultUnsynced,
+        "the cleaner must reclaim the segment of the old version once the COMMIT is synced"
     );
 
     cluster.power_loss_restart(A).await;
