@@ -32,6 +32,7 @@ use crate::ram::cell::OwnedCell;
 use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, Type};
 use crate::server::transactions::TxnId;
+use crate::utils::sharded::Sharded;
 use bifrost_hasher::hash_str;
 use dovahkiin::types::key_hash;
 use parking_lot::Mutex;
@@ -48,8 +49,7 @@ pub const STATUS_ORIGIN: u16 = 0xFFF;
 pub const STATUS_PROBES: u64 = 8;
 
 lazy_static! {
-    pub static ref TXN_STATUS_SCHEMA_ID: SchemaVid =
-        SchemaVid(key_hash(TXN_STATUS_SCHEMA) as u32);
+    pub static ref TXN_STATUS_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(TXN_STATUS_SCHEMA) as u32);
 }
 
 /// The hidden schema of status cells. Registered locally on every store,
@@ -111,7 +111,11 @@ impl std::fmt::Display for StatusCellError {
         match self {
             StatusCellError::NotAStatusCell => write!(f, "the cell is not a status cell"),
             StatusCellError::Field(name) => {
-                write!(f, "the status cell field {} is missing or has another type", name)
+                write!(
+                    f,
+                    "the status cell field {} is missing or has another type",
+                    name
+                )
             }
             StatusCellError::Participants(count) => write!(
                 f,
@@ -214,8 +218,8 @@ struct State {
 /// The status cells of one store, and the transactions it resolves.
 #[derive(Default)]
 pub struct TxnStatusRegistry {
-    state: Mutex<State>,
-    /// How many cell ids `in_doubt_cells` holds: the common path pays one
+    state: Sharded<Mutex<State>>,
+    /// Sum of distinct in-doubt IDs per shard. The common path pays one
     /// atomic load.
     in_doubt_cell_count: std::sync::atomic::AtomicUsize,
 }
@@ -226,7 +230,7 @@ impl TxnStatusRegistry {
     }
 
     pub fn register(&self, txn: TxnId, entry: StatusEntry) {
-        let mut state = crate::profile_lock!(H09, self.state.lock());
+        let mut state = crate::profile_lock!(H09, self.state.shard(&txn).lock());
         state.ids.insert(entry.id.bits());
         if let Some(old) = state.live.insert(txn, entry) {
             if !state.live.values().any(|other| other.id == old.id) {
@@ -236,11 +240,14 @@ impl TxnStatusRegistry {
     }
 
     pub fn get(&self, txn: &TxnId) -> Option<StatusEntry> {
-        crate::profile_lock!(H09, self.state.lock()).live.get(txn).cloned()
+        crate::profile_lock!(H09, self.state.shard(txn).lock())
+            .live
+            .get(txn)
+            .cloned()
     }
 
     pub fn remove(&self, txn: &TxnId) -> Option<StatusEntry> {
-        let mut state = crate::profile_lock!(H09, self.state.lock());
+        let mut state = crate::profile_lock!(H09, self.state.shard(txn).lock());
         let entry = state.live.remove(txn)?;
         state.ids.remove(&entry.id.bits());
         Some(entry)
@@ -249,35 +256,52 @@ impl TxnStatusRegistry {
     /// Whether `id` is a status cell of this store: scans and migration skip
     /// it.
     pub fn is_status_id(&self, id: u64) -> bool {
-        let state = crate::profile_lock!(H09, self.state.lock());
-        !state.ids.is_empty() && state.ids.contains(&id)
+        self.state
+            .iter()
+            .any(|shard| crate::profile_lock!(H09, shard.lock()).ids.contains(&id))
     }
 
     pub fn note_peer_synced(&self, txn: &TxnId, peer: u64) {
-        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.shard(txn).lock())
+            .live
+            .get_mut(txn)
+        {
             entry.synced_peers.insert(peer);
         }
     }
 
     pub fn mark_self_synced(&self, txn: &TxnId) {
-        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.shard(txn).lock())
+            .live
+            .get_mut(txn)
+        {
             entry.self_synced = true;
         }
     }
 
     pub fn mark_announced(&self, txn: &TxnId) {
-        if let Some(entry) = crate::profile_lock!(H09, self.state.lock()).live.get_mut(txn) {
+        if let Some(entry) = crate::profile_lock!(H09, self.state.shard(txn).lock())
+            .live
+            .get_mut(txn)
+        {
             entry.announced = true;
         }
     }
 
     pub fn entries(&self) -> Vec<(TxnId, StatusEntry)> {
-        crate::profile_lock!(H09, self.state
-            .lock())
-            .live
+        let mut entries: Vec<_> = self
+            .state
             .iter()
-            .map(|(txn, entry)| (txn.clone(), entry.clone()))
-            .collect()
+            .flat_map(|shard| {
+                crate::profile_lock!(H09, shard.lock())
+                    .live
+                    .iter()
+                    .map(|(txn, entry)| (txn.clone(), entry.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// `txn` is in doubt after recovery: its bracket writes `cells` (id
@@ -285,7 +309,8 @@ impl TxnStatusRegistry {
     pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>, mut cells: Vec<u64>) {
         cells.sort_unstable();
         cells.dedup();
-        let mut state = crate::profile_lock!(H09, self.state.lock());
+        let mut state = crate::profile_lock!(H09, self.state.shard(&txn).lock());
+        let before = state.in_doubt_cells.len();
         state.resolving.insert(txn.clone(), participants);
         for id in &cells {
             *state.in_doubt_cells.entry(*id).or_insert(0) += 1;
@@ -293,18 +318,27 @@ impl TxnStatusRegistry {
         if let Some(old) = state.resolving_cells.insert(txn, cells) {
             Self::forget_cells(&mut state, &old);
         }
-        self.in_doubt_cell_count
-            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
+        self.update_in_doubt_count(before, state.in_doubt_cells.len());
     }
 
     pub fn end_resolving(&self, txn: &TxnId) {
-        let mut state = crate::profile_lock!(H09, self.state.lock());
+        let mut state = crate::profile_lock!(H09, self.state.shard(txn).lock());
+        let before = state.in_doubt_cells.len();
         state.resolving.remove(txn);
         if let Some(cells) = state.resolving_cells.remove(txn) {
             Self::forget_cells(&mut state, &cells);
         }
-        self.in_doubt_cell_count
-            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
+        self.update_in_doubt_count(before, state.in_doubt_cells.len());
+    }
+
+    fn update_in_doubt_count(&self, before: usize, after: usize) {
+        if after >= before {
+            self.in_doubt_cell_count
+                .fetch_add(after - before, std::sync::atomic::Ordering::Release);
+        } else {
+            self.in_doubt_cell_count
+                .fetch_sub(before - after, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn forget_cells(state: &mut State, cells: &[u64]) {
@@ -328,19 +362,21 @@ impl TxnStatusRegistry {
         {
             return None;
         }
-        let state = crate::profile_lock!(H09, self.state.lock());
-        for (txn, cells) in &state.resolving_cells {
-            for id in cells {
-                let slot = Id::from_bits(*id).locality();
-                if slots.contains(&slot) {
-                    return Some(SlotInDoubt {
-                        slot: slot as u32,
-                        txn: txn.clone(),
-                    });
-                }
-            }
-        }
-        None
+        self.state
+            .iter()
+            .filter_map(|shard| {
+                let state = crate::profile_lock!(H09, shard.lock());
+                state.resolving_cells.iter().find_map(|(txn, cells)| {
+                    cells.iter().find_map(|id| {
+                        let slot = Id::from_bits(*id).locality();
+                        slots.contains(&slot).then(|| SlotInDoubt {
+                            slot: slot as u32,
+                            txn: txn.clone(),
+                        })
+                    })
+                })
+            })
+            .min_by(|a, b| a.txn.cmp(&b.txn))
     }
 
     /// Whether `id` is a cell of a bracket that is in doubt after recovery.
@@ -353,21 +389,45 @@ impl TxnStatusRegistry {
         {
             return false;
         }
-        crate::profile_lock!(H09, self.state.lock()).in_doubt_cells.contains_key(&id)
+        self.state.iter().any(|shard| {
+            crate::profile_lock!(H09, shard.lock())
+                .in_doubt_cells
+                .contains_key(&id)
+        })
     }
 
     pub fn resolving(&self) -> Vec<TxnId> {
-        crate::profile_lock!(H09, self.state.lock()).resolving.keys().cloned().collect()
+        let mut txns: Vec<_> = self
+            .state
+            .iter()
+            .flat_map(|shard| {
+                crate::profile_lock!(H09, shard.lock())
+                    .resolving
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        txns.sort();
+        txns
     }
 
     pub fn resolving_participants(&self, txn: &TxnId) -> Option<Vec<u64>> {
-        crate::profile_lock!(H09, self.state.lock()).resolving.get(txn).cloned()
+        crate::profile_lock!(H09, self.state.shard(txn).lock())
+            .resolving
+            .get(txn)
+            .cloned()
     }
 
     /// `(status cells, resolving)` counts.
     pub fn counts(&self) -> (usize, usize) {
-        let state = crate::profile_lock!(H09, self.state.lock());
-        (state.live.len(), state.resolving.len())
+        self.state
+            .iter()
+            .map(|shard| {
+                let state = crate::profile_lock!(H09, shard.lock());
+                (state.live.len(), state.resolving.len())
+            })
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     }
 }
 
@@ -375,6 +435,42 @@ impl TxnStatusRegistry {
 mod tests {
     use super::*;
     use crate::server::transactions::test_hlc;
+
+    #[test]
+    fn transaction_status_shards_resolve_independently() {
+        let registry = std::sync::Arc::new(TxnStatusRegistry::new());
+        let first = test_hlc(1, 1);
+        let second = (2..1000)
+            .map(|n| test_hlc(n, 1))
+            .find(|tid| !std::ptr::eq(registry.state.shard(&first), registry.state.shard(tid)))
+            .unwrap();
+        let cell = Id::from_parts(7, 8).bits();
+        registry.begin_resolving(first.clone(), vec![1, 2], vec![cell]);
+        let held = registry.state.shard(&first).lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = registry.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.begin_resolving(second_copy.clone(), vec![1, 3], vec![cell]);
+            assert_eq!(
+                worker.resolving_participants(&second_copy),
+                Some(vec![1, 3])
+            );
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        registry.end_resolving(&first);
+        assert!(
+            registry.is_in_doubt_cell(cell),
+            "another shard still protects this cell"
+        );
+        registry.end_resolving(&second);
+        assert!(!registry.is_in_doubt_cell(cell));
+        assert_eq!(registry.counts(), (0, 0));
+    }
 
     #[test]
     fn a_status_cell_round_trips_and_its_ids_are_reserved() {
