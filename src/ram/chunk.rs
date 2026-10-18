@@ -8944,41 +8944,40 @@ mod tests {
         seg_a.decr_references();
     }
 
-    /// The coupling that IS real: a read in flight anywhere holds back every
-    /// reclamation, because the reclaimer cannot tell which segment that
-    /// reader is about to touch. It lasts only as long as the read.
+    /// A read protects raw addresses in its chunk. Other chunks progress.
     #[test]
     fn an_in_flight_read_holds_back_reclamation_until_it_finishes() {
         let _ = env_logger::try_init();
-        let (chunks_a, schema_a) = setup_test_chunks();
+        let (chunks_a, schema_a) = setup_test_chunks_with_size(4 * SEGMENT_SIZE);
         let (chunks_b, _schema_b) = setup_test_chunks();
         let chunk_a = &chunks_a.list[0];
         let chunk_b = &chunks_b.list[0];
-
         let id = Id::allocated(1, 0, 11);
         let mut cell = payload_cell(schema_a.vid.get(), &id, 32);
-        chunks_a
-            .write_cell(&mut cell)
-            .expect("write a cell to read");
-
-        // A read in progress in database A: the guard is the open section.
+        chunks_a.write_cell(&mut cell).expect("write a cell to read");
         let reading = CellGuard::for_read(id.bits(), chunk_a).expect("read guard");
+
+        // Retire a different, unpinned segment in the reader's chunk. This
+        // checks the lookup-to-pin window, independently of reference counts.
+        let unpinned = chunk_a.allocator.alloc_seg(&chunk_a.file_manager).unwrap();
+        let a_seg_id = unpinned.id;
+        chunk_a.put_segment(unpinned);
+        chunk_a.remove_segment(a_seg_id);
+        assert_eq!(chunk_a.retired_segment_count(), 1);
+        assert_eq!(chunk_a.drain_retired_segments(), 0,
+            "a read in flight must hold back reclamation in its chunk");
 
         let b_seg_id = chunk_b.get_head_seg_id();
         chunk_b.rotate_heads_for_scrub_test();
         chunk_b.remove_segment(b_seg_id);
-        assert_eq!(
-            chunk_b.drain_retired_segments(),
-            0,
-            "a read in flight anywhere must hold back reclamation everywhere"
-        );
-
+        assert_eq!(drain_until_reclaimed(chunk_b, std::time::Duration::from_secs(5)), 1,
+            "a reader in another chunk must not block this retirement");
+        // Recheck after the independent retirement. The protected retirement
+        // must remain pending until the same read actually ends.
+        assert_eq!(chunk_a.drain_retired_segments(), 0);
         drop(reading);
-        assert_eq!(
-            drain_until_reclaimed(chunk_b, std::time::Duration::from_secs(5)),
-            1,
-            "once the read finishes, reclamation proceeds"
-        );
+        assert_eq!(drain_until_reclaimed(chunk_a, std::time::Duration::from_secs(5)), 1,
+            "once the read finishes, reclamation proceeds");
     }
 
     /// A segment reference taken on one thread and released on another must
