@@ -508,7 +508,6 @@ async fn idxinflight_buffered_hit_outlives_successful_update() {
                 crate::index::verification::IndexCheck::Schema(SchemaUid(SCHEMA)),
                 crate::index::verification::IndexCheck::Ranged(key_range),
             ],
-            true,
         )
         .await;
     println!(
