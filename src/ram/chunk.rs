@@ -1282,7 +1282,9 @@ pub fn is_in_transaction() -> bool {
 /// to answer "no" for backpressure -- past `SEAL_QUEUE_LIMIT` the rotating
 /// writer archives inline, throttling writers to what archiving sustains.
 pub struct SealQueue {
-    state: parking_lot::Mutex<SealQueueState>,
+    state: [parking_lot::Mutex<SealQueueState>; 64],
+    ready: AtomicU64,
+    next: AtomicUsize,
 }
 
 /// One seal job. The sequence distinguishes generations that reuse the same
@@ -1297,7 +1299,7 @@ struct SealQueueState {
     refused: Vec<(SealJob, std::time::Instant)>,
 }
 
-/// Beyond this backlog, rotation archives inline. Small on purpose: the queue
+/// Beyond this backlog per chunk partition, rotation archives inline. The queue
 /// exists to absorb bursts, not to let backup creation lag a sustained import
 /// without bound.
 const SEAL_QUEUE_LIMIT: usize = 64;
@@ -1340,16 +1342,20 @@ const SEAL_ARCHIVERS: usize = 4;
 impl SealQueue {
     pub fn new() -> Self {
         Self {
-            state: parking_lot::Mutex::new(SealQueueState::default()),
+            state: std::array::from_fn(|_| parking_lot::Mutex::new(SealQueueState::default())),
+            ready: AtomicU64::new(0),
+            next: AtomicUsize::new(0),
         }
     }
     /// True if accepted; false means the caller must do the work inline.
     fn enqueue(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> bool {
-        let mut state = crate::profile_lock!(H42, self.state.lock());
+        let shard = chunk_id % self.state.len();
+        let mut state = crate::profile_lock!(H42, self.state[shard].lock());
         if state.pending.len() + state.refused.len() >= SEAL_QUEUE_LIMIT {
             return false;
         }
         state.pending.push((chunk_id, seg_id, seq_id));
+        self.ready.fetch_or(1 << shard, Ordering::Release);
         true
     }
     /// A refusal already owns a segment. Retain it even under queue backpressure.
@@ -1366,36 +1372,98 @@ impl SealQueue {
         );
     }
     fn requeue(&self, chunk_id: usize, seg_id: u64, seq_id: u64, counter: &AtomicU64) {
-        let mut state = crate::profile_lock!(H42, self.state.lock());
+        let shard = chunk_id % self.state.len();
+        let mut state = crate::profile_lock!(H42, self.state[shard].lock());
         let job = (chunk_id, seg_id, seq_id);
         if !state.pending.contains(&job) && !state.refused.iter().any(|(held, _)| *held == job) {
             state.refused.push((job, std::time::Instant::now()));
+            self.ready.fetch_or(1 << shard, Ordering::Release);
             counter.fetch_add(1, Ordering::Relaxed);
         }
     }
     /// Every queued job, including refused jobs that are not yet due.
     pub fn drain(&self) -> Vec<SealJob> {
-        let mut state = crate::profile_lock!(H42, self.state.lock());
-        let mut jobs = std::mem::take(&mut state.pending);
-        jobs.extend(state.refused.drain(..).map(|(job, _)| job));
+        let mut jobs = Vec::new();
+        for (i, shard) in self.state.iter().enumerate() {
+            let mut state = crate::profile_lock!(H42, shard.lock());
+            jobs.append(&mut state.pending);
+            jobs.extend(state.refused.drain(..).map(|(job, _)| job));
+            self.ready.fetch_and(!(1 << i), Ordering::Release);
+        }
         jobs
     }
-    /// The oldest job that is due, so each archiver takes one job at a time.
+    /// Preserve order within each chunk partition. Skip a busy partition.
     fn pop(&self) -> Option<SealJob> {
-        let mut state = crate::profile_lock!(H42, self.state.lock());
-        let SealQueueState { pending, refused } = &mut *state;
-        refused.retain(|(job, refused_at)| {
-            let due = refused_at.elapsed() >= SEAL_RETRY_INTERVAL;
-            if due {
-                pending.push(*job);
+        let ready = self.ready.load(Ordering::Acquire);
+        if ready == 0 { return None }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.state.len();
+        for offset in 0..self.state.len() {
+            let i = (start + offset) % self.state.len();
+            if ready & (1 << i) == 0 { continue }
+            let Some(guard) = self.state[i].try_lock() else { continue };
+            let mut state = crate::profile_lock!(H42, guard);
+            let SealQueueState { pending, refused } = &mut *state;
+            refused.retain(|(job, refused_at)| {
+                let due = refused_at.elapsed() >= SEAL_RETRY_INTERVAL;
+                if due { pending.push(*job); }
+                !due
+            });
+            let job = (!pending.is_empty()).then(|| pending.remove(0));
+            if pending.is_empty() && refused.is_empty() {
+                self.ready.fetch_and(!(1 << i), Ordering::Release);
             }
-            !due
-        });
-        (!pending.is_empty()).then(|| pending.remove(0))
+            if job.is_some() { return job }
+        }
+        None
     }
     pub fn len(&self) -> usize {
-        let state = crate::profile_lock!(H42, self.state.lock());
-        state.pending.len() + state.refused.len()
+        self.state.iter().map(|shard| {
+            let state = crate::profile_lock!(H42, shard.lock());
+            state.pending.len() + state.refused.len()
+        }).sum()
+    }
+}
+
+#[cfg(test)]
+mod seal_queue_partition_tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_seal_partition_does_not_block_another_chunk() {
+        let queue = Arc::new(SealQueue::new());
+        assert!(queue.enqueue(0, 10, 1));
+        let held = queue.state[0].lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = queue.clone();
+        let thread = std::thread::spawn(move || {
+            assert!(worker.enqueue(1, 20, 1));
+            assert!(worker.enqueue(1, 21, 1));
+            assert_eq!(worker.pop(), Some((1, 20, 1)));
+            assert_eq!(worker.pop(), Some((1, 21, 1)));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(queue.pop(), Some((0, 10, 1)));
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn seal_backpressure_and_retry_delay_stay_local() {
+        let queue = SealQueue::new();
+        for n in 0..SEAL_QUEUE_LIMIT { assert!(queue.enqueue(0, n as u64, 1)); }
+        assert!(!queue.enqueue(0, 999, 1));
+        assert!(queue.enqueue(1, 999, 1));
+        assert_eq!(queue.drain().len(), SEAL_QUEUE_LIMIT + 1);
+        queue.retry(0, 7, 1);
+        queue.retry(0, 7, 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pop(), None);
+        std::thread::sleep(SEAL_RETRY_INTERVAL);
+        assert_eq!(queue.pop(), Some((0, 7, 1)));
+        assert_eq!(queue.pop(), None);
     }
 }
 
