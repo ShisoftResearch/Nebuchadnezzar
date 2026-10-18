@@ -27,7 +27,7 @@ else:
                  '--kind',os.environ.get('MULTISITE_KIND','graceful'),'--steps',os.environ.get('MULTISITE_STEPS','')]
     if name == 'multisite_cut_prepare':
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
-                 '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5')]
+                 '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','0')]
     if name == 'multisite_readonly_e2e':
         args += ['--probe','readonly-e2e']
     elif name.startswith('multisite_readonly'):
