@@ -1,13 +1,11 @@
 //! Independent admission for each cell locality in one index client.
 
-use crate::utils::sharded::Sharded;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use lightning::map::PtrHashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 pub(super) struct ScannableAdmission {
-    localities: Sharded<Mutex<HashMap<u16, Arc<Semaphore>>>>,
+    localities: PtrHashMap<u16, Arc<Semaphore>>,
     limit: usize,
 }
 
@@ -25,19 +23,13 @@ impl Default for ScannableAdmission {
 impl ScannableAdmission {
     fn new(limit: usize) -> Self {
         Self {
-            localities: Sharded::default(),
+            localities: PtrHashMap::with_capacity(64),
             limit,
         }
     }
 
     pub(super) fn for_locality(&self, locality: u16) -> Arc<Semaphore> {
-        // Registry guards end before a caller waits for admission or performs I/O.
-        self.localities
-            .shard(&locality)
-            .lock()
-            .entry(locality)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.limit)))
-            .clone()
+        crate::utils::keyed_state::get_or_insert(&self.localities, locality, || Arc::new(Semaphore::new(self.limit)))
     }
 }
 
