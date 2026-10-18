@@ -344,6 +344,14 @@ fn txn_lease_timeout() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(120))
 }
 
+/// Test only: time spent pinning old-version segments at COMMIT.
+#[cfg(test)]
+pub(crate) static PIN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test only: skip the old-version pin, to show that the window is real.
+#[cfg(test)]
+pub(crate) static PIN_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Transaction {
     state: TxnState,
     affected_cells: Vec<Id>,
@@ -1186,9 +1194,11 @@ impl DataManager {
                 .iter()
                 .map(|segment| (segment.chunk_id, segment.id))
                 .collect();
-        let closed = self.chunks().commit_transaction_brackets(tid, durable);
-        let synced = match closed {
-            Ok(synced) => synced,
+        let closed = self
+            .chunks()
+            .commit_transaction_brackets_with_receipts(tid, durable);
+        let (synced, receipts) = match closed {
+            Ok(closed) => closed,
             Err(refusal) => {
             let reason = match refusal.error() {
                 WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
@@ -1250,6 +1260,38 @@ impl DataManager {
         };
         txn.decided_commit = true;
         txn.commit_durable = true;
+        // The COMMIT of a default transaction is only queued for a sync. A
+        // power loss before the sync rolls the transaction back, and then the
+        // OLD versions of its updated and removed cells are the cells. The
+        // guards below hold their segments only until `end`. So pin each of
+        // them in progress for the cleaner until the COMMIT receipts are
+        // synced (D20). The pin covers the old version, which is marked dead
+        // just below. If no receipt exists, the sync was forced: nothing to pin.
+        #[cfg(test)]
+        let pin_started = std::time::Instant::now();
+        #[cfg(test)]
+        let receipts = receipts.filter(|_| !PIN_DISABLED.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(receipts) = receipts.filter(|receipts| !receipts.is_empty()) {
+            let tokens = Arc::new(receipts.iter().map(|receipt| receipt.token()).collect::<Vec<_>>());
+            // One pin for each segment, however many cells the transaction
+            // took from it.
+            let mut keyed: Vec<((usize, u64), usize)> = txn
+                .segment_guards
+                .iter()
+                .enumerate()
+                .map(|(n, guard)| ((guard.chunk_id(), guard.segment_id()), n))
+                .collect();
+            keyed.sort_unstable();
+            keyed.dedup_by_key(|(key, _)| *key);
+            for (_, n) in keyed {
+                txn.segment_guards[n].pin_until_covered(tid, tokens.clone());
+            }
+        }
+        #[cfg(test)]
+        PIN_NANOS.fetch_add(
+            pin_started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some((chunk, id)) = status {
             // Answered `Committing` until this site's COMMIT is synced, then
             // `Committed` until every participant's is (TLA+ F1, F4).
