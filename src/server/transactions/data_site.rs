@@ -462,7 +462,7 @@ pub struct DataManager {
     cells: crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: SkipSet<Id>,
-    txns_sorted: Sharded<Mutex<BTreeSet<TxnId>>>,
+    txns_sorted: SkipSet<TxnId>,
     database_runtime: Arc<DatabaseRuntime>,
     cleanup_signal: Arc<AtomicBool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
@@ -576,7 +576,7 @@ impl DataManager {
             cells: Default::default(),
             txns: LFMap::with_capacity(128),
             cell_list: SkipSet::new(),
-            txns_sorted: Sharded::default(),
+            txns_sorted: SkipSet::new(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             decided: Sharded::default(),
@@ -658,15 +658,13 @@ impl DataManager {
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
-                crate::profile_lock!(H17, self.txns_sorted.shard(tid).lock()).insert(tid.clone());
+                self.txns_sorted.insert(tid.clone());
                 return txn;
             }
         }
     }
     fn transaction_ids(&self) -> Vec<TxnId> {
-        self.txns_sorted.iter().flat_map(|shard| {
-            crate::profile_lock!(H17, shard.lock()).iter().cloned().collect::<Vec<_>>()
-        }).collect()
+        self.txns_sorted.iter().map(|entry| entry.value().clone()).collect()
     }
 
     /// Prepared transactions that carry at least one write. A fencer drains
@@ -920,7 +918,7 @@ impl DataManager {
             drop(pins);
         }
         let _ = self.txns.remove(tid);
-        crate::profile_lock!(H17, self.txns_sorted.shard(tid).lock()).remove(tid);
+        self.txns_sorted.remove(tid);
     }
 
     /// Restore the cell index, pad the spans, then release the leased heads.
@@ -1870,9 +1868,8 @@ impl DataManager {
     }
 
     async fn cell_meta_cleanup(&self) {
-        let oldest_transaction = self.txns_sorted.iter().filter_map(|shard| {
-            crate::profile_lock!(H17, shard.lock()).first().cloned()
-        }).min().unwrap_or_else(|| self.hlc.now());
+        let oldest_transaction = self.txns_sorted.front()
+            .map(|entry| entry.value().clone()).unwrap_or_else(|| self.hlc.now());
         let mut cells_to_evict = Vec::new();
 
         // First pass: collect cells with their metadata (while holding locks)
@@ -4877,7 +4874,7 @@ mod tests {
             "release_read_pins must wipe a pin-only participant transaction"
         );
         assert!(
-            !crate::profile_lock!(H17, manager.txns_sorted.shard(&tid).lock()).contains(&tid),
+            !manager.txns_sorted.contains(&tid),
             "release_read_pins must drop the txns_sorted entry too"
         );
 
@@ -5590,14 +5587,14 @@ mod tests {
                 .payload;
         assert_eq!(end_result, EndResult::Success);
         assert!(default_manager.txns.get(&shared_tid).is_none());
-        assert!(!crate::profile_lock!(H17, default_manager.txns_sorted.shard(&shared_tid).lock()).contains(&shared_tid));
+        assert!(!default_manager.txns_sorted.contains(&shared_tid));
 
         assert!(
             analytics_manager.txns.get(&shared_tid).is_some(),
             "ending one database transaction must not remove another database's transaction entry"
         );
         assert!(
-            crate::profile_lock!(H17, analytics_manager.txns_sorted.shard(&shared_tid).lock()).contains(&shared_tid),
+            analytics_manager.txns_sorted.contains(&shared_tid),
             "ending one database transaction must not remove another database's sorted bookkeeping"
         );
 
@@ -5610,7 +5607,7 @@ mod tests {
         .payload;
         assert_eq!(analytics_end, EndResult::Success);
         assert!(analytics_manager.txns.get(&shared_tid).is_none());
-        assert!(!crate::profile_lock!(H17, analytics_manager.txns_sorted.shard(&shared_tid).lock()).contains(&shared_tid));
+        assert!(!analytics_manager.txns_sorted.contains(&shared_tid));
 
         server.shutdown().await;
     }
@@ -5662,7 +5659,7 @@ mod tests {
         }
 
         assert!(manager.txns.get(&tid).is_none());
-        assert!(!crate::profile_lock!(H17, manager.txns_sorted.shard(&tid).lock()).contains(&tid));
+        assert!(!manager.txns_sorted.contains(&tid));
 
         server.shutdown().await;
     }
@@ -6862,16 +6859,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn participant_transaction_shards_allow_unrelated_creation() {
+    async fn participant_transaction_iteration_allows_unrelated_creation() {
         let address = crate::utils::test_port::unique_localhost_addr();
         let server = start_transaction_test_server(&address, "participant_txn_shards").await;
         let manager = data_manager_for_database(&server, &address, "participant_txn_shards").await;
         let first = test_hlc(1, 1);
-        let second = (2..1000).map(|n| test_hlc(n, 1)).find(|tid| {
-            !std::ptr::eq(manager.txns_sorted.shard(&first), manager.txns_sorted.shard(tid))
-        }).unwrap();
+        let second = test_hlc(2, 1);
         manager.get_or_create_transaction(&first);
-        let held = manager.txns_sorted.shard(&first).lock();
+        let held = manager.txns_sorted.get(&first).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = manager.clone();
         let second_copy = second.clone();
@@ -6882,7 +6877,7 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2));
         drop(held);
         thread.join().unwrap();
-        assert!(result.is_ok(), "another participant shard must allow creation");
+        assert!(result.is_ok(), "a held iteration entry must allow unrelated creation");
         let ids = manager.transaction_ids();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&first) && ids.contains(&second));
