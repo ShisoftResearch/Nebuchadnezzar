@@ -43,7 +43,7 @@ fn counters() -> [u64; 4] {
         ALLOCATION_EXHAUSTED.load(Ordering::Relaxed),
     ]
 }
-fn extended_counters() -> [u64; 8] {
+fn extended_counters() -> [u64; 10] {
     [
         neb::ram::cleaner::CAS_FULL_PASSES.load(Ordering::Relaxed),
         neb::ram::cleaner::CAS_RECLAIMED_BYTES.load(Ordering::Relaxed),
@@ -53,6 +53,8 @@ fn extended_counters() -> [u64; 8] {
         neb::ram::segs::FORCED_WAL_SYNCS.load(Ordering::Relaxed),
         neb::client::TRANSACTION_RETRIES.load(Ordering::Relaxed),
         neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed),
+        neb::ram::segs::SEAL_RECLAIM_WAIT_RETRIES.load(Ordering::Relaxed),
+        neb::ram::segs::SEAL_INLINE.load(Ordering::Relaxed),
     ]
 }
 
@@ -82,6 +84,11 @@ async fn phase(
     measured: bool,
 ) {
     let before = counters();
+    // The peak of waiting segments is per phase: restart it at the current level.
+    neb::ram::segs::SEAL_WAITING_PEAK.store(
+        neb::ram::segs::SEAL_WAITING_SEGMENTS.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     let extended_before = extended_counters();
     if measured {
         println!("IWP phase_begin {kind}_{writers}{} page_images={} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={}",
@@ -156,8 +163,9 @@ async fn phase(
             .zip(extended_before)
             .map(|(after, before)| after - before)
             .collect();
-        println!("IWP_COUNTERS {kind}_{writers}{} cas_full_passes={} cas_reclaimed_bytes={} archive_refusals={} seal_retries={} namespace_syncs={} forced_wal_syncs={} transaction_retries={} rotations={}",
-            if hot { "_hot" } else { "" }, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7]);
+        println!("IWP_COUNTERS {kind}_{writers}{} cas_full_passes={} cas_reclaimed_bytes={} archive_refusals={} seal_retries={} namespace_syncs={} forced_wal_syncs={} transaction_retries={} rotations={} seal_wait_retries={} seal_inline={} seal_waiting_peak={}",
+            if hot { "_hot" } else { "" }, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8], delta[9],
+            neb::ram::segs::SEAL_WAITING_PEAK.load(Ordering::Relaxed));
         println!("IWP {kind}_{writers}{} ops={} secs={secs:.6} ops_per_sec={:.3} p50_us={:.3} p95_us={:.3} p99_us={:.3} page_images_per_sec={:.3} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={} cas_conflicts={}",
         if hot { "_hot" } else { "" }, times.len(), times.len() as f64 / secs,
         times[times.len()/2] as f64 / 1000.0, times[times.len()*95/100] as f64 / 1000.0,
