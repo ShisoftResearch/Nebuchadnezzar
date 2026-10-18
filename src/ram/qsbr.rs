@@ -25,7 +25,6 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 use lightning::thread_local::ThreadLocal;
 
@@ -47,7 +46,7 @@ pub struct SegmentQsbr {
 }
 
 impl SegmentQsbr {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             // Starts at 1: 0 is reserved to mean "quiescent".
             epoch: AtomicUsize::new(1),
@@ -166,20 +165,14 @@ impl SegmentQsbr {
     }
 }
 
-pub fn segment_qsbr() -> &'static SegmentQsbr {
-    static QSBR: OnceLock<SegmentQsbr> = OnceLock::new();
-    QSBR.get_or_init(SegmentQsbr::new)
-}
+/// A section belongs to the chunk whose raw addresses it protects.
+pub struct QsbrSection<'a>(&'a SegmentQsbr);
 
-/// RAII form, for call sites that are not already paired with the segment
-/// reference counter.
-pub struct QsbrSection;
-
-impl QsbrSection {
+impl<'a> QsbrSection<'a> {
     #[inline(always)]
-    pub fn new() -> Self {
-        segment_qsbr().enter();
-        Self
+    pub fn new(qsbr: &'a SegmentQsbr) -> Self {
+        qsbr.enter();
+        Self(qsbr)
     }
 }
 
@@ -206,16 +199,37 @@ impl Drop for SuspendedSection<'_> {
     }
 }
 
-impl Drop for QsbrSection {
+impl Drop for QsbrSection<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        segment_qsbr().exit();
+        self.0.exit();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_in_another_chunk_cannot_delay_reclamation() {
+        let first = SegmentQsbr::new();
+        let second = SegmentQsbr::new();
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = &first;
+            scope.spawn(move || {
+                let _section = QsbrSection::new(first);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            entered_rx.recv().unwrap();
+            assert!(!first.is_quiesced(first.retire_stamp()));
+            assert!(second.is_quiesced(second.retire_stamp()));
+            release_tx.send(()).unwrap();
+        });
+        assert!(first.is_quiesced(first.retire_stamp()));
+    }
 
     #[test]
     fn a_retirement_waits_for_a_section_that_began_before_it() {
@@ -256,15 +270,24 @@ mod tests {
         qsbr.enter();
         qsbr.enter(); // depth 2
         let stamp = qsbr.retire_stamp();
-        assert!(!qsbr.is_quiesced(stamp), "inside a section we block a retirement");
+        assert!(
+            !qsbr.is_quiesced(stamp),
+            "inside a section we block a retirement"
+        );
         assert_eq!(qsbr.blocking_threads(stamp), 1);
         let seen = qsbr.suspended(|| qsbr.is_quiesced(stamp));
-        assert!(seen, "while suspended the thread must not block its own collection");
+        assert!(
+            seen,
+            "while suspended the thread must not block its own collection"
+        );
         // back at depth 2: two exits are needed before we are quiescent
         let later = qsbr.retire_stamp();
         assert!(!qsbr.is_quiesced(later));
         qsbr.exit();
-        assert!(!qsbr.is_quiesced(later), "one exit from depth 2 is not the outermost");
+        assert!(
+            !qsbr.is_quiesced(later),
+            "one exit from depth 2 is not the outermost"
+        );
         qsbr.exit();
         assert!(qsbr.is_quiesced(later));
     }
@@ -283,7 +306,10 @@ mod tests {
         };
         assert!(early());
         let later = qsbr.retire_stamp();
-        assert!(!qsbr.is_quiesced(later), "resumed at depth 1 after the early return");
+        assert!(
+            !qsbr.is_quiesced(later),
+            "resumed at depth 1 after the early return"
+        );
         qsbr.exit();
         assert!(qsbr.is_quiesced(later));
     }

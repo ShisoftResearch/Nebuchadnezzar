@@ -1569,6 +1569,7 @@ impl DeletedVersions {
 }
 
 pub struct Chunk {
+    pub(crate) qsbr: crate::ram::qsbr::SegmentQsbr,
     pub id: usize,
     /// Shared with every chunk of the store and drained by the sealer thread.
     pub seal_queue: Arc<SealQueue>,
@@ -1868,6 +1869,7 @@ impl Chunk {
             .next_power_of_two();
         let index = WordMap::with_capacity(index_capacity);
         let chunk = Chunk {
+            qsbr: crate::ram::qsbr::SegmentQsbr::new(),
             id,
             segs,
             cell_index: index,
@@ -2842,7 +2844,7 @@ impl Chunk {
                 hook();
             }
         });
-        let _outside_section = crate::ram::qsbr::segment_qsbr().suspend();
+        let _outside_section = self.qsbr.suspend();
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
         }
@@ -3411,7 +3413,7 @@ impl Chunk {
                 gate();
             }
         }
-        let lookup = crate::ram::qsbr::QsbrSection::new();
+        let lookup = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
         if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
             // Reject an obsolete physical-slot generation before touching protection.
             if old_head.seq_id != head_seq_id {
@@ -3559,7 +3561,7 @@ impl Chunk {
     pub(crate) fn release_append_heads_for_test(&self) -> Vec<u64> {
         let mut heads = Vec::new();
         for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
-            let lookup = crate::ram::qsbr::QsbrSection::new();
+            let lookup = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
             let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
             if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
                 if let Some(segment) = self.segs.get(&(old as usize)) {
@@ -3711,7 +3713,7 @@ impl Chunk {
     pub(crate) fn head_at(&self, location: usize) -> Result<CellHeader, ReadError> {
         // Decodes a header straight out of segment memory; same reasoning as
         // `read_cell_at`.
-        let _qsbr = crate::ram::qsbr::QsbrSection::new();
+        let _qsbr = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
         header_from_chunk_raw(location).map(|pair| pair.0)
     }
 
@@ -3726,7 +3728,7 @@ impl Chunk {
         // of its own: there is no CellGuard here to carry one. The caller's
         // pin keeps the segment alive; this keeps the reclaimer from freeing
         // underneath the read itself.
-        let _qsbr = crate::ram::qsbr::QsbrSection::new();
+        let _qsbr = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
         SharedCellData::from_chunk_raw(hash, location, self).map(|(cell, _)| cell.to_owned())
     }
 
@@ -3753,7 +3755,7 @@ impl Chunk {
         need_header: bool,
     ) -> Result<OwnedCell, ReadError> {
         // By-address selection; same reasoning as `read_cell_at`.
-        let _qsbr = crate::ram::qsbr::QsbrSection::new();
+        let _qsbr = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
         let (val, hdr) = select_from_chunk_raw(location, self, fields, need_header)?;
         Ok(SharedCellData::from_data(hdr, val).to_owned())
     }
@@ -4730,7 +4732,7 @@ impl Chunk {
             // The stamp must be taken AFTER the removal, so that a thread
             // whose section began at or after it provably could not have
             // found this segment.
-            let stamp = crate::ram::qsbr::segment_qsbr().retire_stamp();
+            let stamp = self.qsbr.retire_stamp();
             self.retired_segments.lock().push(RetiredSegment {
                 segment: seg,
                 stamp,
@@ -4762,7 +4764,7 @@ impl Chunk {
             std::mem::take(&mut *retired)
         };
 
-        let qsbr = crate::ram::qsbr::segment_qsbr();
+        let qsbr = &self.qsbr;
         let mut freed = 0usize;
         let mut still_pending = Vec::new();
         for mut entry in pending {
@@ -7080,7 +7082,7 @@ pub struct CellGuard<'a> {
     /// rather than on the reference count because a `CellGuard` borrows the
     /// chunk and so cannot outlive the stack frame that made it -- which is
     /// exactly the property a thread-scoped quiescent state needs.
-    _qsbr: crate::ram::qsbr::QsbrSection,
+    _qsbr: crate::ram::qsbr::QsbrSection<'a>,
 }
 
 impl<'a> CellGuard<'a> {
@@ -7167,7 +7169,7 @@ impl<'a> CellGuard<'a> {
                                     #[cfg(debug_assertions)]
                                     HELD_CELL_GUARDS.with(|held| held.set(held.get() + 1));
                                     return Some(CellGuard {
-                                        _qsbr: crate::ram::qsbr::QsbrSection::new(),
+                                        _qsbr: crate::ram::qsbr::QsbrSection::new(&chunk.qsbr),
                                         hash,
                                         guard: Some(guard),
                                         chunk,
@@ -7243,7 +7245,7 @@ impl<'a> CellGuard<'a> {
         #[cfg(debug_assertions)]
         HELD_CELL_GUARDS.with(|held| held.set(held.get() + 1));
         Some(Self {
-            _qsbr: crate::ram::qsbr::QsbrSection::new(),
+            _qsbr: crate::ram::qsbr::QsbrSection::new(&chunk.qsbr),
             guard: Some(guard),
             chunk,
             hash,
@@ -8887,13 +8889,7 @@ mod tests {
         }
     }
 
-    /// Two databases each have their own `Chunks`, their own cleaner and their
-    /// own retire list, but they share one QSBR epoch. What that sharing does
-    /// and does not couple is worth pinning down.
-    ///
-    /// A *reference* held in database A must not block database B: references
-    /// are per-segment, and B's segment has none. Only an in-flight read
-    /// section is global, and only for as long as the read runs.
+    /// A writer can suspend its chunk section after it pins its segment.
     #[test]
     fn a_writer_inside_its_own_qsbr_section_still_reclaims_during_emergency() {
         // The shape of the 13.6M-edge stall: the thread asking for the
@@ -8904,7 +8900,7 @@ mod tests {
         let (chunks, _schema) = setup_test_chunks();
         let chunk = &chunks.list[0];
         let seg_id = chunk.get_head_seg_id();
-        let _section = crate::ram::qsbr::QsbrSection::new();
+        let _section = crate::ram::qsbr::QsbrSection::new(&chunk.qsbr);
         chunk.rotate_heads_for_scrub_test();
         chunk.remove_segment(seg_id);
         assert_eq!(chunk.retired_segment_count(), 1);
@@ -8913,7 +8909,7 @@ mod tests {
             0,
             "inside our own section the retirement must still be blocked -- by us"
         );
-        let freed = crate::ram::qsbr::segment_qsbr()
+        let freed = chunk.qsbr
             .suspended(|| drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)));
         assert_eq!(freed, 1, "suspended, the same thread's collection reclaims");
         assert_eq!(chunk.retired_segment_count(), 0);

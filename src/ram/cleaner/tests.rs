@@ -89,7 +89,7 @@ pub fn full_clean_cycle_without_compact() {
         chunk.rotate_heads_for_scrub_test();
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         // The first pass removes the old cells. A later pass can remove their tombstones.
-        crate::ram::qsbr::segment_qsbr().suspended(|| {
+        chunk.qsbr.suspended(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
                 chunk.drain_retired_segments();
@@ -100,7 +100,7 @@ pub fn full_clean_cycle_without_compact() {
         let empty = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
         chunk.put_segment(empty);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
-        crate::ram::qsbr::segment_qsbr().suspended(|| {
+        chunk.qsbr.suspended(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
                 chunk.drain_retired_segments();
