@@ -380,6 +380,10 @@ struct Transaction {
     /// The coordinator asked for a durable commit (D7): the COMMIT is synced
     /// before `end` answers, also on a retry of a refused close.
     durable_commit: bool,
+    /// A close of this object tried to write the status cell. Before the
+    /// first try no status cell of the transaction can exist here, so the
+    /// close does not search the probes for one (D44).
+    status_cell_attempted: bool,
 }
 
 /// Test hook: a site does not send `synced` notices, as one whose notices
@@ -647,6 +651,7 @@ impl DataManager {
                 commit_durable: false,
                 fenced: false,
                 durable_commit: false,
+                status_cell_attempted: false,
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -1162,7 +1167,9 @@ impl DataManager {
             txn.commit_durable = true;
             // The status cell, inside the bracket, before the COMMIT, under
             // the same sync (D31).
-            match self.write_status_cell(tid, &txn.participants, &store) {
+            let first_attempt = !txn.status_cell_attempted;
+            txn.status_cell_attempted = true;
+            match self.write_status_cell(tid, &txn.participants, &store, first_attempt) {
                 Ok(placed) => status = Some(placed),
                 Err(error) => {
                     error!(
@@ -1628,6 +1635,7 @@ impl DataManager {
         tid: &TxnId,
         participants: &[u64],
         store: &std::ops::Range<usize>,
+        first_attempt: bool,
     ) -> Result<(usize, Id), WriteError> {
         let chunks = self.chunks();
         let chunk_id = crate::ram::chunk::transaction_leased_segments(tid, store)
@@ -1639,8 +1647,13 @@ impl DataManager {
             .list
             .get(chunk_id)
             .ok_or(WriteError::CannotAllocateSpace)?;
-        if let Some((id, _)) = chunk.find_status_cell(tid) {
-            return Ok((chunk_id, id));
+        // A retry can find the cell of an earlier attempt; it keeps that cell
+        // and its id. The first attempt has nothing to find: the first free
+        // probe is the id.
+        if !first_attempt {
+            if let Some((id, _)) = chunk.find_status_cell(tid) {
+                return Ok((chunk_id, id));
+            }
         }
         let id = chunk
             .free_status_id(tid)

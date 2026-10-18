@@ -1059,6 +1059,11 @@ pub(crate) fn refuse_commits_for_test(
     INJECTED_COMMIT_REFUSALS.lock().push((base_addr, txn, times));
 }
 
+/// Test counter: index reads of status-cell probes, per chunk lease key.
+#[cfg(test)]
+static STATUS_PROBE_READS: parking_lot::Mutex<std::collections::BTreeMap<(usize, usize), u64>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
 #[cfg(test)]
 fn take_injected_commit_refusal(
     base_addr: usize,
@@ -2323,6 +2328,8 @@ impl Chunk {
     ) -> Option<(Id, Vec<u64>)> {
         for probe in 0..crate::ram::txn_status::STATUS_PROBES {
             let id = crate::ram::txn_status::status_id(txn, self.id, probe);
+            #[cfg(test)]
+            self.count_status_probe();
             let Ok(cell) = self.read_cell(id.bits()) else {
                 continue;
             };
@@ -2342,6 +2349,8 @@ impl Chunk {
     pub(crate) fn free_status_id(&self, txn: &crate::server::transactions::TxnId) -> Option<Id> {
         for probe in 0..crate::ram::txn_status::STATUS_PROBES {
             let id = crate::ram::txn_status::status_id(txn, self.id, probe);
+            #[cfg(test)]
+            self.count_status_probe();
             match self.read_cell(id.bits()) {
                 Err(_) => return Some(id),
                 Ok(cell) => {
@@ -2354,6 +2363,22 @@ impl Chunk {
             }
         }
         None
+    }
+
+    /// Test counter: one more index read of a status-cell probe here.
+    #[cfg(test)]
+    fn count_status_probe(&self) {
+        *STATUS_PROBE_READS.lock().entry(self.lease_key()).or_insert(0) += 1;
+    }
+
+    /// Test counter: the index reads of status-cell probes in this chunk.
+    #[cfg(test)]
+    pub(crate) fn status_probe_reads(&self) -> u64 {
+        STATUS_PROBE_READS
+            .lock()
+            .get(&self.lease_key())
+            .copied()
+            .unwrap_or(0)
     }
 
     /// This chunk's lease key: unique across every store in the process.

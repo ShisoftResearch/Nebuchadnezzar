@@ -994,6 +994,39 @@ async fn the_status_cell_is_released_once_every_participant_synced() {
     cluster.shutdown().await;
 }
 
+/// The index reads of status-cell probes on site `index`.
+fn status_probe_reads(cluster: &Cluster, index: usize) -> u64 {
+    cluster
+        .site(index)
+        .chunks()
+        .list
+        .iter()
+        .map(|chunk| chunk.status_probe_reads())
+        .sum()
+}
+
+/// D44: the first close of a multi-site transaction reads one status-cell
+/// probe per site. No status cell of the transaction can exist before the
+/// first close, so the close does not search the 8 probes for one. The
+/// transaction still commits on both sites.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_close_reads_one_status_probe_per_site() {
+    let (cluster, client) = Cluster::start("crosssite_first_close").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 9100, 91).await;
+    let before = [status_probe_reads(&cluster, A), status_probe_reads(&cluster, B)];
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    let after = [status_probe_reads(&cluster, A), status_probe_reads(&cluster, B)];
+    assert_eq!(after[0] - before[0], 1, "site A: probe reads of the first close");
+    assert_eq!(after[1] - before[1], 1, "site B: probe reads of the first close");
+    assert!(holds_status(&cluster, A, &tid) && holds_status(&cluster, B, &tid));
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "both sites commit");
+    cluster.shutdown().await;
+}
+
 /// C14: the release waits for every participant's sync, not for the `end`
 /// replies. A's sync is held back; B must keep its status cell. Then A loses
 /// power, its COMMIT is gone, and A resolves from B.
