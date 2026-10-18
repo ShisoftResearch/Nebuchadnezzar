@@ -197,8 +197,8 @@ service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 /// Per the comment above, nothing on an operation path reads this, so a lock
 /// costs nothing here.
 static LOCAL_TREE_SERVICES: std::sync::LazyLock<
-    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<TreeService>>>,
-> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    crate::utils::sharded::Sharded<parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<TreeService>>>>,
+> = std::sync::LazyLock::new(crate::utils::sharded::Sharded::default);
 
 /// Key a database's tree service by the pair that scopes it everywhere else.
 pub fn local_tree_service_key(group_name: &str, database_name: &str) -> String {
@@ -211,9 +211,9 @@ pub fn publish_local_tree_service(
     database_name: &str,
     service: std::sync::Arc<TreeService>,
 ) {
-    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
-        .write())
-        .insert(local_tree_service_key(group_name, database_name), service);
+    let key = local_tree_service_key(group_name, database_name);
+    let replaced = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).write()).insert(key, service);
+    drop(replaced);
 }
 
 /// Forget a database's tree service, because the database is going away.
@@ -222,10 +222,9 @@ pub fn publish_local_tree_service(
 /// -- and every page its trees hold -- outlives the database that owned it, for
 /// the life of the process.
 pub fn retire_local_tree_service(group_name: &str, database_name: &str) -> bool {
-    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
-        .write())
-        .remove(&local_tree_service_key(group_name, database_name))
-        .is_some()
+    let key = local_tree_service_key(group_name, database_name);
+    let retired = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).write()).remove(&key);
+    retired.is_some()
 }
 
 /// This database's tree service, if it has one.
@@ -233,10 +232,8 @@ pub fn local_tree_service(
     group_name: &str,
     database_name: &str,
 ) -> Option<std::sync::Arc<TreeService>> {
-    crate::profile_lock!(C15, LOCAL_TREE_SERVICES
-        .read())
-        .get(&local_tree_service_key(group_name, database_name))
-        .cloned()
+    let key = local_tree_service_key(group_name, database_name);
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).read()).get(&key).cloned()
 }
 
 pub struct TreeService {
@@ -2058,5 +2055,30 @@ pub async fn locate_tree_server_from_conshash(
             .map(|c| client_by_rpc_client(&c, group_name, database_name))
     } else {
         Err(RPCError::RequestError(RPCRequestError::Other))
+    }
+}
+
+#[cfg(test)]
+mod registry_partition_tests {
+    use super::*;
+
+    #[test]
+    fn local_tree_registry_lookups_do_not_share_one_gate() {
+        let first = local_tree_service_key("registry_partition", "first");
+        let second = (0..1000).map(|n| format!("second-{n}")).find(|name| {
+            let key = local_tree_service_key("registry_partition", name);
+            !std::ptr::eq(LOCAL_TREE_SERVICES.shard(&first), LOCAL_TREE_SERVICES.shard(&key))
+        }).unwrap();
+        let held = LOCAL_TREE_SERVICES.shard(&first).write();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            assert!(local_tree_service("registry_partition", &second).is_none());
+            assert!(!retire_local_tree_service("registry_partition", &second));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
     }
 }
