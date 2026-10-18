@@ -185,20 +185,11 @@ service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 /// 43 trees and 117,677,730 keys. Under-reporting to zero is the worst
 /// direction for this particular number: an empty ranged index is exactly the
 /// failure being looked for.
-/// A plain `RwLock<HashMap>`, and it must stay removable. This was a
-/// `PtrHashMap` that was only ever inserted into -- so every database's tree
-/// service, and with it every page its trees held, stayed alive for the life of
-/// the process even after the database was unloaded or dropped. Two separate
-/// mistakes: nothing retired the entry, and `PtrHashMap::remove` would not have
-/// released it anyway (it returns a clone and leaves the original in the retired
-/// node, so removal is not a release; see
-/// `neb::server::tests::ptr_hash_map_remove_does_not_release_the_value`).
-///
-/// Per the comment above, nothing on an operation path reads this, so a lock
-/// costs nothing here.
+/// Keyed publication for status and shutdown. Retirement takes the payload
+/// out before Lightning defers reclamation of its small registry entry.
 static LOCAL_TREE_SERVICES: std::sync::LazyLock<
-    crate::utils::sharded::Sharded<parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<TreeService>>>>,
-> = std::sync::LazyLock::new(crate::utils::sharded::Sharded::default);
+    crate::utils::keyed_state::KeyedState<String, std::sync::Arc<TreeService>>,
+> = std::sync::LazyLock::new(crate::utils::keyed_state::KeyedState::default);
 
 /// Key a database's tree service by the pair that scopes it everywhere else.
 pub fn local_tree_service_key(group_name: &str, database_name: &str) -> String {
@@ -212,7 +203,7 @@ pub fn publish_local_tree_service(
     service: std::sync::Arc<TreeService>,
 ) {
     let key = local_tree_service_key(group_name, database_name);
-    let replaced = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).write()).insert(key, service);
+    let replaced = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).replace(service);
     drop(replaced);
 }
 
@@ -223,7 +214,7 @@ pub fn publish_local_tree_service(
 /// the life of the process.
 pub fn retire_local_tree_service(group_name: &str, database_name: &str) -> bool {
     let key = local_tree_service_key(group_name, database_name);
-    let retired = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).write()).remove(&key);
+    let retired = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).take();
     retired.is_some()
 }
 
@@ -233,7 +224,7 @@ pub fn local_tree_service(
     database_name: &str,
 ) -> Option<std::sync::Arc<TreeService>> {
     let key = local_tree_service_key(group_name, database_name);
-    crate::profile_lock!(C15, LOCAL_TREE_SERVICES.shard(&key).read()).get(&key).cloned()
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).as_ref().cloned()
 }
 
 pub struct TreeService {
@@ -2065,11 +2056,8 @@ mod registry_partition_tests {
     #[test]
     fn local_tree_registry_lookups_do_not_share_one_gate() {
         let first = local_tree_service_key("registry_partition", "first");
-        let second = (0..1000).map(|n| format!("second-{n}")).find(|name| {
-            let key = local_tree_service_key("registry_partition", name);
-            !std::ptr::eq(LOCAL_TREE_SERVICES.shard(&first), LOCAL_TREE_SERVICES.shard(&key))
-        }).unwrap();
-        let held = LOCAL_TREE_SERVICES.shard(&first).write();
+        let second = "second".to_owned();
+        let held = LOCAL_TREE_SERVICES.entry(&first);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             assert!(local_tree_service("registry_partition", &second).is_none());
