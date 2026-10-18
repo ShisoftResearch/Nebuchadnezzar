@@ -10,6 +10,7 @@ pub mod ranged;
 pub mod scrub;
 pub mod vector;
 pub mod verification;
+pub mod query_metrics;
 
 pub const FEATURE_SIZE: usize = 8;
 pub const KEY_SIZE: usize = ID_SIZE + FEATURE_SIZE + 8; // 8 is the estimate length of: schema id u32 (4) + field id u32(4, reduced from u64)

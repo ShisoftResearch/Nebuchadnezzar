@@ -658,6 +658,7 @@ impl IndexedDataClient {
         hit_table: &mut QueryHitTable,
         verify: Verify,
     ) -> Result<IdCursor, RPCError> {
+        crate::index::query_metrics::candidates();
         self.query_ids_with_options_cached(
             schema,
             selection,
