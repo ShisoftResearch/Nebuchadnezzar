@@ -52,6 +52,8 @@ else:
         args += ['--audit-every',os.environ['MULTISITE_AUDIT_EVERY']]
     if os.environ.get('MULTISITE_KEEP_GOING') == '1':
         args.append('--keep-going')
+    if os.environ.get('MULTISITE_SEED_STOP_ONLY') == '1':
+        args.append('--seed-stop-only')
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
     if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':

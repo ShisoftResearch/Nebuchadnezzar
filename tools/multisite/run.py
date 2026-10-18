@@ -302,12 +302,14 @@ class Gate:
     MULTI_POINTS = ['before_p0','after_p0','during_end','before_status_record','after_status_record',
                     'before_status_release','coordinator_before_end','coordinator_after_end']
 
-    def build_request(self, rng, event, workload):
+    def build_request(self, rng, event, workload, with_seed=False):
         members = self.args.members
         durable = self.args.durable
         if workload.startswith('conflict'):
             count = int(workload[len('conflict'):])
             sites = rng.sample(range(members), 2)
+            if with_seed and 0 not in sites:
+                sites[0] = 0
             keys = [[91+m, 100000+event] for m in sites]
             requests = [{'op':'txn','id':f'{event}.{i}','keys':keys,'value':event*1000+i+1,'durable':durable,
                          'coordinator':rng.randrange(members)} for i in range(count)]
@@ -316,6 +318,8 @@ class Gate:
             # A list cell at one site refers to a body cell at another site. A one-sided
             # edge or a dangling reference shows as one cell without the other (D19).
             list_site, body_site = rng.sample(range(members), 2)
+            if with_seed and 0 not in (list_site, body_site):
+                list_site = 0
             low = 100000+event
             keys = [[91+list_site, low], [91+body_site, low]]
             request = {'op':'txn','id':f'{event}.0','keys':keys,'values':[((91+body_site) << 48) | low, 0xB0D1000+event],
@@ -323,6 +327,8 @@ class Gate:
             return request, [list_site, body_site]
         count = min({'s1':1,'s2':2,'s3':3,'abort':2}[workload], members)
         sites = rng.sample(range(members), count)
+        if with_seed and 0 not in sites:
+            sites[0] = 0
         keys = [[91+m, 100000+event] for m in sites]
         request = {'op':'txn','id':f'{event}.0','keys':keys,'value':event*1000+1,'durable':durable,
                    'coordinator':rng.randrange(members)}
@@ -343,10 +349,12 @@ class Gate:
             workload = 's2'
         faults = self.args.faults.split(',') if self.args.faults else self.FAULTS
         fault = faults[(event + event//len(workloads)) % len(faults)]
-        request, sites = self.build_request(rng, event, workload)
+        request, sites = self.build_request(rng, event, workload, self.args.seed_stop_only)
         singles = [request] if request['op'] == 'txn' else request['requests']
         victim = rng.choice(sites)
-        if self.args.no_seed_stop and fault not in ('cut','delay','drop'):
+        if self.args.seed_stop_only and fault not in ('cut','delay','drop','none'):
+            victim = 0
+        elif self.args.no_seed_stop and fault not in ('cut','delay','drop'):
             candidates = [site for site in sites if site != 0]
             if candidates:
                 victim = rng.choice(candidates)
@@ -359,7 +367,7 @@ class Gate:
             else:
                 point = rng.choice(self.SINGLE_POINTS if workload == 's1' else self.MULTI_POINTS)
                 if point.startswith('coordinator_'):
-                    victim = rng.randrange(1 if self.args.no_seed_stop else 0, self.args.members)
+                    victim = 0 if self.args.seed_stop_only else rng.randrange(1 if self.args.no_seed_stop else 0, self.args.members)
                     for single in singles:
                         single['coordinator'] = victim
         if self.args.safe_stops and victim != 0 and fault.endswith('kill'):
@@ -776,6 +784,7 @@ def main():
     parser.add_argument('--workloads', default='')
     parser.add_argument('--audit-every', type=int, default=50)
     parser.add_argument('--keep-going', action='store_true')
+    parser.add_argument('--seed-stop-only', action='store_true')
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
