@@ -413,13 +413,33 @@ class Gate:
                 return observed
             time.sleep(5)
 
-    def verify(self, client, operations):
-        observed = self.read_all(client, [op['keys'] for op in operations])
-        for op, values in zip(operations, observed):
-            if op['kind'] == 'batch':
-                check_batch(op['requests'], op['results'], values)
-            else:
-                check_transaction(op['requests'][0], op['results'][0], values)
+    def verify(self, client, operations, settle=90):
+        """Check each operation. A violation may be an in-flight transaction that the
+        lease sweeper has not resolved yet, so retry for one settle period before it counts."""
+        pending = list(operations)
+        deadline = time.monotonic()+settle
+        waited = 0
+        while True:
+            observed = self.read_all(client, [op['keys'] for op in pending])
+            failed, error = [], None
+            for op, values in zip(pending, observed):
+                try:
+                    if op['kind'] == 'batch':
+                        check_batch(op['requests'], op['results'], values)
+                    else:
+                        check_transaction(op['requests'][0], op['results'][0], values)
+                except AssertionError as caught:
+                    failed.append(op)
+                    error = error or caught
+            if not failed:
+                break
+            if time.monotonic() > deadline:
+                raise error
+            pending = failed
+            waited += 10
+            time.sleep(10)
+        if waited:
+            append(self.root/'checks.jsonl', {'event':'settled','waited_s':waited,'operations':len(operations)})
 
     def audit(self, client, tids, label):
         """Stuck locks, brackets and in-doubt transactions after a heal. Waits one lease period first."""
