@@ -729,23 +729,9 @@ impl IndexBuilder {
         cell_id: Id,
         schema_id: SchemaUid,
     ) -> Result<(), IndexError> {
-        // Bound how many scannable write+verify sequences run at once. The
-        // builder spawns one task per written cell with nothing waiting on
-        // them at creation, so a bulk import queued 562K of these and their
-        // concurrent RPC loops starved the shared runtime (2026-08-31:
-        // 950%-2700% CPU, HTTP polls timing out). Tasks past the bound park
-        // on the semaphore, which costs nothing to the scheduler; permits
-        // turn over in well under a second in the healthy case.
-        static SCANNABLE_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
-            std::sync::OnceLock::new();
-        let permits = SCANNABLE_PERMITS.get_or_init(|| {
-            let n = std::env::var("NEB_SCANNABLE_INFLIGHT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|n| *n > 0)
-                .unwrap_or(64);
-            tokio::sync::Semaphore::new(n)
-        });
+        // Each locality has an independent limit within this client. Keep
+        // secondary RPC work bounded without blocking unrelated localities.
+        let permits = indexers.scannable_admission.for_locality(cell_id.locality());
         let _permit = crate::profile_lock!(H21, permits
             .acquire()
             .await
