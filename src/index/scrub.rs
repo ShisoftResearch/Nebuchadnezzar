@@ -510,6 +510,15 @@ async fn reconcile_cell_entries(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    reconcile_cell_entries_inner(chunks, indexers, mode, #[cfg(test)] None).await
+}
+
+async fn reconcile_cell_entries_inner(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    #[cfg(test)] mut after_snapshot: Option<&mut (dyn FnMut(&crate::ram::chunk::Chunk) + Send)>,
+) -> ScrubReport {
     const BATCH_CELLS: usize = 1024;
 
     let mut total = ScrubReport::default();
@@ -518,6 +527,10 @@ async fn reconcile_cell_entries(
         // so resolve each ID when we visit it. New segments and later writes
         // cannot extend this finite walk.
         let ids = chunk.live_cell_ids();
+        #[cfg(test)]
+        if let Some(hook) = after_snapshot.as_mut() {
+            hook(chunk);
+        }
         for ids in ids.chunks(BATCH_CELLS) {
             // Release all cell guards before the index RPCs.
             let mut batch: Vec<EntryKey> = Vec::new();
@@ -2269,39 +2282,27 @@ mod tests {
             "precondition: {holed}"
         );
 
-        // Keep combining while the walk runs: rewrite a rotating slice of the
-        // even cells, which makes their segments dead-heavy again, then ask for
-        // a full collection, which accepts any segment with dead space.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hammer_stop = stop.clone();
-        let hammer_chunks = server.chunks().clone();
-        let hammer = tokio::task::spawn_blocking(move || {
-            let mut cleaned = 0usize;
-            let mut round = 0u64;
-            while !hammer_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for k in 0..200u64 {
-                    let seq = 2 * ((round * 200 + k) % (RACE_CELLS / 2));
-                    let mut cell = race_cell(seq, round + 1);
-                    let _ = hammer_chunks.update_cell(&mut cell);
-                }
-                cleaned += hammer_chunks
-                    .list
-                    .iter()
-                    .filter(|chunk| crate::ram::cleaner::Cleaner::clean(chunk, true, true))
-                    .count();
-                round += 1;
-            }
-            cleaned
-        });
-
-        let repaired = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let cleaned = hammer.await.unwrap();
+        // Move cells on another thread after the walk captures its IDs.
+        // The hook belongs only to this invocation and cannot affect other tests.
+        let mut cleaned = 0usize;
+        let mut move_after_snapshot = |chunk: &crate::ram::chunk::Chunk| {
+            let selected = chunk.segments();
+            chunk.rotate_heads_for_scrub_test();
+            cleaned += std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &selected).0
+                }).join().unwrap()
+            });
+        };
+        let mut repaired = prune_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        repaired.merge(&reconcile_cell_entries_inner(
+            server.chunks(), indexers, ScrubMode::Repair, Some(&mut move_after_snapshot),
+        ).await);
         server.await_index_tasks().await;
 
         let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         println!(
-            "combine passes={cleaned} reconcile derived={} repaired={} verify={after}",
+            "combine reclaimed_bytes={cleaned} reconcile derived={} repaired={} verify={after}",
             repaired.entries_derived, repaired.entries_repaired
         );
         assert!(
