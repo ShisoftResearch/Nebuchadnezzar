@@ -37,6 +37,8 @@ else:
         args += ['--schedule','mixed']
     if os.environ.get('MULTISITE_FAULTS'):
         args += ['--faults',os.environ['MULTISITE_FAULTS']]
+    if os.environ.get('MULTISITE_NO_REFRESH') == '1':
+        args.append('--no-refresh')
     if os.environ.get('MULTISITE_NO_SEED_STOP') == '1':
         args.append('--no-seed-stop')
     if 'MULTISITE_SEED' in os.environ:

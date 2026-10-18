@@ -486,11 +486,25 @@ class Gate:
         assert counters['events'] >= self.args.events, ('too few events', counters)
         (self.root/'PASS').write_text('mixed campaign passed\n')
 
+    def refresh_tables(self):
+        """A migration tells only its donor and recipient (D45). Refresh every other member."""
+        for index in range(self.args.members):
+            control = self.root/f'control-{index}'
+            (control/'refreshed').unlink(missing_ok=True)
+            (control/'refresh').write_text('1')
+            deadline = time.monotonic()+30
+            while not (control/'refreshed').exists():
+                assert time.monotonic() < deadline, f'member {index} did not refresh'
+                time.sleep(.05)
+            assert (control/'refreshed').read_text() == 'true', f'member {index} refresh failed'
+
     def run(self):
         for index in range(self.args.members):
             self.start(index)
         client = self.client()
         assert client.command({'op':'setup'})['ok']
+        if not self.args.no_refresh:
+            self.refresh_tables()
         if self.args.probe == 'readonly-e2e':
             initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
             assert initial['outcome'] == 'ack', initial
@@ -613,6 +627,7 @@ def main():
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
     parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
+    parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')

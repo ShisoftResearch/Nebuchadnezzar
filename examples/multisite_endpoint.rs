@@ -62,6 +62,11 @@ async fn main() {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = interval.tick() => {
+                    if control.join("refresh").exists() {
+                        let refreshed = server.refresh_slot_placement().await;
+                        std::fs::write(control.join("refreshed"), refreshed.to_string()).unwrap();
+                        std::fs::remove_file(control.join("refresh")).unwrap();
+                    }
                     if let Ok(data) = std::fs::read(control.join("inspect")) {
                         let tids: Vec<transactions::TxnId> = serde_json::from_slice(&data).unwrap();
                         let stats: Vec<Value> = tids.iter().map(|tid| json!({
