@@ -35,6 +35,10 @@ else:
         args.append('--durable')
     if name.startswith('multisite_mixed'):
         args += ['--schedule','mixed']
+    if os.environ.get('MULTISITE_FAULTS'):
+        args += ['--faults',os.environ['MULTISITE_FAULTS']]
+    if os.environ.get('MULTISITE_NO_SEED_STOP') == '1':
+        args.append('--no-seed-stop')
     if 'MULTISITE_SEED' in os.environ:
         args += ['--seed',os.environ['MULTISITE_SEED']]
     if 'MULTISITE_SCHEDULE' in os.environ:

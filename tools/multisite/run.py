@@ -323,10 +323,17 @@ class Gate:
         workload = self.WORKLOADS[event % len(self.WORKLOADS)]
         if workload == 's3' and self.args.members < 3:
             workload = 's2'
-        fault = self.FAULTS[(event + event//len(self.WORKLOADS)) % len(self.FAULTS)]
+        faults = self.args.faults.split(',') if self.args.faults else self.FAULTS
+        fault = faults[(event + event//len(self.WORKLOADS)) % len(faults)]
         request, sites = self.build_request(rng, event, workload)
         singles = [request] if request['op'] == 'txn' else request['requests']
         victim = rng.choice(sites)
+        if self.args.no_seed_stop and fault not in ('cut','delay','drop'):
+            candidates = [site for site in sites if site != 0]
+            if candidates:
+                victim = rng.choice(candidates)
+            else:
+                fault = 'drop'
         point = None
         if fault.startswith('point'):
             if workload == 'abort':
@@ -334,7 +341,7 @@ class Gate:
             else:
                 point = rng.choice(self.SINGLE_POINTS if workload == 's1' else self.MULTI_POINTS)
                 if point.startswith('coordinator_'):
-                    victim = rng.randrange(self.args.members)
+                    victim = rng.randrange(1 if self.args.no_seed_stop else 0, self.args.members)
                     for single in singles:
                         single['coordinator'] = victim
         record = {'event':event,'workload':workload,'fault':fault,'victim':victim,'point':point,'sites':sites}
@@ -606,6 +613,8 @@ def main():
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
     parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
+    parser.add_argument('--faults', default='')
+    parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
     parser.add_argument('--victim', type=int, default=1)
     parser.add_argument('--kind', choices=['kill','graceful'], default='graceful')
