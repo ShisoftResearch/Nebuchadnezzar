@@ -100,6 +100,7 @@ service! {
     rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>, need_header: bool) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc existing_ids(keys: &Vec<Id>) -> Vec<Result<bool, ReadError>>;
     rpc read_all_cells_verified(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr, checks: &Vec<crate::index::verification::IndexCheck>) -> Vec<Result<OwnedCell, ReadError>>;
     // Plain writes: `write_cell`, `update_cell`, `upsert_cell`,
     // `upsert_all_cells`, `remove_cell` and their durable and captured forms.
@@ -365,6 +366,7 @@ pub struct NebRPCService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("cell_rpc/idcontract_tests.rs");
 
     #[test]
     fn index_failure_turns_a_successful_write_into_index_incomplete() {
@@ -1012,6 +1014,25 @@ impl Service for NebRPCService {
         proc: &Expr,
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         self.read_cells_checked(keys, colums, filter, proc, &[])
+    }
+
+    fn existing_ids(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<bool, ReadError>>> {
+        // The word guard serializes this check with publication and deletion.
+        // No segment address is dereferenced and no cold segment is promoted.
+        let result = keys
+            .iter()
+            .map(|id| {
+                if crate::index::verification::control("NEB_TEST_IDCONTRACT_SKIP_EXISTS") {
+                    return Ok(true);
+                }
+                match self.database_runtime.chunks().location_for_read(id) {
+                    Ok(_guard) => Ok(true),
+                    Err(ReadError::CellDoesNotExisted) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect();
+        future::ready(result).boxed()
     }
 
     fn read_all_cells_verified(

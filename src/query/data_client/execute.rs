@@ -139,6 +139,7 @@ impl IndexedDataClient {
         cells: &mut HashMap<Id, OwnedCell>,
         retain_cells: bool,
         cache_fields: &[u64],
+        verify: super::Verify,
     ) -> Result<Vec<Id>, RPCError> {
         let mut all_ids = vec![];
         for disjunct in plan.disjuncts() {
@@ -151,6 +152,7 @@ impl IndexedDataClient {
                     cells,
                     retain_cells,
                     cache_fields,
+                    verify,
                 )
                 .await?;
             all_ids = union_ids_ordered(all_ids, &ids);
@@ -170,7 +172,14 @@ impl IndexedDataClient {
         cells: &mut HashMap<Id, OwnedCell>,
         retain_cells: bool,
         cache_fields: &[u64],
+        verify: super::Verify,
     ) -> Result<Vec<Id>, RPCError> {
+        if verify == super::Verify::Exists
+            && (!disjunct.residual().is_empty()
+                || disjunct.clauses().iter().any(Self::is_special_clause))
+        {
+            return Err(Self::requires_predicate("residual or relevance predicate"));
+        }
         let mut candidate_ids = if disjunct.clauses().is_empty() {
             self.scan_schema_ids(schema, ordering).await?
         } else {
@@ -185,7 +194,10 @@ impl IndexedDataClient {
             {
                 Ok(ids) => ids,
                 Err(e) => {
-                    if Self::is_special_clause(first) || Self::is_invalid_input_error(&e) {
+                    if verify == super::Verify::Exists
+                        || Self::is_special_clause(first)
+                        || Self::is_invalid_input_error(&e)
+                    {
                         return Err(e);
                     }
                     self.scan_schema_ids(schema, ordering).await?
@@ -199,7 +211,10 @@ impl IndexedDataClient {
                 {
                     Ok(ids) => ids,
                     Err(e) => {
-                        if Self::is_special_clause(candidate) || Self::is_invalid_input_error(&e) {
+                        if verify == super::Verify::Exists
+                            || Self::is_special_clause(candidate)
+                            || Self::is_invalid_input_error(&e)
+                        {
                             return Err(e);
                         }
                         candidate_ids = self.scan_schema_ids(schema, ordering).await?;
@@ -222,6 +237,18 @@ impl IndexedDataClient {
             candidate_ids
         };
 
+        if verify == super::Verify::Exists
+            && !crate::index::verification::control("NEB_TEST_IDCONTRACT_FORCE_PREDICATE")
+        {
+            let ids = self.existing_ids(&candidate_ids).await?;
+            #[cfg(test)]
+            let ids = if crate::index::verification::control("NEB_TEST_IDCONTRACT_DROP_ID") {
+                ids.into_iter().skip(1).collect()
+            } else {
+                ids
+            };
+            return Ok(ids);
+        }
         let mut checks = vec![IndexCheck::Schema(schema)];
         for clause in disjunct.clauses() {
             match clause {

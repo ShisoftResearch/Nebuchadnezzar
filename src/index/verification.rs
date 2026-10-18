@@ -11,6 +11,15 @@ use crate::ram::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Verification for hash and range index candidates.
+/// Existence permits stale predicates but never returns a missing cell.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Verify {
+    #[default]
+    Exists,
+    Predicate,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IndexCheck {
     Schema(SchemaUid),
@@ -119,4 +128,13 @@ pub(crate) fn query_schema(schema: &Schema, checks: &[IndexCheck]) -> Schema {
         !indices.is_empty()
     });
     selected
+}
+
+/// Isolated negative controls are enabled before each test process starts.
+#[inline]
+pub(crate) fn control(name: &str) -> bool {
+    #[cfg(test)]
+    { std::env::var_os(name).is_some() }
+    #[cfg(not(test))]
+    { let _ = name; false }
 }

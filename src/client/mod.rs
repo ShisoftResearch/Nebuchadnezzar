@@ -1866,7 +1866,7 @@ impl AsyncClient {
     /// let ranged = client.ranged();
     ///
     /// // Scan all documents in a schema
-    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100).await? {
+    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100, crate::index::verification::Verify::Predicate).await? {
     ///     while let Some(id) = cursor.next().await? {
     ///         let doc = client.read_cell(id).await?;
     ///     }

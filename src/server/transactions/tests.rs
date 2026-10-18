@@ -339,7 +339,12 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
 
     let query_result = server
         .indexed_data_client()
-        .hashed_query(schema.uid, hash_str("id"), &OwnedValue::U64(100))
+        .hashed_query(
+            schema.uid,
+            hash_str("id"),
+            &OwnedValue::U64(100),
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();

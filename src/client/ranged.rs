@@ -3,6 +3,7 @@
 //! This module provides `RangedClient` for performing distributed range queries
 //! across the Nebuchadnezzar cluster's B-tree based ranged index.
 
+use crate::index::verification::Verify;
 use std::sync::Arc;
 
 use bifrost::conshash::ConsistentHashing;
@@ -28,7 +29,7 @@ use crate::ram::types::Id;
 /// let ranged = client.ranged();
 ///
 /// // Scan all documents of a schema
-/// let mut cursor = ranged.scan_schema(schema_id, 100).await?;
+/// let mut cursor = ranged.scan_schema(schema_id, 100, Verify::Exists).await?;
 /// while let Some(id) = cursor.next().await? {
 ///     let doc = client.read_cell(id).await?;
 /// }
@@ -41,6 +42,7 @@ use crate::ram::types::Id;
 ///     Some(&max_feature),  // end
 ///     ScanOrder::Forward,
 ///     100,
+///     Verify::Exists,
 /// ).await?;
 /// ```
 pub struct RangedClient {
@@ -117,6 +119,7 @@ impl RangedClient {
         &self,
         schema_id: SchemaUid,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let key = EntryKey::for_schema(schema_id);
         let range = Range::new_inclusive_opened(key, Ordering::Forward);
@@ -128,6 +131,7 @@ impl RangedClient {
                     cursor,
                     self.reader.clone(),
                     vec![crate::index::verification::IndexCheck::Schema(schema_id)],
+                    verify,
                 )
                 .await?,
             )),
@@ -141,6 +145,7 @@ impl RangedClient {
         schema_id: SchemaUid,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let key = EntryKey::for_schema(schema_id);
         let range = Range::new_inclusive_opened(key, order.into());
@@ -152,6 +157,7 @@ impl RangedClient {
                     cursor,
                     self.reader.clone(),
                     vec![crate::index::verification::IndexCheck::Schema(schema_id)],
+                    verify,
                 )
                 .await?,
             )),
@@ -176,6 +182,7 @@ impl RangedClient {
         end_feature: Option<&Feature>,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let range = crate::query::data_client::ValueRange {
             start: start_feature
@@ -193,7 +200,7 @@ impl RangedClient {
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, None).await? {
             Some(cursor) => Ok(Some(
-                RangedCursor::new(cursor, self.reader.clone(), checks).await?,
+                RangedCursor::new(cursor, self.reader.clone(), checks, verify).await?,
             )),
             None => Ok(None),
         }
@@ -210,6 +217,7 @@ impl RangedClient {
         key: EntryKey,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let range = Range::new_inclusive_opened(key, order.into());
         let checks = vec![crate::index::verification::IndexCheck::Ranged(
@@ -218,7 +226,7 @@ impl RangedClient {
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, None).await? {
             Some(cursor) => Ok(Some(
-                RangedCursor::new(cursor, self.reader.clone(), checks).await?,
+                RangedCursor::new(cursor, self.reader.clone(), checks, verify).await?,
             )),
             None => Ok(None),
         }
@@ -261,6 +269,7 @@ pub struct RangedCursor {
     inner: ClientCursor,
     reader: crate::query::data_client::read::CellReader,
     checks: Vec<crate::index::verification::IndexCheck>,
+    verify: Verify,
     ids: Vec<Id>,
     cells: Vec<Option<crate::ram::cell::OwnedCell>>,
     pos: usize,
@@ -271,11 +280,13 @@ impl RangedCursor {
         inner: ClientCursor,
         reader: crate::query::data_client::read::CellReader,
         checks: Vec<crate::index::verification::IndexCheck>,
+        verify: Verify,
     ) -> Result<Self, RPCError> {
         let mut cursor = Self {
             inner,
             reader,
             checks,
+            verify,
             ids: Vec::new(),
             cells: Vec::new(),
             pos: 0,
@@ -286,18 +297,23 @@ impl RangedCursor {
 
     async fn refresh(&mut self) -> Result<bool, RPCError> {
         loop {
-            let cells = self
-                .reader
-                .read_cells_from_ids_checked(
-                    self.inner.current_block(),
-                    &vec![],
-                    &dovahkiin::expr::serde::Expr::nothing(),
-                    &dovahkiin::expr::serde::Expr::nothing(),
-                    &self.checks,
-                )
-                .await;
-            self.ids = cells.iter().map(|cell| cell.id()).collect();
-            self.cells = cells.into_iter().map(Some).collect();
+            if self.verify == Verify::Exists {
+                self.ids = self.reader.existing_ids(self.inner.current_block()).await?;
+                self.cells.clear();
+            } else {
+                let cells = self
+                    .reader
+                    .read_cells_from_ids_checked(
+                        self.inner.current_block(),
+                        &vec![],
+                        &dovahkiin::expr::serde::Expr::nothing(),
+                        &dovahkiin::expr::serde::Expr::nothing(),
+                        &self.checks,
+                    )
+                    .await;
+                self.ids = cells.iter().map(|cell| cell.id()).collect();
+                self.cells = cells.into_iter().map(Some).collect();
+            }
             self.pos = 0;
             if !self.ids.is_empty() {
                 return Ok(true);
@@ -309,17 +325,41 @@ impl RangedCursor {
     }
 
     pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
-        Ok(self.next_cell().await?.map(|cell| cell.id()))
-    }
-
-    /// Return the cell that passed verification, with no second read.
-    pub async fn next_cell(&mut self) -> Result<Option<crate::ram::cell::OwnedCell>, RPCError> {
         if self.pos >= self.ids.len() && !self.next_block().await? {
             return Ok(None);
         }
-        let cell = self.cells.get_mut(self.pos).and_then(Option::take);
-        self.pos += usize::from(cell.is_some());
-        Ok(cell)
+        let id = self.ids.get(self.pos).copied();
+        self.pos += usize::from(id.is_some());
+        Ok(id)
+    }
+
+    /// Return a cell that passed predicate verification.
+    pub async fn next_cell(&mut self) -> Result<Option<crate::ram::cell::OwnedCell>, RPCError> {
+        loop {
+            if self.pos >= self.ids.len() && !self.next_block().await? {
+                return Ok(None);
+            }
+            let index = self.pos;
+            self.pos += 1;
+            if self.verify == Verify::Predicate {
+                return Ok(self.cells.get_mut(index).and_then(Option::take));
+            }
+            // Cell results always verify the predicate, even on an existence cursor.
+            let mut cells = self
+                .reader
+                .read_cells_from_ids_checked(
+                    &[self.ids[index]],
+                    &vec![],
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &self.checks,
+                    false,
+                )
+                .await;
+            if let Some(cell) = cells.pop() {
+                return Ok(Some(cell));
+            }
+        }
     }
 
     pub fn current(&self) -> Option<&Id> {

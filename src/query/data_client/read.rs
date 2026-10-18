@@ -290,6 +290,12 @@ impl IndexedDataClient {
         cursor
     }
 
+    pub(super) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {
+        CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
+            .existing_ids(ids)
+            .await
+    }
+
     pub(super) async fn read_cells_from_ids(
         &self,
         ids: &[Id],
@@ -343,7 +349,11 @@ impl IndexedDataClient {
         let mut tasks = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_for_slot(crate::slots::slot_of(id) as u64).map(|sid| (i, sid, *id)))
+            .filter_map(|(i, id)| {
+                self.conshash
+                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                    .map(|sid| (i, sid, *id))
+            })
             .sorted_by_key(|(_i, sid, _id)| *sid)
             .chunk_by(|(_i, sid, _id)| *sid)
             .into_iter()
@@ -431,6 +441,67 @@ impl CellReader {
             database_name: database_name.into(),
         }
     }
+    pub(crate) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {
+        let mut groups = std::collections::BTreeMap::<u64, Vec<(usize, Id)>>::new();
+        for (index, id) in ids.iter().enumerate() {
+            let sid = self
+                .conshash
+                .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                .ok_or_else(|| {
+                    RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no owner for index candidate",
+                    ))
+                })?;
+            groups.entry(sid).or_default().push((index, *id));
+        }
+        let mut tasks = groups
+            .into_iter()
+            .map(|(sid, entries)| async move {
+                let name = self.conshash.try_server_name(sid).ok_or_else(|| {
+                    RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no owner address",
+                    ))
+                })?;
+                let client = client_by_server_name_for_database(
+                    sid,
+                    name,
+                    &self.group_name,
+                    &self.database_name,
+                )
+                .await?;
+                let keys = entries.iter().map(|(_, id)| *id).collect();
+                let present = client.existing_ids(&keys).await?;
+                if present.len() != entries.len() {
+                    return Err(RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "existence response length mismatch",
+                    )));
+                }
+                let mut result = Vec::new();
+                for ((index, id), present) in entries.into_iter().zip(present) {
+                    match present {
+                        Ok(true) => result.push((index, id)),
+                        Ok(false) => {}
+                        Err(error) => {
+                            return Err(RPCError::IOError(std::io::Error::other(format!(
+                                "existence check: {error:?}"
+                            ))))
+                        }
+                    }
+                }
+                Ok::<_, RPCError>(result)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut result = Vec::new();
+        while let Some(batch) = tasks.next().await {
+            result.extend(batch?);
+        }
+        result.sort_unstable_by_key(|(index, _)| *index);
+        Ok(result.into_iter().map(|(_, id)| id).collect())
+    }
+
     pub(crate) async fn read_cells_from_ids_checked(
         &self,
         ids: &[Id],
@@ -452,7 +523,11 @@ impl CellReader {
         let mut tasks = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_for_slot(crate::slots::slot_of(id) as u64).map(|sid| (i, sid, *id)))
+            .filter_map(|(i, id)| {
+                self.conshash
+                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                    .map(|sid| (i, sid, *id))
+            })
             .sorted_by_key(|(_i, sid, _id)| *sid)
             .chunk_by(|(_i, sid, _id)| *sid)
             .into_iter()

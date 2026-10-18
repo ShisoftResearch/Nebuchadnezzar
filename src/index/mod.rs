@@ -174,8 +174,9 @@ impl IndexerClients {
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        HashedIndexClient::query(&self.hashed_client, index_id, field_id, value).await
+        HashedIndexClient::query(&self.hashed_client, index_id, field_id, value, verify).await
     }
 
     pub async fn bm25_search(
