@@ -54,6 +54,7 @@ pub struct IndexerClients {
     pub embedding_client: Arc<EmbeddingIndexClient>,
     fulltext_indexer: OnceLock<Arc<InvertedIndexer>>,
     scannable_admission: admission::ScannableAdmission,
+    pending_tasks: Arc<builder::PendingIndexTasks>,
     // Store initialization parameters for lazy initialization
     server_id: u64,
     pub(crate) neb_client: Arc<AsyncClient>,
@@ -81,6 +82,7 @@ impl IndexerClients {
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
+            pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
             scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(),
             server_id,
@@ -138,6 +140,7 @@ impl IndexerClients {
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
+            pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
             scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(), // Empty, won't be initialized
             server_id,

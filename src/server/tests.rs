@@ -2360,7 +2360,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
                 .expect("secondary big write");
         }
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     assert_eq!(
         scan_count(&dynamic, tiny_schema_id).await,
         tiny_count as usize,
@@ -2533,7 +2533,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
                 .expect("tombstone-test write");
         }
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     for schema in [LOW_SCHEMA, MID_SCHEMA, HIGH_SCHEMA] {
         assert_eq!(
             scan_count(&dynamic, schema).await,
@@ -2551,7 +2551,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
             .remove_cell(&cell_id(MID_SCHEMA, index))
             .expect("tombstone-test delete");
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     assert_eq!(
         scan_count(&dynamic, MID_SCHEMA).await,
         0,

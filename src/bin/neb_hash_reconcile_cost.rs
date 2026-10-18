@@ -266,7 +266,7 @@ async fn run(dir: &Path, group: &str, cells: u64, batch: usize, lanes: u64, port
             "DELETE ops={changed} secs={:.6}",
             began.elapsed().as_secs_f64()
         );
-        IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         // The later verification scrub also allocates. Report the write
         // phase's peak separately from the whole process's peak RSS.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };

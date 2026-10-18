@@ -267,7 +267,7 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     let idx_data_client = server.indexed_data_client();
     {
@@ -308,7 +308,7 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id_2), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     {
         let mut cursor = idx_data_client
@@ -4199,7 +4199,7 @@ async fn bm25_search_returns_ranked_results() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4327,7 +4327,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4438,7 +4438,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4553,7 +4553,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4652,7 +4652,7 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4785,7 +4785,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4907,7 +4907,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5066,7 +5066,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
             .unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5199,7 +5199,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
             .unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5313,7 +5313,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
         .unwrap()
         .unwrap();
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -6095,7 +6095,7 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
 
     let idx_data_client = server.indexed_data_client();

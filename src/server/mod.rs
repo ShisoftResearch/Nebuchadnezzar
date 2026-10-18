@@ -1291,6 +1291,15 @@ impl DatabaseRuntime {
         self.indexer.as_ref()
     }
 
+    /// Wait for unscoped index tasks from this database's local client.
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        match self.indexer() {
+            Some(indexer) => indexer.await_all_indices().await,
+            None => Vec::new(),
+        }
+    }
+
+
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
@@ -1806,7 +1815,7 @@ impl NebServer {
             );
             // Owner for index tasks spawned outside any request scope; request
             // handlers deliberately await only their own work.
-            IndexBuilder::spawn_pending_index_reaper();
+            builder.spawn_pending_index_reaper();
             Some(builder)
         } else {
             None
@@ -2072,7 +2081,7 @@ impl NebServer {
         }
 
         if runtime.indexer().is_some() {
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = runtime.await_index_tasks().await;
 
             if let Some(indexer) = runtime.indexer() {
                 if let Err(e) = indexer.graceful_shutdown().await {
@@ -2260,6 +2269,11 @@ impl NebServer {
         self.database_runtime.indexer()
     }
 
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        self.database_runtime.await_index_tasks().await
+    }
+
+
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.database_runtime.txn_manager()
@@ -2346,7 +2360,7 @@ impl NebServer {
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = self.await_index_tasks().await;
             info!("All pending index tasks completed");
 
 

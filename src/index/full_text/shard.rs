@@ -2592,7 +2592,7 @@ mod tests {
         }
 
         // Wait for async indexing tasks to complete
-        let _ = IndexBuilder::await_indices().await;
+        let _ = server.indexer().unwrap().await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
@@ -2792,7 +2792,7 @@ mod tests {
             index_builder.ensure_indices(&cell, &schema, None);
         }
         // Wait for async indexing tasks to complete
-        let _ = IndexBuilder::await_indices().await;
+        let _ = server.indexer().unwrap().await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;

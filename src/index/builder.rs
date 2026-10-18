@@ -20,8 +20,6 @@ use futures::{
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
 };
-use lazy_static::lazy_static;
-use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
@@ -379,11 +377,74 @@ impl IndexMeta {
     }
 }
 
-// Global storage for pending index tasks
-// Using Mutex for synchronous access across async boundaries
-lazy_static! {
-    static ref PENDING_INDEX_TASKS: Arc<Mutex<Vec<JoinHandle<Result<(), IndexError>>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+/// Completion ownership for unscoped work from one index client.
+#[derive(Default)]
+pub(super) struct PendingIndexTasks {
+    handles: crossbeam::queue::SegQueue<JoinHandle<Result<(), IndexError>>>,
+    inflight: std::sync::atomic::AtomicI64,
+}
+
+impl PendingIndexTasks {
+    fn take(&self) -> Vec<JoinHandle<Result<(), IndexError>>> {
+        // Bound the pass so new producers cannot keep a drain busy forever.
+        (0..self.handles.len())
+            .filter_map(|_| self.handles.pop())
+            .collect()
+    }
+
+    async fn await_indices(&self) -> Vec<Result<Result<(), IndexError>, JoinError>> {
+        self.take()
+            .into_iter()
+            .collect::<FuturesUnordered<_>>()
+            .collect()
+            .await
+    }
+
+    async fn await_all_indices(&self) -> Vec<Result<Result<(), IndexError>, JoinError>> {
+        let results = self.await_indices().await;
+        let failed = results.iter().filter(|r| !matches!(r, Ok(Ok(())))).count();
+        note_index_failures(failed as u64, "client shutdown drain");
+        // Another drainer can own the handles. Completion follows the tasks,
+        // not the queue. This wait affects only this client's work.
+        let started = std::time::Instant::now();
+        while self.inflight.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                log::warn!(
+                    "index tasks for this client did not quiesce within 60 s: {} still in flight",
+                    self.inflight.load(std::sync::atomic::Ordering::Acquire)
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        results
+    }
+
+    fn spawn_reaper(self: &Arc<Self>) {
+        let owner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let Some(owner) = owner.upgrade() else { break };
+                let results = owner.await_indices().await;
+                let mut failed = 0;
+                for result in results {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            log::warn!("Background index task failed: {:?}", error);
+                            failed += 1;
+                        }
+                        Err(error) => {
+                            log::warn!("Background index task join failed: {:?}", error);
+                            failed += 1;
+                        }
+                    }
+                }
+                note_index_failures(failed, "client background reaper");
+            }
+        });
+    }
 }
 
 std::thread_local! {
@@ -402,9 +463,7 @@ std::thread_local! {
         RefCell::new(Vec::new());
 }
 
-/// Index tasks routed to a request-local scope against the process-wide
-/// backlog. The global path takes one mutex per task, so if writes land there
-/// it is a single lock on the hot path of every cell written.
+/// Count request-local tasks separately from client-owned background work.
 pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Index tasks that FAILED -- the cell is durable, its index entries are not.
@@ -527,14 +586,20 @@ pub static INDEX_TASKS_INFLIGHT: std::sync::atomic::AtomicI64 =
 /// Decrements the in-flight gauge when the task finishes, unwind included --
 /// a panicking index task must not leak a gauge increment, or the reading
 /// drifts up forever and any admission control keyed on it starves.
-struct InflightGuard;
+struct InflightGuard(Arc<PendingIndexTasks>);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        self.0
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
         INDEX_TASKS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
+fn new_index_task(
+    owner: &Arc<PendingIndexTasks>,
+    task: impl Future<Output = Result<(), IndexError>> + Send + 'static,
+) {
     // Inside a request scope the future is only collected; it is spawned once
     // for the whole request when the scope closes. Outside one there is no
     // later moment to spawn at, so the task goes to the scheduler immediately
@@ -557,17 +622,15 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
     INDEX_TASK_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     INDEX_TASKS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let task = pending.take().expect("index task should exist");
+    owner
+        .inflight
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    let guard = InflightGuard(owner.clone());
     let handle = tokio::spawn(async move {
-        let _guard = InflightGuard;
+        let _guard = guard;
         task.await
     });
-    let t0 = std::time::Instant::now();
-    let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
-    INDEX_GLOBAL_WAIT_NANOS.fetch_add(
-        t0.elapsed().as_nanos() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    guard.push(handle);
+    owner.handles.push(handle);
 }
 
 // Main struct for building and managing indices
@@ -664,7 +727,7 @@ impl IndexBuilder {
             // cell, which is not what the key is prefixed by.
             let schema_uid = schema.uid;
             let t_spawn = std::time::Instant::now();
-            new_index_task(async move {
+            new_index_task(&self.clients.pending_tasks, async move {
                 if let Some(key) = scannable_key {
                     Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid)
                         .await?;
@@ -707,11 +770,12 @@ impl IndexBuilder {
         let indexers = self.clients.clone();
         let cell_id = cell.id();
         let schema_uid = schema.uid;
-        new_index_task(async move {
+        new_index_task(&self.clients.pending_tasks, async move {
             if let Some(key) = restored_scannable_key {
                 Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid).await?;
             }
-            Self::ensure_indices_(restored_indices, Some(applied_indices), indexers.clone()).await?;
+            Self::ensure_indices_(restored_indices, Some(applied_indices), indexers.clone())
+                .await?;
             if let Some(key) = remove_scannable_key {
                 indexers
                     .ranged_client
@@ -731,11 +795,16 @@ impl IndexBuilder {
     ) -> Result<(), IndexError> {
         // Each locality has an independent limit within this client. Keep
         // secondary RPC work bounded without blocking unrelated localities.
-        let permits = indexers.scannable_admission.for_locality(cell_id.locality());
-        let _permit = crate::profile_lock!(H21, permits
-            .acquire()
-            .await
-            .expect("scannable permit semaphore is never closed"));
+        let permits = indexers
+            .scannable_admission
+            .for_locality(cell_id.locality());
+        let _permit = crate::profile_lock!(
+            H21,
+            permits
+                .acquire()
+                .await
+                .expect("scannable permit semaphore is never closed")
+        );
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
             cell_id,
@@ -800,7 +869,9 @@ impl IndexBuilder {
             self.remove_scannable(cell, schema.uid, &indexers);
         }
         let indices = probe_cell_indices(cell, schema);
-        new_index_task(async move { Self::remove_indices_(indices, indexers).await });
+        new_index_task(&self.clients.pending_tasks, async move {
+            Self::remove_indices_(indices, indexers).await
+        });
     }
 
     // Remove scannable indices
@@ -816,7 +887,7 @@ impl IndexBuilder {
     ) {
         let key = EntryKey::for_scannable(&cell.id(), schema_uid);
         let indexers = indexers.clone();
-        new_index_task(async move {
+        new_index_task(&self.clients.pending_tasks, async move {
             indexers
                 .ranged_client
                 .delete(&key)
@@ -826,35 +897,10 @@ impl IndexBuilder {
         });
     }
 
-    /// Opportunistically drain whatever unscoped index backlog this call happens
-    /// to grab. **This is not a barrier and must not be used as one.**
-    ///
-    /// The stale comment here used to say it was "called by with_indices_ensured()
-    /// after each RPC to ensure indices are updated". It is not, and it would not
-    /// ensure that if it were: the pending list is process-global and every taker
-    /// STEALS it, including `spawn_pending_index_reaper` every 200 ms, so this
-    /// frequently takes an empty list and returns while tasks are still running.
-    /// That is the bug fixed in `await_all_indices` (task #67), and this variant
-    /// keeps the behaviour deliberately -- it sits on the transaction commit path,
-    /// where waiting for every other database's index work would be a convoy.
-    ///
-    /// What actually makes a write's indices visible is
-    /// `with_request_index_scope`, which collects the tasks THIS request created
-    /// and awaits exactly those. Callers wanting a guarantee want that, or
-    /// `await_all_indices` if they genuinely mean process-wide quiescence.
-    pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
-        async move {
-            let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-                let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
-                std::mem::take(&mut *guard)
-            };
-            tasks
-                .into_iter()
-                .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
-                .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
-                .await
-        }
-        .boxed()
+    /// Join the unscoped handles currently owned by this client.
+    /// This is not a completion barrier when another drainer owns handles.
+    pub fn await_indices(&self) -> BoxFuture<'_, Vec<Result<Result<(), IndexError>, JoinError>>> {
+        self.clients.pending_tasks.await_indices().boxed()
     }
 
     // Collect futures so a test can choose a valid completion order.
@@ -936,129 +982,14 @@ impl IndexBuilder {
         .boxed()
     }
 
-    /// Drains index tasks that were spawned outside any request scope.
-    ///
-    /// Request handlers only await their own tasks, so unscoped work (recovery,
-    /// background maintenance, transaction paths) needs an owner. This reaper
-    /// is that owner: it keeps the backlog bounded and surfaces failures,
-    /// without putting the backlog on any request's critical path.
-    pub fn spawn_pending_index_reaper() {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-                    let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
-                    std::mem::take(&mut *guard)
-                };
-                if tasks.is_empty() {
-                    continue;
-                }
-                let results = tasks
-                    .into_iter()
-                    .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
-                    .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
-                    .await;
-                let mut failed = 0u64;
-                let mut first_error = None;
-                for result in results {
-                    // Every failure keeps its own line, as before. The summary
-                    // below is ADDITIONAL signal; dropping the detail to make
-                    // room for it would trade a diagnosable failure for a
-                    // countable one.
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            log::warn!("Background index task failed: {:?}", e);
-                            failed += 1;
-                            first_error.get_or_insert_with(|| format!("{:?}", e));
-                        }
-                        Err(e) => {
-                            log::warn!("Background index task join failed: {:?}", e);
-                            failed += 1;
-                            first_error.get_or_insert_with(|| format!("join: {:?}", e));
-                        }
-                    }
-                }
-                note_index_failures(
-                    failed,
-                    &format!(
-                        "background reaper, first error: {}",
-                        first_error.as_deref().unwrap_or("none")
-                    ),
-                );
-            }
-        });
+    /// Own the unscoped work from this client until it completes.
+    pub fn spawn_pending_index_reaper(&self) {
+        self.clients.pending_tasks.spawn_reaper();
     }
 
-    /// Wait until no index task is still running anywhere in this process.
-    ///
-    /// Joining the handle list is NOT enough, and that was a real bug. The list
-    /// is process-global and every taker STEALS it with `mem::take` -- including
-    /// `spawn_pending_index_reaper`, which drains it every 200 ms. So a caller
-    /// very often takes an EMPTY list, joins nothing, and returns while its own
-    /// index tasks are still running in the reaper's join set.
-    ///
-    /// Symptom: a test wrote six cells, awaited the indices, scanned, and found
-    /// nothing -- `wrote 6, scan found 0` -- in about 1 full-suite run in 5, and
-    /// never when run alone (alone, nothing else is draining the list).
-    ///
-    /// `INDEX_TASKS_INFLIGHT` is the honest measure: incremented where a task is
-    /// spawned, decremented by a guard that survives unwinding. Waiting on it is
-    /// correct no matter who holds the handles.
-    async fn await_index_quiescence() {
-        // Generous, because the alternative to waiting is answering a query from
-        // an index that is not built yet. Bounded anyway, and LOUD on expiry: a
-        // silent timeout would put the original bug back without the symptom.
-        const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
-        let started = std::time::Instant::now();
-        loop {
-            if INDEX_TASKS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) <= 0 {
-                return;
-            }
-            if started.elapsed() > LIMIT {
-                log::warn!(
-                    "index tasks did not quiesce within {:?}: {} still in flight. Anything \
-                     read now may be missing entries.",
-                    LIMIT,
-                    INDEX_TASKS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire)
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-    }
-
-    // Wait for ALL pending index tasks globally (for shutdown)
-    // This ensures all index tasks from all threads are completed before shutdown
-    pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
-        let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-            let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
-            std::mem::take(&mut *guard)
-        };
-
-        let count = tasks.len();
-        if count > 0 {
-            log::info!(
-                "Waiting for {} pending index tasks to complete before shutdown",
-                count
-            );
-        }
-
-        let results: Vec<Result<Result<(), IndexError>, JoinError>> =
-            futures::future::join_all(tasks).await;
-
-        let success_count = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
-        let error_count = results.len() - success_count;
-        if error_count > 0 {
-            note_index_failures(error_count as u64, "shutdown drain");
-        } else if count > 0 {
-            log::info!("All {} index tasks completed successfully", success_count);
-        }
-
-        // Whatever this call managed to take, someone else may hold the rest.
-        Self::await_index_quiescence().await;
-
-        results
+    /// Wait for this client's unscoped index work, including reaper-owned work.
+    pub async fn await_all_indices(&self) -> Vec<Result<Result<(), IndexError>, JoinError>> {
+        self.clients.pending_tasks.await_all_indices().await
     }
 
     // Helper function to remove indices
@@ -1439,27 +1370,18 @@ mod tests {
         assert_eq!(meta.model, EmbeddingModel::from("test-model"));
     }
 
-    lazy_static! {
-        /// Serializes tests that assert on the process-wide index backlog.
-        /// They mutate shared global state, so running them concurrently makes
-        /// them steal each other's task handles.
-        static ref GLOBAL_BACKLOG_TEST_GUARD: parking_lot::Mutex<()> =
-            parking_lot::Mutex::new(());
-    }
-
     #[tokio::test]
-    async fn request_index_scope_does_not_wait_for_unrelated_global_tasks() {
-        let _backlog_guard = GLOBAL_BACKLOG_TEST_GUARD.lock();
-        let _ = IndexBuilder::await_indices().await;
+    async fn request_index_scope_does_not_wait_for_unrelated_client_tasks() {
+        let owner = Arc::new(PendingIndexTasks::default());
 
-        new_index_task(async move {
+        new_index_task(&owner, async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             Ok(())
         });
 
         let started = Instant::now();
         let (value, local_results) = IndexBuilder::with_request_index_scope(|| {
-            new_index_task(async move {
+            new_index_task(&owner, async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 Ok(())
             });
@@ -1478,10 +1400,9 @@ mod tests {
             "request scope should not block on unrelated global index work"
         );
 
-        let global_results =
-            tokio::time::timeout(Duration::from_secs(1), IndexBuilder::await_indices())
-                .await
-                .expect("global index backlog should drain");
+        let global_results = tokio::time::timeout(Duration::from_secs(1), owner.await_indices())
+            .await
+            .expect("global index backlog should drain");
         assert_eq!(
             global_results.len(),
             1,
@@ -1490,29 +1411,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_backlog_can_be_drained_before_task_completion() {
-        let _backlog_guard = GLOBAL_BACKLOG_TEST_GUARD.lock();
-        let _ = IndexBuilder::await_indices().await;
+    async fn client_backlog_can_be_drained_before_task_completion() {
+        let owner = Arc::new(PendingIndexTasks::default());
 
         let completed = Arc::new(AtomicBool::new(false));
         let completed_flag = completed.clone();
-        new_index_task(async move {
+        new_index_task(&owner, async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             completed_flag.store(true, Ordering::SeqCst);
             Ok(())
         });
 
-        let drained_tasks = {
-            let mut guard = crate::profile_lock!(H22, PENDING_INDEX_TASKS.lock());
-            std::mem::take(&mut *guard)
-        };
+        let drained_tasks = owner.take();
         assert_eq!(
             drained_tasks.len(),
             1,
             "the global queue should expose the in-flight task handle"
         );
 
-        let later_waiter_results = IndexBuilder::await_indices().await;
+        let later_waiter_results = owner.await_indices().await;
         assert!(
             later_waiter_results.is_empty(),
             "a later waiter sees an empty backlog once another waiter drained the handles"
@@ -1527,6 +1444,54 @@ mod tests {
         assert!(
             completed.load(Ordering::SeqCst),
             "the original drained task should still complete successfully"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_client_completion_does_not_wait_for_another_client() {
+        let busy = Arc::new(PendingIndexTasks::default());
+        let independent = Arc::new(PendingIndexTasks::default());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        new_index_task(&busy, async move {
+            wait.await.unwrap();
+            Ok(())
+        });
+        new_index_task(&independent, async { Ok(()) });
+        let results = tokio::time::timeout(Duration::from_secs(1), independent.await_all_indices())
+            .await
+            .expect("another client's task must not delay completion");
+        assert_eq!(results.len(), 1);
+        assert!(results.into_iter().all(|r| matches!(r, Ok(Ok(())))));
+        let drained = busy.take();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), busy.await_all_indices())
+                .await
+                .is_err(),
+            "taking handles must not hide this client's running work"
+        );
+        release.send(()).unwrap();
+        for result in futures::future::join_all(drained).await {
+            assert!(matches!(result, Ok(Ok(()))));
+        }
+        assert!(busy.await_all_indices().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_index_task_releases_its_client_completion_count() {
+        let owner = Arc::new(PendingIndexTasks::default());
+        new_index_task(&owner, std::future::pending());
+        let tasks = owner.take();
+        assert_eq!(tasks.len(), 1);
+        tasks[0].abort();
+        assert!(futures::future::join_all(tasks).await[0]
+            .as_ref()
+            .unwrap_err()
+            .is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), owner.await_all_indices())
+                .await
+                .is_ok()
         );
     }
 

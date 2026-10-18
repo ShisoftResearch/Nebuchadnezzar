@@ -7369,7 +7369,10 @@ impl Service for DataManager {
                 #[cfg(feature = "occ_phase_profile")]
                 let _phase_guard = phase_guard;
                 let (payload, request_results) = scoped_commit.await;
-                let pending_results = IndexBuilder::await_indices().await;
+                let pending_results = match self.database_runtime.indexer() {
+                    Some(indexer) => indexer.await_indices().await,
+                    None => Vec::new(),
+                };
                 self.warn_on_index_wait_results(
                     &tid_for_logs,
                     request_results
