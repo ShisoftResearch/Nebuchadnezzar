@@ -289,6 +289,19 @@ class Gate:
             self.start(index)
         client = self.client()
         assert client.command({'op':'setup'})['ok']
+        if self.args.probe == 'readonly-e2e':
+            initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
+            assert initial['outcome'] == 'ack', initial
+            first = client.command({'op':'txn','id':'reader-writer','keys':[[91,901]],'reads':[[92,900]],
+                                    'value':2,'durable':self.args.durable})
+            time.sleep(35)
+            second = client.command({'op':'txn','id':'conflicting-write','keys':[[92,900]],'value':3,'durable':True})
+            report = {'first':first,'second':second}
+            (self.root/'probe-e2e.json').write_text(json.dumps(report,indent=2))
+            assert first['outcome'] == 'ack', report
+            assert second['outcome'] == 'ack', ('read-only participant left the cell locked', report)
+            (self.root/'PASS').write_text('read-only e2e probe passed\n')
+            return
         if self.args.probe in ('readonly','readonly-control'):
             initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
             assert initial['outcome'] == 'ack', initial
@@ -391,7 +404,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','restart'], default='none')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart'], default='none')
     parser.add_argument('--victim', type=int, default=1)
     parser.add_argument('--kind', choices=['kill','graceful'], default='graceful')
     parser.add_argument('--settle', type=float, default=5)
