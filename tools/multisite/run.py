@@ -386,13 +386,15 @@ class Gate:
             client.send(request)
             time.sleep(rng.uniform(0, .1))
             append(self.root/'events.jsonl', record | {'kind':fault})
-            if fault == 'cut':
+            if fault == 'none':
+                pass
+            elif fault == 'cut':
                 self.set_links(victim, cut=True)
                 time.sleep(rng.uniform(2, 6))
             elif fault == 'delay':
                 self.set_links(victim, delay=.1)
                 time.sleep(rng.uniform(2, 6))
-            else:
+            elif fault == 'drop':
                 self.set_links(victim, drop=3)
                 time.sleep(1)
             self.set_links(victim, cut=False, delay=0, drop=0)
