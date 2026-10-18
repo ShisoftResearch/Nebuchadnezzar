@@ -289,6 +289,20 @@ class Gate:
             self.start(index)
         client = self.client()
         assert client.command({'op':'setup'})['ok']
+        if self.args.probe in ('readonly','readonly-control'):
+            initial = client.command({'op':'txn','id':'initial','keys':[[92,900]],'value':1,'durable':True})
+            assert initial['outcome'] == 'ack', initial
+            keys = [[91,901]] if self.args.probe == 'readonly' else [[91,901],[92,901]]
+            result = client.command({'op':'txn','id':'readonly-probe','keys':keys,'reads':[[92,900]],
+                                     'value':2,'end_site':1})
+            (self.root/'probe-result.json').write_text(json.dumps(result,indent=2))
+            time.sleep(35)
+            status = client.command({'op':'status','site':1,'tid':result['tid']})
+            (self.root/'probe-status.json').write_text(json.dumps(status,indent=2))
+            assert result['end'] == 'Success', ('read-only end must finish', result, status)
+            assert status['status'] != 'Committing', ('end remains stuck',status)
+            (self.root/'PASS').write_text('read-only end probe passed\n')
+            return
         rng = random.Random(self.args.seed)
         operations = []
         points = ['after_p0','during_end','before_status_record','after_status_record',
@@ -298,7 +312,7 @@ class Gate:
             keys = [[91+i,event+1] for i in range(sites)]
             request = {'op':'txn','id':event,'keys':keys,'value':event+1000,'durable':self.args.durable}
             victim = rng.randrange(sites)
-            kind = ['kill','graceful','cut','delay','drop'][event%5]
+            kind = 'none' if self.args.no_faults else ['kill','graceful','cut','delay','drop'][event%5]
             if self.args.schedule == 'protocol':
                 point = points[event%len(points)]
                 if point.startswith('coordinator_'):
@@ -328,7 +342,7 @@ class Gate:
                 if kind in ('kill','graceful'):
                     self.servers[victim].stop(abrupt=kind=='kill')
                     self.start(victim)
-                else:
+                elif kind != 'none':
                     source = (victim+1)%self.args.members
                     proxy = self.proxies[source,victim]
                     if kind == 'cut':
@@ -359,6 +373,8 @@ def main():
     parser.add_argument('--seed', type=int, default=6601)
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
+    parser.add_argument('--no-faults', action='store_true')
+    parser.add_argument('--probe', choices=['none','readonly','readonly-control'], default='none')
     parser.add_argument('--schedule', choices=['baseline','protocol'], default='baseline')
     args = parser.parse_args()
     def interrupted(signum, frame):

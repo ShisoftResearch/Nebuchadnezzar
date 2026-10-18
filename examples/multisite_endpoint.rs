@@ -1,4 +1,5 @@
 //! Process endpoint for tools/multisite. The controller owns all fault actions.
+use bifrost::rpc::ServiceClient;
 use bifrost::{membership::client::ObserverClient, raft, rpc};
 use dovahkiin::types::Type;
 use neb::client::{transaction::Transaction, AsyncClient};
@@ -135,6 +136,16 @@ async fn command(client: &Arc<AsyncClient>, peers: &[String], group: &str, req: 
             }
             json!({"ok":true})
         }
+        "status" => {
+            let index = req["site"].as_u64().unwrap() as usize;
+            let tid: transactions::TxnId = serde_json::from_value(req["tid"].clone()).unwrap();
+            let rpc = rpc::DEFAULT_CLIENT_POOL.get(&peers[index]).await.unwrap();
+            let site = transactions::data_site::AsyncServiceClient::new_with_service_id(
+                transactions::data_site::generate_scoped_service_id(group, group),
+                &rpc,
+            );
+            json!({"status":format!("{:?}",site.txn_status(tid).await.unwrap().payload)})
+        }
         "read" => {
             client.reload_slot_owners().await;
             let mut values = Vec::new();
@@ -195,6 +206,19 @@ async fn command(client: &Arc<AsyncClient>, peers: &[String], group: &str, req: 
                 return json!({"outcome":"prepare_error","error":format!("{:?}",error)});
             }
             emit(json!({"event":"prepared", "id":req["id"], "tid":txn.tid}));
+            if let Some(index) = req["end_site"].as_u64() {
+                let rpc = rpc::DEFAULT_CLIENT_POOL
+                    .get(&peers[index as usize])
+                    .await
+                    .unwrap();
+                let site = transactions::data_site::AsyncServiceClient::new_with_service_id(
+                    transactions::data_site::generate_scoped_service_id(group, group),
+                    &rpc,
+                );
+                let end = site.end(txn.tid, txn.tid, false).await.unwrap().payload;
+                let abort = site.abort(txn.tid, txn.tid).await.unwrap().payload;
+                return json!({"outcome":"end_probe", "tid":txn.tid, "end":format!("{end:?}"), "abort":format!("{abort:?}")});
+            }
             let outcome = if req["durable"].as_bool().unwrap_or(false) {
                 txn.commit_durable().await
             } else {
