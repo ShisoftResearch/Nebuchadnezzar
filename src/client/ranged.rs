@@ -353,7 +353,6 @@ impl RangedCursor {
                     &dovahkiin::expr::serde::Expr::nothing(),
                     &dovahkiin::expr::serde::Expr::nothing(),
                     &self.checks,
-                    false,
                 )
                 .await;
             if let Some(cell) = cells.pop() {

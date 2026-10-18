@@ -600,11 +600,11 @@ async fn compose_durable_receipts_preserve_verified_reads() {
     let empty = Expr::List(vec![]);
     for _ in 0..2 {
         let rejected = rpc
-            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(1), true)
+            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(1))
             .await;
         assert!(matches!(&rejected[0], Err(ReadError::NotMatch)));
         let accepted = rpc
-            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(2), true)
+            .read_all_cells_verified(&ids, &vec![], &empty, &empty, &checks(2))
             .await;
         assert_eq!(
             accepted[0].as_ref().unwrap().data["value"],
