@@ -29,7 +29,7 @@ else:
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
                  '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','-1'),'--wait',os.environ.get('MULTISITE_WAIT','0')]
     if name == 'multisite_ring':
-        args += ['--probe','ring','--members',os.environ.get('MULTISITE_MEMBERS','3'),'--settle',os.environ.get('MULTISITE_SETTLE','20')]
+        args += ['--probe','ring','--members',os.environ.get('MULTISITE_MEMBERS','3'),'--settle',os.environ.get('MULTISITE_SETTLE','20'),'--link-delay',os.environ.get('MULTISITE_LINK_DELAY','0')]
     if name == 'multisite_point_stop':
         args += ['--probe','point-stop','--victim',os.environ.get('MULTISITE_VICTIM','0'),'--kind',os.environ.get('MULTISITE_KIND','kill'),
                  '--cut-point',os.environ.get('MULTISITE_POINT','during_end'),'--coordinator',os.environ.get('MULTISITE_COORDINATOR','-1'),'--rounds',os.environ.get('MULTISITE_ROUNDS','1'),'--batch',os.environ.get('MULTISITE_BATCH','1')]

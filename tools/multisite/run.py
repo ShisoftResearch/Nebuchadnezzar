@@ -573,8 +573,13 @@ class Gate:
             assert (control/'refreshed').read_text() == 'true', f'member {index} refresh failed'
 
     def run(self):
+        if self.args.link_delay:
+            for proxy in self.proxies.values():
+                proxy.delay = self.args.link_delay
         for index in range(self.args.members):
             self.start(index)
+        for proxy in self.proxies.values():
+            proxy.delay = 0
         client = self.client()
         assert client.command({'op':'setup'})['ok']
         if not self.args.no_refresh:
@@ -847,6 +852,7 @@ def main():
     parser.add_argument('--coordinator', type=int, default=-1)
     parser.add_argument('--rounds', type=int, default=1)
     parser.add_argument('--batch', type=int, default=1)
+    parser.add_argument('--link-delay', type=float, default=0)
     parser.add_argument('--faults', default='')
     parser.add_argument('--no-seed-stop', action='store_true')
     parser.add_argument('--steps', default='')
