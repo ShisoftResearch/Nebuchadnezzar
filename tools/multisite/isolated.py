@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_raft_seed', 'multisite_raft_heartbeat', 'multisite_raft_roster', 'multisite_raft_rejoin', 'multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring']
+names = ['multisite_raft_seed', 'multisite_raft_heartbeat', 'multisite_raft_roster', 'multisite_raft_rejoin', 'multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring', 'multisite_torn']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -33,6 +33,8 @@ else:
     if name == 'multisite_cut_prepare':
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
                  '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','-1'),'--wait',os.environ.get('MULTISITE_WAIT','0')]
+    if name == 'multisite_torn':
+        args += ['--probe','torn','--link-delay',os.environ.get('MULTISITE_LINK_DELAY','0')]
     if name == 'multisite_ring':
         args += ['--probe','ring','--members',os.environ.get('MULTISITE_MEMBERS','3'),'--settle',os.environ.get('MULTISITE_SETTLE','20'),'--link-delay',os.environ.get('MULTISITE_LINK_DELAY','0')]
     if name == 'multisite_point_stop':

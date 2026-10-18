@@ -638,6 +638,26 @@ class Gate:
             assert not holes, ('member view incomplete after start', holes)
             (self.root/'PASS').write_text('ring probe passed\n')
             return
+        if self.args.probe == 'torn':
+            # Member 1 prepares, then the coordinator (member 2) is cut off. Member 1 must ask member 2.
+            request = {'op':'txn','id':'torn','keys':[[92,8000],[93,8000]],'value':8,'coordinator':2,'durable':self.args.durable}
+            self.arm(1, 'after_p0')
+            client.send(request)
+            self.wait_pause(1, 'after_p0')
+            self.set_links(2, cut=True)
+            (self.root/'control-1'/'resume').touch()
+            time.sleep(self.args.cut_hold)
+            self.set_links(2, cut=False)
+            result = self.collect(client, request, {'event':'torn'})
+            time.sleep(self.args.lease_secs+40)
+            observed = client.command({'op':'read','keys':request['keys']})['values']
+            status = {i: client.command({'op':'status','site':i,'tid':self.tids['torn']},60)['status'] for i in range(self.args.members)}
+            report = {'result':result,'observed':observed,'status':status}
+            (self.root/'probe-torn.json').write_text(json.dumps(report,indent=2))
+            check_transaction(request, result, observed)
+            assert 'InDoubt' not in status.values() and 'Committing' not in status.values(), ('stuck', report)
+            (self.root/'PASS').write_text('torn probe passed\n')
+            return
         if self.args.probe == 'point-stop':
             victim, point = self.args.victim, self.args.cut_point
             other = 1 if victim == 0 else 0
@@ -838,7 +858,7 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring'], default='none')
+    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring','torn'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
     parser.add_argument('--no-orphan-adoption', action='store_true')
