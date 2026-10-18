@@ -12,7 +12,7 @@ use bifrost::utils::time::get_time;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
-use lightning::linked_list::LinkedList;
+use crossbeam_skiplist::SkipSet;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
@@ -459,9 +459,9 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: crate::utils::sharded::Sharded<parking_lot::RwLock<HashMap<Id, CellMetaMutex>>>,
+    cells: crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
-    cell_list: LinkedList<Id>,
+    cell_list: SkipSet<Id>,
     txns_sorted: Sharded<Mutex<BTreeSet<TxnId>>>,
     database_runtime: Arc<DatabaseRuntime>,
     cleanup_signal: Arc<AtomicBool>,
@@ -575,7 +575,7 @@ impl DataManager {
         let manager = Arc::new(Self {
             cells: Default::default(),
             txns: LFMap::with_capacity(128),
-            cell_list: LinkedList::new(),
+            cell_list: SkipSet::new(),
             txns_sorted: Sharded::default(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
@@ -716,26 +716,20 @@ impl DataManager {
     }
 
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
-        crate::profile_lock!(H07, self.cells.shard(id).read()).get(id).cloned()
+        crate::profile_lock!(H07, self.cells.entry(id)).as_ref().cloned()
     }
 
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        if let Some(meta) = self.existing_cell_meta_mutex(id) {
-            return meta;
-        }
-        let mut cells = crate::profile_lock!(H07, self.cells.shard(id).write());
-        cells
-            .entry(*id)
-            .or_insert_with(|| {
-                self.cell_list.push_back(*id);
-                Arc::new(Mutex::new(CellMeta {
-                    read: TxnId::default(),
-                    write: TxnId::default(),
-                    owner: None,
-                    lock_acquired_at: None,
-                }))
-            })
-            .clone()
+        let mut entry = crate::profile_lock!(H07, self.cells.entry(id));
+        entry.get_or_insert_with(|| {
+            self.cell_list.insert(*id);
+            Arc::new(Mutex::new(CellMeta {
+                read: TxnId::default(),
+                write: TxnId::default(),
+                owner: None,
+                lock_acquired_at: None,
+            }))
+        }).clone()
     }
     fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
@@ -1882,26 +1876,24 @@ impl DataManager {
         let mut cells_to_evict = Vec::new();
 
         // First pass: collect cells with their metadata (while holding locks)
-        for cell_id_ref in self.cell_list.iter_front() {
-            let cell_id = cell_id_ref.deref();
+        for cell_id_ref in self.cell_list.iter() {
+            let cell_id = *cell_id_ref.value();
             if let Some(cell_meta) = self.existing_cell_meta_mutex(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction && meta.read < oldest_transaction {
                     cells_to_evict.push((cell_id_ref, cell_meta.clone()));
-                } else {
-                    // Cells are ordered by activity, stop at first active one
-                    break;
                 }
+                // The side index orders IDs, so an active cell does not end the scan.
             } else {
                 // Cell not in map but in list - just remove from list
                 cell_id_ref.remove();
             }
         }
 
-        // Reference acquisition and removal share the map lock. A reference
-        // borrowed before prepare must stay mapped even before it has an owner.
+        // Borrow and removal share only this cell's entry guard. A borrowed
+        // reference must stay mapped even before prepare gives it an owner.
         for (cell_id_ref, cell_meta) in cells_to_evict {
-            let cell_id = cell_id_ref.deref();
+            let cell_id = *cell_id_ref.value();
             #[cfg(test)]
             {
                 let delay = prepare_delay_hooks()
@@ -1912,9 +1904,9 @@ impl DataManager {
                 }
             }
             let meta = cell_meta.lock();
-            let mut cells = crate::profile_lock!(H07, self.cells.shard(&cell_id).write());
+            let mut cells = crate::profile_lock!(H07, self.cells.entry(&cell_id));
             let same_meta = cells
-                .get(&cell_id)
+                .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &cell_meta));
             // These 2 references belong to the map and this cleanup candidate.
             // Any other reference belongs to an operation that can acquire an owner.
@@ -1924,7 +1916,7 @@ impl DataManager {
                 && meta.read < oldest_transaction
                 && meta.owner.is_none()
             {
-                cells.remove(&cell_id);
+                cells.take();
                 cell_id_ref.remove();
             }
         }
@@ -5097,7 +5089,7 @@ mod tests {
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
-        assert!(manager.cells.iter().all(|shard| crate::profile_lock!(H07, shard.read()).is_empty()));
+        assert!(manager.cell_list.is_empty());
         server.shutdown().await;
     }
 
@@ -6904,10 +6896,8 @@ mod tests {
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
         let first = Id::allocated(0, 0, 99001);
-        let second = (99002..100002).map(|n| Id::allocated(0, 0, n)).find(|id| {
-            !std::ptr::eq(manager.cells.shard(&first), manager.cells.shard(id))
-        }).unwrap();
-        let held = manager.cells.shard(&first).write();
+        let second = Id::allocated(0, 0, 99002);
+        let held = manager.cells.entry(&first);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = manager.clone();
         let thread = std::thread::spawn(move || {
@@ -6919,7 +6909,7 @@ mod tests {
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
         drop(held);
         thread.join().unwrap();
-        assert!(result.is_ok(), "an unrelated metadata shard must make progress");
+        assert!(result.is_ok(), "an unrelated cell must make progress");
         server.shutdown().await;
     }
 
