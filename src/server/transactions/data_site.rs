@@ -1504,6 +1504,12 @@ impl DataManager {
     /// Works for a live transaction and for a bracket in doubt after a
     /// restart; both fence this site durably first.
     pub(crate) async fn decide_in_doubt(&self, tid: &TxnId, peers: &[u64]) -> InDoubtDecision {
+        bifrost::doubt_trace!(
+            "resolve site={} tid={:?} peers={:?}",
+            self.database_runtime.rpc.server_id,
+            tid,
+            peers
+        );
         let Some(txn_manager) = self.database_runtime.txn_manager().cloned() else {
             return InDoubtDecision::Wait;
         };
@@ -1515,12 +1521,22 @@ impl DataManager {
         for peer in peers {
             #[cfg(test)]
             if silent_peers_for_test().lock().contains(peer) {
+                bifrost::doubt_trace!("silent_test_peer tid={:?} peer={}", tid, peer);
                 wait = true;
                 continue;
             }
             match txn_manager.data_site_for(*peer).await {
-                Ok(site) => sites.push((*peer, site)),
+                Ok(site) => {
+                    bifrost::doubt_trace!("peer_client tid={:?} peer={} ok", tid, peer);
+                    sites.push((*peer, site));
+                }
                 Err(error) => {
+                    bifrost::doubt_trace!(
+                        "peer_client tid={:?} peer={} error={:?}",
+                        tid,
+                        peer,
+                        error
+                    );
                     debug!(
                         "cannot reach participant {} to resolve {:?}: {}",
                         peer, tid, error
@@ -1530,9 +1546,16 @@ impl DataManager {
             }
         }
         for (peer, site) in &sites {
+            bifrost::doubt_trace!("status_query tid={:?} peer={}", tid, peer);
             match site.txn_status(tid.clone()).await {
                 Ok(response) => {
                     self.update_clock(response.clock);
+                    bifrost::doubt_trace!(
+                        "status_answer tid={:?} peer={} outcome={:?}",
+                        tid,
+                        peer,
+                        response.payload
+                    );
                     match response.payload {
                         TxnOutcome::Committed => return InDoubtDecision::Commit,
                         // Decided, not synced yet (F1): ask again later.
@@ -1541,6 +1564,12 @@ impl DataManager {
                     }
                 }
                 Err(error) => {
+                    bifrost::doubt_trace!(
+                        "status_error tid={:?} peer={} error={:?}",
+                        tid,
+                        peer,
+                        error
+                    );
                     debug!(
                         "participant {} did not answer about {:?}: {:?}",
                         peer, tid, error
@@ -7490,6 +7519,26 @@ impl Service for DataManager {
     }
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
         let outcome = self.txn_outcome(&tid);
+        #[cfg(feature = "c3doubt_trace")]
+        {
+            let entry = self.chunks().txn_status().get(&tid);
+            bifrost::doubt_trace!(
+                "status_cell site={} tid={:?} present={} synced={}",
+                self.database_runtime.rpc.server_id,
+                tid,
+                entry.is_some(),
+                entry
+                    .as_ref()
+                    .map(|e| self.status_entry_synced(&tid, e))
+                    .unwrap_or(false)
+            );
+        }
+        bifrost::doubt_trace!(
+            "status_serve site={} tid={:?} outcome={:?}",
+            self.database_runtime.rpc.server_id,
+            tid,
+            outcome
+        );
         async move { self.response_with(outcome).await }.boxed()
     }
 
