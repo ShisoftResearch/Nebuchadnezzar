@@ -686,9 +686,12 @@ async fn wait_status_synced(cluster: &Cluster, index: usize, tid: &TxnId) {
     while !status_synced(cluster, index, tid) {
         assert!(
             std::time::Instant::now() < deadline,
-            "site {} never synced the status cell of {:?}",
+            "site {} never observed a synced status cell of {:?}; present={}, held={}, outcome={:?}",
             index,
-            tid
+            tid,
+            holds_status(cluster, index, tid),
+            held_for(cluster, index, tid),
+            outcome_on(cluster, index, tid)
         );
         data_site(cluster, index).status_release_round(false).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1271,6 +1274,10 @@ async fn an_unsynced_commit_answers_committing() {
     let (cluster, client) = Cluster::start("crosssite_c13b_unsynced").await;
     let (txn, tid, _ids, _scores) = prepared_transaction(&cluster, &client, 14_500, 1).await;
     drop(client);
+    // Keep the status cell until this test observes its sync. Otherwise the
+    // background notice exchange can retire it before the polling read.
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(true, std::sync::atomic::Ordering::Release);
     let b_dir = cluster.temp[B].path().to_path_buf();
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, true);
     assert!(matches!(
@@ -1282,6 +1289,9 @@ async fn an_unsynced_commit_answers_committing() {
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, false);
     wait_status_synced(&cluster, B, &tid).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committed);
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(false, std::sync::atomic::Ordering::Release);
+    wait_released(&cluster, B, &tid).await;
     cluster.shutdown().await;
 }
 
