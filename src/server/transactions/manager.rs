@@ -2342,6 +2342,68 @@ mod tests {
         OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
     }
 
+    async fn prepare_with_a_ring_address_gap(fresh_ring: bool) {
+        use super::Service as _;
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "manager_ring_address_gap";
+        let server = start_manager_test_server(&address, group).await;
+        let runtime = server.current_database();
+        install_basic_schema(&runtime);
+        let ring = if fresh_ring {
+            // An incomplete first group read leaves the configured owner's
+            // address absent. Its stored slot still names that owner.
+            let ring = ConsistentHashing::new_with_id(
+                crate::server::CONS_HASH_ID,
+                group,
+                &server.raft_client,
+                &server.membership,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ring.nodes_count(), 0);
+            ring.set_slot_overrides(Some(vec![server.server_id]), 1);
+            ring
+        } else {
+            server.consh.clone()
+        };
+        let manager = TransactionManager::new(Arc::new(TransactionManagerDeps {
+            database_runtime: runtime,
+            server_id: server.server_id,
+            consh: ring,
+            member_pool: Arc::new(ClientPool::new()),
+            hlc: server.hlc.clone(),
+        }));
+        let tid = manager.begin().await.unwrap();
+        let written = manager
+            .write(tid.clone(), counter_cell(1, Id::from_parts(0, 71), 7))
+            .await;
+        assert!(matches!(written, Ok(TxnExecResult::Accepted(()))));
+        let prepared = manager.prepare(tid.clone()).await;
+        warn!(
+            "C3DOUBT manager control: fresh_ring={}, prepare={:?}",
+            fresh_ring, prepared
+        );
+        let _ = manager.abort(tid).await;
+        manager.shutdown.store(true, Ordering::Relaxed);
+        server.shutdown().await;
+        assert!(
+            matches!(prepared, Ok(TMPrepareResult::Success)),
+            "the configured owner must be reachable: {:?}",
+            prepared
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_locates_a_configured_owner_after_an_incomplete_ring_read() {
+        prepare_with_a_ring_address_gap(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_prepare_locates_an_owner_with_a_current_ring() {
+        prepare_with_a_ring_address_gap(false).await;
+    }
+
     #[test]
     fn changed_existing_replacement_builds_update_commit_op() {
         let id = Id::allocated(0, 0, 7001);
