@@ -85,6 +85,8 @@ where
             };
             match node {
                 &NodeData::External(ref n) => {
+                    #[cfg(test)]
+                    super::revision_tests::after_external_borrow();
                     trace!(
                         "search in external for {:?}, len {}, ordering {:?}",
                         key,

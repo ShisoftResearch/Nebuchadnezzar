@@ -2,6 +2,7 @@ use super::*;
 use std::cell::RefCell;
 
 thread_local! {
+    static AFTER_EXTERNAL_BORROW: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static AFTER_MEDIAN_COPY: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static BEFORE_REF_INCREMENT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
@@ -76,3 +77,88 @@ fn rev1_median_child_condemned_before_clone() {
     );
 }
 
+pub(super) struct DropProbe(pub Arc<std::sync::atomic::AtomicBool>);
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Release);
+    }
+}
+
+pub(super) fn after_external_borrow() {
+    let action = AFTER_EXTERNAL_BORROW.with(|hook| hook.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+fn payload_lifetime(cursor_step: bool, clear: bool) {
+    let tree = Arc::new(leaf());
+    assert!(tree.insert(&key(10)));
+    assert!(tree.insert(&key(20)));
+    let root = tree.get_root();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    write_node::<Keys, Ptrs>(&root)
+        .extnode_mut_no_persist()
+        .drop_probe = Some(DropProbe(dropped.clone()));
+    let mut cursor = if cursor_step {
+        Some(tree.seek(&key(10), Ordering::Forward))
+    } else {
+        None
+    };
+    let writer_root = root.clone();
+    let writer_tree = tree.clone();
+    let retained = dropped.clone();
+    AFTER_EXTERNAL_BORROW.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                if clear {
+                    writer_tree.clear();
+                } else {
+                    write_node::<Keys, Ptrs>(&writer_root).make_empty_node(false);
+                }
+            })
+            .join()
+            .unwrap();
+            assert!(
+                !retained.load(Acquire),
+                "payload dropped while an optimistic reader holds its reference"
+            );
+        }))
+    });
+    if let Some(cursor) = &mut cursor {
+        assert_eq!(cursor.next(), Some(key(10)));
+        assert_eq!(cursor.current(), None);
+    } else {
+        assert_eq!(tree.seek(&key(10), Ordering::Forward).current(), None);
+    }
+    for _ in 0..1000 {
+        let epoch = crossbeam_epoch::pin();
+        epoch.flush();
+        drop(epoch);
+        if dropped.load(Acquire) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        dropped.load(Acquire),
+        "payload was not reclaimed after the reader left its epoch"
+    );
+}
+
+#[test]
+fn rev1_payload_seek_prune() {
+    payload_lifetime(false, false);
+}
+#[test]
+fn rev1_payload_seek_clear() {
+    payload_lifetime(false, true);
+}
+#[test]
+fn rev1_payload_cursor_prune() {
+    payload_lifetime(true, false);
+}
+#[test]
+fn rev1_payload_cursor_clear() {
+    payload_lifetime(true, true);
+}

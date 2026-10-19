@@ -180,6 +180,8 @@ where
         }
         read_node(page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
+                #[cfg(test)]
+                super::revision_tests::after_external_borrow();
                 let follow_src = match ordering {
                     Ordering::Forward => &n.next,
                     Ordering::Backward => &n.prev,
@@ -272,6 +274,8 @@ where
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
                 &NodeData::External(ref n) => {
+                    #[cfg(test)]
+                    super::revision_tests::after_external_borrow();
                     let filtering = self.filter_deleted && !self.deletion.is_empty();
                     let snap = |range: std::ops::Range<usize>| -> SnapKeys {
                         if filtering {
