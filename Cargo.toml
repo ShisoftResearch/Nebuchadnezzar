@@ -55,6 +55,7 @@ mimalloc = { version = "0.1.52", optional = true }
 tikv-jemallocator = { version = "0.7.0", features = ["profiling"], optional = true }
 
 [features]
+c3doubt_trace = ["bifrost/c3doubt_trace"]
 # Swap the global allocator. glibc's arenas degrade badly under the
 # fragmentation a large import produces: identical write-plan code measured
 # 1.01us/cell locally against 11.93us/cell on a loaded server.

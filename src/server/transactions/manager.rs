@@ -898,6 +898,14 @@ impl TransactionManager {
         &self,
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+        bifrost::doubt_trace!(
+            "peer_lookup site={} peer={} ring={:p} version={} cached={}",
+            self.deps.server_id,
+            server_id,
+            &*self.deps.consh,
+            self.deps.consh.trace_version(),
+            self.data_sites.contains_key(&server_id)
+        );
         self.get_data_site(server_id).await
     }
 

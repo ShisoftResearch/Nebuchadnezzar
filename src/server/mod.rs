@@ -3451,7 +3451,19 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
         waiting.len()
     );
     let deadline = std::time::Instant::now() + resolve_startup_wait();
+    bifrost::doubt_trace!(
+        "startup_resolution site={} budget={:?} brackets={}",
+        me,
+        resolve_startup_wait(),
+        waiting.len()
+    );
     loop {
+        bifrost::doubt_trace!(
+            "startup_retry site={} remaining={:?} brackets={}",
+            me,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            waiting.len()
+        );
         waiting = resolve_round(database_runtime, &site, waiting).await;
         if waiting.is_empty() || std::time::Instant::now() >= deadline {
             break;
@@ -3487,6 +3499,11 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
                 // Resolved here or by the operator tool.
                 return;
             }
+            bifrost::doubt_trace!(
+                "background_retry site={} period=1s brackets={} deadline=none",
+                runtime.rpc.server_id,
+                parked.len()
+            );
             for (txn, participants) in parked {
                 let peers: Vec<u64> = participants
                     .iter()
