@@ -6315,9 +6315,23 @@ impl Chunks {
         txn: &crate::server::transactions::TxnId,
         durable: bool,
     ) -> Result<bool, CommitRefusal> {
+        self.commit_transaction_brackets_with_receipts(txn, durable)
+            .map(|(synced, _)| synced)
+    }
+
+    /// `commit_transaction_brackets`, plus the receipts of the decision.
+    ///
+    /// The receipts are `Some` when every part is proven by a receipt. The
+    /// caller uses them to keep the OLD versions of the cells of the
+    /// transaction until the queued COMMIT sync lands.
+    pub(crate) fn commit_transaction_brackets_with_receipts(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        durable: bool,
+    ) -> Result<(bool, Option<Arc<Vec<crate::ram::durability::Receipt>>>), CommitRefusal> {
         let manifest = transaction_manifest(txn, &self.address_range());
         if manifest.is_empty() {
-            return Ok(true);
+            return Ok((true, None));
         }
         let chunk_ids: Vec<u16> = {
             let mut ids: Vec<u16> = manifest.iter().map(|member| member.chunk_id).collect();
@@ -6404,7 +6418,7 @@ impl Chunks {
                     segment.protection.decide_transaction(txn, receipts.clone());
                 }
             }
-            return Ok(forced);
+            return Ok((forced, all_parts_proven.then_some(receipts)));
         };
         if synced_commit {
             // Retracting now would make the client hear "failed" about a
