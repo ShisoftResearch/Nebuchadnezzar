@@ -133,6 +133,14 @@ else
     TEST_LIST=$("$TEST_BINARY" --list 2>/dev/null | grep "$FILTER" | grep ': test$' | sed 's/: test$//')
 fi
 
+# An empty selection must not produce a successful test run.
+if [ -z "$TEST_LIST" ]; then
+    echo "Error: no tests matched filter: ${FILTER:-<none>}"
+    rm -f "$RUN_TMP/test-binary"
+    rmdir "$RUN_TMP" 2>/dev/null || true
+    exit 1
+fi
+
 # Count total tests
 TOTAL_TESTS=$(echo "$TEST_LIST" | wc -l)
 echo "Found $TOTAL_TESTS tests to run"
