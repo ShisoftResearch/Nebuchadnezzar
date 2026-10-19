@@ -243,6 +243,14 @@ impl TxnStatusRegistry {
         let mut state = self.state.lock();
         let entry = state.live.remove(txn)?;
         state.ids.remove(&entry.id.bits());
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+        log::info!(
+            "TRACE status entry removed {:?} participants {:?} synced peers {:?} self synced {}",
+            txn,
+            entry.participants,
+            entry.synced_peers,
+            entry.self_synced
+        );
         Some(entry)
     }
 

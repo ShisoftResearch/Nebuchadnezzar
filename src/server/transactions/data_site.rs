@@ -1526,6 +1526,13 @@ impl DataManager {
     /// cannot be fenced: it was told to commit, or the fence could not be
     /// made durable; the asker waits.
     pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
+        let answer = self.fence_here_inner(tid);
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+        info!("TRACE fence_here {:?} -> {:?}", tid, answer);
+        answer
+    }
+
+    fn fence_here_inner(&self, tid: &TxnId) -> FenceAnswer {
         let decided = self.decided.lock().get(tid).copied();
         match decided {
             Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
@@ -1839,13 +1846,23 @@ impl DataManager {
     /// the asker waits. A power loss here could still drop such a record, and
     /// a peer that acted on it would tear the transaction.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
+        let (outcome, branch) = self.txn_outcome_with_branch(tid);
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md): every
+        // answer that is not `Committed`, with the branch that gave it.
+        if outcome != TxnOutcome::Committed {
+            info!("TRACE txn_outcome {:?} -> {:?} ({})", tid, outcome, branch);
+        }
+        outcome
+    }
+
+    fn txn_outcome_with_branch(&self, tid: &TxnId) -> (TxnOutcome, &'static str) {
         if let Some(entry) = self.chunks().txn_status().get(tid) {
             return if self.status_entry_synced(tid, &entry) {
                 #[cfg(multisite_test)]
                 crate::utils::multisite::point_json("status_answer", serde_json::json!({"tid":tid,"outcome":"Committed","self_synced":entry.self_synced}));
-                TxnOutcome::Committed
+                (TxnOutcome::Committed, "status cell synced")
             } else {
-                TxnOutcome::Committing
+                (TxnOutcome::Committing, "status cell not synced")
             };
         }
         let live = self.find_transaction(tid).map(|txn| {
@@ -1853,21 +1870,21 @@ impl DataManager {
             (txn.state, txn.decided_commit)
         });
         match live {
-            Some((_, true)) => return TxnOutcome::Committing,
-            Some((TxnState::Aborted, false)) => return TxnOutcome::Aborted,
-            Some(_) => return TxnOutcome::InDoubt,
+            Some((_, true)) => return (TxnOutcome::Committing, "live, decided commit"),
+            Some((TxnState::Aborted, false)) => return (TxnOutcome::Aborted, "live, aborted"),
+            Some(_) => return (TxnOutcome::InDoubt, "live, undecided"),
             None => {}
         }
         if self.chunks().txn_status().resolving_participants(tid).is_some() {
-            return TxnOutcome::InDoubt;
+            return (TxnOutcome::InDoubt, "resolving after restart");
         }
         // A finished multi-site commit is answered from its status cell
         // above until every participant is synced; a single-site one is never
         // asked about.
         if let Some(outcome) = self.decided.lock().get(tid) {
-            return *outcome;
+            return (*outcome, "decided map");
         }
-        TxnOutcome::Unknown
+        (TxnOutcome::Unknown, "no record")
     }
 
     async fn cell_meta_cleanup(&self) {
