@@ -74,6 +74,20 @@ impl<K: Clone + Hash + SwiftKeyProbe + Ord + Send + Sync + 'static, V> KeyedStat
         }
     }
 
+    /// A read miss does not allocate or publish an empty entry.
+    pub(crate) fn get(&self, key: &K) -> Option<StateGuard<'_, K, V>> {
+        let state = self.map.get(key)?;
+        let guard = state.lock_arc();
+        if !guard.registered {
+            return None;
+        }
+        Some(StateGuard {
+            registry: self,
+            key: key.clone(),
+            guard,
+        })
+    }
+
     pub(crate) fn keys(&self) -> impl Iterator<Item = K> + '_ {
         self.keys
             .as_ref()
@@ -126,6 +140,18 @@ impl<K: Clone + Hash + SwiftKeyProbe + Ord + Send + Sync + 'static, V> Drop
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_misses_do_not_publish_entries_and_retired_reads_stay_absent() {
+        let registry = KeyedState::<u64, usize>::ordered();
+        assert!(registry.get(&1).is_none());
+        assert!(registry.map.get(&1).is_none());
+        *registry.entry(&1) = Some(7);
+        assert_eq!(*registry.get(&1).unwrap(), Some(7));
+        registry.entry(&1).take();
+        assert!(registry.get(&1).is_none());
+        assert_eq!(registry.keys().count(), 0);
+    }
 
     #[test]
     fn racing_constructors_publish_one_identity() {
