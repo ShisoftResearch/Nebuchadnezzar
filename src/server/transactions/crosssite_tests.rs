@@ -237,6 +237,35 @@ impl Cluster {
         }
     }
 
+    /// The image of site `index` as a power loss leaves it now. The site
+    /// keeps running.
+    fn power_image(&self, index: usize) -> tempfile::TempDir {
+        let image = tempfile::TempDir::new().unwrap();
+        let live = self.temp[index].path().to_path_buf();
+        crate::ram::segs::power_loss_model::copy_store_as_after_power_loss(
+            &live.join("wal"),
+            &live.join("backup"),
+            &image.path().join("wal"),
+            &image.path().join("backup"),
+        )
+        .unwrap();
+        image
+    }
+
+    /// Stop each site of `sites` and start it again from its image, one at
+    /// a time and in the order given.
+    async fn restart_from_images(&mut self, sites: &[usize], images: Vec<tempfile::TempDir>) {
+        for (index, image) in sites.iter().zip(images) {
+            self.stop(*index).await;
+            copy_dir(
+                &self.temp[*index].path().join("raft"),
+                &image.path().join("raft"),
+            );
+            self.temp[*index] = image;
+            self.start_site(*index).await;
+        }
+    }
+
     async fn shutdown(mut self) {
         for index in 0..self.servers.len() {
             if self.servers[index].is_some() {
@@ -2751,4 +2780,615 @@ async fn client_commit_outcome_wrapper_does_not_retry_or_abort() {
         Some(8)
     );
     cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The old version of an updated cell between `end` and the COMMIT sync
+// ---------------------------------------------------------------------------
+
+/// How the transaction commits, and what the test does before the cleaner runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinWindowMode {
+    /// Default commit. Every sync stays paused, so the COMMIT is unsynced.
+    DefaultUnsynced,
+    /// Default commit. The test waits until the COMMIT is synced.
+    DefaultThenSynced,
+    /// Durable commit: the COMMIT is synced before `end`.
+    Durable,
+    /// Default commit. Every WAL sync fails after the COMMIT append.
+    SyncFails,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinOp {
+    Update,
+    Remove,
+}
+
+/// Where the old version sits when the transaction commits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OldVersionIn {
+    /// A sealed segment: the cleaner may take it at once.
+    SealedSegment,
+    /// A segment that is mostly dead when it seals. The seal job syncs it and
+    /// leaves it to the cleaner (D46 seal-pending reclaim).
+    SealPending,
+}
+
+struct PinWindow {
+    group: &'static str,
+    mode: PinWindowMode,
+    op: PinOp,
+    old_in: OldVersionIn,
+    /// Sites that hold one cell each. `[A]` or `[A, B]`.
+    sites: Vec<usize>,
+    pin_enabled: bool,
+}
+
+struct PinWindowOutcome {
+    /// The score that each site reads after the power loss.
+    reads: Vec<Option<u64>>,
+    /// Whether the old segment of each site was reclaimed before the power loss.
+    old_segment_gone: Vec<bool>,
+}
+
+impl PinWindow {
+    fn new(group: &'static str, mode: PinWindowMode) -> Self {
+        PinWindow {
+            group,
+            mode,
+            op: PinOp::Update,
+            old_in: OldVersionIn::SealedSegment,
+            sites: vec![A],
+            pin_enabled: true,
+        }
+    }
+}
+
+fn slot_of_site(site: usize) -> u16 {
+    if site == A {
+        HERE
+    } else {
+        THERE
+    }
+}
+
+fn pin_chunk(cluster: &Cluster, site: usize) -> &Chunk {
+    let chunks = cluster.site(site).chunks();
+    &chunks.list[slot_of_site(site) as usize % chunks.list.len()]
+}
+
+fn force_sync_segment(chunk: &Chunk, segment_id: u64) {
+    chunk
+        .segments()
+        .iter()
+        .find(|segment| segment.id == segment_id)
+        .expect("segment to sync")
+        .force_wal_sync()
+        .unwrap();
+}
+
+/// Combine the old segment with the filler. Return whether the old segment is
+/// gone afterwards. `passes` bounds the wait for a combine that the cleaner
+/// refuses.
+fn compact_old_segment(chunk: &Chunk, old: u64, filler: u64, passes: usize) -> bool {
+    for _ in 0..passes {
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|segment| segment.id == old || segment.id == filler)
+            .collect();
+        if candidates.len() < 2 {
+            break;
+        }
+        let (_, bytes) =
+            crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &candidates);
+        if bytes > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while chunk
+        .retired_segment_files
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        assert!(std::time::Instant::now() < deadline, "sources never retired");
+        chunk.drain_retired_segments();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    !chunk.segments().iter().any(|segment| segment.id == old)
+}
+
+fn old_segment_holds(chunk: &Chunk, old: u64, txn: &TxnId) -> bool {
+    chunk
+        .segments()
+        .iter()
+        .find(|segment| segment.id == old)
+        .is_some_and(|segment| segment.protection.holds_transaction(txn))
+}
+
+impl PinWindow {
+    /// Run the window: old version, transaction, cleaner on the old segment,
+    /// power loss at every site, restart, read.
+    async fn run(&self) -> PinWindowOutcome {
+        use std::sync::atomic::Ordering::SeqCst;
+        crate::ram::segs::power_loss_model::enable();
+        super::data_site::PIN_DISABLED.store(!self.pin_enabled, SeqCst);
+        let (mut cluster, client) = Cluster::start(self.group).await;
+        for site in &self.sites {
+            place_slot(&cluster, &client, slot_of_site(*site), *site).await;
+        }
+        drop(client);
+        let txn = coordinator(&cluster).await;
+        let ids: Vec<Id> = self
+            .sites
+            .iter()
+            .map(|site| Id::from_parts(slot_of_site(*site) as u64, 77))
+            .collect();
+
+        // A sealed filler segment for the combiner, made before any sync is
+        // paused, and before the old version, so the old version does not
+        // share its segment.
+        let mut fillers = Vec::new();
+        for (n, site) in self.sites.iter().enumerate() {
+            let chunks = cluster.site(*site).chunks();
+            let chunk = pin_chunk(&cluster, *site);
+            let filler = Id::from_parts(slot_of_site(*site) as u64, 910_001 + n as u64);
+            chunks.write_cell(&mut cell_of(filler, 1)).expect("filler");
+            let segment = chunk
+                .locate_segment(chunks.address_of(&filler))
+                .expect("filler segment")
+                .id;
+            if chunk.is_active_head(segment) {
+                rotate_out(chunk, segment);
+            }
+            force_sync_segment(chunk, segment);
+            fillers.push(segment);
+        }
+
+        // The old versions. For a seal-pending segment the test thread writes
+        // them beside junk, and the junk dies before the seal. Otherwise a
+        // durable transaction writes them.
+        let first = txn.begin().await.unwrap().unwrap();
+        if self.old_in == OldVersionIn::SealPending {
+            // The test calls the combiner itself. The background cleaner
+            // would take the mostly dead segment before the update.
+            for site in &self.sites {
+                cluster.site(*site).current_database().cleaner().pause();
+            }
+            for (n, (id, site)) in ids.iter().zip(self.sites.iter()).enumerate() {
+                let chunks = cluster.site(*site).chunks();
+                let junk: Vec<Id> = (0..30)
+                    .map(|j| Id::from_parts(slot_of_site(*site) as u64, 5_000 + j))
+                    .collect();
+                for id in &junk {
+                    chunks.write_cell(&mut cell_of(*id, 9)).expect("junk");
+                }
+                chunks
+                    .write_cell(&mut cell_of(*id, 100 + n as u64))
+                    .expect("old version");
+                for id in &junk {
+                    chunks.remove_cell(id).expect("junk dies");
+                }
+            }
+            txn.abort(first.clone()).await.unwrap().unwrap();
+        } else {
+            for (n, id) in ids.iter().enumerate() {
+                txn.write(first.clone(), cell_of(*id, 100 + n as u64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            txn.prepare(first.clone()).await.unwrap().unwrap();
+            assert!(matches!(
+                txn.commit_durable(first.clone()).await,
+                Ok(Ok(EndResult::Success))
+            ));
+        }
+        for site in &self.sites {
+            wait_until("the old versions are unheld", 10, || {
+                held_for(&cluster, *site, &first) == 0
+            })
+            .await;
+        }
+        let mut olds = Vec::new();
+        for (id, site) in ids.iter().zip(self.sites.iter()) {
+            let chunks = cluster.site(*site).chunks();
+            let chunk = pin_chunk(&cluster, *site);
+            let old = chunk
+                .locate_segment(chunks.address_of(id))
+                .expect("segment of the old version")
+                .id;
+            if chunk.is_active_head(old) {
+                rotate_out(chunk, old);
+            }
+            force_sync_segment(chunk, old);
+            assert_ne!(old, fillers[olds.len()]);
+            olds.push(old);
+        }
+
+        // The transaction.
+        let dirs: Vec<std::path::PathBuf> = self
+            .sites
+            .iter()
+            .map(|site| cluster.temp[*site].path().to_path_buf())
+            .collect();
+        if matches!(self.mode, PinWindowMode::DefaultUnsynced | PinWindowMode::SyncFails) {
+            crate::ram::segs::power_loss_model::pause_group_sync(true);
+            for dir in &dirs {
+                crate::ram::durability::pause_receipt_syncs_under(dir, true);
+            }
+        }
+        let second = txn.begin().await.unwrap().unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            match self.op {
+                PinOp::Update => {
+                    txn.update(second.clone(), cell_of(*id, 200 + n as u64))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                PinOp::Remove => {
+                    txn.remove(second.clone(), *id).await.unwrap().unwrap();
+                }
+            }
+        }
+        txn.prepare(second.clone()).await.unwrap().unwrap();
+        let committed = if self.mode == PinWindowMode::Durable {
+            txn.commit_durable(second.clone()).await
+        } else {
+            txn.commit(second.clone()).await
+        };
+        assert!(
+            matches!(committed, Ok(Ok(EndResult::Success))),
+            "{:?}",
+            committed
+        );
+        if self.mode == PinWindowMode::SyncFails {
+            // The COMMIT sync of every head that the transaction wrote fails.
+            for site in &self.sites {
+                for chunk in &cluster.site(*site).chunks().list {
+                    for segment in chunk.segments() {
+                        if segment_holds_record_of(&segment, &second, EntryType::BEGIN) {
+                            if let Ok(Some(receipt)) = segment.durable_receipt() {
+                                receipt.file.inject_failure();
+                            }
+                        }
+                    }
+                }
+            }
+            crate::ram::segs::power_loss_model::pause_group_sync(false);
+            for dir in &dirs {
+                crate::ram::durability::pause_receipt_syncs_under(dir, false);
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        for site in &self.sites {
+            match self.mode {
+                PinWindowMode::DefaultThenSynced => {
+                    wait_until("the COMMIT sync", 20, || {
+                        held_for(&cluster, *site, &second) == 0
+                    })
+                    .await
+                }
+                PinWindowMode::DefaultUnsynced | PinWindowMode::SyncFails => assert!(
+                    held_for(&cluster, *site, &second) > 0,
+                    "test setup: the COMMIT at site {} must be unsynced",
+                    site
+                ),
+                PinWindowMode::Durable => {}
+            }
+        }
+        if self.op == PinOp::Update {
+            for (n, site) in self.sites.iter().enumerate() {
+                assert_eq!(
+                    score_on(cluster.site(*site), &ids[n]),
+                    Some(200 + n as u64)
+                );
+            }
+        }
+        // The pin, and the cleaner on the old segments.
+        let pinned_expected = self.pin_enabled
+            && matches!(
+                self.mode,
+                PinWindowMode::DefaultUnsynced | PinWindowMode::SyncFails
+            );
+        let mut gone = Vec::new();
+        for (n, site) in self.sites.iter().enumerate() {
+            let chunk = pin_chunk(&cluster, *site);
+            if pinned_expected {
+                assert!(
+                    old_segment_holds(chunk, olds[n], &second),
+                    "the old segment of site {} must be pinned by the unsynced transaction",
+                    site
+                );
+            }
+            let passes = if pinned_expected { 20 } else { 50 };
+            gone.push(compact_old_segment(chunk, olds[n], fillers[n], passes));
+            warn!(
+                "PINWIN {} site {}: old segment gone: {}, pinned: {}",
+                self.group, site, gone[n], pinned_expected
+            );
+        }
+
+        // The power loss: the images are taken now, from the synced lengths.
+        let images: Vec<_> = self.sites.iter().map(|site| cluster.power_image(*site)).collect();
+        if pinned_expected && self.mode == PinWindowMode::DefaultUnsynced {
+            // On the live stores the pin ends with the sync, and the cleaner
+            // then reclaims the old segment.
+            crate::ram::segs::power_loss_model::pause_group_sync(false);
+            for dir in &dirs {
+                crate::ram::durability::pause_receipt_syncs_under(dir, false);
+            }
+            for (n, site) in self.sites.iter().enumerate() {
+                wait_until("the COMMIT sync", 20, || {
+                    held_for(&cluster, *site, &second) == 0
+                })
+                .await;
+                let chunk = pin_chunk(&cluster, *site);
+                assert!(
+                    compact_old_segment(chunk, olds[n], fillers[n], 50),
+                    "the cleaner must reclaim the old segment of site {} after the COMMIT sync",
+                    site
+                );
+            }
+        }
+        crate::ram::segs::power_loss_model::pause_group_sync(false);
+        for dir in &dirs {
+            crate::ram::durability::pause_receipt_syncs_under(dir, false);
+        }
+        cluster.restart_from_images(&self.sites, images).await;
+        if self.sites.len() > 1 {
+            for site in &self.sites {
+                wait_until("the in-doubt resolution", 90, || {
+                    !in_doubt_on(&cluster, *site, &second)
+                })
+                .await;
+            }
+        }
+        let reads = ids
+            .iter()
+            .zip(self.sites.iter())
+            .map(|(id, site)| score_on(cluster.site(*site), id))
+            .collect();
+        super::data_site::PIN_DISABLED.store(false, SeqCst);
+        cluster.shutdown().await;
+        PinWindowOutcome {
+            reads,
+            old_segment_gone: gone,
+        }
+    }
+}
+
+/// Default commit, `end`, cleaner on the old segment, power loss before the
+/// COMMIT sync. D19: the transaction is absent, so the OLD value stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_updated_cell_survives_compaction_of_its_old_version_before_the_commit_sync() {
+    let outcome = PinWindow::new("pinwin_default", PinWindowMode::DefaultUnsynced)
+        .run()
+        .await;
+    assert_eq!(outcome.reads, vec![Some(100)]);
+    assert_eq!(outcome.old_segment_gone, vec![false]);
+}
+
+/// Control: the same flow without the pin loses the cell. The window is real.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_without_the_pin_loses_the_cell() {
+    let mut window = PinWindow::new("pinwin_nopin", PinWindowMode::DefaultUnsynced);
+    window.pin_enabled = false;
+    let outcome = window.run().await;
+    assert_eq!(outcome.old_segment_gone, vec![true]);
+    assert_eq!(outcome.reads, vec![None]);
+}
+
+/// Control: the COMMIT is synced before the cleaner runs. The new value stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_synced_commit_keeps_the_cell_after_compaction() {
+    let outcome = PinWindow::new("pinwin_synced", PinWindowMode::DefaultThenSynced)
+        .run()
+        .await;
+    assert_eq!(outcome.reads, vec![Some(200)]);
+    assert_eq!(outcome.old_segment_gone, vec![true]);
+}
+
+/// Control: a durable commit syncs the COMMIT before `end`.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_durable_commit_keeps_the_cell_after_compaction() {
+    let outcome = PinWindow::new("pinwin_durable", PinWindowMode::Durable)
+        .run()
+        .await;
+    assert_eq!(outcome.reads, vec![Some(200)]);
+}
+
+/// T1: two sites, default `end`, nothing synced. Both keep the old value.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_two_site_update_keeps_both_old_values() {
+    let mut window = PinWindow::new("pinwin_two_site", PinWindowMode::DefaultUnsynced);
+    window.sites = vec![A, B];
+    let outcome = window.run().await;
+    // Observed: a two-site default commit is not lost, with or without the
+    // pin. The result is all old or all new, never absent.
+    assert!(
+        outcome.reads == vec![Some(100), Some(101)] || outcome.reads == vec![Some(200), Some(201)],
+        "{:?}",
+        outcome.reads
+    );
+}
+
+/// T1 control: without the pin the two-site result is still atomic and the
+/// cell is never absent. This documents that the window is a single-site
+/// window: a two-site default commit keeps its COMMIT or status cell.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_two_site_without_the_pin_stays_atomic() {
+    let mut window = PinWindow::new("pinwin_two_site_nopin", PinWindowMode::DefaultUnsynced);
+    window.sites = vec![A, B];
+    window.pin_enabled = false;
+    let outcome = window.run().await;
+    assert!(
+        outcome.reads == vec![Some(100), Some(101)] || outcome.reads == vec![Some(200), Some(201)],
+        "{:?}",
+        outcome.reads
+    );
+}
+
+/// T1 control: two sites with a synced COMMIT keep both new values.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_two_site_synced_commit_keeps_both_new_values() {
+    let mut window = PinWindow::new("pinwin_two_site_synced", PinWindowMode::DefaultThenSynced);
+    window.sites = vec![A, B];
+    let outcome = window.run().await;
+    assert_eq!(outcome.reads, vec![Some(200), Some(201)]);
+}
+
+/// T2: a removed cell is present with its old value after the power loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_remove_keeps_the_old_value() {
+    let mut window = PinWindow::new("pinwin_remove", PinWindowMode::DefaultUnsynced);
+    window.op = PinOp::Remove;
+    let outcome = window.run().await;
+    assert_eq!(outcome.reads, vec![Some(100)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_remove_without_the_pin_loses_the_cell() {
+    let mut window = PinWindow::new("pinwin_remove_nopin", PinWindowMode::DefaultUnsynced);
+    window.op = PinOp::Remove;
+    window.pin_enabled = false;
+    assert_eq!(window.run().await.reads, vec![None]);
+}
+
+/// T2 control: a durable remove is absent after the power loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_durable_remove_is_absent() {
+    let mut window = PinWindow::new("pinwin_remove_durable", PinWindowMode::Durable);
+    window.op = PinOp::Remove;
+    assert_eq!(window.run().await.reads, vec![None]);
+}
+
+/// T3 (D46): the old version sits in the active head. The seal job leaves the
+/// mostly dead segment to the cleaner. The pin keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_seal_pending_old_head_keeps_the_old_value() {
+    let mut window = PinWindow::new("pinwin_head", PinWindowMode::DefaultUnsynced);
+    window.old_in = OldVersionIn::SealPending;
+    let outcome = window.run().await;
+    assert_eq!(outcome.reads, vec![Some(100)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_old_head_without_the_pin_loses_the_cell() {
+    let mut window = PinWindow::new("pinwin_head_nopin", PinWindowMode::DefaultUnsynced);
+    window.old_in = OldVersionIn::SealPending;
+    window.pin_enabled = false;
+    assert_eq!(window.run().await.reads, vec![None]);
+}
+
+/// T6: every WAL sync fails after the COMMIT append. The old segment stays
+/// pinned (D20: cannot tell is in progress) and the power loss keeps the old
+/// value.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_failed_commit_sync_keeps_the_old_segment_pinned() {
+    let outcome = PinWindow::new("pinwin_syncfail", PinWindowMode::SyncFails)
+        .run()
+        .await;
+    assert_eq!(outcome.reads, vec![Some(100)]);
+    assert_eq!(outcome.old_segment_gone, vec![false]);
+}
+
+/// T4: an aborted transaction pins no old segment.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_an_aborted_update_pins_nothing() {
+    let (cluster, client) = Cluster::start("pinwin_abort").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    drop(client);
+    let id = Id::from_parts(HERE as u64, 77);
+    let txn = coordinator(&cluster).await;
+    let first = txn.begin().await.unwrap().unwrap();
+    txn.write(first.clone(), cell_of(id, 100)).await.unwrap().unwrap();
+    txn.prepare(first.clone()).await.unwrap().unwrap();
+    assert!(matches!(
+        txn.commit_durable(first.clone()).await,
+        Ok(Ok(EndResult::Success))
+    ));
+    let chunks = cluster.site(A).chunks();
+    let chunk = pin_chunk(&cluster, A);
+    let old = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("old segment")
+        .id;
+    let second = txn.begin().await.unwrap().unwrap();
+    txn.update(second.clone(), cell_of(id, 200)).await.unwrap().unwrap();
+    txn.prepare(second.clone()).await.unwrap().unwrap();
+    assert!(txn.abort(second.clone()).await.is_ok());
+    assert!(!old_segment_holds(chunk, old, &second));
+    assert_eq!(score_on(cluster.site(A), &id), Some(100));
+    cluster.shutdown().await;
+}
+
+/// T5: N default updates of cells in one segment that stays above the dead
+/// bar. The pins do not pile up on the segment.
+async fn many_updates_leave_few_pins(group: &'static str, prune: bool) -> usize {
+    crate::ram::cleaner::protection::NO_PRUNE_ON_PIN
+        .store(!prune, std::sync::atomic::Ordering::SeqCst);
+    let (cluster, client) = Cluster::start(group).await;
+    place_slot(&cluster, &client, HERE, A).await;
+    drop(client);
+    let txn = coordinator(&cluster).await;
+    let ids: Vec<Id> = (0..40).map(|n| Id::from_parts(HERE as u64, 1_000 + n)).collect();
+    let first = txn.begin().await.unwrap().unwrap();
+    for id in &ids {
+        txn.write(first.clone(), cell_of(*id, 1)).await.unwrap().unwrap();
+    }
+    txn.prepare(first.clone()).await.unwrap().unwrap();
+    assert!(matches!(
+        txn.commit_durable(first.clone()).await,
+        Ok(Ok(EndResult::Success))
+    ));
+    let chunks = cluster.site(A).chunks();
+    let chunk = pin_chunk(&cluster, A);
+    let old = chunk
+        .locate_segment(chunks.address_of(&ids[0]))
+        .expect("old segment")
+        .id;
+    if chunk.is_active_head(old) {
+        rotate_out(chunk, old);
+    }
+    let mut tids = Vec::new();
+    for id in ids.iter().take(12) {
+        let update = txn.begin().await.unwrap().unwrap();
+        txn.update(update.clone(), cell_of(*id, 2)).await.unwrap().unwrap();
+        txn.prepare(update.clone()).await.unwrap().unwrap();
+        assert!(matches!(
+            txn.commit(update.clone()).await,
+            Ok(Ok(EndResult::Success))
+        ));
+        tids.push(update);
+    }
+    // Counted at once, with no protection check: a check prunes the pins
+    // itself, and so does the background cleaner a moment later.
+    let _ = &tids;
+    let pins = chunk
+        .segments()
+        .iter()
+        .find(|segment| segment.id == old)
+        .map_or(0, |segment| segment.protection.pin_count());
+    crate::ram::cleaner::protection::NO_PRUNE_ON_PIN
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    cluster.shutdown().await;
+    pins
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinwin_pins_do_not_pile_up_on_a_live_segment() {
+    let pins = many_updates_leave_few_pins("pinwin_pile", true).await;
+    assert!(pins <= 3, "{} stale pins on one segment", pins);
+}
+
+/// Control: without the prune on insert, as in the first fix, the pins pile up.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_pinwin_pins_pile_up_without_the_prune() {
+    let pins = many_updates_leave_few_pins("pinwin_pile_control", false).await;
+    assert!(pins >= 10, "expected stale pins, found {}", pins);
 }
