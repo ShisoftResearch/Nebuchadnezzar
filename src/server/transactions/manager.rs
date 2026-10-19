@@ -870,7 +870,8 @@ impl TransactionManager {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
                         super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
-                    self.sites_end(&tid, affected_objs, &data_sites, durable).await
+                    self.sites_end(&tid, affected_objs, &data_sites, durable)
+                        .await
                 }
                 Err(error) => Err(error),
             };
@@ -1908,7 +1909,10 @@ impl TransactionManager {
                 }
                 Err(error) => {
                     unreachable = true;
-                    debug!("site {} did not answer `end` for {:?}: {:?}", server_id, tid, error);
+                    debug!(
+                        "site {} did not answer `end` for {:?}: {:?}",
+                        server_id, tid, error
+                    );
                 }
             }
         }
@@ -2050,7 +2054,8 @@ impl TransactionManager {
     }
 
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
-        txn.data.clear();
+        // Retired map nodes can keep this transaction alive. Release its cache.
+        txn.data = HashMap::new();
         txn.affected_objects.clear();
         txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;
@@ -2392,6 +2397,34 @@ mod tests {
         assert!(!TransactionManager::abort_cleanup_complete(&Ok(
             AbortResult::Success(Some(vec![]))
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_releases_cache_capacity_while_handle_is_retained() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_cache_capacity";
+        let server = start_manager_test_server(&address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let client = scoped_txn_client_for_database(&address, group, group).await;
+        let tid = client.begin().await.unwrap().unwrap();
+        let retained = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn = retained.lock().await;
+            txn.data.reserve(8192);
+            assert!(txn.data.capacity() >= 8192);
+        }
+        manager.cleanup_transaction(&tid);
+        assert_eq!(manager.transaction_count(), 0);
+        {
+            let txn = retained.lock().await;
+            assert_eq!(txn.state, TxnState::Cleanup);
+            assert_eq!(
+                txn.data.capacity(),
+                0,
+                "a retired map node must not retain the transaction cache allocation"
+            );
+        }
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
