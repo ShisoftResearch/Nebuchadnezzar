@@ -1159,6 +1159,8 @@ impl DataManager {
     ///   not be synced, a COMMIT can come back after a power loss, so it stays
     ///   decided and the client is told the refusal.
     fn close_committed_brackets(&self, tid: &TxnId, durable: bool) -> CloseOutcome {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_detail = super::phase_profile::guard(super::phase_profile::Phase::DecisionClose);
         let Some(txn_lock) = self.find_transaction(tid) else {
             return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
         };
@@ -2149,6 +2151,8 @@ impl DataManager {
         expected_owner: Option<&TxnPriority>,
         affected_cell_ids: &[Id],
     ) -> (usize, Vec<LockReleaseFailure>) {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_detail = super::phase_profile::guard(super::phase_profile::Phase::ReleaseLocks);
         let mut released_count = 0;
         let mut failures = Vec::new();
         let current_time = get_time();
@@ -2537,6 +2541,8 @@ impl DataManager {
         };
         #[cfg(multisite_test)]
         crate::utils::multisite::point("before_p0", tid);
+        #[cfg(feature = "occ_phase_profile")]
+        let sync_phase = super::phase_profile::guard(super::phase_profile::Phase::PrepareSync);
         for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -2551,6 +2557,8 @@ impl DataManager {
                 );
             }
         }
+        #[cfg(feature = "occ_phase_profile")]
+        drop(sync_phase);
         // NO bracket COMMIT here, for the same reason there is no commit
         // marker here: despite its name this runs in the coordinator's
         // PREPARE phase, and a durable COMMIT is the participant saying "this
@@ -7371,6 +7379,8 @@ impl Service for DataManager {
                     }
                 }
 
+                #[cfg(feature = "occ_phase_profile")]
+                let acquire_phase = super::phase_profile::guard(super::phase_profile::Phase::ParticipantAcquireLocks);
                 let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
                 let mut cell_guards = Vec::with_capacity(prepared_ops.len());
 
@@ -7430,6 +7440,8 @@ impl Service for DataManager {
                     meta.lock_acquired_at = Some(lock_time);
                 }
 
+                #[cfg(feature = "occ_phase_profile")]
+                drop(acquire_phase);
                 txn.certified = prepared_ops_by_id;
                 txn.affected_cells = txn.certified.keys().copied().collect();
                 txn.coordinator_id = Some(coordinator_id);
