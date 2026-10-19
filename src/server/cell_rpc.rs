@@ -218,53 +218,43 @@ pub struct FenceLeases {
     holds: KeyedState<u64, LeasedFence>,
 }
 
-#[derive(Default)]
 pub struct CellScans {
     next_id: std::sync::atomic::AtomicU64,
-    open: Sharded<
-        parking_lot::Mutex<std::collections::HashMap<u64, Arc<parking_lot::Mutex<CellScan>>>>,
-    >,
+    open: KeyedState<u64, Arc<parking_lot::Mutex<CellScan>>>,
 }
-
+impl Default for CellScans {
+    fn default() -> Self {
+        Self { next_id: Default::default(), open: KeyedState::ordered() }
+    }
+}
 impl CellScans {
     fn create(&self) -> u64 {
-        for shard in self.open.iter() {
-            crate::profile_lock!(H23, shard.lock()).retain(|_, scan| {
-                let Some(mut scan) = scan.try_lock() else {
-                    return true;
-                };
-                if scan.last_used.elapsed() < CELL_SCAN_IDLE {
-                    return true;
-                }
-                scan.closed = true;
-                false
-            });
+        for id in self.open.keys() {
+            let Some(mut entry) = self.open.get(&id) else { continue };
+            let expired = if let Some(scan) = entry.as_ref() {
+                if let Some(mut scan) = scan.try_lock() {
+                    if scan.last_used.elapsed() >= CELL_SCAN_IDLE {
+                        scan.closed = true;
+                        true
+                    } else { false }
+                } else { false }
+            } else { false };
+            if expired { entry.take(); }
         }
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        crate::profile_lock!(H23, self.open.shard(&id).lock()).insert(
-            id,
-            Arc::new(parking_lot::Mutex::new(CellScan {
-                next_chunk: 0,
-                ids: Vec::new(),
-                position: 0,
-                last_used: std::time::Instant::now(),
-                closed: false,
-            })),
-        );
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        *crate::profile_lock!(H23, self.open.entry(&id)) = Some(Arc::new(parking_lot::Mutex::new(CellScan {
+            next_chunk: 0, ids: Vec::new(), position: 0,
+            last_used: std::time::Instant::now(), closed: false,
+        })));
         id
     }
 
     fn get(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
-        crate::profile_lock!(H23, self.open.shard(&cursor).lock())
-            .get(&cursor)
-            .cloned()
+        crate::profile_lock!(H23, self.open.get(&cursor)?).as_ref().cloned()
     }
 
     fn remove(&self, cursor: u64) -> Option<Arc<parking_lot::Mutex<CellScan>>> {
-        crate::profile_lock!(H23, self.open.shard(&cursor).lock()).remove(&cursor)
+        crate::profile_lock!(H23, self.open.get(&cursor)?).take()
     }
 }
 
@@ -461,6 +451,27 @@ pub struct NebRPCService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_cursor_lookup_and_close_progress_beside_a_held_entry() {
+        let scans = CellScans::default();
+        let first = scans.create();
+        let second = scans.create();
+        let held = scans.open.entry(&first);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(scans.get(second).is_some());
+                assert!(scans.remove(second).is_some());
+                tx.send(()).unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(held);
+            assert!(result.is_ok());
+        });
+        assert!(scans.get(first).is_some());
+        assert!(scans.get(second).is_none());
+    }
 
     #[test]
     fn index_failure_turns_a_successful_write_into_index_incomplete() {
