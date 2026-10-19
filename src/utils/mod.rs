@@ -24,6 +24,4 @@ pub fn thread_id() -> u64 {
 #[macro_use]
 pub mod lock_profile;
 
-pub(crate) mod sharded;
-
 pub(crate) mod keyed_state;

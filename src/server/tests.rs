@@ -1981,7 +1981,7 @@ async fn unloading_a_database_gives_its_threads_back() {
     // `database_runtimes` was a `PtrHashMap`, whose `remove` returns a CLONE and
     // leaves the original in the retired node -- so removal was not a release and
     // every database ever unloaded stayed resident for the life of the process,
-    // memory store included. It is a plain `RwLock<HashMap>` now, which drops on
+    // memory store included. Its immutable registry snapshot now releases values on
     // removal like anything else; the map was never on a request path, so there
     // was no lock-free property to trade away.
     assert!(

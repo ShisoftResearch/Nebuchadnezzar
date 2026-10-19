@@ -1352,20 +1352,10 @@ pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     /// The databases this server hosts, besides its default one.
     ///
-    /// A plain `RwLock<HashMap>`, deliberately, where this used to be a
-    /// `PtrHashMap`. That map's `remove` returns a CLONE and leaves the original
-    /// in the retired node -- correct, since a concurrent reader may still be
-    /// dereferencing it, but it means removal is not a release and the value
-    /// dies only on node reuse or map drop. This map outlives its removals, so
-    /// every database ever unloaded stayed resident for the life of the process,
-    /// entire memory store included. See
-    /// `server::tests::ptr_hash_map_remove_does_not_release_the_value`.
-    ///
-    /// Nothing is lost by the change: the map is written only when a database is
-    /// loaded or unloaded, and read on the same path plus status and shutdown.
-    /// It is not on any request path -- a request reaches its runtime through the
-    /// scoped RPC service that already holds it -- so there is no lock-free
-    /// requirement here to trade away.
+    /// Immutable snapshots keep load/unload publication separate from readers.
+    /// Replacing a snapshot releases its runtime Arcs when its readers finish.
+    /// Lightning's deferred node reclamation would retain removed runtime values.
+    /// Requests already hold their scoped runtime through their RPC service.
     database_runtimes: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
     runtime_initializers: lightning::map::PtrHashMap<String, Arc<tokio::sync::Mutex<()>>>,
@@ -2133,8 +2123,8 @@ impl NebServer {
         // original in the retired node, so unloading never released the runtime
         // at all -- 14 databases loaded and unloaded left 14 runtimes reachable
         // and 14 `stats-sweeper` threads running, and 10 further load/unload
-        // cycles reclaimed none of them. The map is a plain `RwLock<HashMap>`
-        // now and the runtime does drop, which is asserted by
+        // cycles reclaimed none of them. Published snapshots now release the
+        // runtime after their readers finish. This is asserted by
         // `unloading_a_database_gives_its_threads_back`.
         runtime.chunks().stop_background();
         // And forget its tree service. Nothing else retires it, and it holds every
