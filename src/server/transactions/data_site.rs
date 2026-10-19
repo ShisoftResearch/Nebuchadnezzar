@@ -572,6 +572,21 @@ service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
 
 impl DataManager {
+    #[cfg(test)]
+    pub(crate) fn cell_meta_for_test(&self, id: &Id) -> CellMetaMutex {
+        self.cell_meta_mutex(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cell_owner_for_test(&self, id: &Id, owner: Option<TxnPriority>) {
+        self.cell_meta_mutex(id).lock().owner = owner;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_transaction_for_test(&self, tid: &TxnId) -> bool {
+        self.find_transaction(tid).is_some()
+    }
+
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
         hlc: Arc<bifrost::hlc::HlcSource>,

@@ -2704,14 +2704,8 @@ async fn client_commit_outcome_store_full_can_already_be_committed() {
             client: manager.clone(),
         };
         let result = txn.commit().await;
-        if reader {
-            assert!(
-                matches!(result, Err(TxnError::OutcomeUnknown)),
-                "{result:?}"
-            );
-        } else {
-            assert!(result.is_ok(), "single writer control: {result:?}");
-        }
+        // The writer decided COMMIT. A reader's cleanup refusal cannot undo it.
+        assert!(result.is_ok(), "the writer's decision must win: {result:?}");
         assert_eq!(score_on(cluster.site(A), &write_id), Some(seq));
         assert_eq!(
             data_site(&cluster, A).txn_outcome(&tid),
@@ -3391,4 +3385,120 @@ async fn pinwin_pins_do_not_pile_up_on_a_live_segment() {
 async fn control_pinwin_pins_pile_up_without_the_prune() {
     let pins = many_updates_leave_few_pins("pinwin_pile_control", false).await;
     assert!(pins >= 10, "expected stale pins, found {}", pins);
+}
+
+async fn review_f1_reader_report_case(partial: bool, refuse: bool) {
+    use crate::client::transaction::{Transaction, TxnError};
+    use std::cell::Cell;
+    let (cluster, client) = Cluster::start("review_f1_reader_report").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let writer_id = Id::from_parts(HERE as u64, 50_001);
+    let read_ids = [
+        Id::from_parts(THERE as u64, 50_001),
+        Id::from_parts(THERE as u64, 50_002),
+    ];
+    for id in &read_ids {
+        client.write_cell(cell_of(*id, 1)).await.unwrap().unwrap();
+    }
+    let manager = coordinator(&cluster).await;
+    let tid = manager.begin().await.unwrap().unwrap();
+    for id in read_ids.iter().take(if partial { 2 } else { 1 }) {
+        manager.read(tid, *id).await.unwrap().unwrap();
+    }
+    manager
+        .write(tid, cell_of(writer_id, 73))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    let writer = data_site(&cluster, A);
+    let reader = data_site(&cluster, B);
+    // A late END can reach a read-only participant after its local abort.
+    assert_eq!(
+        <super::data_site::DataManager as super::data_site::Service>::abort(&reader, tid, tid)
+            .await
+            .payload,
+        AbortResult::Success(None)
+    );
+    reader.set_cell_owner_for_test(
+        &read_ids[0],
+        Some(TxnPriority::new(
+            cluster.site(B).hlc.now(),
+            cluster.site(B).server_id,
+        )),
+    );
+    if refuse {
+        crate::ram::chunk::refuse_next_commit_for_test(cluster.site(A).chunks().base_addr, tid);
+    }
+    // B sorts first. Hold A's rollback until B has returned its lock report.
+    let writer_meta = writer.cell_meta_for_test(&writer_id);
+    let (release, held) = if refuse {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let guard = writer_meta.lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        (Some(release_tx), Some(held))
+    } else {
+        (None, None)
+    };
+    let watching_reader = reader.clone();
+    let ordered = tokio::spawn(async move {
+        wait_until("reader END finishes before writer rollback", 10, || {
+            !watching_reader.has_transaction_for_test(&tid)
+        })
+        .await;
+        if let Some(release) = release {
+            release.send(()).unwrap();
+        }
+    });
+    let txn = Transaction {
+        tid,
+        state: Cell::new(TxnState::Prepared),
+        client: manager,
+    };
+    let result = txn.commit_durable().await;
+    ordered.await.unwrap();
+    if let Some(held) = held {
+        held.join().unwrap();
+    }
+    reader.set_cell_owner_for_test(&read_ids[0], None);
+    println!("F1 result: {result:?}; partial reader report: {partial}; writer refusal: {refuse}");
+    if refuse {
+        assert_eq!(writer.txn_outcome(&tid), TxnOutcome::Aborted);
+        assert_eq!(score_on(cluster.site(A), &writer_id), None);
+    } else {
+        assert_eq!(writer.txn_outcome(&tid), TxnOutcome::Committed);
+        assert_eq!(score_on(cluster.site(A), &writer_id), Some(73));
+    }
+    cluster.shutdown().await;
+    if refuse {
+        assert!(
+            matches!(result, Err(TxnError::OutcomeUnknown)),
+            "a reader report hid writer rollback: {result:?}"
+        );
+    } else {
+        assert!(result.is_ok(), "committed writer control: {result:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_reader_exhausted_report_cannot_hide_writer_rollback() {
+    review_f1_reader_report_case(false, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_reader_partial_report_cannot_hide_writer_rollback() {
+    review_f1_reader_report_case(true, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_committed_writer_control() {
+    review_f1_reader_report_case(false, false).await;
 }
