@@ -309,12 +309,14 @@ where
         let step = read_node(&current, |node: &NodeReadHandler<KS, PS>| {
             match &**node {
                 NodeData::External(n) => {
+                    let n = &**n;
                     let keys = n.keys.to_vec(0..n.len);
                     #[cfg(test)]
                     super::revision_tests::after_median_copy();
                     BoundaryStep::Key(keys.get(keys.len() / 2).cloned())
                 }
                 NodeData::Internal(n) => {
+                    let n = &**n;
                     let keys = n.keys.to_vec(n.len);
                     #[cfg(test)]
                     super::revision_tests::after_median_copy();

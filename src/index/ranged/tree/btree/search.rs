@@ -85,6 +85,7 @@ where
             };
             match node {
                 &NodeData::External(ref n) => {
+                    let n = &**n;
                     #[cfg(test)]
                     super::revision_tests::after_external_borrow();
                     trace!(

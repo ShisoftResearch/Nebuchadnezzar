@@ -180,6 +180,7 @@ where
         }
         read_node(page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
+                    let n = &**n;
                 #[cfg(test)]
                 super::revision_tests::after_external_borrow();
                 let follow_src = match ordering {
@@ -274,6 +275,7 @@ where
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
                 &NodeData::External(ref n) => {
+                    let n = &**n;
                     #[cfg(test)]
                     super::revision_tests::after_external_borrow();
                     let filtering = self.filter_deleted && !self.deletion.is_empty();
