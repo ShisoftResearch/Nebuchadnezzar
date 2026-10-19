@@ -2711,51 +2711,96 @@ impl NebServer {
     /// an operator step that cuts the old voters off on purpose). After the
     /// start, the old identities leave the roster and the slots they owned are
     /// re-pointed at this server. Nothing of this runs on a normal start.
+    ///
+    /// The storage locks are taken before the raft store is written and held
+    /// through the start, so a live server cannot share the store (IC2). The
+    /// call refuses a store that names more than one voter unless
+    /// `force_new_cluster` is true (IC3). The call can run again after a stop
+    /// in the middle: the old owners come from the slot table, not only from
+    /// the voters that this call removed (IC4). Every removed member must stay
+    /// stopped for ever.
     pub async fn restore_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
         group_name: &'a str,
+        force_new_cluster: bool,
         prepare_raft_service: F,
     ) -> Result<Arc<NebServer>, ServerError> {
         let group = String::from(group_name);
         let layout = database::DatabaseStorageLayout::from_options(opts, &group, &group);
+        let locks = Arc::new(
+            StorageDirectoryLocks::acquire(&layout, opts.disable_storage_locks)
+                .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+        );
         let storage = raft_storage_for_layout(&layout);
-        let restored = raft::restore_sole_voter(storage, server_addr, raft::DEFAULT_SERVICE_ID)
-            .await
-            .map_err(|e| ServerError::CannotRestoreStore(e.to_string()))?;
-        let old_owners: Vec<u64> = restored
+        let restored = raft::restore_sole_voter(
+            storage,
+            server_addr,
+            raft::DEFAULT_SERVICE_ID,
+            force_new_cluster,
+        )
+        .await
+        .map_err(|e| ServerError::CannotRestoreStore(e.to_string()))?;
+        let mut old_owners: Vec<u64> = restored
             .iter()
             .filter(|plane| plane.plane_id == raft::PlaneId::type1())
             .flat_map(|plane| plane.removed.iter().map(|address| hash_str(address)))
             .collect();
-        let server = Self::new_from_opts(opts, server_addr, group_name, prepare_raft_service).await?;
+        let server = Self::new_cluster_from_opts_with_locks(
+            opts,
+            server_addr,
+            &vec![server_addr.to_owned()],
+            group_name,
+            group_name,
+            prepare_raft_service,
+            Some(locks),
+        )
+        .await?;
+        let heir = hash_str(server_addr);
         let membership = bifrost::membership::raft::client::SMClient::new(
             bifrost::membership::DEFAULT_SERVICE_ID,
             &server.raft_client,
         );
+        let table = match crate::slots::load_owner_vec(
+            &server.group_name,
+            &server.raft_client,
+            SLOTS_SM_ID,
+        )
+        .await
+        {
+            Ok((table, _)) => table,
+            Err(reason) => return Err(ServerError::CannotRestoreStore(reason)),
+        };
+        // A second run finds `removed` empty. The owners that a stop left in
+        // the slot table are old identities too: this server is the only voter
+        // and the only live member of the group after the raft step.
+        if let Some(table) = &table {
+            for owner in table {
+                if *owner != 0 && *owner != heir && !old_owners.contains(owner) {
+                    old_owners.push(*owner);
+                }
+            }
+        }
         for old in &old_owners {
             if let Err(error) = membership.leave(old).await {
                 warn!("restore: old member {} could not leave the roster: {:?}", old, error);
             }
         }
-        match crate::slots::load_owner_vec(&server.group_name, &server.raft_client, SLOTS_SM_ID)
-            .await
-        {
-            Ok((Some(table), _)) => {
+        match &table {
+            Some(table) => {
                 let moved = crate::slots::restore_slot_owners(
                     &server.group_name,
                     &server.raft_client,
                     SLOTS_SM_ID,
-                    &table,
+                    table,
                     &old_owners,
-                    hash_str(server_addr),
+                    heir,
                 )
                 .await
                 .map_err(ServerError::CannotRestoreStore)?;
                 info!("restore: re-pointed {} slot(s) at {}", moved, server_addr);
             }
-            Ok((None, _)) => debug!("restore: no slot placement table"),
-            Err(reason) => return Err(ServerError::CannotRestoreStore(reason)),
+            None => debug!("restore: no slot placement table"),
         }
         server.refresh_slot_placement().await;
         Ok(server)
@@ -2805,15 +2850,42 @@ impl NebServer {
         database_name: &'a str,
         prepare_raft_service: F,
     ) -> Result<Arc<NebServer>, ServerError> {
+        Self::new_cluster_from_opts_with_locks(
+            opts,
+            server_addr,
+            meta_servers,
+            group_name,
+            database_name,
+            prepare_raft_service,
+            None,
+        )
+        .await
+    }
+
+    /// `new_cluster_from_opts_in_database` with storage locks that the caller
+    /// already holds (the explicit restore holds them while it writes the raft
+    /// store, and keeps them through the start).
+    async fn new_cluster_from_opts_with_locks<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        meta_servers: &Vec<String>,
+        group_name: &'a str,
+        database_name: &'a str,
+        prepare_raft_service: F,
+        held_storage_locks: Option<Arc<StorageDirectoryLocks>>,
+    ) -> Result<Arc<NebServer>, ServerError> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         let storage_layout =
             database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
-        let startup_storage_locks = Arc::new(
-            StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
-                .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
-        );
+        let startup_storage_locks = match held_storage_locks {
+            Some(locks) => locks,
+            None => Arc::new(
+                StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
+                    .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+            ),
+        };
         debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
         let meta_members: Vec<_> = meta_servers
