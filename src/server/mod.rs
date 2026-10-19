@@ -97,12 +97,7 @@ fn routed_cluster_members(
 ) -> Vec<String> {
     configured_cluster_members(server_addr, meta_members)
         .into_iter()
-        .filter(|member| {
-            conshash
-                .to_server_name_option(Some(hash_str(member)))
-                .as_ref()
-                == Some(member)
-        })
+        .filter(|member| conshash.is_routing_member(hash_str(member)))
         .collect()
 }
 
@@ -162,6 +157,91 @@ async fn wait_for_scoped_cell_rpc_services(
         members,
         last_unavailable
     )))
+}
+
+#[cfg(test)]
+mod readiness_membership_tests {
+    use super::*;
+
+    async fn readiness_with_configured_outsider(outsider: bool) {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            "readiness_configured_seed",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let (host, group, ring) = if outsider {
+            let host = crate::utils::test_port::unique_localhost_addr();
+            let group = "readiness_other_group".to_string();
+            let id = hash_str(&host);
+            server.membership.sm_client.join(&host).await.unwrap();
+            assert!(server
+                .membership
+                .sm_client
+                .join_group(&group, &id)
+                .await
+                .unwrap());
+            let ring = ConsistentHashing::new_with_id(
+                CONS_HASH_ID,
+                &group,
+                &server.raft_client,
+                &server.membership,
+            )
+            .await
+            .unwrap();
+            ring.set_weight(&host, 1).await.unwrap();
+            ring.init_table().await.unwrap();
+            (host, group, ring)
+        } else {
+            (
+                address.clone(),
+                server.group_name.clone(),
+                server.consh.clone(),
+            )
+        };
+        // The configured seed has no scoped cell service for the other group.
+        // Its address stays discoverable, but it is not a readiness peer.
+        assert_eq!(
+            ring.try_server_name(server.server_id),
+            Some(address.clone())
+        );
+        let configured = vec![address.clone()];
+        let peers = routed_cluster_members(&host, &configured, &ring);
+        let ready =
+            wait_for_scoped_cell_rpc_services(&host, &configured, &ring, &group, &group).await;
+        server.shutdown().await;
+        assert!(
+            ready.is_ok(),
+            "a configured outsider must not block scoped readiness: {:?}",
+            ready
+        );
+        assert_eq!(peers, vec![host]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_outsider_does_not_block_scoped_readiness() {
+        readiness_with_configured_outsider(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_a_group_member_passes_scoped_readiness() {
+        readiness_with_configured_outsider(false).await;
+    }
 }
 
 fn discover_known_databases_from_raft_storage(
