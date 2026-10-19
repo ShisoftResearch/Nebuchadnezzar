@@ -254,9 +254,34 @@ impl TransactionManagerDeps {
 
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
         let consh = self.consh.clone();
-        self.member_pool
+        let cached = self
+            .member_pool
             .get_by_id(server_id, move |_| consh.try_server_name(server_id))
+            .await;
+        if !matches!(&cached, Err(error) if error.kind() == io::ErrorKind::NotFound) {
+            return cached;
+        }
+        // Recovery must reach stored participants even when the derived ring
+        // missed their membership notification during a restart.
+        let (members, _) = self
+            .consh
+            .membership()
+            .all_members(false)
             .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("cannot locate transaction participant {server_id}: {error:?}"),
+                )
+            })?;
+        match members.into_iter().find(|member| member.id == server_id) {
+            Some(member) => {
+                self.member_pool
+                    .get_by_id(server_id, move |_| Some(member.address))
+                    .await
+            }
+            None => cached,
+        }
     }
 
     pub fn schemas(&self) -> &crate::ram::schema::LocalSchemasCache {
