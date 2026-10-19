@@ -12,8 +12,9 @@
 //!    Abandoned block tails become gaps; gaps are legal.
 //!
 //! The in-memory fast path is the revision-allocator discipline: an
-//! per-lane atomic cursor and an immutable upper bound per durable block.
-//! A lane has one refill in flight. Different lanes lease independently.
+//! atomic cursor and an immutable upper bound per durable block.
+//! Independent refill lanes publish only newer blocks. All takers share
+//! the current block, so switching tasks cannot return an older sequence.
 
 use crate::utils::keyed_state::KeyedState;
 use dovahkiin::types::custom_types::id::{Id, ID_ORIGIN_MASK, ID_SEQUENCE_MASK};
@@ -25,8 +26,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Ids handed out per durable lease. At 2^20 ids per block, a restart
-/// wastes at most one tail per active lane (64 lanes maximum). Consensus
-/// traffic amortizes to one round per million IDs within each lane.
+/// can abandon tails from concurrent refills (64 lanes maximum). The
+/// unexhausted path uses the current block without a refill gate.
 pub const ID_BLOCK_SPAN: u64 = 1 << 20;
 
 /// A durable block lease: this allocator (`origin`, at `epoch`) may
@@ -172,17 +173,17 @@ impl SequenceBlock {
 }
 
 struct SequenceLane {
-    block: arc_swap::ArcSwap<SequenceBlock>,
     refill: Mutex<()>,
 }
 
-/// Independent block leases for one origin, partitioned by caller task.
-/// A task keeps its lane across worker migration, so its IDs stay increasing.
+/// One current block per origin, with independent refill lanes.
+/// Atomic block publication preserves order across caller tasks.
 pub struct IdAllocator {
     origin: u16,
     epoch: AtomicU64,
     floor: AtomicU64,
     lanes: [SequenceLane; 64],
+    block: arc_swap::ArcSwap<SequenceBlock>,
     store: Arc<dyn LeaseStore>,
 }
 
@@ -205,11 +206,11 @@ impl IdAllocator {
             origin,
             epoch: AtomicU64::new(epoch),
             floor: AtomicU64::new(floor),
+            block: arc_swap::ArcSwap::from_pointee(SequenceBlock {
+                next: AtomicU64::new(floor),
+                end: 0,
+            }),
             lanes: std::array::from_fn(|_| SequenceLane {
-                block: arc_swap::ArcSwap::from_pointee(SequenceBlock {
-                    next: AtomicU64::new(floor),
-                    end: 0,
-                }),
                 refill: Mutex::new(()),
             }),
             store,
@@ -255,7 +256,7 @@ impl IdAllocator {
 
     async fn take_sequence_in_lane(&self, lane: usize) -> io::Result<u64> {
         loop {
-            let block = self.lanes[lane].block.load();
+            let block = self.block.load();
             if let Some(value) = block.take(self.floor.load(Ordering::Acquire)) {
                 if value > self.floor.load(Ordering::Acquire) {
                     return Ok(value);
@@ -290,7 +291,7 @@ impl IdAllocator {
     async fn refill(&self, lane: usize) -> io::Result<()> {
         let lane = &self.lanes[lane];
         let _serialized = crate::profile_lock!(H40, lane.refill.lock().await);
-        let current = lane.block.load();
+        let current = self.block.load();
         let floor = self.floor.load(Ordering::Acquire);
         let next = current.next.load(Ordering::Relaxed).max(floor);
         if next < current.end {
@@ -305,13 +306,24 @@ impl IdAllocator {
                 ID_BLOCK_SPAN,
             )
             .await?;
-        // A reader retains one immutable range. It cannot pair an overshoot
-        // from an old range with the upper bound of a later lease.
-        lane.block.store(Arc::new(SequenceBlock {
+        self.publish_block(lease);
+        Ok(())
+    }
+
+    fn publish_block(&self, lease: BlockLease) {
+        let next = Arc::new(SequenceBlock {
             next: AtomicU64::new(lease.start),
             end: lease.end,
-        }));
-        Ok(())
+        });
+        // A slower refill cannot replace a newer published lease. Readers
+        // retain one range, so an exhausted cursor cannot borrow a new bound.
+        self.block.rcu(|current| {
+            if next.end > current.end {
+                next.clone()
+            } else {
+                current.clone()
+            }
+        });
     }
 }
 
@@ -421,7 +433,7 @@ mod tests {
         drop(held);
         let next = alloc.take_sequence_in_lane(0).await.unwrap();
         assert_ne!(value, next);
-        let old = alloc.lanes[1].block.load_full();
+        let old = alloc.block.load_full();
         old.next.store(old.end, Ordering::Relaxed);
         let later = alloc.take_sequence_in_lane(1).await.unwrap();
         assert!(later > old.end);
@@ -433,6 +445,22 @@ mod tests {
         for lane in 0..64 {
             assert!(alloc.take_sequence_in_lane(lane).await.unwrap() > later + ID_BLOCK_SPAN);
         }
+    }
+
+    #[tokio::test]
+    async fn switching_lanes_keeps_sequence_order_and_late_refills_cannot_rewind() {
+        let alloc = allocator(13).await;
+        let first = alloc.take_sequence_in_lane(0).await.unwrap();
+        let second = alloc.take_sequence_in_lane(1).await.unwrap();
+        let third = alloc.take_sequence_in_lane(0).await.unwrap();
+        assert!(first < second && second < third, "lane changes cannot rewind IDs");
+
+        let older = alloc.store.lease_block(13, 1, third, ID_BLOCK_SPAN).await.unwrap();
+        let newer = alloc.store.lease_block(13, 1, older.end, ID_BLOCK_SPAN).await.unwrap();
+        alloc.publish_block(newer);
+        let later = alloc.take_sequence_in_lane(2).await.unwrap();
+        alloc.publish_block(older);
+        assert!(alloc.take_sequence_in_lane(0).await.unwrap() > later);
     }
 
     #[test]
