@@ -141,6 +141,7 @@ impl Drop for CapturedWriteBatch {
 }
 
 pub struct AsyncClient {
+    pub(crate) write_back_hub: std::sync::OnceLock<Arc<crate::index::ranged::tree::btree::storage::WriteBackHub>>,
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
@@ -179,6 +180,7 @@ impl AsyncClient {
                 .await
                 {
                     Ok(chash) => Ok(Self {
+                        write_back_hub: std::sync::OnceLock::new(),
                         schema_client: {
                             let schema_plane_client =
                                 raft_client.plane(database_meta_plane_id(group, database_name));

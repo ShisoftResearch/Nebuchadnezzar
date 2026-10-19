@@ -96,10 +96,9 @@ const WRITE_BACK_MAX_ATTEMPTS: u32 = 200;
 // mint a separate chain in the target locality. Thus a lane owns every
 // forward-page dependency and deletion fence for its assigned localities.
 const WRITE_BACK_LANES: usize = 64;
-const HUB_REGISTRY_SHARDS: usize = 64;
-type HubRegistry = Vec<(Weak<client::AsyncClient>, Arc<WriteBackHub>)>;
 
 pub struct WriteBackHub {
+    registry_id: AtomicUsize,
     lanes: [Arc<WriteBackLane>; WRITE_BACK_LANES],
 }
 
@@ -132,6 +131,7 @@ impl WriteBackLane {
 impl WriteBackHub {
     fn new() -> Self {
         Self {
+            registry_id: AtomicUsize::new(0),
             lanes: std::array::from_fn(|_| Arc::new(WriteBackLane::new())),
         }
     }
@@ -183,42 +183,31 @@ impl WriteBackHub {
     }
 }
 
-lazy_static! {
-    static ref HUBS: [Mutex<HubRegistry>; HUB_REGISTRY_SHARDS] =
-        std::array::from_fn(|_| Mutex::new(Vec::new()));
+// Administrative traversal only. The hot lookup belongs to the client.
+static HUBS: std::sync::LazyLock<crossbeam_skiplist::SkipMap<usize, Weak<WriteBackHub>>> =
+    std::sync::LazyLock::new(crossbeam_skiplist::SkipMap::new);
+static NEXT_HUB: AtomicUsize = AtomicUsize::new(1);
+
+impl Drop for WriteBackHub {
+    fn drop(&mut self) {
+        let id = self.registry_id.load(Ordering::Relaxed);
+        if id != 0 { HUBS.remove(&id); }
+    }
 }
 
-/// Find one client's hub under its registry shard. No I/O uses this guard.
+/// The client owns its hub. Only this client's first lookup initializes it.
 pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
-    let shard = hash_shard(Arc::as_ptr(client) as usize as u64, HUB_REGISTRY_SHARDS);
-    let mut hubs = crate::profile_lock!(
-        C14,
-        HUBS[shard]
-            .lock()
-            .expect("write-back hub registry poisoned")
-    );
-    hubs.retain(|(c, _)| c.strong_count() > 0);
-    for (c, hub) in hubs.iter() {
-        if c.upgrade()
-            .is_some_and(|existing| Arc::ptr_eq(&existing, client))
-        {
-            return hub.clone();
-        }
-    }
-    let hub = Arc::new(WriteBackHub::new());
-    hubs.push((Arc::downgrade(client), hub.clone()));
-    hub
+    client.write_back_hub.get_or_init(|| {
+        let hub = Arc::new(WriteBackHub::new());
+        let id = NEXT_HUB.fetch_add(1, Ordering::Relaxed);
+        hub.registry_id.store(id, Ordering::Relaxed);
+        HUBS.insert(id, Arc::downgrade(&hub));
+        hub
+    }).clone()
 }
 
 fn all_hubs() -> Vec<Arc<WriteBackHub>> {
-    HUBS.iter()
-        .flat_map(|shard| {
-            crate::profile_lock!(C14, shard.lock().expect("write-back hub registry poisoned"))
-                .iter()
-                .map(|(_, hub)| hub.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    HUBS.iter().filter_map(|entry| entry.value().upgrade()).collect()
 }
 
 // Decrements the live-worker count when a worker ends for any reason,
@@ -925,9 +914,6 @@ pub async fn reset_write_back_state() {
     for hub in all_hubs() {
         hub.reset().await;
     }
-    for shard in HUBS.iter() {
-        crate::profile_lock!(C14, shard.lock().expect("write-back hub registry poisoned")).clear();
-    }
     debug!("B-tree write-back state reset");
 }
 
@@ -960,6 +946,33 @@ mod tests {
     }
 
     #[test]
+    fn weak_hub_traversal_does_not_retain_retired_owners() {
+        let hub = Arc::new(WriteBackHub::new());
+        let id = NEXT_HUB.fetch_add(1, Ordering::Relaxed);
+        hub.registry_id.store(id, Ordering::Relaxed);
+        HUBS.insert(id, Arc::downgrade(&hub));
+        let held = HUBS.get(&id).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::new(WriteBackHub::new());
+        let other_id = NEXT_HUB.fetch_add(1, Ordering::Relaxed);
+        other.registry_id.store(other_id, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                HUBS.insert(other_id, Arc::downgrade(&other));
+                tx.send(()).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(held);
+            assert!(result.is_ok());
+        });
+        drop(hub);
+        assert!(HUBS.get(&id).is_none());
+        assert!(HUBS.get(&other_id).is_some());
+        drop(other);
+        assert!(HUBS.get(&other_id).is_none());
+    }
+
+    #[test]
     fn independent_localities_complete_concurrently() {
         assert!(completion_progresses_beside_held_lane(WriteBackHub::new()));
     }
@@ -968,6 +981,7 @@ mod tests {
     fn single_lane_control_serializes_independent_localities() {
         let lane = Arc::new(WriteBackLane::new());
         let control = WriteBackHub {
+            registry_id: AtomicUsize::new(0),
             lanes: std::array::from_fn(|_| lane.clone()),
         };
         assert!(!completion_progresses_beside_held_lane(control));
