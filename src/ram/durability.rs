@@ -115,6 +115,21 @@ pub struct Receipt {
     pub epoch: u64,
     pub(crate) descriptor: Option<Arc<File>>,
 }
+
+impl Receipt {
+    /// The same coverage test without the WAL descriptor.
+    ///
+    /// A holder that waits for a sync but never syncs by itself must not keep
+    /// the file open: the segment may archive and unlink its WAL meanwhile.
+    pub(crate) fn token(&self) -> Receipt {
+        Receipt {
+            file: self.file.clone(),
+            offset: self.offset,
+            epoch: self.epoch,
+            descriptor: None,
+        }
+    }
+}
 struct Touched {
     file: Arc<DurableFile>,
     // Pin once on first touch. Rotation may unlink/drop the segment before the
