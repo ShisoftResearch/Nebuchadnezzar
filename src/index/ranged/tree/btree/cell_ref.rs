@@ -198,6 +198,8 @@ impl NodeCellRef {
             // Not `unwrap`: a torn read that lands on null is exactly the
             // case callers retry, so it is a None, never a panic.
             let inner = inner_ptr.as_ref()?;
+            #[cfg(test)]
+            super::revision_tests::before_ref_increment();
             inner
                 .counter
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -228,6 +230,8 @@ impl Clone for NodeCellRef {
         if !self.is_default() {
             unsafe {
                 let inner = self.inner.as_ref().unwrap();
+                #[cfg(test)]
+                super::revision_tests::before_ref_increment();
                 let prev = inner.counter.fetch_add(1, Ordering::AcqRel);
                 // Cloning an owned ref: the ref itself keeps the count >= 1.
                 // Cloning a pointer read out of unlatched node data must go

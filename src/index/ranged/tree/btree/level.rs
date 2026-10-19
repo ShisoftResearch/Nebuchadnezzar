@@ -301,6 +301,8 @@ where
     let res = read_node(node, |node: &NodeReadHandler<KS, PS>| {
         let node_keys = node.keys();
         let node_len = node_keys.len();
+        #[cfg(test)]
+        super::revision_tests::after_median_copy();
         if node.len() < 1 {
             if node.is_ext() {
                 return Ok(None);
