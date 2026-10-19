@@ -8,11 +8,10 @@ use super::segs::{
 };
 use super::tombstone::Tombstone;
 use crate::ram::types::Id;
-use crate::utils::sharded::Sharded;
+use crate::utils::keyed_state::KeyedState;
 use crossbeam::queue::SegQueue;
 use lightning::aarc::Arc as AArc;
 use lightning::map::WordMap;
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
@@ -436,21 +435,15 @@ fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AAr
 /// bracketed entries are BUFFERED here and applied once every segment has
 /// been read and every COMMIT is known.
 pub struct BracketLedger {
-    parts: Sharded<
-        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
-    >,
-    closed_parts: Sharded<
-        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
-    >,
+    parts: KeyedState<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>,
+    closed_parts: KeyedState<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>,
     /// Every (chunk, seq) this recovery discovered. A manifest member counts
     /// as present iff it is here.
     present: std::collections::HashSet<(u16, u64)>,
-    pending: Sharded<Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>>,
-    commits: Sharded<
-        Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
-    >,
+    pending: KeyedState<crate::server::transactions::TxnId, Vec<PendingBracketCell>>,
+    commits: KeyedState<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>,
     /// The participant set each BEGIN names, per transaction.
-    participants: Sharded<Mutex<HashMap<crate::server::transactions::TxnId, Vec<u64>>>>,
+    participants: KeyedState<crate::server::transactions::TxnId, Vec<u64>>,
     /// Every status cell entry the scan met, by chunk.
     status_cells: SegQueue<(usize, Id)>,
     /// Every plain (unbracketed) tombstone the scan met, newest version per
@@ -462,7 +455,7 @@ pub struct BracketLedger {
     /// applied later, respect it.
     plain_deletes: SegQueue<(IdKey, DeleteMark)>,
     /// Equal-version ties, see `DeleteBook::ties`.
-    ties: Sharded<Mutex<HashMap<IdKey, u32>>>,
+    ties: KeyedState<IdKey, u32>,
     /// Plain cells the scan discarded for carrying a LOWER version than what
     /// was already installed although they sit LATER in write order. That is
     /// either a stale copy, or a re-created id (versions restart at 1) whose
@@ -506,12 +499,9 @@ impl PendingBracketCell {
 }
 
 // Call only after replay workers have joined. No registry guard spans settlement I/O.
-fn take_replay_map<K: std::hash::Hash + Eq, V>(
-    map: &Sharded<Mutex<HashMap<K, V>>>,
-) -> HashMap<K, V> {
-    map.iter()
-        .flat_map(|shard| std::mem::take(&mut *shard.lock()))
-        .collect()
+fn take_replay_map<K, V>(map: &KeyedState<K, V>) -> HashMap<K, V>
+where K: Clone + std::hash::Hash + Eq + Ord + Send + Sync + 'static {
+    map.keys().filter_map(|key| map.get(&key)?.take().map(|value| (key, value))).collect()
 }
 
 fn drain_replay_queue<T>(queue: &SegQueue<T>) -> Vec<T> {
@@ -521,18 +511,18 @@ fn drain_replay_queue<T>(queue: &SegQueue<T>) -> Vec<T> {
 impl BracketLedger {
     pub fn new(files: &[SegmentFileInfo]) -> Self {
         BracketLedger {
-            parts: Sharded::default(),
-            closed_parts: Sharded::default(),
+            parts: KeyedState::ordered(),
+            closed_parts: KeyedState::ordered(),
             present: files
                 .iter()
                 .map(|file| (file.chunk_id as u16, file.seq_id))
                 .collect(),
-            pending: Sharded::default(),
-            commits: Sharded::default(),
-            participants: Sharded::default(),
+            pending: KeyedState::ordered(),
+            commits: KeyedState::ordered(),
+            participants: KeyedState::ordered(),
             status_cells: SegQueue::new(),
             plain_deletes: SegQueue::new(),
-            ties: Sharded::default(),
+            ties: KeyedState::ordered(),
             late_losers: SegQueue::new(),
             resolved_rewrites: SegQueue::new(),
         }
@@ -551,15 +541,13 @@ impl BracketLedger {
 
     /// A second cell entry with the very same version as the one installed.
     fn note_tie(&self, chunk_id: usize, hash: u64) {
-        *crate::profile_lock!(C08_ties, self.ties.shard(&(chunk_id, hash)).lock())
-            .entry((chunk_id, hash))
-            .or_insert(0) += 1;
+        *crate::profile_lock!(C08_ties, self.ties.entry(&(chunk_id, hash)))
+            .get_or_insert(0) += 1;
     }
 
     fn note_pending(&self, txn: &crate::server::transactions::TxnId, cell: PendingBracketCell) {
-        crate::profile_lock!(C08_pending, self.pending.shard(txn).lock())
-            .entry(txn.clone())
-            .or_insert_with(Vec::new)
+        crate::profile_lock!(C08_pending, self.pending.entry(txn))
+            .get_or_insert_with(Vec::new)
             .push(cell);
     }
 
@@ -568,16 +556,14 @@ impl BracketLedger {
         txn: &crate::server::transactions::TxnId,
         manifest: Vec<crate::ram::bracket::ManifestEntry>,
     ) {
-        crate::profile_lock!(C08_commits, self.commits.shard(txn).lock())
-            .insert(txn.clone(), manifest);
+        *crate::profile_lock!(C08_commits, self.commits.entry(txn)) = Some(manifest);
     }
 
     /// Every part of a transaction names the same set; the first one seen
     /// is kept.
     fn note_participants(&self, txn: &crate::server::transactions::TxnId, participants: Vec<u64>) {
-        crate::profile_lock!(C08_participants, self.participants.shard(txn).lock())
-            .entry(txn.clone())
-            .or_insert(participants);
+        crate::profile_lock!(C08_participants, self.participants.entry(txn))
+            .get_or_insert(participants);
     }
 
     /// Apply every committed bracket and report the rest.
@@ -1916,9 +1902,8 @@ fn scan_segment_from_data(
                 match crate::ram::bracket::decode_begin(content) {
                     Ok(begin) => {
                         ledger.note_participants(&begin.txn, begin.participants);
-                        crate::profile_lock!(C08_parts, ledger.parts.shard(&begin.txn).lock())
-                            .entry(begin.txn.clone())
-                            .or_default()
+                        crate::profile_lock!(C08_parts, ledger.parts.entry(&begin.txn))
+                            .get_or_insert_with(Default::default)
                             .insert((chunk.id, seg_id));
                         open_bracket = Some((cursor + entry_size, begin.txn));
                     }
@@ -1952,10 +1937,9 @@ fn scan_segment_from_data(
                         // settles it once every COMMIT is known.
                         crate::profile_lock!(
                             C08_closed_parts,
-                            ledger.closed_parts.shard(&commit_txn).lock()
+                            ledger.closed_parts.entry(&commit_txn)
                         )
-                        .entry(commit_txn.clone())
-                        .or_default()
+                        .get_or_insert_with(Default::default)
                         .insert((chunk.id, seg_id));
                         ledger.note_commit(&commit_txn, manifest);
                         open_bracket = None;
@@ -2670,14 +2654,11 @@ pub fn recover_chunks(
                         .unwrap_or(false);
 
                     let undecided_wal = !file_info.is_backup && {
-                        bracket_ledger.parts.iter().any(|partition| {
-                            let candidates: Vec<_> = crate::profile_lock!(C08_parts, partition.lock())
-                                .iter().filter(|(_, members)| members.contains(&(chunk_id, file_info.seg_id)))
-                                .map(|(txn, _)| txn.clone()).collect();
-                            candidates.iter().any(|txn| {
-                                !crate::profile_lock!(C08_closed_parts, bracket_ledger.closed_parts.shard(txn).lock())
-                                    .get(txn).is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id)))
-                            })
+                        bracket_ledger.parts.keys().any(|txn| {
+                            let member = bracket_ledger.parts.get(&txn).is_some_and(|parts|
+                                parts.as_ref().is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id))));
+                            member && !bracket_ledger.closed_parts.get(&txn).is_some_and(|closed|
+                                closed.as_ref().is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id))))
                         })
                     };
                     let recover_as_cold = if undecided_wal {
@@ -2928,14 +2909,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn replay_transactions_progress_in_independent_partitions() {
+    fn replay_transactions_progress_with_independent_entries() {
         let ledger = BracketLedger::new(&[]);
         let first = crate::server::transactions::test_hlc(99801, 1);
-        let second = (99802..100802)
-            .map(|n| crate::server::transactions::test_hlc(n, 1))
-            .find(|txn| !std::ptr::eq(ledger.pending.shard(&first), ledger.pending.shard(txn)))
-            .unwrap();
-        let held = ledger.pending.shard(&first).lock();
+        let second = crate::server::transactions::test_hlc(99802, 1);
+        let held = ledger.pending.entry(&first);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
