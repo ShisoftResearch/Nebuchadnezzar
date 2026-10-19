@@ -572,6 +572,21 @@ service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
 
 impl DataManager {
+    #[cfg(test)]
+    pub(crate) fn cell_meta_for_test(&self, id: &Id) -> CellMetaMutex {
+        self.cell_meta_mutex(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cell_owner_for_test(&self, id: &Id, owner: Option<TxnPriority>) {
+        self.cell_meta_mutex(id).lock().owner = owner;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_transaction_for_test(&self, tid: &TxnId) -> bool {
+        self.find_transaction(tid).is_some()
+    }
+
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
         hlc: Arc<bifrost::hlc::HlcSource>,
@@ -1177,6 +1192,8 @@ impl DataManager {
             // the same sync (D31).
             let first_attempt = !txn.status_cell_attempted;
             txn.status_cell_attempted = true;
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("before_status_record", tid);
             match self.write_status_cell(tid, &txn.participants, &store, first_attempt) {
                 Ok(placed) => status = Some(placed),
                 Err(error) => {
@@ -1189,6 +1206,8 @@ impl DataManager {
                 }
             }
         }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_status_record", tid);
         let segments: Vec<crate::ram::txn_status::SegmentRef> =
             crate::ram::chunk::transaction_leased_segments(tid, &store)
                 .iter()
@@ -1258,6 +1277,8 @@ impl DataManager {
             };
             }
         };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point_json("commit_closed", serde_json::json!({"tid":tid,"synced":synced}));
         txn.decided_commit = true;
         txn.commit_durable = true;
         // The COMMIT of a default transaction is only queued for a sync. A
@@ -1763,6 +1784,8 @@ impl DataManager {
                 .is_some_and(|segment| segment.protection.holds_transaction(txn))
         });
         if !pending {
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("status_synced", txn);
             chunks.txn_status().mark_self_synced(txn);
         }
         !pending
@@ -1853,6 +1876,8 @@ impl DataManager {
             let Some(chunk) = chunks.list.get(entry.chunk) else {
                 continue;
             };
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point_json("before_status_release", serde_json::json!({"tid":txn,"participants":entry.participants,"synced_peers":entry.synced_peers,"self_synced":entry.self_synced}));
             match chunk.remove_status_cell(&entry.id) {
                 Ok(()) => {
                     registry.remove(&txn);
@@ -1902,6 +1927,8 @@ impl DataManager {
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
         if let Some(entry) = self.chunks().txn_status().get(tid) {
             return if self.status_entry_synced(tid, &entry) {
+                #[cfg(multisite_test)]
+                crate::utils::multisite::point_json("status_answer", serde_json::json!({"tid":tid,"outcome":"Committed","self_synced":entry.self_synced}));
                 TxnOutcome::Committed
             } else {
                 TxnOutcome::Committing
@@ -2508,6 +2535,8 @@ impl DataManager {
         } else {
             entry_segments
         };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("before_p0", tid);
         for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -2552,6 +2581,8 @@ impl DataManager {
             return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
         }
 
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_p0", tid);
         // NO commit marker here, deliberately.
         //
         // Despite its name, this runs in the coordinator's PREPARE phase
@@ -2775,6 +2806,111 @@ mod tests {
     use futures::future::join_all;
     use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
+
+    /// One server holds both the coordinator and the only data participant.
+    async fn d74_one_site_commit_case(case: u8) {
+        use crate::client::transaction::{Transaction as ClientTransaction, TxnError};
+        use std::cell::Cell;
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "d74_one_site_client";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let site = runtime.data_site().unwrap();
+        let client = crate::server::transactions::new_async_client_for_database(&address, group, group)
+            .await
+            .unwrap();
+        let tid = client.begin().await.unwrap().unwrap();
+        let id = Id::allocated(0, 0, 99400 + case as u64);
+        client
+            .write(tid, counter_cell(schema.vid.get(), id, 73, "one site"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(
+            site.find_transaction(&tid).unwrap().lock().participants,
+            vec![server.server_id]
+        );
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+        let txn = ClientTransaction {
+            tid,
+            state: Cell::new(TxnState::Prepared),
+            client,
+        };
+        let result = match case {
+            0 => {
+                // The coordinator stops before END. Its state is then gone, but END can arrive later.
+                let stop =
+                    crate::server::transactions::manager::stop_end_fanout_before_commit_point(tid);
+                assert!(matches!(
+                    txn.commit_durable().await,
+                    Err(TxnError::OutcomeUnknown)
+                ));
+                drop(stop);
+                let retry = txn.commit_durable().await;
+                println!("D74 one-site result before delayed END: {retry:?}");
+                assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+                assert_eq!(
+                    <DataManager as Service>::end(&site, tid, tid, true)
+                        .await
+                        .payload,
+                    EndResult::Success
+                );
+                retry
+            }
+            1 => {
+                // A lock now belongs to a later owner. COMMIT still closes before release is refused.
+                site.cell_meta_mutex(&id).lock().owner =
+                    Some(TxnPriority::new(site.hlc.now(), server.server_id));
+                let result = txn.commit_durable().await;
+                site.cell_meta_mutex(&id).lock().owner = None;
+                println!("D74 one-site result after lock-release refusal: {result:?}");
+                result
+            }
+            _ => txn.commit_durable().await,
+        };
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::Committed);
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().data["score"]
+                .u64()
+                .copied(),
+            Some(73)
+        );
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&tid, &runtime.chunks().address_range()),
+            0
+        );
+        println!("D74 one-site transaction committed with exact payload 73");
+        server.shutdown().await;
+        if case == 0 {
+            assert!(
+                matches!(result, Err(TxnError::OutcomeUnknown)),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "known commit must succeed: {result:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_retry_before_delayed_end_stays_unknown() {
+        d74_one_site_commit_case(0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_lock_release_failure_is_a_known_commit() {
+        d74_one_site_commit_case(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_known_commit_control() {
+        d74_one_site_commit_case(2).await;
+    }
 
     #[test]
     fn pinned_read_set_records_and_returns_entry() {
@@ -7437,6 +7573,8 @@ impl Service for DataManager {
         tid: TxnId,
         durable: bool,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("during_end", &tid);
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);

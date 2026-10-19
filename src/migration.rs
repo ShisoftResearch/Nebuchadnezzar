@@ -533,6 +533,8 @@ async fn migrate_slot_prepared(
         .map_err(|error| MigrationError::Placement(format!("{error:?}")))?
         .map_err(MigrationError::Placement)?;
 
+    #[cfg(multisite_test)]
+    crate::utils::multisite::point("during_slot_transfer", (slot, from, to));
     let mut handover = SlotHandover {
         slot,
         from,

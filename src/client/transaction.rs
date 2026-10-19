@@ -92,11 +92,12 @@ pub enum TxnError {
     ReadError(ReadError),
     WriteError(WriteError),
     PrepareError(TMPrepareResult),
-    CommitError(EndResult),
     AbortError(AbortResult),
     /// The commit request reached the coordinator, and the outcome is not
     /// known (D33): read the data again before any retry.
     OutcomeUnknown,
+    /// No participant received this commit decision. A new transaction can retry.
+    CommitNotApplied,
 }
 
 #[derive(Clone)]
@@ -231,7 +232,11 @@ impl Transaction {
     }
 
     async fn commit_with(&self, durable: bool) -> Result<(), TxnError> {
-        self.state.set(TxnState::Committed);
+        // Do not send another commit after a request whose outcome can be unknown.
+        if self.state.get() == TxnState::Committed {
+            return Err(TxnError::OutcomeUnknown);
+        }
+        let previous_state = self.state.replace(TxnState::Committed);
         let result = if durable {
             self.client.commit_durable(self.tid.to_owned()).await
         } else {
@@ -255,17 +260,13 @@ impl Transaction {
                 return Ok(());
             }
             Ok(Ok(EndResult::LockReleaseRetriesExhausted { ref failures })) => {
-                // Complete lock release failure - this is an error
-                error!(
-                    "Transaction {:?} commit failed: lock release retries exhausted, {} failures",
+                // The decision is COMMIT even when lock release fails.
+                warn!(
+                    "Transaction {:?} committed; lock release retries exhausted, {} failures",
                     self.tid,
                     failures.len()
                 );
-                Err(TxnError::CommitError(
-                    EndResult::LockReleaseRetriesExhausted {
-                        failures: failures.clone(),
-                    },
-                ))
+                Ok(())
             }
             Ok(Ok(EndResult::DecidedPending)) => {
                 // Decided COMMIT: every site keeps it and finishes its close
@@ -276,9 +277,33 @@ impl Transaction {
                 );
                 Ok(())
             }
-            Ok(Ok(er)) => Err(TxnError::CommitError(er)),
-            Ok(Err(TMError::OutcomeUnknown)) => Err(TxnError::OutcomeUnknown),
-            Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
+            // One site can refuse after another site accepts COMMIT.
+            Ok(Ok(_)) => Err(TxnError::OutcomeUnknown),
+            // The manager resolves every participant before it sends any `end`.
+            Ok(Err(TMError::CannotLocateCellServer)) => {
+                self.state.set(previous_state);
+                Err(TxnError::CommitNotApplied)
+            }
+            Ok(Err(
+                error @ TMError::InvalidTransactionState(TxnState::Started | TxnState::Aborted),
+            )) => {
+                self.state.set(previous_state);
+                Err(TxnError::ManagerError(error))
+            }
+            // Missing or closed manager state cannot prove that COMMIT did not run.
+            Ok(Err(_)) => Err(TxnError::OutcomeUnknown),
+            Err(error) if error.request_was_not_sent() => {
+                self.state.set(previous_state);
+                Err(TxnError::CommitNotApplied)
+            }
+            Err(bifrost::rpc::RPCError::RequestError(
+                bifrost::rpc::RPCRequestError::FunctionIdNotFound
+                | bifrost::rpc::RPCRequestError::ServiceIdNotFound
+                | bifrost::rpc::RPCRequestError::BadRequest,
+            )) => {
+                self.state.set(previous_state);
+                Err(TxnError::CommitNotApplied)
+            }
             // The request may have been taken and `end` sent (D33).
             Err(_) => Err(TxnError::OutcomeUnknown),
         }
@@ -295,6 +320,147 @@ impl Transaction {
             Ok(Ok(ar)) => Err(TxnError::AbortError(ar)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_outcome_tests {
+    use super::*;
+    use bifrost::bytes::{BufMut, BytesMut};
+    use bifrost::rpc::{RPCClient, ServiceClient};
+    use std::pin::Pin;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn commit_response(
+        response: Option<Result<EndResult, TMError>>,
+        durable: bool,
+    ) -> Result<(), TxnError> {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let rpc = RPCClient::new_async(&address).await.unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let length = socket.read_u32().await.unwrap();
+            let mut request = vec![0; length as usize];
+            socket.read_exact(&mut request).await.unwrap();
+            assert!(request.len() > 24, "a commit request must arrive");
+            if let Some(response) = response {
+                let mut reply = BytesMut::from(&request[..8]);
+                reply.put_u8(0);
+                reply.extend_from_slice(&bifrost::utils::serde::serialize(&response));
+                socket.write_u32(reply.len() as u32).await.unwrap();
+                socket.write_all(&reply).await.unwrap();
+            }
+        });
+        let txn = Transaction {
+            tid: TxnId::default(),
+            state: StdCell::new(TxnState::Prepared),
+            client: manager::AsyncServiceClient::new_with_service_id(0, &rpc),
+        };
+        let result = txn.commit_with(durable).await;
+        peer.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn commit_outcome_unsent_is_retryable_control_lost_reply_is_unknown() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let rpc = RPCClient::new_async(&address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket);
+        drop(listener);
+        // Drain the dead connection with a non-commit request. The next call must reconnect.
+        assert!(RPCClient::send_async(Pin::new(&*rpc), 0, BytesMut::new())
+            .await
+            .is_err());
+        let txn = Transaction {
+            tid: TxnId::default(),
+            state: StdCell::new(TxnState::Prepared),
+            client: manager::AsyncServiceClient::new_with_service_id(0, &rpc),
+        };
+        let result = txn.commit().await;
+        assert!(
+            matches!(result, Err(TxnError::CommitNotApplied)),
+            "{result:?}"
+        );
+        assert_eq!(txn.state.get(), TxnState::Prepared);
+        assert!(matches!(
+            commit_response(None, false).await,
+            Err(TxnError::OutcomeUnknown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_outcome_refusals_remain_unknown() {
+        for durable in [false, true] {
+            for refusal in [
+                EndResult::StoreFull(WriteError::CannotAllocateSpace),
+                EndResult::WriteError(WriteError::TransactionHeadUnavailable),
+                EndResult::CheckFailed(CheckError::CannotEnd),
+            ] {
+                let result = commit_response(Some(Ok(refusal)), durable).await;
+                assert!(
+                    matches!(result, Err(TxnError::OutcomeUnknown)),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_outcome_manager_errors_are_classified() {
+        for error in [
+            TMError::TransactionNotFound,
+            TMError::TransactionIdExisted,
+            TMError::RPCErrorFromCellServer,
+            TMError::AssertionError,
+            TMError::Other,
+            TMError::InvalidTransactionState(TxnState::Prepared),
+            TMError::InvalidTransactionState(TxnState::Committed),
+            TMError::InvalidTransactionState(TxnState::Cleanup),
+            TMError::OutcomeUnknown,
+        ] {
+            let result = commit_response(Some(Err(error)), false).await;
+            assert!(
+                matches!(result, Err(TxnError::OutcomeUnknown)),
+                "{result:?}"
+            );
+        }
+        assert!(matches!(
+            commit_response(Some(Err(TMError::CannotLocateCellServer)), false).await,
+            Err(TxnError::CommitNotApplied)
+        ));
+        for state in [TxnState::Started, TxnState::Aborted] {
+            assert!(
+                matches!(commit_response(Some(Err(TMError::InvalidTransactionState(state))), false).await,
+                Err(TxnError::ManagerError(TMError::InvalidTransactionState(actual))) if actual == state)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_outcome_success_control() {
+        assert!(commit_response(Some(Ok(EndResult::Success)), false)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_outcome_known_commit_controls() {
+        for response in [
+            EndResult::Success,
+            EndResult::DecidedPending,
+            EndResult::SomeLocksNotReleased {
+                released: 0,
+                total: 1,
+                failures: vec![],
+            },
+            EndResult::LockReleaseRetriesExhausted { failures: vec![] },
+        ] {
+            assert!(commit_response(Some(Ok(response)), true).await.is_ok());
         }
     }
 }

@@ -1870,6 +1870,8 @@ impl TransactionManager {
             );
             return Err(TMError::OutcomeUnknown);
         }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_before_end", tid);
         let participants: Vec<u64> = changed_objs
             .iter()
             .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
@@ -1877,7 +1879,9 @@ impl TransactionManager {
             .collect();
         let sites: Vec<u64> = changed_objs.keys().copied().collect();
         if participants.len() < 2 {
-            return self.end_sites(tid, &sites, data_sites, durable).await;
+            return self
+                .end_sites(tid, &sites, data_sites, durable, participants.first().copied())
+                .await;
         }
         // Multi-site: one site that closed its brackets decides the
         // transaction, because its COMMIT is durable and every site that got
@@ -1896,6 +1900,8 @@ impl TransactionManager {
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_after_end", tid);
         let mut committed = false;
         // A participant that refused but keeps the transaction decided (a
         // refused close: store full, WAL error) commits it later.
@@ -1959,42 +1965,50 @@ impl TransactionManager {
         Ok(undecided_refusal.unwrap_or(EndResult::DecidedPending))
     }
 
-    /// `end` to each of `sites` in parallel; the first non-success wins.
+    /// End every site. A reader's cleanup report cannot decide a writer's outcome.
     async fn end_sites(
         &self,
         tid: &TxnId,
         sites: &[u64],
         data_sites: &DataSitesMap,
         durable: bool,
+        writer: Option<u64>,
     ) -> Result<EndResult, TMError> {
         let end_futures: FuturesUnordered<_> = sites
             .iter()
             .map(|server_id| {
                 let data_site = data_sites.get(server_id).unwrap();
-                async move { data_site.end(self.get_clock(), tid.clone(), durable).await }
+                async move {
+                    (
+                        *server_id,
+                        data_site.end(self.get_clock(), tid.clone(), durable).await,
+                    )
+                }
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
-        for result in end_results {
-            match result {
+        let mut writer_result = None;
+        let mut cleanup_result = None;
+        for (server_id, result) in end_results {
+            let result = match result {
                 Ok(result) => {
                     self.merge_clock(result.clock);
-                    let payload = result.payload;
-                    match payload {
-                        EndResult::Success => {}
-                        _ => {
-                            return Ok(payload);
-                        }
-                    }
+                    Ok(result.payload)
                 }
-                Err(e) => {
-                    debug!("Error on site end {:?}", e);
-                    return Err(TMError::OutcomeUnknown);
+                Err(error) => {
+                    debug!("Error on site end {:?}", error);
+                    Err(TMError::OutcomeUnknown)
                 }
+            };
+            if Some(server_id) == writer {
+                writer_result = Some(result);
+            } else if !matches!(result, Ok(EndResult::Success)) && cleanup_result.is_none() {
+                cleanup_result = Some(result);
             }
         }
-        Ok(EndResult::Success)
+        writer_result.unwrap_or_else(|| cleanup_result.unwrap_or(Ok(EndResult::Success)))
     }
+
     /// Best-effort, idempotent release of read pins on every server this
     /// transaction pinned a read on. Runs on commit/abort for both read-only and
     /// read-write transactions: a server the transaction only *read* (pinned) is
