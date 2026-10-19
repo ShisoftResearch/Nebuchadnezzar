@@ -669,12 +669,13 @@ fn holds_status(cluster: &Cluster, index: usize, tid: &TxnId) -> bool {
 /// Whether site `index` holds the status cell of `tid` and its COMMIT is
 /// synced.
 fn status_synced(cluster: &Cluster, index: usize, tid: &TxnId) -> bool {
-    cluster
-        .site(index)
-        .chunks()
-        .txn_status()
-        .get(tid)
-        .is_some_and(|entry| entry.self_synced)
+    let entry = cluster.site(index).chunks().txn_status().get(tid);
+    bifrost::doubt_trace!(
+        "test_status_poll site={} index={} tid={:?} present={} self_synced={} held_segments={}",
+        cluster.site(index).server_id, index, tid, entry.is_some(),
+        entry.as_ref().is_some_and(|entry| entry.self_synced), held_for(cluster, index, tid)
+    );
+    entry.is_some_and(|entry| entry.self_synced)
 }
 
 /// Segments of site `index` that `tid` keeps in progress (D20).
@@ -1302,6 +1303,7 @@ async fn an_unsynced_commit_answers_committing() {
     drop(client);
     let b_dir = cluster.temp[B].path().to_path_buf();
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, true);
+    bifrost::doubt_trace!("test_sync_paused tid={:?}", tid);
     assert!(matches!(
         txn.commit(tid.clone()).await,
         Ok(Ok(EndResult::Success))
@@ -1309,6 +1311,7 @@ async fn an_unsynced_commit_answers_committing() {
     data_site(&cluster, B).status_release_round(false).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committing);
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, false);
+    bifrost::doubt_trace!("test_sync_resumed tid={:?}", tid);
     wait_status_synced(&cluster, B, &tid).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committed);
     cluster.shutdown().await;

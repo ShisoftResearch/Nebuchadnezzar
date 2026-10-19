@@ -1785,6 +1785,10 @@ impl DataManager {
                 .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
                 .is_some_and(|segment| segment.protection.holds_transaction(txn))
         });
+        bifrost::doubt_trace!(
+            "status_sync site={} tid={:?} remembered={} pending={} segments={:?}",
+            self.database_runtime.rpc.server_id, txn, entry.self_synced, pending, entry.segments
+        );
         if !pending {
             #[cfg(multisite_test)]
             crate::utils::multisite::point("status_synced", txn);
@@ -1810,6 +1814,7 @@ impl DataManager {
         let chunks = self.chunks().clone();
         let registry = chunks.txn_status();
         let me = self.database_runtime.rpc.server_id;
+        bifrost::doubt_trace!("release_round site={} sweep={}", me, sweep);
         let mut notices: HashMap<u64, Vec<TxnId>> = HashMap::new();
         for (txn, entry) in registry.entries() {
             if !self.status_entry_synced(&txn, &entry) {
@@ -1872,6 +1877,10 @@ impl DataManager {
                     .iter()
                     .filter(|peer| **peer != me)
                     .all(|peer| entry.synced_peers.contains(peer));
+            bifrost::doubt_trace!(
+                "release_check site={} tid={:?} self_synced={} peers={:?} synced_peers={:?} all_synced={}",
+                me, txn, entry.self_synced, entry.participants, entry.synced_peers, all_synced
+            );
             if !all_synced {
                 continue;
             }
@@ -1883,6 +1892,7 @@ impl DataManager {
             match chunk.remove_status_cell(&entry.id) {
                 Ok(()) => {
                     registry.remove(&txn);
+                    bifrost::doubt_trace!("status_released site={} tid={:?}", me, txn);
                     released += 1;
                 }
                 Err(error) => debug!(
