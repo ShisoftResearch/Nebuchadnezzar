@@ -262,11 +262,12 @@ impl TransactionManagerDeps {
             return cached;
         }
         // Recovery must reach stored participants even when the derived ring
-        // missed their membership notification during a restart.
-        let (members, _) = self
+        // missed their membership notification during a restart. Order new
+        // discovery after completed removals; an ordinary voter query can lag.
+        let (member, _) = self
             .consh
             .membership()
-            .all_members(false)
+            .ordered_member(server_id)
             .await
             .map_err(|error| {
                 io::Error::new(
@@ -274,7 +275,7 @@ impl TransactionManagerDeps {
                     format!("cannot locate transaction participant {server_id}: {error:?}"),
                 )
             })?;
-        match members.into_iter().find(|member| member.id == server_id) {
+        match member.filter(|member| member.id == server_id) {
             Some(member) => {
                 self.member_pool
                     .get_by_id(server_id, move |_| Some(member.address))
