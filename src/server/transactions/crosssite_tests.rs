@@ -3278,3 +3278,166 @@ async fn control_pinwin_pins_pile_up_without_the_prune() {
     let pins = many_updates_leave_few_pins("pinwin_pile_control", false).await;
     assert!(pins >= 10, "expected stale pins, found {}", pins);
 }
+
+/// Create a ring before the participants join. A separate client retains
+/// only the seed's configuration; the normal client also receives notices.
+async fn cluster_with_an_early_participant_ring(
+    group: &str,
+    stale_configuration: bool,
+) -> (
+    Cluster,
+    Arc<AsyncClient>,
+    Arc<bifrost::conshash::ConsistentHashing>,
+) {
+    let _ = env_logger::try_init();
+    let services = vec![vec![Service::Cell, Service::Transaction]; 3];
+    let temp: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let mut addresses: Vec<String> = (0..3)
+        .map(|_| crate::utils::test_port::unique_localhost_addr())
+        .collect();
+    if bifrost_hasher::hash_str(&addresses[B]) > bifrost_hasher::hash_str(&addresses[A]) {
+        addresses.swap(A, B);
+    }
+    let seed = NebServer::new_cluster_from_opts(
+        &opts_for(&temp[SEED], &services[SEED]),
+        &addresses[SEED],
+        &addresses,
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let source = if stale_configuration {
+        bifrost::raft::client::RaftClient::new(&addresses, bifrost::raft::DEFAULT_SERVICE_ID)
+            .await
+            .unwrap()
+    } else {
+        seed.raft_client.clone()
+    };
+    let ring = bifrost::conshash::ConsistentHashing::new_with_id(
+        crate::server::CONS_HASH_ID,
+        &format!("{group}-empty-ring"),
+        &source,
+        &seed.membership,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ring.try_server_name(bifrost_hasher::hash_str(&addresses[B]))
+            .is_none(),
+        "the ring must not know the participant before it joins"
+    );
+    let mut servers = vec![Some(seed)];
+    for index in 1..3 {
+        servers.push(Some(
+            NebServer::new_cluster_from_opts(
+                &opts_for(&temp[index], &services[index]),
+                &addresses[index],
+                &addresses,
+                group,
+                async |_| {},
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seed = servers[SEED].as_ref().unwrap();
+    let client = Arc::new(
+        AsyncClient::new(&seed.rpc, &seed.membership, &addresses, group)
+            .await
+            .unwrap(),
+    );
+    client.reload_slot_owners().await;
+    for server in servers.iter().flatten() {
+        server.meta().schemas.debug_only_new_schema(schema());
+    }
+    let cluster = Cluster {
+        group: group.to_string(),
+        addresses,
+        temp,
+        servers,
+        services,
+    };
+    (cluster, client, ring)
+}
+
+async fn find_a_committed_participant_after_an_address_gap(stale_configuration: bool) {
+    use bifrost::rpc::ClientPool;
+    let group = if stale_configuration {
+        "crosssite_membership_only_address"
+    } else {
+        "crosssite_missing_ring_address"
+    };
+    let (cluster, client, ring) =
+        cluster_with_an_early_participant_ring(group, stale_configuration).await;
+    let (tid, _ids, _scores) = torn_transaction(&cluster, &client, 49_000).await;
+    wait_status_synced(&cluster, B, &tid).await;
+    let seed = cluster.site(SEED);
+    let peer = cluster.site(B).server_id;
+    let (members, _) = seed.membership.all_members(false).await.unwrap();
+    assert!(
+        members.iter().any(|member| member.id == peer),
+        "membership must know the committed participant"
+    );
+    assert_eq!(
+        ring.nodes_count(),
+        0,
+        "the probe ring has no routing snapshot"
+    );
+    if stale_configuration {
+        assert!(
+            ring.try_server_name(peer).is_none(),
+            "the old configuration and the probe ring's notices must not supply this address"
+        );
+    }
+    let deps = super::manager::TransactionManagerDeps {
+        database_runtime: seed.current_database(),
+        server_id: seed.server_id,
+        consh: ring,
+        member_pool: Arc::new(ClientPool::new()),
+        hlc: seed.hlc.clone(),
+    };
+    let located = deps.get_member_by_server_id(peer).await;
+    let error = located.as_ref().err().map(|error| format!("{error:?}"));
+    let mut outcome = None;
+    if let Ok(rpc) = located {
+        assert_eq!(rpc.server_id, peer);
+        let site = super::data_site::AsyncServiceClient::new_with_service_id(
+            super::data_site::generate_scoped_service_id(&cluster.group, seed.database_name()),
+            &rpc,
+        );
+        outcome = Some(site.txn_status(tid).await.unwrap().payload);
+    }
+    let absent = (1..1000)
+        .find(|id| !cluster.servers.iter().flatten().any(|s| s.server_id == *id))
+        .unwrap();
+    let unknown = deps
+        .get_member_by_server_id(absent)
+        .await
+        .err()
+        .expect("an unknown participant remains an error");
+    assert_eq!(unknown.kind(), std::io::ErrorKind::NotFound);
+    drop(client);
+    cluster.shutdown().await;
+    assert_eq!(
+        outcome,
+        Some(TxnOutcome::Committed),
+        "the manager must locate the committed participant; lookup error: {:?}",
+        error
+    );
+}
+
+/// Adapted from relmark: the ring starts without the participant's address.
+/// Configuration and notices must let the manager ask a committed participant.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_finds_a_participant_missing_from_the_ring_cache() {
+    find_a_committed_participant_after_an_address_gap(false).await;
+}
+
+/// A participant joins after the configuration snapshot, before subscription.
+/// Membership knows it, but neither address source supplied it to this ring.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_finds_a_membership_only_participant_after_a_configuration_snapshot() {
+    find_a_committed_participant_after_an_address_gap(true).await;
+}
