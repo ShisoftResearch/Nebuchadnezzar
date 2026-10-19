@@ -9,7 +9,6 @@ use crate::ram::segs::{Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SE
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
-use crate::utils::sharded::Sharded;
 use crate::{index::builder::IndexBuilder, ram::cell::*};
 use crate::{
     index::builder::{probe_cell_indices, IndexRes},
@@ -5734,15 +5733,9 @@ pub struct Chunks {
     fences: crate::ram::fence::FenceLog,
     /// In-doubt transactions that wait for their participants' answers. The
     /// background resolver and the operator tool take one from here under
-    /// this lock, so only one of them resolves it.
-    unresolved: Sharded<
-        Mutex<
-            std::collections::BTreeMap<
-                crate::server::transactions::TxnId,
-                crate::ram::recovery::InDoubtBracket,
-            >,
-        >,
-    >,
+    /// its keyed entry, so only one of them resolves it.
+    unresolved: crate::utils::keyed_state::KeyedState<
+        crate::server::transactions::TxnId, crate::ram::recovery::InDoubtBracket>,
     /// Set when the owning server goes away, so the background sweeper exits
     /// without waiting for the store itself to be dropped. The store can
     /// outlive its server -- an RPC service still holds it -- and a thread that
@@ -5849,31 +5842,23 @@ impl Chunks {
 
     /// Keep an in-doubt transaction that waits for its participants.
     pub fn park_unresolved(&self, bracket: crate::ram::recovery::InDoubtBracket) {
-        crate::profile_lock!(C07_unresolved, self.unresolved.shard(&bracket.txn).lock())
-            .insert(bracket.txn.clone(), bracket);
+        let txn = bracket.txn.clone();
+        *crate::profile_lock!(C07_unresolved, self.unresolved.entry(&txn)) = Some(bracket);
     }
 
     pub fn take_unresolved(
         &self,
         txn: &crate::server::transactions::TxnId,
     ) -> Option<crate::ram::recovery::InDoubtBracket> {
-        crate::profile_lock!(C07_unresolved, self.unresolved.shard(txn).lock()).remove(txn)
+        crate::profile_lock!(C07_unresolved, self.unresolved.get(txn)?).take()
     }
 
     /// The parked transactions and their participant sets.
     pub fn unresolved_transactions(&self) -> Vec<(crate::server::transactions::TxnId, Vec<u64>)> {
-        let mut transactions: Vec<_> = self
-            .unresolved
-            .iter()
-            .flat_map(|shard| {
-                crate::profile_lock!(C07_unresolved, shard.lock())
-                    .iter()
-                    .map(|(txn, bracket)| (txn.clone(), bracket.participants.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        transactions.sort_by(|a, b| a.0.cmp(&b.0));
-        transactions
+        self.unresolved.keys().filter_map(|txn| {
+            let entry = self.unresolved.get(&txn)?;
+            entry.as_ref().map(|bracket| (txn, bracket.participants.clone()))
+        }).collect()
     }
 
     /// Take the transactions recovery could not decide, for resolution.
@@ -6089,7 +6074,7 @@ impl Chunks {
             recovered_brackets: crossbeam::atomic::AtomicCell::new(None),
             txn_status: crate::ram::txn_status::TxnStatusRegistry::new(),
             fences: crate::ram::fence::FenceLog::new(wal_storage.as_deref()),
-            unresolved: Sharded::default(),
+            unresolved: crate::utils::keyed_state::KeyedState::ordered(),
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,
@@ -8437,22 +8422,14 @@ mod tests {
     /// INVARIANT B at context exit: a scope restores what was named before,
     /// on a normal exit and on an unwind alike.
     #[test]
-    fn recovered_brackets_have_one_consumer_and_independent_unresolved_partitions() {
+    fn recovered_brackets_have_one_consumer_and_independent_unresolved_transactions() {
         use crate::ram::recovery::{InDoubtBracket, RecoveredBrackets};
         assert!(crossbeam::atomic::AtomicCell::<
             Option<Box<RecoveredBrackets>>,
         >::is_lock_free());
         let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
         let first = test_txn_id(99801);
-        let second = (99802..100802)
-            .map(test_txn_id)
-            .find(|txn| {
-                !std::ptr::eq(
-                    chunks.unresolved.shard(&first),
-                    chunks.unresolved.shard(txn),
-                )
-            })
-            .unwrap();
+        let second = test_txn_id(99802);
         chunks.remember_recovered_brackets(RecoveredBrackets {
             committed: vec![],
             status_cells: vec![],
@@ -8474,7 +8451,7 @@ mod tests {
                 1
             );
         });
-        let held = chunks.unresolved.shard(&first).lock();
+        let held = chunks.unresolved.entry(&first);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
