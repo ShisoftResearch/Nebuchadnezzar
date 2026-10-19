@@ -1302,6 +1302,9 @@ async fn an_unsynced_commit_answers_committing() {
     let (txn, tid, _ids, _scores) = prepared_transaction(&cluster, &client, 14_500, 1).await;
     drop(client);
     let b_dir = cluster.temp[B].path().to_path_buf();
+    // Keep status release after the sync assertions. Release has its own control below.
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(true, std::sync::atomic::Ordering::Release);
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, true);
     bifrost::doubt_trace!("test_sync_paused tid={:?}", tid);
     assert!(matches!(
@@ -1314,6 +1317,49 @@ async fn an_unsynced_commit_answers_committing() {
     bifrost::doubt_trace!("test_sync_resumed tid={:?}", tid);
     wait_status_synced(&cluster, B, &tid).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committed);
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(false, std::sync::atomic::Ordering::Release);
+    cluster.shutdown().await;
+}
+
+/// Release removes a synced record before a later poll can observe it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_synced_commit_keeps_its_committed_outcome() {
+    let (cluster, client) = Cluster::start("crosssite_c13b_release_control").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 14_600, 1).await;
+    drop(client);
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(matches!(
+        txn.commit(tid.clone()).await,
+        Ok(Ok(EndResult::Success))
+    ));
+    for index in [A, B] {
+        cluster.site(index).chunks().sync_all().unwrap();
+        wait_status_synced(&cluster, index, &tid).await;
+        assert!(status_synced(&cluster, index, &tid));
+        assert_eq!(held_for(&cluster, index, &tid), 0);
+        assert_eq!(outcome_on(&cluster, index, &tid), TxnOutcome::Committed);
+    }
+    // Deliver both confirmations before the next poll. No scheduler timing is required.
+    for (index, peer) in [(A, B), (B, A)] {
+        <super::data_site::DataManager as super::data_site::Service>::synced(
+            &data_site(&cluster, index),
+            cluster.site(peer).server_id,
+            vec![tid],
+        )
+        .await;
+        data_site(&cluster, index).status_release_round(false).await;
+        assert!(!holds_status(&cluster, index, &tid));
+        assert!(!status_synced(&cluster, index, &tid));
+        assert_eq!(held_for(&cluster, index, &tid), 0);
+        assert_eq!(outcome_on(&cluster, index, &tid), TxnOutcome::Committed);
+    }
+    assert_all_or_nothing(&cluster, &ids, &scores, "synced status release");
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "status release must retain both committed payloads");
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(false, std::sync::atomic::Ordering::Release);
     cluster.shutdown().await;
 }
 
