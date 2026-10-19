@@ -1367,7 +1367,10 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
         "an unused slot must enumerate empty"
     );
     assert!(
-        chunks.cell_ids_in_slots(&HashSet::new()).unwrap().is_empty(),
+        chunks
+            .cell_ids_in_slots(&HashSet::new())
+            .unwrap()
+            .is_empty(),
         "an empty slot set must enumerate empty"
     );
 }
@@ -1951,4 +1954,45 @@ pub async fn a_joining_member_is_filled_automatically() {
             .unwrap_or_else(|e| panic!("{id:?} unreachable after an automatic fill: {e:?}"));
         assert_eq!(cell.header.id, *id);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_chunk_count_uses_database_layout() {
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let group = "chunk_layout";
+    let database = "testdb_chunk_layout";
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 32 << 20,
+            db_size: 256 << 20,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &address,
+        group,
+        database,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let client = client::AsyncClient::new_for_database(
+        &server.rpc,
+        &server.membership,
+        &vec![address],
+        group,
+        database,
+    )
+    .await
+    .unwrap();
+    let owner = client
+        .locate_plain_server(Id::from_parts(0, 1))
+        .await
+        .unwrap();
+    assert_eq!(owner.storage_chunk_count().await.unwrap(), 8);
 }
