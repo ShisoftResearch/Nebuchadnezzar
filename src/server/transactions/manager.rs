@@ -2055,7 +2055,11 @@ impl TransactionManager {
 
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
         // Retired map nodes can keep this transaction alive. Release its cache.
-        txn.data = HashMap::new();
+        {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase = super::phase_profile::guard(super::phase_profile::Phase::CacheRelease);
+            txn.data = HashMap::new();
+        }
         txn.affected_objects.clear();
         txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;

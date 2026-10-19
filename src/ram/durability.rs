@@ -690,6 +690,10 @@ pub fn capture<T>(op: impl FnOnce() -> T) -> (T, Vec<Receipt>) {
 }
 
 pub async fn wait(receipts: Vec<Receipt>) -> Result<(), WriteError> {
+    #[cfg(feature = "occ_phase_profile")]
+    let _phase = crate::server::transactions::phase_profile::guard(
+        crate::server::transactions::phase_profile::Phase::DecisionSyncWait,
+    );
     #[cfg(test)]
     if std::env::var_os("NEB_TEST_DISABLE_DURABLE_WAIT").is_some() {
         return Ok(());
