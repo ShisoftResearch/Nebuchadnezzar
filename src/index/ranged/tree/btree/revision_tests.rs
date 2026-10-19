@@ -162,3 +162,39 @@ fn rev1_payload_cursor_prune() {
 fn rev1_payload_cursor_clear() {
     payload_lifetime(true, true);
 }
+
+#[test]
+fn rev1_sustained_writer_releases_reader() {
+    let tree = leaf();
+    assert!(tree.insert(&key(10)));
+    let root = tree.get_root();
+    let writer_root = root.clone();
+    let (request, requests) = std::sync::mpsc::channel();
+    let (ack, acknowledgements) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        while requests.recv().is_ok() {
+            drop(write_node::<Keys, Ptrs>(&writer_root));
+            if ack.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut attempts = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_node(&root, |_: &NodeReadHandler<Keys, Ptrs>| {
+            attempts += 1;
+            assert!(
+                attempts <= 4096,
+                "reader exceeded the control budget under sustained writes"
+            );
+            request.send(()).unwrap();
+            acknowledgements.recv().unwrap();
+        })
+    }));
+    drop(request);
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "reader did not return during sustained version changes"
+    );
+}
