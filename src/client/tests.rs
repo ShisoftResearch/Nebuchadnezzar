@@ -1791,11 +1791,23 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
         "the donor must not end below the member it just filled"
     );
 
-    // The placement table agrees with the counters.
-    let joiner_slots = placement
-        .slots_owned_by(&group, &second.server_id)
-        .await
-        .unwrap();
+    // The placement table agrees with the counters. A query is served by any
+    // member, and a follower applies the last committed entry when the next
+    // heartbeat carries the commit index. This client never saw the fill's
+    // commands, so its cursor cannot force the follower to catch up. Raft
+    // gives no read-your-writes across clients; wait until the table settles
+    // (a heartbeat takes 1 s) and then compare.
+    let mut joiner_slots = Vec::new();
+    for _ in 0..100 {
+        joiner_slots = placement
+            .slots_owned_by(&group, &second.server_id)
+            .await
+            .unwrap();
+        if joiner_slots.len() == report.moved_slots {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(joiner_slots.len(), report.moved_slots);
 
     // Every cell is still readable through the ordinary path afterwards.
