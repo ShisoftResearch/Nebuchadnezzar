@@ -6338,6 +6338,50 @@ mod resumable_scan {
         for limit in [97usize, 4096, 5000, 20_000] {
             let pages = pages(&server, 7104, limit).await;
             let got: Vec<Id> = pages.iter().flat_map(|p| p.ids.clone()).collect();
+            let expected: std::collections::HashSet<Id> = want.iter().copied().collect();
+            let mut seen = std::collections::HashMap::new();
+            let mut duplicates = vec![];
+            let mut outside_fixture = vec![];
+            let mut before_resume = vec![];
+            let mut after = None;
+            for (page_index, page) in pages.iter().enumerate() {
+                for (offset, id) in page.ids.iter().enumerate() {
+                    if let Some(first) = seen.insert(*id, (page_index, offset)) {
+                        duplicates.push((*id, first, (page_index, offset)));
+                    }
+                    if !expected.contains(id) {
+                        outside_fixture.push((*id, page_index, offset));
+                    }
+                    if after.is_some_and(|cursor| *id <= cursor) {
+                        before_resume.push((*id, page_index, offset, after));
+                    }
+                }
+                after = page.next_cursor;
+            }
+            eprintln!(
+                "SCANPAGE_DIAGNOSTIC {}",
+                serde_json::json!({
+                    "limit_cells": limit,
+                    "trees": trees,
+                    "returned_cells": got.len(),
+                    "expected_cells": want.len(),
+                    "duplicate_cells": duplicates,
+                    "outside_fixture_cells": outside_fixture,
+                    "before_resume_cells": before_resume,
+                })
+            );
+            if got != want {
+                eprintln!(
+                    "SCANPAGE_FAILED_PAGES {}",
+                    serde_json::to_string(
+                        &pages
+                            .iter()
+                            .map(|page| (&page.ids, page.next_cursor))
+                            .collect::<Vec<_>>()
+                    )
+                    .unwrap()
+                );
+            }
             assert_eq!(got.len(), want.len(), "pages of {limit} across {trees} trees");
             assert_eq!(got, want, "pages of {limit} across {trees} trees");
         }
