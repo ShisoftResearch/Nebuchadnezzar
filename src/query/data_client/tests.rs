@@ -6314,6 +6314,14 @@ mod resumable_scan {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn construction_across_ranged_index_partitions() {
+        crate::index::ranged::tree::btree::set_tree_depth(2);
+        let (server, _client) = fixture(7104, 40_000).await;
+        eprintln!("BTREE_CONSTRUCTION_COMPLETE rows_cells=40000");
+        server.shutdown().await;
+    }
+
     /// Pages that end inside a tree and pages that straddle a tree boundary
     /// both resume exactly. Depth 2 caps a tree at ~16K keys, so 40K cells
     /// span at least three trees once the index has migrated.
