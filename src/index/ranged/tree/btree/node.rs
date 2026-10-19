@@ -667,6 +667,14 @@ where
         self.node_ref.is_default()
     }
 
+    // Readers can retain references to the old payload until validation.
+    // Retire that payload through the same epoch that protects node reads.
+    pub(super) fn replace_data(&mut self, replacement: NodeData<KS, PS>) {
+        let old = mem::replace(unsafe { &mut *self.data }, replacement);
+        let epoch = crossbeam_epoch::pin();
+        unsafe { epoch.defer_unchecked(move || drop(old)); }
+    }
+
     // make an empty node as empty node, right node pointer covered
     pub fn make_empty_node(&mut self, update_right: bool) {
         if self.is_empty_node() {
@@ -684,7 +692,7 @@ where
             left: left_node,
             right: right_node,
         };
-        *data = NodeData::Empty(Box::new(empty))
+        self.replace_data(NodeData::Empty(Box::new(empty)));
     }
 
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
