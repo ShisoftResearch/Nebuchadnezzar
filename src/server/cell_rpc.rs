@@ -3,7 +3,6 @@ use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
-use crate::utils::sharded::Sharded;
 use crate::utils::keyed_state::KeyedState;
 use crate::{
     client::AsyncClient,
@@ -294,7 +293,7 @@ type CapturedReceiptEntry = (
 struct CapturedReceipts {
     incarnation: u64,
     next: std::sync::atomic::AtomicU64,
-    entries: Sharded<parking_lot::Mutex<std::collections::HashMap<Id, CapturedReceiptEntry>>>,
+    entries: KeyedState<Id, CapturedReceiptEntry>,
     started: std::time::Instant,
     cleanup_period: std::sync::atomic::AtomicU64,
 }
@@ -310,7 +309,7 @@ impl Default for CapturedReceipts {
         Self {
             incarnation,
             next: std::sync::atomic::AtomicU64::new(0),
-            entries: Default::default(),
+            entries: KeyedState::ordered(),
             started: std::time::Instant::now(),
             cleanup_period: std::sync::atomic::AtomicU64::new(0),
         }
@@ -319,7 +318,7 @@ impl Default for CapturedReceipts {
 impl CapturedReceipts {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.entries.iter().all(|shard| shard.lock().is_empty())
+        self.entries.keys().next().is_none()
     }
 
     // Abandoned RPC replies must not pin descriptors indefinitely. An expired
@@ -337,21 +336,11 @@ impl CapturedReceipts {
             .fetch_max(period, atomic::Ordering::Relaxed)
             < period
         {
-            for shard in self.entries.iter() {
-                let expired = {
-                    let mut entries = crate::profile_lock!(H24, shard.lock());
-                    let expired: Vec<_> = entries
-                        .iter()
-                        .filter_map(|(token, (_, at, _, _))| {
-                            (now.duration_since(*at).as_secs() >= 600).then_some(*token)
-                        })
-                        .collect();
-                    expired
-                        .into_iter()
-                        .filter_map(|token| entries.remove(&token))
-                        .collect::<Vec<_>>()
-                };
-                drop(expired);
+            for token in self.entries.keys() {
+                let Some(mut entry) = self.entries.get(&token) else { continue };
+                if entry.as_ref().is_some_and(|(_, at, _, _)| now.duration_since(*at).as_secs() >= 600) {
+                    entry.take();
+                }
             }
         }
         receipts
@@ -368,8 +357,8 @@ impl CapturedReceipts {
                     .expect("receipt token space exhausted")
                     + 1;
                 let token = Id::from_parts(self.incarnation, next);
-                crate::profile_lock!(H24, self.entries.shard(&token).lock())
-                    .insert(token, (receipt, now, derived, acknowledge && index == 0));
+                *crate::profile_lock!(H24, self.entries.entry(&token)) =
+                    Some((receipt, now, derived, acknowledge && index == 0));
                 token
             })
             .collect()
@@ -382,28 +371,15 @@ impl CapturedReceipts {
         let mut missing = false;
         let mut derived = false;
         let mut acknowledged = 0;
-        // Claim a request's tokens together. Order the involved partitions to
-        // preserve batch consumption when concurrent requests overlap.
-        let mut partitions: Vec<_> = tokens
-            .iter()
-            .map(|token| self.entries.shard(token))
-            .collect();
-        partitions.sort_unstable_by_key(|partition| *partition as *const _ as usize);
-        partitions.dedup_by_key(|partition| *partition as *const _ as usize);
-        let mut guards: Vec<_> = partitions
-            .iter()
-            .map(|partition| crate::profile_lock!(H24, partition.lock()))
-            .collect();
-        let claimed: Vec<_> = tokens
-            .iter()
-            .map(|token| {
-                let partition = self.entries.shard(token) as *const _ as usize;
-                let index = partitions
-                    .binary_search_by_key(&partition, |p| *p as *const _ as usize)
-                    .unwrap();
-                guards[index].remove(token)
-            })
-            .collect();
+        // Claim overlapping batches in token order. Each guard owns one token.
+        let mut ordered = tokens.clone();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let mut guards: Vec<_> = ordered.iter()
+            .map(|token| crate::profile_lock!(H24, self.entries.entry(token))).collect();
+        let claimed: Vec<_> = tokens.iter().map(|token| {
+            guards[ordered.binary_search(token).unwrap()].take()
+        }).collect();
         drop(guards);
         for entry in claimed {
             let Some((receipt, at, has_indices, acknowledge)) = entry else {

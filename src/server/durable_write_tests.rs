@@ -455,9 +455,8 @@ async fn durable_ack_captured_receipts_fail_on_sync_expiry_and_restart() {
     let (_, tokens) = rpc.write_cell_captured(cell(1, 1)).await;
     rpc.captured_receipts
         .entries
-        .shard(&tokens[0])
-        .lock()
-        .get_mut(&tokens[0])
+        .entry(&tokens[0])
+        .as_mut()
         .unwrap()
         .1 -= std::time::Duration::from_secs(600);
     assert!(matches!(
@@ -622,29 +621,16 @@ async fn compose_durable_receipts_preserve_verified_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn captured_receipt_shards_can_finish_independently() {
+async fn captured_receipt_tokens_can_finish_independently() {
     let dir = tempfile::tempdir().unwrap();
     let (server, rpc) = fixture(&dir).await;
     let (result, first) = rpc.write_cell_captured(cell(1, 1)).await;
     result.unwrap();
-    let mut all = first.clone();
-    let mut independent = None;
-    for n in 2..100 {
-        let (result, tokens) = rpc.write_cell_captured(cell(n, n)).await;
-        result.unwrap();
-        if tokens.iter().all(|token| {
-            !std::ptr::eq(
-                rpc.captured_receipts.entries.shard(&first[0]),
-                rpc.captured_receipts.entries.shard(token),
-            )
-        }) {
-            independent = Some(tokens);
-            break;
-        }
-        all.extend(tokens);
-    }
-    let independent = independent.expect("find another receipt shard");
-    let held = rpc.captured_receipts.entries.shard(&first[0]).lock();
+    let all = first.clone();
+    let (result, independent) = rpc.write_cell_captured(cell(2, 2)).await;
+    result.unwrap();
+    assert!(independent.iter().all(|token| !first.contains(token)));
+    let held = rpc.captured_receipts.entries.entry(&first[0]);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = rpc.clone();
     let thread = std::thread::spawn(move || {
