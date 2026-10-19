@@ -5,6 +5,11 @@ use super::node::NodeReadHandler;
 use super::*;
 use std::fmt::Debug;
 
+enum SearchError {
+    Follow(NodeCellRef),
+    InvalidPosition { pos: usize, len: usize },
+}
+
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
     key: &EntryKey,
@@ -50,24 +55,26 @@ where
             if ordering == Ordering::Backward && node.is_empty() {
                 if let Some(left) = node.left_ref() {
                     let Some(follow) = left.try_clone_speculative() else {
-                        return Err(node_ref.clone());
+                        return Err(SearchError::Follow(node_ref.clone()));
                     };
-                    return Err(follow);
+                    return Err(SearchError::Follow(follow));
                 }
             }
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
                 // Pointer read from unlatched data: clone speculatively and
                 // retry on this node if its target is already condemned.
-                return Err(right_node
-                    .try_clone_speculative()
-                    .unwrap_or_else(|| node_ref.clone()));
+                return Err(SearchError::Follow(
+                    right_node
+                        .try_clone_speculative()
+                        .unwrap_or_else(|| node_ref.clone()),
+                ));
             }
             let pos = match node.search_unwindable(key) {
                 Ok(pos) => pos,
                 Err(_) => {
                     warn!("Search cursor failed, expecting retry");
-                    return Err(node_ref.clone());
+                    return Err(SearchError::Follow(node_ref.clone()));
                 }
             };
             match node {
@@ -135,9 +142,9 @@ where
                                 Ordering::Backward => &n.prev,
                             };
                             let Some(follow) = follow_src.try_clone_speculative() else {
-                                return Err(node_ref.clone());
+                                return Err(SearchError::Follow(node_ref.clone()));
                             };
-                            Err(follow)
+                            Err(SearchError::Follow(follow))
                         }
                     }
                 }
@@ -148,16 +155,27 @@ where
                         n.len,
                         pos
                     );
+                    let observed_len = n.len;
+                    // A split can change the key count after the search. Check
+                    // the invariant only after read_node validates this version.
+                    if pos > observed_len {
+                        return Err(SearchError::InvalidPosition {
+                            pos,
+                            len: observed_len,
+                        });
+                    }
                     let next_node_ref = &n.ptrs.as_slice_immute()[pos];
-                    debug_assert!(pos <= n.len);
-                    Err(next_node_ref
-                        .try_clone_speculative()
-                        .unwrap_or_else(|| node_ref.clone()))
+                    Err(SearchError::Follow(
+                        next_node_ref
+                            .try_clone_speculative()
+                            .unwrap_or_else(|| node_ref.clone()),
+                    ))
                 }
-                &NodeData::Empty(ref n) => Err(n
-                    .right
-                    .try_clone_speculative()
-                    .unwrap_or_else(|| node_ref.clone())),
+                &NodeData::Empty(ref n) => Err(SearchError::Follow(
+                    n.right
+                        .try_clone_speculative()
+                        .unwrap_or_else(|| node_ref.clone()),
+                )),
                 &NodeData::None => Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted)),
             }
         });
@@ -166,7 +184,10 @@ where
                 cursor.initialize();
                 return cursor;
             }
-            Err(e) => {
+            Err(SearchError::InvalidPosition { pos, len }) => {
+                panic!("validated internal search position {pos} exceeds key count {len}");
+            }
+            Err(SearchError::Follow(e)) => {
                 node = e;
                 node_ref = &node;
                 spins += 1;
