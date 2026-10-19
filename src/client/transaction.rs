@@ -92,7 +92,6 @@ pub enum TxnError {
     ReadError(ReadError),
     WriteError(WriteError),
     PrepareError(TMPrepareResult),
-    CommitError(EndResult),
     AbortError(AbortResult),
     /// The commit request reached the coordinator, and the outcome is not
     /// known (D33): read the data again before any retry.
