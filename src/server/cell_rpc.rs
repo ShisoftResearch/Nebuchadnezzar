@@ -4,6 +4,7 @@ use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
 use crate::utils::sharded::Sharded;
+use crate::utils::keyed_state::KeyedState;
 use crate::{
     client::AsyncClient,
     index::builder::IndexBuilder,
@@ -214,7 +215,7 @@ struct LeasedFence {
 #[derive(Default)]
 pub struct FenceLeases {
     next_token: std::sync::atomic::AtomicU64,
-    holds: Sharded<parking_lot::Mutex<std::collections::HashMap<u64, LeasedFence>>>,
+    holds: KeyedState<u64, LeasedFence>,
 }
 
 #[derive(Default)]
@@ -1245,20 +1246,17 @@ impl Service for NebRPCService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let lease = std::time::Duration::from_millis(lease_ms.max(1));
-            crate::profile_lock!(C05, leases.holds.shard(&token).lock()).insert(
-                token,
-                LeasedFence {
+            *crate::profile_lock!(C05, leases.holds.entry(&token)) = Some(LeasedFence {
                     _hold: hold,
                     expires: std::time::Instant::now() + lease,
-                },
-            );
+                });
             // The reaper: lifts the fence if the holder stops renewing.
             let leases = Arc::clone(&self.fence_leases);
             tokio::spawn(async move {
                 loop {
                     let wait = {
-                        let holds = crate::profile_lock!(C05, leases.holds.shard(&token).lock());
-                        match holds.get(&token) {
+                        let holds = crate::profile_lock!(C05, leases.holds.entry(&token));
+                        match holds.as_ref() {
                             None => return,
                             Some(held) => held
                                 .expires
@@ -1266,8 +1264,8 @@ impl Service for NebRPCService {
                         }
                     };
                     if wait.is_zero() {
-                        if crate::profile_lock!(C05, leases.holds.shard(&token).lock())
-                            .remove(&token)
+                        if crate::profile_lock!(C05, leases.holds.entry(&token))
+                            .take()
                             .is_some()
                         {
                             warn!(
@@ -1285,8 +1283,8 @@ impl Service for NebRPCService {
     }
 
     fn fence_renew(&self, token: u64, lease_ms: u64) -> BoxFuture<'_, bool> {
-        let mut holds = crate::profile_lock!(C05, self.fence_leases.holds.shard(&token).lock());
-        let renewed = match holds.get_mut(&token) {
+        let mut holds = crate::profile_lock!(C05, self.fence_leases.holds.entry(&token));
+        let renewed = match holds.as_mut() {
             Some(held) => {
                 held.expires =
                     std::time::Instant::now() + std::time::Duration::from_millis(lease_ms.max(1));
@@ -1298,7 +1296,7 @@ impl Service for NebRPCService {
     }
 
     fn fence_release(&self, token: u64) -> BoxFuture<'_, ()> {
-        crate::profile_lock!(C05, self.fence_leases.holds.shard(&token).lock()).remove(&token);
+        crate::profile_lock!(C05, self.fence_leases.holds.entry(&token)).take();
         future::ready(()).boxed()
     }
 

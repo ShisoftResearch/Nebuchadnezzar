@@ -690,19 +690,12 @@ async fn cell_scan_cursors_progress_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fence_lease_shards_allow_independent_renewals() {
+async fn fence_lease_tokens_allow_independent_renewals() {
     let dir = tempfile::tempdir().unwrap();
     let (server, rpc) = fixture(&dir).await;
     let first = rpc.fence_engage(&vec![], 1000, 10000).await.unwrap();
-    let second = (first + 1..first + 1000)
-        .find(|token| {
-            !std::ptr::eq(
-                rpc.fence_leases.holds.shard(&first),
-                rpc.fence_leases.holds.shard(token),
-            )
-        })
-        .unwrap();
-    let held = rpc.fence_leases.holds.shard(&first).lock();
+    let second = first + 1;
+    let held = rpc.fence_leases.holds.entry(&first);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = rpc.clone();
     let thread = std::thread::spawn(move || {
