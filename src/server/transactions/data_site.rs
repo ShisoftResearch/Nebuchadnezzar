@@ -2763,6 +2763,111 @@ mod tests {
     use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
 
+    /// One server holds both the coordinator and the only data participant.
+    async fn d74_one_site_commit_case(case: u8) {
+        use crate::client::transaction::{Transaction as ClientTransaction, TxnError};
+        use std::cell::Cell;
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "d74_one_site_client";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let site = runtime.data_site().unwrap();
+        let client = crate::server::transactions::new_async_client_for_database(&address, group, group)
+            .await
+            .unwrap();
+        let tid = client.begin().await.unwrap().unwrap();
+        let id = Id::allocated(0, 0, 99400 + case as u64);
+        client
+            .write(tid, counter_cell(schema.vid.get(), id, 73, "one site"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(
+            site.find_transaction(&tid).unwrap().lock().participants,
+            vec![server.server_id]
+        );
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+        let txn = ClientTransaction {
+            tid,
+            state: Cell::new(TxnState::Prepared),
+            client,
+        };
+        let result = match case {
+            0 => {
+                // The coordinator stops before END. Its state is then gone, but END can arrive later.
+                let stop =
+                    crate::server::transactions::manager::stop_end_fanout_before_commit_point(tid);
+                assert!(matches!(
+                    txn.commit_durable().await,
+                    Err(TxnError::OutcomeUnknown)
+                ));
+                drop(stop);
+                let retry = txn.commit_durable().await;
+                println!("D74 one-site result before delayed END: {retry:?}");
+                assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+                assert_eq!(
+                    <DataManager as Service>::end(&site, tid, tid, true)
+                        .await
+                        .payload,
+                    EndResult::Success
+                );
+                retry
+            }
+            1 => {
+                // A lock now belongs to a later owner. COMMIT still closes before release is refused.
+                site.cell_meta_mutex(&id).lock().owner =
+                    Some(TxnPriority::new(site.hlc.now(), server.server_id));
+                let result = txn.commit_durable().await;
+                site.cell_meta_mutex(&id).lock().owner = None;
+                println!("D74 one-site result after lock-release refusal: {result:?}");
+                result
+            }
+            _ => txn.commit_durable().await,
+        };
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::Committed);
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().data["score"]
+                .u64()
+                .copied(),
+            Some(73)
+        );
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&tid, &runtime.chunks().address_range()),
+            0
+        );
+        println!("D74 one-site transaction committed with exact payload 73");
+        server.shutdown().await;
+        if case == 0 {
+            assert!(
+                matches!(result, Err(TxnError::OutcomeUnknown)),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "known commit must succeed: {result:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_retry_before_delayed_end_stays_unknown() {
+        d74_one_site_commit_case(0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_lock_release_failure_is_a_known_commit() {
+        d74_one_site_commit_case(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_known_commit_control() {
+        d74_one_site_commit_case(2).await;
+    }
+
     #[test]
     fn pinned_read_set_records_and_returns_entry() {
         let mut set = PinnedReadSet::default();
