@@ -10,6 +10,23 @@ use tokio::net::TcpSocket;
 
 static RESERVED_PORTS: Mutex<Vec<TcpSocket>> = Mutex::new(Vec::new());
 
+// The diagnostic runner assigns a separate locked range to each process.
+#[cfg(feature = "c3doubt_trace")]
+fn test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    match std::env::var("C3DOUBT_PORT_BASE") {
+        Ok(base) => {
+            base.parse::<u16>().unwrap() + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }
+        Err(_) => 0,
+    }
+}
+
+#[cfg(not(feature = "c3doubt_trace"))]
+fn test_port() -> u16 {
+    0
+}
+
 /// Returns a localhost port reserved for this process's RPC listeners.
 pub fn unique_localhost_port() -> u16 {
     let socket = TcpSocket::new_v4().expect("create port reservation socket");
@@ -17,7 +34,7 @@ pub fn unique_localhost_port() -> u16 {
         .set_reuseaddr(false)
         .expect("disable reuse during allocation");
     socket
-        .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, test_port()).into())
         .expect("bind ephemeral port");
     let port = socket.local_addr().expect("read ephemeral port").port();
     // The RPC listener uses SO_REUSEADDR. Allow it to share this bind while
