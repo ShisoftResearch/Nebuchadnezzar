@@ -3441,3 +3441,52 @@ async fn recovery_finds_a_participant_missing_from_the_ring_cache() {
 async fn recovery_finds_a_membership_only_participant_after_a_configuration_snapshot() {
     find_a_committed_participant_after_an_address_gap(true).await;
 }
+
+/// A completed removal must fence discovery even when a normal query is stale.
+#[cfg(feature = "c3doubt_trace")]
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_rejects_an_uncached_removed_participant_with_a_lagging_roster() {
+    use bifrost::membership::client::ObserverClient;
+    use bifrost::raft::client::RaftClient;
+    use bifrost::rpc::ClientPool;
+    let (cluster, client, ring) =
+        cluster_with_an_early_participant_ring("crosssite_removed_participant", true).await;
+    let (tid, _, _) = torn_transaction(&cluster, &client, 49_100).await;
+    wait_status_synced(&cluster, B, &tid).await;
+    let seed = cluster.site(SEED);
+    let peer = cluster.site(B).server_id;
+    let captured = seed.membership.all_members(false).await.unwrap();
+    assert!(captured.0.iter().any(|member| member.id == peer));
+    assert!(ring.try_server_name(peer).is_none());
+    let removal_raft = RaftClient::new(&cluster.addresses, bifrost::raft::DEFAULT_SERVICE_ID)
+        .await
+        .unwrap();
+    let removal = ObserverClient::new(&removal_raft);
+    assert!(removal.sm_client.leave(&peer).await.unwrap());
+    let current = removal.all_members(false).await.unwrap();
+    assert!(current.1 > captured.1);
+    assert!(!current.0.iter().any(|member| member.id == peer));
+    // Keep the removed participant's RPC service alive. Only membership rejects it.
+    seed.membership.set_query_roster_for_test(captured);
+    let lagging = ring.membership().all_members(false).await.unwrap();
+    assert!(lagging.1 < current.1);
+    assert!(lagging.0.iter().any(|member| member.id == peer));
+    assert!(ring.try_server_name(peer).is_none());
+    let deps = super::manager::TransactionManagerDeps {
+        database_runtime: seed.current_database(),
+        server_id: seed.server_id,
+        consh: ring,
+        member_pool: Arc::new(ClientPool::new()),
+        hlc: seed.hlc.clone(),
+    };
+    let result = deps.get_member_by_server_id(peer).await;
+    let rejected = matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    let unknown = deps.get_member_by_server_id(0).await;
+    assert!(matches!(unknown, Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+    drop(client);
+    cluster.shutdown().await;
+    assert!(
+        rejected,
+        "discovery accepted a removed participant from a lagging roster"
+    );
+}
