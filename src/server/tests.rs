@@ -2375,7 +2375,7 @@ async fn a_restore_that_stopped_halfway_completes_on_the_second_run() {
     let dir = tempfile::TempDir::new().unwrap();
     let group = "restore_halfway_group";
     const SCHEMA: u32 = 9183;
-    let (opts, id, _old_address) = a_closed_store_with_one_cell(&dir, group, SCHEMA, true).await;
+    let (opts, id, old_address) = a_closed_store_with_one_cell(&dir, group, SCHEMA, true).await;
     let other = crate::utils::test_port::unique_localhost_addr();
     let layout = database::DatabaseStorageLayout::from_options(&opts, group, group);
     let removed = raft::restore_sole_voter(
@@ -2393,6 +2393,28 @@ async fn a_restore_that_stopped_halfway_completes_on_the_second_run() {
     let restored = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {})
         .await
         .expect("the second run completes the restore");
+    // The slot step: every slot names the new server, none names the old one.
+    // (The cell read below goes through the local chunk and does not use the
+    // table, so it cannot show this step.)
+    let (table, _) = crate::slots::load_owner_vec(
+        &restored.group_name,
+        &restored.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .unwrap();
+    let table = table.expect("the store has a slot placement table");
+    let heir = bifrost_hasher::hash_str(&other);
+    let old = bifrost_hasher::hash_str(&old_address);
+    assert!(
+        table.iter().all(|owner| *owner != old),
+        "a slot still names the old server"
+    );
+    assert!(
+        table.iter().filter(|owner| **owner == heir).count() > 0
+            && table.iter().all(|owner| *owner == 0 || *owner == heir),
+        "not every slot names the new server"
+    );
     restored.meta().schemas.register_internal_schema(Schema::new_with_id(
         SCHEMA,
         "restore_store_schema",
