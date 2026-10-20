@@ -159,6 +159,8 @@ where
                 }
                 &NodeData::Internal(ref n) => {
                     #[cfg(test)]
+                    super::revision_tests::after_internal_borrow(n);
+                    #[cfg(test)]
                     AFTER_INTERNAL_POSITION.with(|hook| {
                         let action = hook.borrow_mut().take();
                         if let Some(action) = action {
@@ -312,6 +314,8 @@ where
                         return Err(node_ref.clone());
                     }
                 };
+                #[cfg(test)]
+                super::revision_tests::after_internal_borrow(n);
                 match n.ptrs.as_slice_immute()[pos].try_clone_speculative() {
                     Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
                     None => Err(node_ref.clone()),

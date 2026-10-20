@@ -551,6 +551,8 @@ where
     loop {
         let cc_num = cc.load(Acquire);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
+            #[cfg(test)]
+            super::revision_tests::latch_wait();
             spins += 1;
             if spins.is_power_of_two() && spins >= STUCK_LATCH_WARN_SPINS {
                 warn!(
@@ -672,7 +674,13 @@ where
     pub(super) fn replace_data(&mut self, replacement: NodeData<KS, PS>) {
         let old = mem::replace(unsafe { &mut *self.data }, replacement);
         let epoch = crossbeam_epoch::pin();
-        unsafe { epoch.defer_unchecked(move || drop(old)); }
+        #[cfg(test)]
+        let retirement = super::revision_tests::track_retirement();
+        unsafe { epoch.defer_unchecked(move || {
+            #[cfg(test)]
+            let _retirement = retirement;
+            drop(old);
+        }); }
     }
 
     // make an empty node as empty node, right node pointer covered
