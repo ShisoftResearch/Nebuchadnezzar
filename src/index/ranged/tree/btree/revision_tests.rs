@@ -446,3 +446,51 @@ fn rev2_stalled_pin_bounds_retirement_for_a_fixed_node_set() {
     }
     assert_eq!(stats.pending.load(Acquire), 0);
 }
+
+// Adapt the reviewer's probe. The retirement token records completion of
+// the descriptor's destructor without interposing on the system allocator.
+#[test]
+fn rev3_unchecked_descriptor_reference_survives_replacement() {
+    let tree = leaf();
+    assert!(tree.insert(&key(10)));
+    let root = tree.get_root();
+    let reader = read_unchecked::<Keys, Ptrs>(&root);
+    let descriptor: &NodeData<Keys, Ptrs> = &*reader;
+    let stats = Arc::new(RetirementStats::default());
+    let observed = stats.clone();
+    std::thread::spawn(move || {
+        RETIREMENT_STATS.with(|slot| *slot.borrow_mut() = Some(observed.clone()));
+        write_node::<Keys, Ptrs>(&root).make_empty_node(false);
+        RETIREMENT_STATS.with(|slot| *slot.borrow_mut() = None);
+        for _ in 0..10000 {
+            let epoch = crossbeam_epoch::pin();
+            epoch.flush();
+            drop(epoch);
+            if observed.pending.load(Acquire) == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(stats.peak.load(Acquire), 1);
+    assert_eq!(
+        stats.pending.load(Acquire),
+        1,
+        "a descriptor borrowed through an unchecked reader was destroyed"
+    );
+    // Do not access the descriptor unless the lifetime check has passed.
+    assert_eq!(descriptor.extnode().keys.key_at(0), key(10));
+    drop(reader);
+    for _ in 0..10000 {
+        let epoch = crossbeam_epoch::pin();
+        epoch.flush();
+        drop(epoch);
+        if stats.pending.load(Acquire) == 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(stats.pending.load(Acquire), 0);
+}
