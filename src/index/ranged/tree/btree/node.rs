@@ -527,16 +527,43 @@ where
     cc_num != expected
 }
 
-// Borrow a node's data through a ref that may itself have been read out of
-// unlatched node data. Requires an active epoch pin (read_node provides
-// one); the data may be torn mid-write, like read_unchecked, but the memory
-// cannot be freed while pinned.
-pub fn peek_data<'a, KS, PS>(node: &'a NodeCellRef) -> &'a NodeData<KS, PS>
+// This guard protects a descriptor borrowed through a speculative node
+// reference. The caller must keep that node reference valid during entry.
+// The returned descriptor reference cannot outlive this guard's epoch pin.
+pub struct NodeDataGuard<'a, KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    unsafe { &*node.deref::<KS, PS>().data.load(Acquire) }
+    data: *const NodeData<KS, PS>,
+    _epoch: crossbeam_epoch::Guard,
+    _node: PhantomData<&'a NodeCellRef>,
+}
+
+impl<KS, PS> Deref for NodeDataGuard<'_, KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    type Target = NodeData<KS, PS>;
+
+    fn deref(&self) -> &Self::Target {
+        // The pin precedes the pointer load and remains alive for this borrow.
+        unsafe { &*self.data }
+    }
+}
+
+pub fn peek_data<'a, KS, PS>(node: &'a NodeCellRef) -> NodeDataGuard<'a, KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let epoch = crossbeam_epoch::pin();
+    NodeDataGuard {
+        data: node.deref::<KS, PS>().data.load(Acquire),
+        _epoch: epoch,
+        _node: PhantomData,
+    }
 }
 
 const OPTIMISTIC_READ_RETRIES: usize = 8;
@@ -569,11 +596,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Pin the epoch for the whole optimistic read: closures peek at sibling
-    // and child pointers whose targets may have deferred destructions
-    // pending; the pin keeps that memory valid until the closure returns
-    // (docs/tla/SeqlockReclaim.tla).
-    let _epoch = crossbeam_epoch::pin();
+    // The handler owns the epoch pin for every attempt and callback borrow.
+    // It also protects speculative sibling and child references until return.
     let mut handler = read_unchecked(node);
     if node.is_default() {
         handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
@@ -624,6 +648,8 @@ where
     }
 }
 
+// Descriptor borrows retain this reader's epoch protection. This does not
+// validate concurrent changes to payload fields.
 pub fn read_unchecked<KS, PS>(node: &NodeCellRef) -> NodeReadHandler<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -634,6 +660,7 @@ where
         snapshot: ptr::null(),
         node_ref: node.clone(),
         mark: PhantomData,
+        _epoch: crossbeam_epoch::pin(),
     }
 }
 
@@ -917,24 +944,13 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub version: usize,
-    // A non-null snapshot is valid only inside read_node's pinned scope.
+    // The owned pin protects both snapshots and unchecked descriptor loads.
+    // Deref ties each descriptor reference to a borrow of this handler.
     snapshot: *const NodeData<KS, PS>,
     node_ref: NodeCellRef,
     mark: PhantomData<(KS, PS)>,
+    _epoch: crossbeam_epoch::Guard,
 }
-
-// Only read_node sets a snapshot, and it never moves its handler out of
-// the pinned scope. Unchecked handlers retain the owned node reference.
-unsafe impl<KS, PS> Send for NodeReadHandler<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{}
-unsafe impl<KS, PS> Sync for NodeReadHandler<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{}
 
 impl<KS, PS> Deref for NodeReadHandler<KS, PS>
 where
@@ -980,6 +996,7 @@ where
             snapshot: ptr::null(),
             node_ref: Default::default(),
             mark: PhantomData,
+            _epoch: crossbeam_epoch::pin(),
         }
     }
 }
