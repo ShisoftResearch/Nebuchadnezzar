@@ -793,17 +793,13 @@ impl IndexBuilder {
         cell_id: Id,
         schema_id: SchemaUid,
     ) -> Result<(), IndexError> {
-        // Each locality has an independent limit within this client. Keep
-        // secondary RPC work bounded without blocking unrelated localities.
-        let permits = indexers
-            .scannable_admission
-            .for_locality(cell_id.locality());
+        // The locality retains its own admission state. The shared atomic budget
+        // bounds the whole write+verify sequence across all clients/localities.
+        // On 2026-08-31, 562K queued tasks drove 950%-2700% CPU and stalled HTTP
+        // polls. Excess sequences now park in a FIFO queue without timer polling.
         let _permit = crate::profile_lock!(
             H21,
-            permits
-                .acquire()
-                .await
-                .expect("scannable permit semaphore is never closed")
+            indexers.scannable_admission.acquire(cell_id.locality()).await
         );
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",

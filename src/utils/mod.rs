@@ -27,3 +27,5 @@ pub mod lock_profile;
 pub(crate) mod keyed_state;
 #[cfg(multisite_test)]
 pub mod multisite;
+
+pub(crate) mod budget;

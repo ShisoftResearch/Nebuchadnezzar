@@ -1,5 +1,4 @@
 use crate::ram::chunk::Chunk;
-#[cfg(feature = "compress_backups")]
 use crate::ram::compression;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
@@ -665,21 +664,41 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// At most 32 MiB of staging per chunk, including inline and shutdown archives.
-/// Lightning's slab allocator prefaults a 64 MiB range per calling thread.
-/// A shared buffer pool keeps this cost independent of the thread count.
+/// At most 32 MiB of staging across all chunks and stores in this process.
+/// Idle buffers share the same bound. Per-chunk pools retain their identity;
+/// a lock-free reserve lets another owner reuse an idle buffer without a sweep.
 const ARCHIVE_STAGING_LIMIT: usize = 4;
 
-#[derive(Default)]
-struct ArchiveStagingState {
-    allocated: usize,
-    idle: Vec<Vec<u8>>,
+struct ArchiveStagingReserve {
+    budget: Arc<crate::utils::budget::Budget>,
+    idle: crossbeam::queue::ArrayQueue<Vec<u8>>,
 }
 
-#[derive(Default)]
+fn archive_staging_reserve() -> Arc<ArchiveStagingReserve> {
+    static RESERVE: arc_swap::ArcSwapOption<ArchiveStagingReserve> =
+        arc_swap::ArcSwapOption::const_empty();
+    if let Some(reserve) = RESERVE.load_full() {
+        return reserve;
+    }
+    let candidate = Arc::new(ArchiveStagingReserve {
+        budget: crate::utils::budget::Budget::new(ARCHIVE_STAGING_LIMIT),
+        idle: crossbeam::queue::ArrayQueue::new(ARCHIVE_STAGING_LIMIT),
+    });
+    let previous = RESERVE.compare_and_swap(
+        &None::<Arc<ArchiveStagingReserve>>,
+        Some(Arc::clone(&candidate)),
+    );
+    previous.as_ref().cloned().unwrap_or(candidate)
+}
+
 pub(crate) struct ArchiveStagingPool {
-    state: parking_lot::Mutex<ArchiveStagingState>,
-    available: parking_lot::Condvar,
+    reserve: Arc<ArchiveStagingReserve>,
+}
+
+impl Default for ArchiveStagingPool {
+    fn default() -> Self {
+        Self { reserve: archive_staging_reserve() }
+    }
 }
 
 impl ArchiveStagingPool {
@@ -687,41 +706,27 @@ impl ArchiveStagingPool {
         #[cfg(feature = "lock_profile")]
         let capacity_wait =
             crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
-        // During snapshot, compression, and write, holders take no lock and wait for no thread.
-        let mut state = crate::profile_lock!(H43_mutex, self.state.lock());
-        loop {
-            if let Some(buffer) = state.idle.pop() {
-                return ArchiveStagingGuard {
-                    pool: self.clone(),
-                    #[cfg(feature = "lock_profile")]
-                    _profile: capacity_wait.acquired(()),
-                    buffer: Some(buffer),
-                };
-            }
-            if state.allocated < ARCHIVE_STAGING_LIMIT {
-                state.allocated += 1;
-                drop(state);
-                return ArchiveStagingGuard {
-                    pool: self.clone(),
-                    #[cfg(feature = "lock_profile")]
-                    _profile: capacity_wait.acquired(()),
-                    buffer: Some(vec![0; SEGMENT_SIZE]),
-                };
-            }
+        // Claim before allocation. Return the buffer before releasing this claim.
+        // Thus both live and idle buffers stay within the same four-slot reserve.
+        let permit = self.reserve.budget.acquire_blocking();
+        let buffer = self.reserve.idle.pop().unwrap_or_else(|| vec![0; SEGMENT_SIZE]);
+        ArchiveStagingGuard {
+            pool: Arc::clone(self),
             #[cfg(feature = "lock_profile")]
-            state.suspend(|guard| self.available.wait(guard));
-            #[cfg(not(feature = "lock_profile"))]
-            self.available.wait(&mut state);
+            _profile: capacity_wait.acquired(()),
+            buffer: Some(buffer),
+            _permit: permit,
         }
     }
 }
 
-/// Return the buffer on success, an I/O error, or a panic.
+/// Return the buffer and its quota on success, an I/O error, or a panic.
 struct ArchiveStagingGuard {
     #[cfg(feature = "lock_profile")]
     _profile: crate::utils::lock_profile::Guard<()>,
     pool: Arc<ArchiveStagingPool>,
     buffer: Option<Vec<u8>>,
+    _permit: crate::utils::budget::Permit,
 }
 
 impl ArchiveStagingGuard {
@@ -734,10 +739,8 @@ impl ArchiveStagingGuard {
 
 impl Drop for ArchiveStagingGuard {
     fn drop(&mut self) {
-        crate::profile_lock!(H43_mutex, self.pool.state.lock())
-            .idle
-            .push(self.buffer.take().unwrap());
-        self.pool.available.notify_one();
+        assert!(self.pool.reserve.idle.push(self.buffer.take().unwrap()).is_ok());
+        // Field drop releases the quota only after the buffer is reusable.
     }
 }
 
@@ -4311,7 +4314,9 @@ mod tests {
         let first_store = Arc::new(SegmentFileManager::new(None, None));
         let second_store = Arc::new(SegmentFileManager::new(None, None));
         let saturated = first_store.archive_staging_pool(0);
-        let held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| saturated.acquire()).collect();
+        // D106 restores the shared cap. Leave headroom for two other owners;
+        // saturation of the process budget must block every owner.
+        let held: Vec<_> = (0..2).map(|_| saturated.acquire()).collect();
         assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool(0)));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = first_store.clone();
@@ -4324,6 +4329,88 @@ mod tests {
         drop(held);
         thread.join().unwrap();
         assert!(result.is_ok(), "unrelated chunks must have independent archive capacity");
+    }
+
+    #[test]
+    fn archive_staging_total_across_chunks_and_two_stores_is_32_mib() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let mut held = Vec::new();
+        let mut addresses = std::collections::HashSet::new();
+        for chunk in 0..4 {
+            let pool = stores[chunk % 2].archive_staging_pool(chunk);
+            held.push(pool.acquire());
+            addresses.insert(held.last().unwrap().buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+        let extra_store = Arc::clone(&stores[1]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let buffer = extra_store.archive_staging_pool(99).acquire();
+            acquired_tx.send(buffer.buffer.as_ref().unwrap().as_ptr() as usize).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        drop(held.pop());
+        let address = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(error) => panic!("archive waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout), "process staging exceeded 32 MiB across stores");
+        addresses.insert(address);
+        drop(held);
+        // Retain every per-chunk pool while cycling owners. Idle memory must
+        // share the same four buffers, rather than growing by owner count.
+        for chunk in 4..128 {
+            let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+            addresses.insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn concurrent_archive_owners_share_four_buffers_and_wake_after_release() {
+        use std::sync::atomic::AtomicUsize;
+        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let active = AtomicUsize::new(0);
+        let addresses = parking_lot::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|scope| {
+            for chunk in 0..32 {
+                let stores = &stores;
+                let active = &active;
+                let addresses = &addresses;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+                        assert!(active.fetch_add(1, SeqCst) < 4);
+                        addresses.lock().insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+                        std::thread::yield_now();
+                        active.fetch_sub(1, SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(active.load(SeqCst), 0);
+        assert!(addresses.lock().len() <= 4);
+    }
+
+    #[test]
+    fn cancelling_a_parked_archive_claim_does_not_leak_staging() {
+        use futures::FutureExt;
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let held: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        let mut pending = Box::pin(pool.reserve.budget.acquire());
+        assert!(pending.as_mut().now_or_never().is_none());
+        drop(pending);
+        drop(held);
+        let recovered: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        assert!(pool.reserve.budget.try_acquire().is_none());
+        drop(recovered);
     }
 
     #[test]
