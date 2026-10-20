@@ -280,8 +280,15 @@ impl RangedIndexerClient {
                 &self.database_name,
             )
             .await?;
-            if let OpResult::Successful(audit) = tree_client.audit(placement.id).await? {
-                res.push(audit);
+            match tree_client.audit(placement.id).await? {
+                OpResult::Successful(audit) => res.push(audit),
+                OpResult::ReadRetryExhausted => {
+                    return Err(bifrost::rpc::RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        crate::index::ranged::tree::btree::ReadRetryExhausted,
+                    )))
+                }
+                _ => {}
             }
             match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
                 NextTree::Found(next_lower, next_placement) => {
@@ -337,13 +344,18 @@ impl RangedIndexerClient {
                             OpResult::NotFound => "not loaded here",
                             OpResult::OutOfBound => "out of bound",
                             OpResult::Migrating => "migrating",
+                            OpResult::ReadRetryExhausted => "read retry budget exhausted",
                             OpResult::EpochMissMatch(..) => "epoch mismatch",
                             OpResult::Successful(_) => unreachable!(),
                         }
                     );
                 }
             }
-            match self.next_tree(&lower, Ordering::Forward).await.map_err(exec_err)? {
+            match self
+                .next_tree(&lower, Ordering::Forward)
+                .await
+                .map_err(exec_err)?
+            {
                 NextTree::Found(next_lower, next_placement) => {
                     lower = next_lower;
                     placement = next_placement;
@@ -426,6 +438,12 @@ impl RangedIndexerClient {
             )
             .await?
             {
+                OpResult::ReadRetryExhausted => {
+                    return Err(bifrost::rpc::RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        crate::index::ranged::tree::btree::ReadRetryExhausted,
+                    )))
+                }
                 OpResult::Successful(res) => {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);

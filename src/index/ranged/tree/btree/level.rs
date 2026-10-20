@@ -31,12 +31,12 @@ fn merge_prune<KS, PS>(
     deleted: &mut HashSet<EntryKey>,
     prune_src: bool,
     lsm: usize,
-) -> (usize, Option<NodeCellRef>)
+) -> ReadResult<(usize, Option<NodeCellRef>)>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let search = mut_first::<KS, PS>(node);
+    let search = mut_first::<KS, PS>(node)?;
     match search {
         MutSearchResult::External => {
             debug!(
@@ -72,7 +72,7 @@ where
                     "Collected {} keys at level {}, merging to destination tree",
                     num_keys_merged, level
                 );
-                dest_tree.merge_with_keys(merging_keys);
+                dest_tree.merge_with_keys(merging_keys)?;
                 debug!("Merge completed in external level");
                 if prune_src {
                     debug!("Pruning source tree for {} external pages", nodes.len());
@@ -91,7 +91,7 @@ where
                     src_tree.len.fetch_sub(num_keys_merged, Release);
                     debug!("Source tree external nodes pruned with head {:?}", head_id);
                 }
-                return (num_keys_merged, None);
+                return Ok((num_keys_merged, None));
             } else {
                 error!("Found partial external node in selection");
                 unreachable!();
@@ -138,7 +138,7 @@ where
                 deleted,
                 prune_src,
                 lsm,
-            );
+            )?;
             let mut new_root = None;
             if prune_src {
                 let right_node =
@@ -208,7 +208,7 @@ where
                     }
                 };
             }
-            return (num_keys_merged, new_root);
+            return Ok((num_keys_merged, new_root));
         }
     }
 }
@@ -299,45 +299,45 @@ enum BoundaryStep {
     Retry,
 }
 
-pub fn select_merge_boundary<KS, PS>(node: &NodeCellRef) -> Option<EntryKey>
+pub fn select_merge_boundary<KS, PS>(node: &NodeCellRef) -> ReadResult<Option<EntryKey>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut current = node.clone();
+    let mut budget = node::ReadBudget::new();
     loop {
-        let step = read_node(&current, |node: &NodeReadHandler<KS, PS>| {
-            match &**node {
-                NodeData::External(n) => {
-                    let n = &**n;
-                    let keys = n.keys.to_vec(0..n.len);
-                    #[cfg(test)]
-                    super::revision_tests::after_median_copy();
-                    BoundaryStep::Key(keys.get(keys.len() / 2).cloned())
-                }
-                NodeData::Internal(n) => {
-                    let n = &**n;
-                    let keys = n.keys.to_vec(n.len);
-                    #[cfg(test)]
-                    super::revision_tests::after_median_copy();
-                    if let Some(key) = keys.get(keys.len() / 2) {
-                        BoundaryStep::Key(Some(key.clone()))
-                    } else {
-                        match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
-                            Some(child) => BoundaryStep::Follow(child),
-                            None => BoundaryStep::Retry,
-                        }
+        budget.attempt()?;
+        let step = read_node(&current, |node: &NodeReadHandler<KS, PS>| match &**node {
+            NodeData::External(n) => {
+                let n = &**n;
+                let keys = n.keys.to_vec(0..n.len);
+                #[cfg(test)]
+                super::revision_tests::after_median_copy();
+                BoundaryStep::Key(keys.get(keys.len() / 2).cloned())
+            }
+            NodeData::Internal(n) => {
+                let n = &**n;
+                let keys = n.keys.to_vec(n.len);
+                #[cfg(test)]
+                super::revision_tests::after_median_copy();
+                if let Some(key) = keys.get(keys.len() / 2) {
+                    BoundaryStep::Key(Some(key.clone()))
+                } else {
+                    match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
+                        Some(child) => BoundaryStep::Follow(child),
+                        None => BoundaryStep::Retry,
                     }
                 }
-                NodeData::Empty(n) => match n.right.try_clone_speculative() {
-                    Some(right) => BoundaryStep::Follow(right),
-                    None => BoundaryStep::Retry,
-                },
-                NodeData::None => BoundaryStep::Key(None),
             }
-        });
+            NodeData::Empty(n) => match n.right.try_clone_speculative() {
+                Some(right) => BoundaryStep::Follow(right),
+                None => BoundaryStep::Retry,
+            },
+            NodeData::None => BoundaryStep::Key(None),
+        })?;
         match step {
-            BoundaryStep::Key(key) => return key,
+            BoundaryStep::Key(key) => return Ok(key),
             BoundaryStep::Follow(next) => current = next,
             BoundaryStep::Retry => {}
         }
@@ -350,14 +350,14 @@ pub fn level_merge<KS, PS>(
     dest_tree: &dyn LevelTree,
     deleted: &mut HashSet<EntryKey>,
     prune: bool,
-) -> usize
+) -> ReadResult<usize>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Merging LSM tree level {}", level);
     let root = src_tree.get_root();
-    let key_boundary = select_merge_boundary::<KS, PS>(&root).unwrap();
+    let key_boundary = select_merge_boundary::<KS, PS>(&root)?.unwrap();
     merge_with_boundary(level, src_tree, dest_tree, &key_boundary, deleted, prune)
 }
 
@@ -368,7 +368,7 @@ pub fn merge_with_boundary<KS, PS>(
     key_boundary: &EntryKey,
     deleted: &mut HashSet<EntryKey>,
     prune: bool,
-) -> usize
+) -> ReadResult<usize>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -397,7 +397,7 @@ where
             deleted,
             prune,
             level,
-        );
+        )?;
         debug!("Merged {} keys, pruning: {}", num_keys, prune);
         if let Some(new_root_ref) = new_root {
             debug!("Level merge update source root {:?}", &new_root_ref);
@@ -416,5 +416,5 @@ where
         );
     }
     debug!("MERGE LEVEL {} COMPLETED", level);
-    return num_keys;
+    return Ok(num_keys);
 }

@@ -562,13 +562,13 @@ mod test {
                 let all_keys = all_keys.clone();
                 std::thread::spawn(move || {
                     trace!("Checking {:?}", key);
-                    let mut cursor = tree.seek(&key, Ordering::Forward);
+                    let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
                     assert_eq!(cursor.current().unwrap(), &key);
                     let mut rng = rand::thread_rng();
                     if i > all_keys.len() / 2 && rng.gen_range(0..50) == 1 {
                         for j in i..all_keys.len() {
                             assert_eq!(cursor.current().unwrap(), &all_keys[j]);
-                            cursor.next();
+                            cursor.next().unwrap();
                         }
                         assert!(cursor.current().is_none());
                     }

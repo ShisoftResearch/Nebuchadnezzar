@@ -71,15 +71,15 @@ fn init() {
     let key = EntryKey::from_id(&id);
     info!("test insertion");
     let entry_key = key.clone();
-    tree.insert(&entry_key);
-    let cursor = tree.seek(&key, Ordering::Forward);
+    tree.insert(&entry_key).unwrap();
+    let cursor = tree.seek(&key, Ordering::Forward).unwrap();
     assert_eq!(cursor.current().unwrap().id(), id);
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
-    let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
-    let mut last_key = cursor.next().unwrap(); // Get first item
-    while let Some(current_key) = cursor.next() {
+    let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+    let mut last_key = cursor.next().unwrap().unwrap(); // Get first item
+    while let Some(current_key) = cursor.next().unwrap() {
         let current = &current_key;
         if &last_key > current {
             dump_tree(tree, "error_insert_dump.json");
@@ -119,7 +119,7 @@ fn crd() {
             let id = Id::from_parts(1, n);
             let key = EntryKey::from_id(&id);
             debug!("{}. insert id: {}", i, n);
-            tree.insert(&key);
+            tree.insert(&key).unwrap();
             if roll_die.next().unwrap() == 6 {
                 check_ordering(&tree, &key);
             }
@@ -132,7 +132,7 @@ fn crd() {
 
     {
         debug!("Scanning for sequence");
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
         for i in 0..num {
             let id = cursor.current().unwrap().id();
             let unmatched = i != id.bits();
@@ -151,16 +151,19 @@ fn crd() {
             }
             // next() returns current and advances
             assert!(
-                cursor.next().is_some(),
+                cursor.next().unwrap().is_some(),
                 "next() should return Some for valid position {}",
                 i
             );
         }
         // Cursor should be exhausted after iterating all items
-        assert!(cursor.next().is_none(), "cursor should be exhausted");
+        assert!(
+            cursor.next().unwrap().is_none(),
+            "cursor should be exhausted"
+        );
 
         debug!("Forward scanning for sequence verification");
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
         for i in 0..num {
             let expected = Id::from_parts(1, i);
             debug!("Expecting id {:?}", expected);
@@ -168,13 +171,16 @@ fn crd() {
             assert_eq!(id, expected);
             // next() returns current and advances
             assert!(
-                cursor.next().is_some(),
+                cursor.next().unwrap().is_some(),
                 "next() should return Some for valid position {}",
                 i
             );
         }
         // Cursor should be exhausted
-        assert!(cursor.next().is_none(), "cursor should be exhausted");
+        assert!(
+            cursor.next().unwrap().is_none(),
+            "cursor should be exhausted"
+        );
         assert!(cursor.current().is_none());
     }
 
@@ -182,7 +188,7 @@ fn crd() {
         debug!("Backward scanning for sequence verification");
         // search backward required max possible id
         let entry_key = EntryKey::from_id(&Id::from_parts(::std::u64::MAX, ::std::u64::MAX));
-        let mut cursor = tree.seek(&entry_key, Ordering::Backward);
+        let mut cursor = tree.seek(&entry_key, Ordering::Backward).unwrap();
         for i in (0..num).rev() {
             let expected = Id::from_parts(1, i);
             debug!("Expecting id {:?}", expected);
@@ -190,13 +196,16 @@ fn crd() {
             assert_eq!(id, expected, "{}", i);
             // next() returns current and advances
             assert!(
-                cursor.next().is_some(),
+                cursor.next().unwrap().is_some(),
                 "next() should return Some for valid position {}",
                 i
             );
         }
         // Cursor should be exhausted
-        assert!(cursor.next().is_none(), "cursor should be exhausted");
+        assert!(
+            cursor.next().unwrap().is_none(),
+            "cursor should be exhausted"
+        );
         assert!(cursor.current().is_none());
     }
 
@@ -206,7 +215,11 @@ fn crd() {
             let id = Id::from_parts(1, i);
             let key = EntryKey::from_id(&id);
             assert_eq!(
-                tree.seek(&key, Ordering::default()).current().unwrap().id(),
+                tree.seek(&key, Ordering::default())
+                    .unwrap()
+                    .current()
+                    .unwrap()
+                    .id(),
                 id,
                 "{}",
                 i
@@ -230,7 +243,7 @@ pub fn alternative_insertion_pattern() {
         let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
         debug!("insert {:?}", key);
-        tree.insert(&key);
+        tree.insert(&key).unwrap();
     }
 
     assert!(verification::is_tree_in_order(&tree, 0));
@@ -245,21 +258,21 @@ pub fn alternative_insertion_pattern() {
             continue;
         }
         debug!("checking {:?}", &key);
-        let mut cursor = tree.seek(&key, Ordering::Forward);
+        let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
         for j in i..num {
             let id = Id::from_parts(1, j);
             let key = EntryKey::from_id(&id);
             assert_eq!(cursor.current(), Some(&key));
             // next() returns current and advances, so it's always Some for valid positions
             assert!(
-                cursor.next().is_some(),
+                cursor.next().unwrap().is_some(),
                 "next() should return Some for position {}",
                 j
             );
         }
         // After iterating through all items, cursor should be exhausted
         assert!(
-            cursor.next().is_none(),
+            cursor.next().unwrap().is_none(),
             "cursor should be exhausted after iterating all items"
         );
     }
@@ -294,7 +307,7 @@ fn parallel() {
         let i = *i;
         let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
-        tree.insert(&key);
+        tree.insert(&key).unwrap();
     });
 
     dump_tree(&*tree, "btree_parallel_insertion_dump.json");
@@ -311,7 +324,7 @@ fn parallel() {
         let key = EntryKey::from_id(&id);
         debug!("checking: {}", i);
         {
-            let mut cursor = tree.seek(&key, Ordering::Forward);
+            let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
             assert_eq!(cursor.current(), Some(&key), "{}", i);
             if roll_die.next().unwrap() == 6 {
                 debug!("Scanning {}", num);
@@ -321,7 +334,7 @@ fn parallel() {
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
                     assert!(
-                        cursor.next().is_some(),
+                        cursor.next().unwrap().is_some(),
                         "next() should return Some for position {}/{}",
                         i,
                         j
@@ -329,14 +342,14 @@ fn parallel() {
                 }
                 // Cursor should be exhausted after iterating all items
                 assert!(
-                    cursor.next().is_none(),
+                    cursor.next().unwrap().is_none(),
                     "cursor should be exhausted after scanning from {}",
                     i
                 );
             }
         }
         {
-            let mut cursor = tree.seek(&key, Ordering::Backward);
+            let mut cursor = tree.seek(&key, Ordering::Backward).unwrap();
             assert_eq!(cursor.current(), Some(&key), "{}", i);
             if roll_die.next().unwrap() == 6 {
                 debug!("Scanning {}", num);
@@ -346,7 +359,7 @@ fn parallel() {
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
                     assert!(
-                        cursor.next().is_some(),
+                        cursor.next().unwrap().is_some(),
                         "next() should return Some for position {}/{}",
                         i,
                         j
@@ -354,7 +367,7 @@ fn parallel() {
                 }
                 // Cursor should be exhausted after iterating all items
                 assert!(
-                    cursor.next().is_none(),
+                    cursor.next().unwrap().is_none(),
                     "cursor should be exhausted after scanning backward to {}",
                     i
                 );
@@ -396,7 +409,7 @@ async fn level_merge() {
         let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
         let entry_key = key.clone();
-        tree_1.insert(&entry_key);
+        tree_1.insert(&entry_key).unwrap();
     }
 
     for i in 0..range {
@@ -404,7 +417,7 @@ async fn level_merge() {
         let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
-        tree_2.insert(&key);
+        tree_2.insert(&key).unwrap();
     }
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_before_dump.json");
@@ -414,7 +427,9 @@ async fn level_merge() {
     assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     debug!("MERGING...");
-    let merged = tree_1.merge_to(999, &*tree_2, &mut StdHashSet::new(), true);
+    let merged = tree_1
+        .merge_to(999, &*tree_2, &mut StdHashSet::new(), true)
+        .unwrap();
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
@@ -427,21 +442,27 @@ async fn level_merge() {
         let n2 = i * 2 + 1;
         let id2 = Id::from_parts(1, n2);
         let key2 = EntryKey::from_id(&id2);
-        let key2_cur = tree_2.seek(&key2, Ordering::Forward);
+        let key2_cur = tree_2.seek(&key2, Ordering::Forward).unwrap();
         if (i as usize) < merged {
             let n1 = i * 2;
             let id1 = Id::from_parts(1, n1);
             let key1 = EntryKey::from_id(&id1);
-            let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
+            let mut key1_cur = tree_2.seek(&key1, Ordering::Forward).unwrap();
             assert_eq!(key1_cur.current().unwrap(), &key1);
             // next() returns current (key1) and advances to key2
-            assert!(key1_cur.next().is_some(), "next() should return key1");
+            assert!(
+                key1_cur.next().unwrap().is_some(),
+                "next() should return key1"
+            );
             assert_eq!(key1_cur.current().unwrap(), &key2);
-            assert_ne!(tree_1.seek(&key1, Ordering::Forward).current(), Some(&key1));
+            assert_ne!(
+                tree_1.seek(&key1, Ordering::Forward).unwrap().current(),
+                Some(&key1)
+            );
         }
         assert_eq!(key2_cur.current().unwrap(), &key2);
 
-        tree_2.seek(&key2, Default::default());
+        tree_2.seek(&key2, Default::default()).unwrap();
     }
 }
 
@@ -467,7 +488,7 @@ fn level_merge_insertion() {
         let n = i as u64;
         let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
-        assert!(tree.insert(&key));
+        assert!(tree.insert(&key).unwrap());
     }
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_orig_dump.json");
@@ -479,7 +500,7 @@ fn level_merge_insertion() {
             let n = i as u64;
             let id = Id::from_parts(1, n);
             let key = EntryKey::from_id(&id);
-            assert!(tree_2.insert(&key));
+            assert!(tree_2.insert(&key).unwrap());
         });
     });
 
@@ -495,7 +516,7 @@ fn level_merge_insertion() {
         .sorted()
         .collect();
     let th2 = thread::spawn(move || {
-        tree_3.merge_with_keys(merge_keys);
+        tree_3.merge_with_keys(merge_keys).unwrap();
     });
     th1.join().unwrap();
     th2.join().unwrap();
@@ -508,7 +529,7 @@ fn level_merge_insertion() {
         let n = num as u64;
         let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
-        let cursor = tree.seek(&key, Ordering::Forward);
+        let cursor = tree.seek(&key, Ordering::Forward).unwrap();
         assert_eq!(&key, cursor.current().unwrap());
     }
 }
@@ -578,7 +599,7 @@ fn reconstruct() {
     for n in 0..num {
         let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
-        let cursor = tree.seek(&key, Ordering::Forward);
+        let cursor = tree.seek(&key, Ordering::Forward).unwrap();
         assert_eq!(&key, cursor.current().unwrap());
     }
 }
@@ -672,7 +693,8 @@ fn retaining_every_key_away_leaves_a_writable_tree() {
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new(&deletion_set());
     for i in 1..=(PAGE_SIZE as u64 * 3) {
-        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)))
+            .unwrap();
     }
     // A pivot below every key in the tree: nothing is retained.
     tree.retain_by_key(&*MIN_ENTRY_KEY);
@@ -681,11 +703,11 @@ fn retaining_every_key_away_leaves_a_writable_tree() {
     // takes a write -- a retained-to-nothing tree is reused, not discarded.
     let key = EntryKey::from_id(&Id::from_parts(2, 1));
     assert!(
-        tree.insert(&key),
+        tree.insert(&key).unwrap(),
         "a retained-to-nothing tree must accept a key"
     );
     assert_eq!(
-        tree.seek(&key, Ordering::Forward).current(),
+        tree.seek(&key, Ordering::Forward).unwrap().current(),
         Some(&key),
         "and must be able to find it again"
     );
@@ -710,14 +732,15 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
     for pivot_at in 2..=total {
         let tree = LevelBPlusTree::new(&deletion_set());
         for i in (1..=total).map(|i| i * 2) {
-            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)))
+                .unwrap();
         }
         let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
         tree.retain_by_key(&pivot);
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
         let mut seen = Vec::new();
-        while let Some(key) = cursor.next() {
+        while let Some(key) = cursor.next().unwrap() {
             seen.push(key);
         }
         assert!(
@@ -730,12 +753,12 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
         // strictly inside the retained range.
         let key = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2 - 1));
         assert!(
-            tree.insert(&key),
+            tree.insert(&key).unwrap(),
             "pivot {}: a retained tree must accept a key inside its range",
             pivot_at
         );
         assert_eq!(
-            tree.seek(&key, Ordering::Forward).current(),
+            tree.seek(&key, Ordering::Forward).unwrap().current(),
             Some(&key),
             "pivot {}: and must find it again",
             pivot_at
@@ -769,16 +792,27 @@ fn a_split_off_copy_is_born_in_its_own_slot_not_the_sources() {
     let total = PAGE_SIZE as u64 * 4;
     let tree = LevelBPlusTree::new(&deletion_set());
     for i in (1..=total).map(|i| i * 2) {
-        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)))
+            .unwrap();
     }
     let source_slot = tree.head_id().locality();
     // a home whose slot differs from the source's, so the assertion can fail
     let home = Id::from_parts(u64::from(source_slot) + 1, 7);
     assert_ne!(home.locality(), source_slot);
     let pivot = EntryKey::from_id(&Id::from_parts(1, total));
-    let so = super::split_off::copy_off(&tree, &pivot, &home).expect("keys past the pivot");
-    assert_eq!(so.new_head_id.locality(), home.locality(), "first page in the home slot");
-    assert_ne!(so.new_head_id.locality(), source_slot, "and not in the source's");
+    let so = super::split_off::copy_off(&tree, &pivot, &home)
+        .unwrap()
+        .expect("keys past the pivot");
+    assert_eq!(
+        so.new_head_id.locality(),
+        home.locality(),
+        "first page in the home slot"
+    );
+    assert_ne!(
+        so.new_head_id.locality(),
+        source_slot,
+        "and not in the source's"
+    );
 }
 
 #[test]
@@ -788,16 +822,17 @@ fn copy_split_at_any_pivot_leaves_the_source_writable() {
     for pivot_at in 2..=total {
         let tree = LevelBPlusTree::new(&deletion_set());
         for i in (1..=total).map(|i| i * 2) {
-            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)))
+                .unwrap();
         }
         let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
-        let moved = super::split_off::copy_off(&tree, &pivot, &Id::rand());
+        let moved = super::split_off::copy_off(&tree, &pivot, &Id::rand()).unwrap();
         super::split::retain(&tree, &pivot);
 
         // Whatever moved, the source keeps only keys below the pivot...
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
         let mut seen = Vec::new();
-        while let Some(key) = cursor.next() {
+        while let Some(key) = cursor.next().unwrap() {
             seen.push(key);
         }
         assert!(
@@ -811,12 +846,12 @@ fn copy_split_at_any_pivot_leaves_the_source_writable() {
         // numbers were never inserted, so this key is fresh.
         let key = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2 - 1));
         assert!(
-            tree.insert(&key),
+            tree.insert(&key).unwrap(),
             "pivot {}: the source tree must still accept a key in its range",
             pivot_at
         );
         assert_eq!(
-            tree.seek(&key, Ordering::Forward).current(),
+            tree.seek(&key, Ordering::Forward).unwrap().current(),
             Some(&key),
             "pivot {}: and must find it again",
             pivot_at

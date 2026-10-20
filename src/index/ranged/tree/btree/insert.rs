@@ -192,28 +192,28 @@ pub fn insert_to_tree_node<KS, PS>(
     parent: &NodeCellRef,
     key: &EntryKey,
     level: usize,
-) -> Option<Option<NodeSplit<KS, PS>>>
+) -> ReadResult<Option<Option<NodeSplit<KS, PS>>>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let search = mut_search::<KS, PS>(node_ref, key);
+    let search = mut_search::<KS, PS>(node_ref, key)?;
     let modification = match search {
         MutSearchResult::External => {
             if let Some(insertion) = insert_external_tree_node(tree, node_ref, parent, key) {
                 insertion
             } else {
-                return None;
+                return Ok(None);
             }
         }
         MutSearchResult::Internal(sub_node) => {
-            if let Some(split_res) = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1)
+            if let Some(split_res) = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1)?
             {
                 insert_internal_tree_node(split_res, parent)
             } else {
-                return None;
+                return Ok(None);
             }
         }
     };
-    Some(modification)
+    Ok(Some(modification))
 }

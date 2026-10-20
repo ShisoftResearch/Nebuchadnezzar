@@ -28,7 +28,7 @@ fn key_of(n: u64) -> EntryKey {
 fn backward_seek_on_empty_tree_is_empty() {
     let _ = env_logger::try_init();
     let tree = TinyTree::new(&deletion_set());
-    let cursor = tree.seek(&max_entry_key(), Ordering::Backward);
+    let cursor = tree.seek(&max_entry_key(), Ordering::Backward).unwrap();
     assert_eq!(
         cursor.current(),
         None,
@@ -40,7 +40,7 @@ fn backward_seek_on_empty_tree_is_empty() {
 fn forward_seek_on_empty_tree_is_empty() {
     let _ = env_logger::try_init();
     let tree = TinyTree::new(&deletion_set());
-    let cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
     assert_eq!(cursor.current(), None);
 }
 
@@ -52,18 +52,18 @@ fn merge_existing_key_into_full_page_no_duplicate() {
     let tree = TinyTree::new(&deletion_set());
     // Fill the single root leaf completely: 0, 2, 4, 6, 8
     for n in [0u64, 2, 4, 6, 8] {
-        assert!(tree.insert(&key_of(n)));
+        assert!(tree.insert(&key_of(n)).unwrap());
     }
     // Merge a key that is already present while the page is full.
-    tree.merge_with_keys_(vec![key_of(4)]);
+    tree.merge_with_keys_(vec![key_of(4)]).unwrap();
     assert!(
         verification::is_tree_in_order(&tree, 0),
         "duplicate key introduced by merge split path"
     );
     // Full scan must see each key exactly once.
-    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
     let mut seen = vec![];
-    while let Some(k) = cursor.next() {
+    while let Some(k) = cursor.next().unwrap() {
         seen.push(k);
     }
     let expected: Vec<_> = [0u64, 2, 4, 6, 8].iter().map(|&n| key_of(n)).collect();
@@ -79,11 +79,11 @@ fn backward_seek_gap_key_returns_predecessor() {
     const N: u64 = 200;
     // Insert only even keys; odd keys are gaps.
     for n in 0..N {
-        assert!(tree.insert(&key_of(n * 2)));
+        assert!(tree.insert(&key_of(n * 2)).unwrap());
     }
     for n in 0..N - 1 {
         let gap = key_of(n * 2 + 1); // between 2n and 2n+2
-        let cursor = tree.seek(&gap, Ordering::Backward);
+        let cursor = tree.seek(&gap, Ordering::Backward).unwrap();
         assert_eq!(
             cursor.current(),
             Some(&key_of(n * 2)),
@@ -101,11 +101,11 @@ fn backward_seek_before_min_is_empty() {
     let _ = env_logger::try_init();
     let tree = TinyTree::new(&deletion_set());
     for n in 0..50u64 {
-        assert!(tree.insert(&key_of(n)));
+        assert!(tree.insert(&key_of(n)).unwrap());
     }
     // key_of uses Id::from_parts(1, n); an id with higher=0 sorts before all of them.
     let before_min = EntryKey::from_id(&Id::from_parts(0, 42));
-    let cursor = tree.seek(&before_min, Ordering::Backward);
+    let cursor = tree.seek(&before_min, Ordering::Backward).unwrap();
     assert_eq!(
         cursor.current(),
         None,
@@ -123,7 +123,7 @@ fn concurrent_scan_does_not_skip_keys() {
     const NUM: u64 = 2_000;
     let tree = Arc::new(TinyTree::new(&deletion_set()));
     for n in 0..NUM {
-        assert!(tree.insert(&key_of(n)));
+        assert!(tree.insert(&key_of(n)).unwrap());
     }
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = vec![];
@@ -135,17 +135,17 @@ fn concurrent_scan_does_not_skip_keys() {
             while !stop.load(AtomicOrdering::Relaxed) {
                 // Re-inserting an existing key is a no-op that still write-latches
                 // the leaf, so it churns node versions without changing content.
-                tree.insert(&key_of(n % NUM));
+                tree.insert(&key_of(n % NUM)).unwrap();
                 n += 1;
             }
         }));
     }
     let mut min_count = usize::MAX;
     for _ in 0..300 {
-        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
         let mut count = 0usize;
         let mut last: Option<EntryKey> = None;
-        while let Some(k) = cursor.next() {
+        while let Some(k) = cursor.next().unwrap() {
             if let Some(prev) = &last {
                 assert!(prev < &k, "scan out of order: {:?} >= {:?}", prev, k);
             }
@@ -175,7 +175,7 @@ fn tombstone_compaction_reclaims_set() {
     let tree = TinyTree::new(&deletion);
     const N: u64 = 40;
     for n in 0..N {
-        assert!(tree.insert(&key_of(n)));
+        assert!(tree.insert(&key_of(n)).unwrap());
     }
     // Tombstone the even keys.
     for n in (0..N).step_by(2) {
@@ -208,16 +208,16 @@ fn tombstone_compaction_reclaims_set() {
         );
     }
     // Scan yields exactly the odd keys.
-    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
     let mut seen = vec![];
-    while let Some(k) = cursor.next() {
+    while let Some(k) = cursor.next().unwrap() {
         seen.push(k);
     }
     let expected: Vec<_> = (1..N).step_by(2).map(key_of).collect();
     assert_eq!(seen, expected);
     // Reclaimed keys can be re-inserted and become visible again.
-    assert!(tree.insert(&key_of(0)));
-    let cursor = tree.seek(&key_of(0), Ordering::Forward);
+    assert!(tree.insert(&key_of(0)).unwrap());
+    let cursor = tree.seek(&key_of(0), Ordering::Forward).unwrap();
     assert_eq!(cursor.current(), Some(&key_of(0)));
 }
 
@@ -228,16 +228,16 @@ fn merge_compaction_drops_tombstones() {
     let deletion = deletion_set();
     let tree = TinyTree::new(&deletion);
     for n in [0u64, 2, 4, 6, 8] {
-        assert!(tree.insert(&key_of(n)));
+        assert!(tree.insert(&key_of(n)).unwrap());
     }
     assert!(deletion.insert(key_of(2)));
     assert!(deletion.insert(key_of(6)));
-    tree.merge_with_keys_(vec![key_of(1)]);
+    tree.merge_with_keys_(vec![key_of(1)]).unwrap();
     assert!(!deletion.contains(&key_of(2)));
     assert!(!deletion.contains(&key_of(6)));
-    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
     let mut seen = vec![];
-    while let Some(k) = cursor.next() {
+    while let Some(k) = cursor.next().unwrap() {
         seen.push(k);
     }
     let expected: Vec<_> = [0u64, 1, 4, 8].iter().map(|&n| key_of(n)).collect();
@@ -261,17 +261,17 @@ fn copy_split_partitions_exactly() {
             let deletion = deletion_set();
             let tree = TinyTree::new(&deletion);
             for i in 0..n {
-                assert!(tree.insert(&key_of(i * 2))); // even keys 0,2,4,...
+                assert!(tree.insert(&key_of(i * 2)).unwrap()); // even keys 0,2,4,...
             }
             let pivot = key_of(pivot_n * 2); // may be a real key or a gap
             let orig_len = tree.len();
-            let res = copy_off(&tree, &pivot, &Id::rand());
+            let res = copy_off(&tree, &pivot, &Id::rand()).unwrap();
             super::split::retain(&tree, &pivot);
 
             // Collect the source's remaining keys.
             let mut src_keys = vec![];
-            let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
-            while let Some(k) = c.next() {
+            let mut c = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+            while let Some(k) = c.next().unwrap() {
                 src_keys.push(k);
             }
             assert!(
@@ -302,8 +302,8 @@ fn copy_split_partitions_exactly() {
                     n,
                     pivot_n
                 );
-                let mut c = new_tree.seek(&min_entry_key(), Ordering::Forward);
-                while let Some(k) = c.next() {
+                let mut c = new_tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+                while let Some(k) = c.next().unwrap() {
                     moved_keys.push(k);
                 }
                 assert!(
@@ -361,19 +361,19 @@ fn copy_split_randomized() {
             let k = rng.random_range(0..2000u64);
             if !model.contains(&k) {
                 model.push(k);
-                assert!(tree.insert(&key_of(k)));
+                assert!(tree.insert(&key_of(k)).unwrap());
             }
         }
         model.sort();
         // Pivot: a value in [0, 2001), often between keys.
         let pivot_v = rng.random_range(0..2001u64);
         let pivot = key_of(pivot_v);
-        let res = copy_off(&tree, &pivot, &Id::rand());
+        let res = copy_off(&tree, &pivot, &Id::rand()).unwrap();
         super::split::retain(&tree, &pivot);
 
         let mut src: Vec<u64> = vec![];
-        let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
-        while let Some(k) = c.next() {
+        let mut c = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+        while let Some(k) = c.next().unwrap() {
             src.push(k.id().bits() & ((1u64 << 48) - 1));
         }
         assert!(verification::is_tree_in_order(&tree, 0), "src not in order");
@@ -387,8 +387,8 @@ fn copy_split_randomized() {
                 &deletion,
             );
             assert!(verification::is_tree_in_order(&nt, 0), "moved not in order");
-            let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
-            while let Some(k) = c.next() {
+            let mut c = nt.seek(&min_entry_key(), Ordering::Forward).unwrap();
+            while let Some(k) = c.next().unwrap() {
                 moved.push(k.id().bits() & ((1u64 << 48) - 1));
             }
             assert_eq!(moved.len(), so.moved_len, "moved_len");
@@ -458,9 +458,9 @@ fn copy_split_is_balanced_at_any_pivot() {
         let deletion = deletion_set();
         let tree = TinyTree::new(&deletion);
         for k in &keys {
-            tree.insert(&key_of(*k));
+            tree.insert(&key_of(*k)).unwrap();
         }
-        let Some(so) = copy_off(&tree, &key_of(pivot_v), &Id::rand()) else {
+        let Some(so) = copy_off(&tree, &key_of(pivot_v), &Id::rand()).unwrap() else {
             continue;
         };
         checked += 1;

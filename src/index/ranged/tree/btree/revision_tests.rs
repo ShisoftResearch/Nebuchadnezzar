@@ -2,6 +2,7 @@ use super::*;
 use std::cell::RefCell;
 
 thread_local! {
+    static AFTER_READ_ATTEMPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static AFTER_EXTERNAL_BORROW: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static AFTER_MEDIAN_COPY: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static BEFORE_REF_INCREMENT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
@@ -36,12 +37,12 @@ fn rev1_median_insert_after_empty_copy() {
     let writer = tree.clone();
     AFTER_MEDIAN_COPY.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
-            std::thread::spawn(move || assert!(writer.insert(&key(10))))
+            std::thread::spawn(move || assert!(writer.insert(&key(10)).unwrap()))
                 .join()
                 .unwrap();
         }))
     });
-    assert_eq!(tree.mid_key(), Some(key(10)));
+    assert_eq!(tree.mid_key().unwrap(), Some(key(10)));
 }
 
 #[test]
@@ -72,7 +73,7 @@ fn rev1_median_child_condemned_before_clone() {
         }))
     });
     assert_eq!(
-        level::select_merge_boundary::<Keys, Ptrs>(&root),
+        level::select_merge_boundary::<Keys, Ptrs>(&root).unwrap(),
         Some(key(20))
     );
 }
@@ -93,15 +94,15 @@ pub(super) fn after_external_borrow() {
 
 fn payload_lifetime(cursor_step: bool, clear: bool) {
     let tree = Arc::new(leaf());
-    assert!(tree.insert(&key(10)));
-    assert!(tree.insert(&key(20)));
+    assert!(tree.insert(&key(10)).unwrap());
+    assert!(tree.insert(&key(20)).unwrap());
     let root = tree.get_root();
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     write_node::<Keys, Ptrs>(&root)
         .extnode_mut_no_persist()
         .drop_probe = Some(DropProbe(dropped.clone()));
     let mut cursor = if cursor_step {
-        Some(tree.seek(&key(10), Ordering::Forward))
+        Some(tree.seek(&key(10), Ordering::Forward).unwrap())
     } else {
         None
     };
@@ -126,10 +127,13 @@ fn payload_lifetime(cursor_step: bool, clear: bool) {
         }))
     });
     if let Some(cursor) = &mut cursor {
-        assert_eq!(cursor.next(), Some(key(10)));
+        assert_eq!(cursor.next().unwrap(), Some(key(10)));
         assert_eq!(cursor.current(), None);
     } else {
-        assert_eq!(tree.seek(&key(10), Ordering::Forward).current(), None);
+        assert_eq!(
+            tree.seek(&key(10), Ordering::Forward).unwrap().current(),
+            None
+        );
     }
     for _ in 0..1000 {
         let epoch = crossbeam_epoch::pin();
@@ -166,7 +170,7 @@ fn rev1_payload_cursor_clear() {
 #[test]
 fn rev1_sustained_writer_releases_reader() {
     let tree = leaf();
-    assert!(tree.insert(&key(10)));
+    assert!(tree.insert(&key(10)).unwrap());
     let root = tree.get_root();
     let writer_root = root.clone();
     let (request, requests) = std::sync::mpsc::channel();
@@ -197,4 +201,75 @@ fn rev1_sustained_writer_releases_reader() {
         result.is_ok(),
         "reader did not return during sustained version changes"
     );
+    assert_eq!(result.unwrap(), Err(ReadRetryExhausted));
+    assert_eq!(attempts, READ_RETRY_LIMIT);
+}
+
+pub(crate) fn install_sustained_writer<KS, PS>(root: NodeCellRef)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    AFTER_EXTERNAL_BORROW.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = root.clone();
+            std::thread::spawn(move || drop(write_node::<KS, PS>(&writer)))
+                .join()
+                .unwrap();
+            install_sustained_writer::<KS, PS>(root);
+        }))
+    });
+}
+
+#[test]
+fn rev1_seek_reports_retry_exhaustion() {
+    let tree = leaf();
+    assert!(tree.insert(&key(10)).unwrap());
+    install_sustained_writer::<Keys, Ptrs>(tree.get_root());
+    assert!(matches!(
+        tree.seek(&key(10), Ordering::Forward),
+        Err(ReadRetryExhausted)
+    ));
+    AFTER_EXTERNAL_BORROW.with(|hook| *hook.borrow_mut() = None);
+    assert!(!crossbeam_epoch::is_pinned());
+}
+
+#[test]
+fn rev1_cursor_reports_retry_exhaustion() {
+    let tree = leaf();
+    assert!(tree.insert(&key(10)).unwrap());
+    let mut cursor = tree.seek(&key(10), Ordering::Forward).unwrap();
+    install_sustained_writer::<Keys, Ptrs>(tree.get_root());
+    assert_eq!(cursor.next(), Err(ReadRetryExhausted));
+    AFTER_EXTERNAL_BORROW.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!(cursor.current(), Some(&key(10)));
+    assert!(!crossbeam_epoch::is_pinned());
+}
+
+pub(crate) fn clear_writer_hook() {
+    AFTER_READ_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+    AFTER_EXTERNAL_BORROW.with(|hook| *hook.borrow_mut() = None);
+}
+
+pub(super) fn after_read_attempt() {
+    let action = AFTER_READ_ATTEMPT.with(|hook| hook.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+pub(crate) fn install_version_writer<KS, PS>(root: NodeCellRef)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    AFTER_READ_ATTEMPT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = root.clone();
+            std::thread::spawn(move || drop(write_node::<KS, PS>(&writer)))
+                .join()
+                .unwrap();
+            install_version_writer::<KS, PS>(root);
+        }))
+    });
 }

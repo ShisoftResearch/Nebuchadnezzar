@@ -524,10 +524,39 @@ where
     unsafe { &*node.deref::<KS, PS>().data.get() }
 }
 
+/// Maximum attempts in a read or traversal budget.
+pub const READ_RETRY_LIMIT: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadRetryExhausted;
+
+impl std::fmt::Display for ReadRetryExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("B-tree optimistic read retry budget exhausted")
+    }
+}
+impl std::error::Error for ReadRetryExhausted {}
+
+pub type ReadResult<T> = Result<T, ReadRetryExhausted>;
+
+pub(super) struct ReadBudget(usize);
+impl ReadBudget {
+    pub(super) fn new() -> Self {
+        Self(READ_RETRY_LIMIT)
+    }
+    pub(super) fn attempt(&mut self) -> ReadResult<()> {
+        if self.0 == 0 {
+            return Err(ReadRetryExhausted);
+        }
+        self.0 -= 1;
+        Ok(())
+    }
+}
+
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
     node: &NodeCellRef,
     mut func: F,
-) -> R
+) -> ReadResult<R>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -539,38 +568,39 @@ where
     let _epoch = crossbeam_epoch::pin();
     let mut handler = read_unchecked(node);
     if node.is_default() || handler.is_none() {
-        return func(&handler);
+        return Ok(func(&handler));
     }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
-    // This loop inlines into every search: latched forever means readers
-    // spin here at 100% CPU with no outer counter ever advancing (the
-    // 2026-08-30 sidecar-import hang). Count, warn, then yield -- while
-    // pinned, an eternal spin also stalls epoch reclamation for everyone.
+    // Version changes and latch waits have separate finite budgets.
+    // Both errors leave this scope and release its epoch pin.
     let mut spins: u64 = 0;
+    let mut budget = ReadBudget::new();
     loop {
         let cc_num = cc.load(Acquire);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
             spins += 1;
+            if spins >= STUCK_LATCH_YIELD_SPINS {
+                return Err(ReadRetryExhausted);
+            }
             if spins.is_power_of_two() && spins >= STUCK_LATCH_WARN_SPINS {
                 warn!(
                     "read_node has waited {} rounds for the latch on {:?} (cc {:#x}): holder is not releasing",
                     spins, node, cc_num
                 );
             }
-            if spins >= STUCK_LATCH_YIELD_SPINS {
-                backoff.snooze();
-            } else {
-                backoff.spin();
-            }
+            backoff.spin();
             continue;
         }
+        budget.attempt()?;
         handler.version = cc_num & (!LATCH_FLAG);
         let res = func(&handler);
+        #[cfg(test)]
+        super::revision_tests::after_read_attempt();
         let new_cc_num = cc.load(Acquire);
         // Check the version. If not found need to retry
         if new_cc_num == cc_num {
-            return res;
+            return Ok(res);
         }
     }
 }

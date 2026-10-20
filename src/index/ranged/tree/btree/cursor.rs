@@ -137,18 +137,19 @@ where
     // Settle the initial position, moving to the following page or past a
     // deleted seek hit as needed. Called once, outside any read closure.
     // Keys materialize lazily on access.
-    pub(super) fn initialize(&mut self) {
+    pub(super) fn initialize(&mut self) -> ReadResult<()> {
         if self.lazy {
             // Snapshot-time verdict from the seek closure; iteration relies
             // on snapshot-time filtering throughout.
             if self.current_deleted {
-                self.advance(true);
+                self.advance(true)?;
             }
-            return;
+            return Ok(());
         }
-        if self.index >= self.keys.len() && !self.load_following_page() {
+        if self.index >= self.keys.len() && !self.load_following_page()? {
             self.page = None;
         }
+        Ok(())
     }
 
     // Fill the current-key cache from the snapshot. At most one write per
@@ -174,13 +175,13 @@ where
         ordering: Ordering,
         deletion: &DeletionSet,
         filter_deleted: bool,
-    ) -> PageSnap {
+    ) -> ReadResult<PageSnap> {
         if page_ref.is_default() {
-            return PageSnap::End;
+            return Ok(PageSnap::End);
         }
         read_node(page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
-                    let n = &**n;
+                let n = &**n;
                 #[cfg(test)]
                 super::revision_tests::after_external_borrow();
                 let follow_src = match ordering {
@@ -231,15 +232,17 @@ where
     // Move the snapshot to the next page in iteration direction. Returns false
     // when the chain ends; on success `index` points at the first candidate of
     // the new snapshot.
-    fn load_following_page(&mut self) -> bool {
-        let mut follow = mem::take(&mut self.follow);
+    fn load_following_page(&mut self) -> ReadResult<bool> {
+        let mut follow = self.follow.clone();
+        let mut budget = node::ReadBudget::new();
         loop {
-            match Self::read_page(&follow, self.ordering, &self.deletion, self.filter_deleted) {
+            budget.attempt()?;
+            match Self::read_page(&follow, self.ordering, &self.deletion, self.filter_deleted)? {
                 PageSnap::Retry => continue,
-                PageSnap::End => return false,
+                PageSnap::End => return Ok(false),
                 PageSnap::Skip(next) => {
                     if next.is_default() {
-                        return false;
+                        return Ok(false);
                     }
                     follow = next;
                 }
@@ -252,7 +255,7 @@ where
                     self.keys = keys;
                     self.page = Some(follow);
                     self.follow = next_follow;
-                    return true;
+                    return Ok(true);
                 }
             }
         }
@@ -262,17 +265,18 @@ where
     // iteration direction. Runs once per lazy cursor, on first advance. The
     // position is re-derived from the current key, which keeps the snapshot
     // correct even if the page changed since the seek.
-    fn materialize_tail(&mut self) {
-        self.lazy = false;
+    fn materialize_tail(&mut self) -> ReadResult<()> {
         let cur = match self.current.get_mut() {
             Some(k) => k.clone(),
-            None => return,
+            None => return Ok(()),
         };
         let page_ref = match &self.page {
             Some(r) => r.clone(),
-            None => return,
+            None => return Ok(()),
         };
+        let mut budget = node::ReadBudget::new();
         let snap = loop {
+            budget.attempt()?;
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
                 &NodeData::External(ref n) => {
                     let n = &**n;
@@ -333,12 +337,13 @@ where
                 }
                 &NodeData::None => PageSnap::End,
                 &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
-            });
+            })?;
             match attempt {
                 PageSnap::Retry => continue,
                 other => break other,
             }
         };
+        self.lazy = false;
         match snap {
             PageSnap::Page(keys, follow) => {
                 // Sentinel positions: "before the first" for Forward (wraps to
@@ -366,13 +371,14 @@ where
             // The retry loop above never breaks with Retry.
             PageSnap::Retry => unreachable!(),
         }
+        Ok(())
     }
 
     // Move to the following position. `materialize` pre-fills the key cache
     // (the full-key iteration hot path); id-only traversal skips it.
-    fn advance(&mut self, materialize: bool) {
+    fn advance(&mut self, materialize: bool) -> ReadResult<()> {
         if self.lazy {
-            self.materialize_tail();
+            self.materialize_tail()?;
         }
         *self.current.get_mut() = None;
         loop {
@@ -396,18 +402,18 @@ where
                     }
                 }
             };
-            if !stepped && !self.load_following_page() {
+            if !stepped && !self.load_following_page()? {
                 self.keys = SnapKeys::empty();
                 self.index = 0;
                 self.page = None;
-                return;
+                return Ok(());
             }
             // Snapshots are filtered against the deletion set when they are
             // taken; no per-yield lookup is needed.
             if materialize {
                 *self.current.get_mut() = Some(self.keys.key(self.index));
             }
-            return;
+            return Ok(());
         }
     }
 }
@@ -418,11 +424,11 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // Returns the current key and advances to the following one.
-    fn next(&mut self) -> Option<EntryKey> {
+    fn next(&mut self) -> ReadResult<Option<EntryKey>> {
         if self.lazy && self.current.get_mut().is_some() {
             // Materialize while the anchor key is still set; it anchors the
             // deferred page read.
-            self.materialize_tail();
+            self.materialize_tail()?;
         }
         // The cache is eagerly refilled by advance(true) on this path, so
         // the take is a plain move; the build fallback covers a cursor that
@@ -433,14 +439,14 @@ where
             None => None,
         };
         if out.is_some() {
-            self.advance(true);
+            self.advance(true)?;
         }
-        out
+        Ok(out)
     }
 
     // Id-only traversal: skips full key materialization for packed
     // snapshots (the id is extracted straight from the suffix bytes).
-    fn next_id(&mut self) -> Option<Id> {
+    fn next_id(&mut self) -> ReadResult<Option<Id>> {
         let id = if let Some(k) = self.current.get_mut() {
             Some(k.id())
         } else if self.index < self.keys.len() {
@@ -452,9 +458,9 @@ where
             None
         };
         if id.is_some() {
-            self.advance(false);
+            self.advance(false)?;
         }
-        id
+        Ok(id)
     }
 
     fn current(&self) -> Option<&EntryKey> {

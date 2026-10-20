@@ -22,7 +22,7 @@ pub fn search_node<KS, PS>(
     ordering: Ordering,
     deletion: &Arc<DeletionSet>,
     filter_deleted: bool,
-) -> RTCursor<KS, PS>
+) -> ReadResult<RTCursor<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -34,7 +34,9 @@ where
     // mid-write, say -- used to spin here silently forever, pinning the
     // thread. Say so, periodically, so the hang has a name.
     let mut spins: u64 = 0;
+    let mut budget = node::ReadBudget::new();
     loop {
+        budget.attempt()?;
         // The closure must stay free of side effects: read_node re-runs it when
         // the node version changes under a concurrent writer.
         let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
@@ -205,11 +207,11 @@ where
                 )),
                 &NodeData::None => Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted)),
             }
-        });
+        })?;
         match r {
             Ok(mut cursor) => {
-                cursor.initialize();
-                return cursor;
+                cursor.initialize()?;
+                return Ok(cursor);
             }
             Err(SearchError::InvalidPosition { pos, len }) => {
                 panic!("validated internal search position {pos} exceeds key count {len}");
@@ -249,7 +251,7 @@ mod position_tests {
     fn internal_split_during_search_retries_before_checking_position() {
         let deletion = Arc::new(DeletionSet::with_capacity(16));
         let leaf = BPlusTree::<Keys, Ptrs>::new(&deletion);
-        assert!(leaf.insert(&key(55)));
+        assert!(leaf.insert(&key(55)).unwrap());
         let mut internal = InNode::<Keys, Ptrs>::new(5, max_entry_key());
         internal.keys = InternalKeys::from_keys(&[key(10), key(20), key(30), key(40), key(50)]);
         Slice::as_slice(&mut internal.ptrs)[5] = leaf.get_root();
@@ -277,10 +279,11 @@ mod position_tests {
                 .unwrap();
             }));
         });
-        let cursor = search_node::<Keys, Ptrs>(&root, &key(55), Ordering::Forward, &deletion, true);
+        let cursor =
+            search_node::<Keys, Ptrs>(&root, &key(55), Ordering::Forward, &deletion, true).unwrap();
         assert_eq!(cursor.current(), Some(&key(55)));
         assert_eq!(
-            read_node(&root, |n: &NodeReadHandler<Keys, Ptrs>| n.innode().len),
+            read_node(&root, |n: &NodeReadHandler<Keys, Ptrs>| n.innode().len).unwrap(),
             3
         );
     }
@@ -291,7 +294,7 @@ pub enum MutSearchResult {
     Internal(NodeCellRef),
 }
 
-pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> MutSearchResult
+pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> ReadResult<MutSearchResult>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -302,7 +305,9 @@ where
     // Same discipline as search_node: a condemned pointer that never heals
     // must not become a silent forever-spin.
     let mut spins: u64 = 0;
+    let mut budget = node::ReadBudget::new();
     loop {
+        budget.attempt()?;
         match read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::Internal(ref n) => {
                 let pos = match n.search_unwindable(key) {
@@ -323,8 +328,8 @@ where
                 .try_clone_speculative()
                 .unwrap_or_else(|| node_ref.clone())),
             &NodeData::None => unreachable!(),
-        }) {
-            Ok(res) => return res,
+        })? {
+            Ok(res) => return Ok(res),
             Err(e) => {
                 other_ref = e;
                 node_ref = &other_ref;
@@ -345,22 +350,31 @@ where
     }
 }
 
-pub fn mut_first<KS, PS>(node_ref: &NodeCellRef) -> MutSearchResult
+pub fn mut_first<KS, PS>(node_ref: &NodeCellRef) -> ReadResult<MutSearchResult>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
-        &NodeData::Internal(ref n) => match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
-            Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
-            None => Err(node_ref.clone()),
-        },
-        &NodeData::External(_) => Ok(MutSearchResult::External),
-        &NodeData::Empty(ref n) => Err(n
-            .right
-            .try_clone_speculative()
-            .unwrap_or_else(|| node_ref.clone())),
-        &NodeData::None => unreachable!(),
-    });
-    res.unwrap_or_else(|e| mut_first::<KS, PS>(&e))
+    let mut current = node_ref.clone();
+    let mut budget = node::ReadBudget::new();
+    loop {
+        budget.attempt()?;
+        let res = read_node(&current, |node: &NodeReadHandler<KS, PS>| match &**node {
+            &NodeData::Internal(ref n) => match n.ptrs.as_slice_immute()[0].try_clone_speculative()
+            {
+                Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
+                None => Err(current.clone()),
+            },
+            &NodeData::External(_) => Ok(MutSearchResult::External),
+            &NodeData::Empty(ref n) => Err(n
+                .right
+                .try_clone_speculative()
+                .unwrap_or_else(|| current.clone())),
+            &NodeData::None => unreachable!(),
+        })?;
+        match res {
+            Ok(found) => return Ok(found),
+            Err(next) => current = next,
+        }
+    }
 }
