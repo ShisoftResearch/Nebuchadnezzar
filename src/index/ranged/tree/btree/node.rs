@@ -524,6 +524,28 @@ where
     unsafe { &*node.deref::<KS, PS>().data.get() }
 }
 
+const OPTIMISTIC_READ_RETRIES: usize = 8;
+
+// This guard reuses the node's existing exclusive latch for a read-only
+// attempt. Releasing it preserves the version because no data changed.
+struct NodeReadLatch<KS, PS>(NodeWriteGuard<KS, PS>)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static;
+
+impl<KS, PS> Drop for NodeReadLatch<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn drop(&mut self) {
+        if !self.0.cc.is_null() {
+            unsafe { (*self.0.cc).store(self.0.version, Release); }
+            self.0.cc = ptr::null();
+        }
+    }
+}
+
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
     node: &NodeCellRef,
     mut func: F,
@@ -548,7 +570,13 @@ where
     // 2026-08-30 sidecar-import hang). Count, warn, then yield -- while
     // pinned, an eternal spin also stalls epoch reclamation for everyone.
     let mut spins: u64 = 0;
+    let mut failed_validations = 0;
     loop {
+        if failed_validations == OPTIMISTIC_READ_RETRIES {
+            let latch = NodeReadLatch(write_node::<KS, PS>(node));
+            handler.version = latch.0.version;
+            return func(&handler);
+        }
         let cc_num = cc.load(Acquire);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
             #[cfg(test)]
@@ -574,6 +602,7 @@ where
         if new_cc_num == cc_num {
             return res;
         }
+        failed_validations += 1;
     }
 }
 
