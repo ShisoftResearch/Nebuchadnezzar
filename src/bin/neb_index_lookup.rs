@@ -70,6 +70,26 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
+    let only = std::env::var("INDEX_LOOKUP_ONLY").ok();
+    if let Some(row) = only.as_deref() {
+        assert!(
+            matches!(
+                row,
+                "hash_point"
+                    | "range_full"
+                    | "range_limit"
+                    | "range_ids"
+                    | "range_ids_limit"
+                    | "range_count"
+                    | "hash_ids"
+                    | "hash_ids_limit"
+                    | "hash_count"
+                    | "range_rows"
+            ),
+            "unknown lookup row: {row}"
+        );
+    }
+    let enabled = |row: &str| only.as_deref().is_none_or(|selected| selected == row);
     assert!(count >= 128 && count % 4 == 0);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -127,25 +147,30 @@ async fn main() {
         assert_eq!(ids(&indexed, "price", None).await, count / 4);
         assert_eq!(ids(&indexed, "region", None).await, count / 4);
     }
-    let began = Instant::now();
-    let points = rounds * 128;
-    for i in 0..points {
-        let n = i % count;
-        let found = indexed
-            .hashed_query(
-                SchemaUid(SCHEMA),
-                hash_str("sku"),
-                &OwnedValue::U64(n as u64),
-                verify(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(found, vec![Id::from_parts(3, 100 + n as u64)]);
-        std::hint::black_box(found);
+    if enabled("hash_point") {
+        let began = Instant::now();
+        let points = rounds * 128;
+        for i in 0..points {
+            let n = i % count;
+            let found = indexed
+                .hashed_query(
+                    SchemaUid(SCHEMA),
+                    hash_str("sku"),
+                    &OwnedValue::U64(n as u64),
+                    verify(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found, vec![Id::from_parts(3, 100 + n as u64)]);
+            std::hint::black_box(found);
+        }
+        emit("hash_point", points, began);
     }
-    emit("hash_point", points, began);
     for (label, limit) in [("range_full", None), ("range_limit", Some(32))] {
+        if !enabled(label) {
+            continue;
+        }
         let feature = OwnedValue::U64(0).feature();
         let ranged = client.ranged();
         let began = Instant::now();
@@ -177,6 +202,9 @@ async fn main() {
     }
     for (field, prefix) in [("price", "range"), ("region", "hash")] {
         for (suffix, limit) in [("ids", None), ("ids_limit", Some(32))] {
+            if !enabled(&format!("{prefix}_{suffix}")) {
+                continue;
+            }
             let began = Instant::now();
             for _ in 0..rounds {
                 assert_eq!(
@@ -186,63 +214,67 @@ async fn main() {
             }
             emit(&format!("{prefix}_{suffix}"), rounds, began);
         }
+        if enabled(&format!("{prefix}_count")) {
+            let began = Instant::now();
+            for _ in 0..rounds {
+                let mut cursor = indexed
+                    .aggregate(
+                        SchemaUid(SCHEMA),
+                        AggregateQuery {
+                            selection: eq(field, 0),
+                            group_by_fields: vec![],
+                            aggregates: vec![AggregateSpec {
+                                func: AggregateFunction::CountStar,
+                                field_id: None,
+                                alias: "count".into(),
+                            }],
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                        },
+                        vec![ProjectionItem::Aggregate {
+                            alias: "count".into(),
+                            output_name: None,
+                        }],
+                        verify(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    cursor.next().await.unwrap().unwrap().columns[0].1,
+                    OwnedValue::U64((count / 4) as u64)
+                );
+            }
+            emit(&format!("{prefix}_count"), rounds, began);
+        }
+    }
+    if enabled("range_rows") {
+        let feature = OwnedValue::U64(0).feature();
         let began = Instant::now();
         for _ in 0..rounds {
             let mut cursor = indexed
-                .aggregate(
+                .range_index_scan(
                     SchemaUid(SCHEMA),
-                    AggregateQuery {
-                        selection: eq(field, 0),
-                        group_by_fields: vec![],
-                        aggregates: vec![AggregateSpec {
-                            func: AggregateFunction::CountStar,
-                            field_id: None,
-                            alias: "count".into(),
-                        }],
-                        order_by: None,
-                        limit: None,
-                        offset: None,
+                    hash_str("price"),
+                    ValueRange {
+                        start: ValueRangeTerm::Inclusive(feature),
+                        end: ValueRangeTerm::Inclusive(feature),
                     },
-                    vec![ProjectionItem::Aggregate {
-                        alias: "count".into(),
-                        output_name: None,
-                    }],
-                    verify(),
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    neb::index::ranged::tree::btree::Ordering::Forward,
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                cursor.next().await.unwrap().unwrap().columns[0].1,
-                OwnedValue::U64((count / 4) as u64)
-            );
+            let mut hits = 0;
+            while let Some(cell) = cursor.next().await.unwrap() {
+                assert_eq!(cell[hash_str("price")], OwnedValue::U64(0));
+                hits += 1;
+            }
+            assert_eq!(hits, count / 4);
         }
-        emit(&format!("{prefix}_count"), rounds, began);
+        emit("range_rows", rounds, began);
     }
-    let feature = OwnedValue::U64(0).feature();
-    let began = Instant::now();
-    for _ in 0..rounds {
-        let mut cursor = indexed
-            .range_index_scan(
-                SchemaUid(SCHEMA),
-                hash_str("price"),
-                ValueRange {
-                    start: ValueRangeTerm::Inclusive(feature),
-                    end: ValueRangeTerm::Inclusive(feature),
-                },
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                neb::index::ranged::tree::btree::Ordering::Forward,
-            )
-            .await
-            .unwrap();
-        let mut hits = 0;
-        while let Some(cell) = cursor.next().await.unwrap() {
-            assert_eq!(cell[hash_str("price")], OwnedValue::U64(0));
-            hits += 1;
-        }
-        assert_eq!(hits, count / 4);
-    }
-    emit("range_rows", rounds, began);
     server.shutdown().await;
 }
