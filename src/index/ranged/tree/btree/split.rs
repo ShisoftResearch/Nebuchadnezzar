@@ -105,7 +105,7 @@ where
             // external node with no keys is exactly what a fresh tree's root
             // is, so the tree stays readable and writable with nothing in it.
             if key_index == 0 && !is_level_head {
-                *node = NodeData::Empty(Box::new(Default::default()));
+                node.replace_data(NodeData::Empty(Box::new(Default::default())));
             } else {
                 // min: a pivot past every key here keeps them all.
                 n.len = key_index.min(origin_node_len);
@@ -131,7 +131,7 @@ where
                 let node_id = node.ext_id();
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
-                *node = NodeData::Empty(Box::new(Default::default()));
+                node.replace_data(NodeData::Empty(Box::new(Default::default())));
                 make_deleted::<KS, PS>(&node_id, tree);
             }
             tree.len.fetch_sub(num_removed_keys, Release);
@@ -181,15 +181,15 @@ where
                     // which is how a retained-to-one-child root panicked.
                     innode.len = 0;
                 } else if kept_children == 0 {
-                    *node = NodeData::Empty(Box::new(Default::default()));
+                    node.replace_data(NodeData::Empty(Box::new(Default::default())));
                 } else if kept_children == 1 {
                     // This internal node now has a single live child and no separator
                     // keys. Represent it as a bypass Empty node, matching merge behavior.
                     let child = innode.ptrs.as_slice_immute()[0].clone();
-                    *node = NodeData::Empty(Box::new(EmptyNode {
+                    node.replace_data(NodeData::Empty(Box::new(EmptyNode {
                         left: Some(child.clone()),
                         right: child,
-                    }));
+                    })));
                 } else {
                     debug_assert_eq!(Some(index), expected_index);
                     innode.len = kept_children - 1;
@@ -200,7 +200,7 @@ where
             while !right_node_ref.is_default() {
                 let mut node = write_node::<KS, PS>(&right_node_ref);
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
-                *node = NodeData::Empty(Box::new(Default::default()));
+                node.replace_data(NodeData::Empty(Box::new(Default::default())));
             }
             child_kept || index > 0
         }

@@ -391,7 +391,22 @@ where
     // owner-generation scheme in docs/ranged-index-robustness-plan.md
     // proposal 2: detachment is one-way, so a plain bool carries it.
     pub(super) detached: std::sync::atomic::AtomicBool,
-    data: UnsafeCell<NodeData<KS, PS>>,
+    // The descriptor's tag and box pointer never change after publication.
+    // Writers change payload fields under the existing node latch.
+    data: std::sync::atomic::AtomicPtr<NodeData<KS, PS>>,
+}
+
+impl<KS, PS> Drop for Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn drop(&mut self) {
+        // Node destruction already waits for pinned readers.
+        unsafe {
+            drop(Box::from_raw(*self.data.get_mut()));
+        }
+    }
 }
 
 impl<KS, PS> Node<KS, PS>
@@ -401,7 +416,7 @@ where
 {
     pub fn new(data: NodeData<KS, PS>) -> Self {
         Node {
-            data: UnsafeCell::new(data),
+            data: std::sync::atomic::AtomicPtr::new(Box::into_raw(Box::new(data))),
             cc: AtomicUsize::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             persisted: std::sync::atomic::AtomicBool::new(false),
@@ -471,7 +486,7 @@ where
                 node.capture_backtrace();
             }
             return NodeWriteGuard {
-                data: node_deref.data.get(),
+                data: node_deref.data.load(Acquire),
                 cc: &node_deref.cc as *const AtomicUsize,
                 version: node_version(cc_num),
                 node_ref: node.clone(),
@@ -521,7 +536,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    unsafe { &*node.deref::<KS, PS>().data.get() }
+    unsafe { &*node.deref::<KS, PS>().data.load(Acquire) }
 }
 
 const OPTIMISTIC_READ_RETRIES: usize = 8;
@@ -560,7 +575,8 @@ where
     // (docs/tla/SeqlockReclaim.tla).
     let _epoch = crossbeam_epoch::pin();
     let mut handler = read_unchecked(node);
-    if node.is_default() || handler.is_none() {
+    if node.is_default() {
+        handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
         return func(&handler);
     }
     let cc = &node.deref::<KS, PS>().cc;
@@ -575,6 +591,7 @@ where
         if failed_validations == OPTIMISTIC_READ_RETRIES {
             let latch = NodeReadLatch(write_node::<KS, PS>(node));
             handler.version = latch.0.version;
+            handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
             return func(&handler);
         }
         let cc_num = cc.load(Acquire);
@@ -596,6 +613,7 @@ where
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
+        handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
         let res = func(&handler);
         let new_cc_num = cc.load(Acquire);
         // Check the version. If not found need to retry
@@ -613,6 +631,7 @@ where
 {
     NodeReadHandler {
         version: 0,
+        snapshot: ptr::null(),
         node_ref: node.clone(),
         mark: PhantomData,
     }
@@ -647,6 +666,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // Replace a descriptor with replace_data; do not assign a new variant
+    // through this reference. Published descriptor slots stay immutable.
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
         assert!(!self.data.is_null());
         unsafe { &mut *self.data }
@@ -701,15 +722,19 @@ where
     // Readers can retain references to the old payload until validation.
     // Retire that payload through the same epoch that protects node reads.
     pub(super) fn replace_data(&mut self, replacement: NodeData<KS, PS>) {
-        let old = mem::replace(unsafe { &mut *self.data }, replacement);
+        let published = Box::into_raw(Box::new(replacement));
+        let old = self.node_ref.deref::<KS, PS>().data.swap(published, AcqRel);
+        self.data = published;
         let epoch = crossbeam_epoch::pin();
         #[cfg(test)]
         let retirement = super::revision_tests::track_retirement();
-        unsafe { epoch.defer_unchecked(move || {
-            #[cfg(test)]
-            let _retirement = retirement;
-            drop(old);
-        }); }
+        unsafe {
+            epoch.defer_unchecked(move || {
+                #[cfg(test)]
+                let _retirement = retirement;
+                drop(Box::from_raw(old));
+            });
+        }
     }
 
     // make an empty node as empty node, right node pointer covered
@@ -840,7 +865,7 @@ where
     }
 
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef> {
-        let node = self.data.get().as_mut().unwrap();
+        let node = self.data.load(Acquire).as_mut().unwrap();
         let mut res = vec![];
         if !node.is_none() && !node.is_empty() && node.is_internal() {
             for ptr in node.ptrs_mut() {
@@ -892,9 +917,24 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub version: usize,
+    // A non-null snapshot is valid only inside read_node's pinned scope.
+    snapshot: *const NodeData<KS, PS>,
     node_ref: NodeCellRef,
     mark: PhantomData<(KS, PS)>,
 }
+
+// Only read_node sets a snapshot, and it never moves its handler out of
+// the pinned scope. Unchecked handlers retain the owned node reference.
+unsafe impl<KS, PS> Send for NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{}
+unsafe impl<KS, PS> Sync for NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{}
 
 impl<KS, PS> Deref for NodeReadHandler<KS, PS>
 where
@@ -904,7 +944,12 @@ where
     type Target = NodeData<KS, PS>;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        unsafe { &*self.node_ref.deref().data.get() }
+        let data = if self.snapshot.is_null() {
+            self.node_ref.deref::<KS, PS>().data.load(Acquire)
+        } else {
+            self.snapshot
+        };
+        unsafe { &*data }
     }
 }
 
@@ -932,6 +977,7 @@ where
     fn default() -> Self {
         Self {
             version: 0,
+            snapshot: ptr::null(),
             node_ref: Default::default(),
             mark: PhantomData,
         }

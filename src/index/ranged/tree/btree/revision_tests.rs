@@ -171,6 +171,7 @@ fn rev1_sustained_writer_releases_reader() {
     let tree = leaf();
     assert!(tree.insert(&key(10)));
     let root = tree.get_root();
+    let initial_version = root.deref::<Keys, Ptrs>().version();
     let writer_root = root.clone();
     let (request, requests) = std::sync::mpsc::channel();
     let (started, starts) = std::sync::mpsc::channel();
@@ -221,6 +222,10 @@ fn rev1_sustained_writer_releases_reader() {
     assert_eq!(result.unwrap(), key(10 + attempts - 1));
     assert_eq!(writes, attempts);
     assert_eq!(attempts, 9);
+    assert_eq!(
+        root.deref::<Keys, Ptrs>().version(),
+        initial_version + writes as usize
+    );
 }
 
 pub(super) fn after_internal_borrow<KS, PS>(slot: &Box<InNode<KS, PS>>)
