@@ -405,12 +405,6 @@ impl ClientCursor {
                     .seek(tree.id, range, &self.pattern, self.buffer_size, tree.epoch)
                     .await?;
                 match seek_res {
-                    OpResult::ReadRetryExhausted => {
-                        return Err(bifrost::rpc::RPCError::IOError(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            crate::index::ranged::tree::btree::ReadRetryExhausted,
-                        )))
-                    }
                     OpResult::Successful(block) => {
                         if trace_refill {
                             debug!(

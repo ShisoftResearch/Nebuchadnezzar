@@ -47,16 +47,6 @@ pub enum OpResult<T> {
     OutOfBound,
     EpochMissMatch(u64, u64),
     Migrating,
-    ReadRetryExhausted,
-}
-
-macro_rules! read_or_return {
-    ($read:expr) => {
-        match $read {
-            Ok(value) => value,
-            Err(_) => return OpResult::ReadRetryExhausted,
-        }
-    };
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -350,15 +340,13 @@ fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: SchemaUid,
 
     let missing_id = Id::from_bits(gap.0.bits() + 1);
     let probe_key = EntryKey::for_scannable(&missing_id, schema_id);
-    let Ok(mut cursor) = tree.seek(&probe_key, Ordering::Forward) else {
-        return;
-    };
+    let mut cursor = tree.seek(&probe_key, Ordering::Forward);
     let mut seen = Vec::new();
     if let Some(current) = cursor.current() {
         seen.push(current.id());
     }
     while seen.len() < 4 {
-        let Ok(Some(next)) = cursor.next() else {
+        let Some(next) = cursor.next() else {
             break;
         };
         if seen.last() != Some(&next.id()) {
@@ -502,7 +490,12 @@ impl Service for TreeService {
 
     fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, entry, epoch, true, move |entry, tree, _dist_prop| {
-            OpResult::Successful(read_or_return!(tree.insert(&entry)))
+            let inserted = tree.insert(&entry);
+            if inserted {
+                OpResult::Successful(true)
+            } else {
+                OpResult::Successful(false)
+            }
         })
     }
 
@@ -514,13 +507,17 @@ impl Service for TreeService {
     /// unrepeatable.
     fn contains(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, entry, epoch, false, move |entry, tree, _dist_prop| {
-            OpResult::Successful(read_or_return!(tree.contains(&entry)))
+            OpResult::Successful(tree.contains(&entry))
         })
     }
 
     fn delete(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, entry, epoch, true, move |entry, tree, _dist_prop| {
-            OpResult::Successful(read_or_return!(tree.delete(&entry)))
+            if tree.delete(&entry) {
+                OpResult::Successful(true)
+            } else {
+                OpResult::Successful(false)
+            }
         })
     }
 
@@ -547,13 +544,13 @@ impl Service for TreeService {
 
             let key_is_before_boundary = |key: &EntryKey| key < &boundary.lower;
             let key_is_after_boundary = |key: &EntryKey| key >= &boundary.upper;
-            let advance_after = |anchor: &EntryKey| -> super::btree::ReadResult<Option<EntryKey>> {
+            let advance_after = |anchor: &EntryKey| {
                 let Some(next_start) = bump_entry_key(anchor, ordering) else {
-                    return Ok(None);
+                    return None;
                 };
-                Ok(tree.seek(&next_start, ordering)?.current().cloned())
+                tree.seek(&next_start, ordering).current().cloned()
             };
-            let mut cursor = read_or_return!(tree.seek(&entry, ordering));
+            let mut cursor = tree.seek(&entry, ordering);
             let mut current = cursor.current().cloned();
             if seek_regression_mode() != SeekRegressionMode::Off {
                 if let Some(first) = &current {
@@ -639,7 +636,7 @@ impl Service for TreeService {
                     // this cursor is broken.
                     if &key == prev {
                         equal_replays += 1;
-                        current = read_or_return!(cursor.next());
+                        current = cursor.next();
                         continue;
                     }
                     let regressed = match ordering {
@@ -684,7 +681,7 @@ impl Service for TreeService {
                         let Some(next_start) = bump_entry_key(prev, ordering) else {
                             break;
                         };
-                        cursor = read_or_return!(tree.seek(&next_start, ordering));
+                        cursor = tree.seek(&next_start, ordering);
                         current = cursor.current().cloned();
                         continue;
                     }
@@ -701,7 +698,7 @@ impl Service for TreeService {
                     Ordering::Forward => {
                         if key_is_before_boundary(&key) {
                             boundary_skips += 1;
-                            let next_candidate = read_or_return!(cursor.next());
+                            let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
                                     "skip-before current={:?} next={:?}",
@@ -719,7 +716,7 @@ impl Service for TreeService {
                             RangeTerm::Inclusive(k) => {
                                 if key.prefix_lt(k) {
                                     start_skips += 1;
-                                    let next_candidate = read_or_return!(cursor.next());
+                                    let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
                                             "skip-start current={:?} next={:?}",
@@ -734,7 +731,7 @@ impl Service for TreeService {
                             RangeTerm::Exclusive(k) => {
                                 if key.prefix_le(k) {
                                     start_skips += 1;
-                                    let next_candidate = read_or_return!(cursor.next());
+                                    let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
                                             "skip-start-ex current={:?} next={:?}",
@@ -765,7 +762,7 @@ impl Service for TreeService {
                     Ordering::Backward => {
                         if key_is_after_boundary(&key) {
                             boundary_skips += 1;
-                            let next_candidate = read_or_return!(cursor.next());
+                            let next_candidate = cursor.next();
                             if let Some(progress) = trace_progress.as_mut() {
                                 progress.push(format!(
                                     "skip-after current={:?} next={:?}",
@@ -782,7 +779,7 @@ impl Service for TreeService {
                         match &range.end {
                             RangeTerm::Inclusive(k) => {
                                 if key.prefix_gt(k) {
-                                    let next_candidate = read_or_return!(cursor.next());
+                                    let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
                                             "skip-end current={:?} next={:?}",
@@ -796,7 +793,7 @@ impl Service for TreeService {
                             }
                             RangeTerm::Exclusive(k) => {
                                 if key.prefix_ge(k) {
-                                    let next_candidate = read_or_return!(cursor.next());
+                                    let next_candidate = cursor.next();
                                     if let Some(progress) = trace_progress.as_mut() {
                                         progress.push(format!(
                                             "skip-end-ex current={:?} next={:?}",
@@ -840,7 +837,7 @@ impl Service for TreeService {
                     }
                 }
 
-                let next_candidate = read_or_return!(cursor.next());
+                let next_candidate = cursor.next();
                 if let Some(progress) = trace_progress.as_mut() {
                     progress.push(format!(
                         "advance current={:?} next={:?}",
@@ -871,7 +868,7 @@ impl Service for TreeService {
             let mut dup_hops = 0usize;
             while next.is_some() && next.as_ref().map(|k| k.id()).as_ref() == buffer.last() {
                 let anchor = next.clone().unwrap();
-                let candidate = read_or_return!(advance_after(&anchor));
+                let candidate = advance_after(&anchor);
                 let progressed = match (&candidate, ordering) {
                     (Some(c), Ordering::Forward) => c > &anchor,
                     (Some(c), Ordering::Backward) => c < &anchor,
@@ -994,7 +991,7 @@ impl Service for TreeService {
             } else {
                 entry.clone()
             };
-            let mut cursor = read_or_return!(tree.seek(&start, Ordering::Forward));
+            let mut cursor = tree.seek(&start, Ordering::Forward);
             let mut pending = cursor.current().cloned();
             let mut keys: Vec<EntryKey> = Vec::with_capacity(limit.min(1024));
             // Rounds, not keys: the dedup and the boundary arms advance the
@@ -1022,7 +1019,7 @@ impl Service for TreeService {
                     break;
                 }
                 if keys.last() == Some(&key) {
-                    pending = read_or_return!(cursor.next());
+                    pending = cursor.next();
                     continue;
                 }
                 if keys.len() >= limit {
@@ -1030,7 +1027,7 @@ impl Service for TreeService {
                     break;
                 }
                 keys.push(key);
-                pending = read_or_return!(cursor.next());
+                pending = cursor.next();
             }
             let next = pending.filter(|key| key < &boundary.upper);
             OpResult::Successful(KeyBlock { keys, next })
@@ -1065,10 +1062,7 @@ impl Service for TreeService {
 
     fn audit(&self, id: Id) -> BoxFuture<'_, OpResult<TreeAudit>> {
         future::ready(if let Some(tree) = self.trees.get(&id) {
-            let (keys, duplicates, tombstoned_present) = match tree.tree.audit_raw() {
-                Ok(counts) => counts,
-                Err(_) => return future::ready(OpResult::ReadRetryExhausted).boxed(),
-            };
+            let (keys, duplicates, tombstoned_present) = tree.tree.audit_raw();
             if duplicates > 0 {
                 error!(
                     "INDEX AUDIT: tree {:?} holds {} duplicate key copies among {} keys; \
@@ -1579,19 +1573,12 @@ impl TreeService {
                             tree_prop_snapshot.epoch
                         );
                         // Tree oversized, need to migrate
-                        let pivot_key = match tree.pivot_key() {
-                            Ok(Some(key)) => key,
-                            Ok(None) => {
-                                warn!(
-                                    "Skipping migration for {:?}: oversized tree has no pivot key",
-                                    dist_tree.id
-                                );
-                                continue;
-                            }
-                            Err(error) => {
-                                warn!("Skipping migration for {:?}: {}", dist_tree.id, error);
-                                continue;
-                            }
+                        let Some(pivot_key) = tree.pivot_key() else {
+                            warn!(
+                                "Skipping migration for {:?}: oversized tree has no pivot key",
+                                dist_tree.id
+                            );
+                            continue;
                         };
                         let migration_target_id = Id::rand();
                         let source_upper = { dist_tree.prop.read().boundary.upper.clone() };
@@ -1619,8 +1606,7 @@ impl TreeService {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                                 > 0
                             {
-                                if !drain_warned
-                                    && drain_started.elapsed() > Duration::from_secs(10)
+                                if !drain_warned && drain_started.elapsed() > Duration::from_secs(10)
                                 {
                                     warn!(
                                         "Split of {:?} has waited {:?} for {} in-flight \
@@ -1651,15 +1637,8 @@ impl TreeService {
                             "Structurally splitting {:?} at {:?} into {:?}",
                             dist_tree.id, pivot_key, migration_target_id
                         );
-                        let copied = match tree.copy_off(&pivot_key, &client, &migration_target_id)
-                        {
-                            Ok(copy) => copy,
-                            Err(error) => {
-                                warn!("Copy for migration of {:?} failed: {}", dist_tree.id, error);
-                                None
-                            }
-                        };
-                        let Some((moved_tree, moved_len)) = copied else {
+                        let Some((moved_tree, moved_len)) = tree.copy_off(&pivot_key, &client, &migration_target_id)
+                        else {
                             // Nothing moved (pivot past every key); undo the
                             // marker and try again later.
                             warn!(

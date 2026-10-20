@@ -187,22 +187,18 @@ where
         self.root.read().clone()
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> ReadResult<RTCursor<KS, PS>> {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
         search_node(&self.get_root(), key, ordering, &self.deletion, true)
     }
 
     /// Approximate median key, found by descending the tree (O(height))
     /// instead of walking a cursor count/2 steps (O(n)). Returns None only
     /// for an empty tree. Used to pick a balanced migration split point.
-    pub fn mid_key(&self) -> ReadResult<Option<EntryKey>> {
+    pub fn mid_key(&self) -> Option<EntryKey> {
         level::select_merge_boundary::<KS, PS>(&self.get_root())
     }
 
-    pub(crate) fn seek_raw(
-        &self,
-        key: &EntryKey,
-        ordering: Ordering,
-    ) -> ReadResult<RTCursor<KS, PS>> {
+    pub(crate) fn seek_raw(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
         search_node(&self.get_root(), key, ordering, &self.deletion, false)
     }
 
@@ -210,29 +206,33 @@ where
         external::make_changed(node, self);
     }
 
+    pub(crate) fn increment_visible_len(&self) {
+        self.len.fetch_add(1, Relaxed);
+    }
+
     pub(crate) fn decrement_visible_len(&self) {
         self.len.fetch_sub(1, Relaxed);
     }
 
-    pub fn insert(&self, key: &EntryKey) -> ReadResult<bool> {
-        match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0)? {
+    pub fn insert(&self, key: &EntryKey) -> bool {
+        match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => apply_top_level_split(self, split),
             Some(None) => {}
-            None => return Ok(false),
+            None => return false,
         }
         self.len.fetch_add(1, Relaxed);
-        return Ok(true);
+        return true;
     }
 
-    pub fn merge_with_keys_(&self, keys: Vec<EntryKey>) -> ReadResult<()> {
+    pub fn merge_with_keys_(&self, keys: Vec<EntryKey>) {
         let keys_len = keys.len();
         if keys.len() == 0 {
             warn!("Merge attempt with no keys");
-            return Ok(());
+            return;
         }
         let root = self.get_root();
         debug!("Performing merging in sub levels with {} keys", keys.len());
-        let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0)?;
+        let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
         debug!(
             "Sub level merge completed, have {} new pages for root",
             root_new_pages.len()
@@ -313,7 +313,6 @@ where
             );
         }
         self.len.fetch_add(keys_len, Relaxed);
-        Ok(())
     }
 
     pub fn flush_all(&self) {
@@ -374,18 +373,18 @@ pub trait LevelTree: Sync + Send {
         target: &'a dyn LevelTree,
         deleted: &mut HashSet<EntryKey>,
         prune: bool,
-    ) -> ReadResult<usize>;
+    ) -> usize;
     fn merge_all_to<'a>(
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
         deleted: &mut HashSet<EntryKey>,
         prune: bool,
-    ) -> ReadResult<usize>;
-    fn merge_with_keys(&self, keys: Vec<EntryKey>) -> ReadResult<()>;
+    ) -> usize;
+    fn merge_with_keys(&self, keys: Vec<EntryKey>);
     fn retain_by_key(&self, key: &EntryKey);
-    fn insert_into(&self, key: &EntryKey) -> ReadResult<bool>;
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> ReadResult<Box<dyn Cursor>>;
+    fn insert_into(&self, key: &EntryKey) -> bool;
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn dump(&self, f: &str);
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
@@ -461,7 +460,7 @@ where
         target: &'a dyn LevelTree,
         deleted: &mut HashSet<EntryKey>,
         prune: bool,
-    ) -> ReadResult<usize> {
+    ) -> usize {
         level::level_merge(level, self, target, deleted, prune)
     }
 
@@ -471,20 +470,20 @@ where
         target: &'a dyn LevelTree,
         deleted: &mut HashSet<EntryKey>,
         prune: bool,
-    ) -> ReadResult<usize> {
+    ) -> usize {
         level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, deleted, prune)
     }
 
-    fn merge_with_keys(&self, keys: Vec<EntryKey>) -> ReadResult<()> {
+    fn merge_with_keys(&self, keys: Vec<EntryKey>) {
         self.merge_with_keys_(keys)
     }
 
-    fn insert_into(&self, key: &EntryKey) -> ReadResult<bool> {
+    fn insert_into(&self, key: &EntryKey) -> bool {
         self.insert(key)
     }
 
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> ReadResult<Box<dyn Cursor>> {
-        Ok(Box::new(self.seek(key, ordering)?))
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
+        Box::new(self.seek(key, ordering))
     }
 
     fn dump(&self, f: &str) {
@@ -529,7 +528,7 @@ impl LevelTree for DummyLevelTree {
         _target: &'a dyn LevelTree,
         _deleted: &mut HashSet<EntryKey>,
         _prune: bool,
-    ) -> ReadResult<usize> {
+    ) -> usize {
         unreachable!()
     }
 
@@ -539,19 +538,19 @@ impl LevelTree for DummyLevelTree {
         _target: &'a dyn LevelTree,
         _deleted: &mut HashSet<EntryKey>,
         _prune: bool,
-    ) -> ReadResult<usize> {
+    ) -> usize {
         unreachable!()
     }
 
-    fn merge_with_keys(&self, _keys: Vec<EntryKey>) -> ReadResult<()> {
+    fn merge_with_keys(&self, _keys: Vec<EntryKey>) {
         unreachable!()
     }
 
-    fn insert_into(&self, _key: &EntryKey) -> ReadResult<bool> {
+    fn insert_into(&self, _key: &EntryKey) -> bool {
         unreachable!()
     }
 
-    fn seek_for(&self, _key: &EntryKey, _ordering: Ordering) -> ReadResult<Box<dyn Cursor>> {
+    fn seek_for(&self, _key: &EntryKey, _ordering: Ordering) -> Box<dyn Cursor> {
         unreachable!()
     }
 
@@ -596,4 +595,4 @@ pub mod bench_test;
 pub mod test;
 
 #[cfg(test)]
-pub(super) mod revision_tests;
+mod revision_tests;

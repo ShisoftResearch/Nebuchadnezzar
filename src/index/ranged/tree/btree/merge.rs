@@ -80,13 +80,13 @@ pub fn merge_into_tree_node<KS, PS>(
     _parent: &NodeCellRef,
     keys: Vec<EntryKey>,
     level: usize,
-) -> ReadResult<BTreeMap<EntryKey, NodeCellRef>>
+) -> BTreeMap<EntryKey, NodeCellRef>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     debug_check_serialized(&keys);
-    let search = mut_search::<KS, PS>(node, &keys[0])?;
+    let search = mut_search::<KS, PS>(node, &keys[0]);
     let new_pages = match search {
         MutSearchResult::External => {
             // merge keys into internal pages
@@ -194,7 +194,7 @@ where
         }
         MutSearchResult::Internal(sub_node) => {
             let lower_level_new_pages =
-                merge_into_tree_node(tree, &sub_node, node, keys, level + 1)?;
+                merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
             let mut new_pages = BTreeMap::new();
             if lower_level_new_pages.len() > 0 {
                 merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
@@ -215,5 +215,5 @@ where
             read_unchecked::<KS, PS>(&node).first_key()
         )
     }
-    return Ok(new_pages);
+    return new_pages;
 }

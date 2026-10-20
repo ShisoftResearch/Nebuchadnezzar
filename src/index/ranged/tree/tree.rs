@@ -340,25 +340,45 @@ impl RangedTree {
     ///
     /// `seek` (not `seek_raw`) because a key in the deletion set is
     /// logically absent -- the scrub must agree with what a reader sees.
-    pub fn contains(&self, entry: &EntryKey) -> ReadResult<bool> {
-        Ok(self.tree.seek(entry, Ordering::Forward)?.current() == Some(entry))
+    pub fn contains(&self, entry: &EntryKey) -> bool {
+        self.tree.seek(entry, Ordering::Forward).current() == Some(entry)
     }
 
     /// Insert an entry into the tree
-    pub fn insert(&self, entry: &EntryKey) -> ReadResult<bool> {
+    pub fn insert(&self, entry: &EntryKey) -> bool {
         debug!("Inserting entry: {:?}", entry);
+        if self.tree.deletion.remove(entry) {
+            // The un-delete path: this insert targets a key that carries a
+            // tombstone, so the tombstone is consumed and, if the physical
+            // copy still exists, revived in place. Legitimate for a caller
+            // re-inserting a deleted key -- so this is DEBUG, not a warning
+            // -- but it is also the only in-tree path that can undo a
+            // delete, so it stays counted: a workload that never re-inserts
+            // deleted keys and still sees this counter move has found a
+            // resurrection at its source.
+            UNDELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("UNDELETE consumed a tombstone for {:?}", entry.id());
+            let cursor = self.tree.seek_raw(entry, Ordering::Forward);
+            if cursor.current() == Some(entry) {
+                if let Some(page) = cursor.page.as_ref() {
+                    self.tree.mark_changed(page);
+                }
+                self.tree.increment_visible_len();
+                return true;
+            }
+        }
         self.tree.insert(entry)
     }
 
     /// Delete an entry from the tree
-    pub fn delete(&self, entry: &EntryKey) -> ReadResult<bool> {
-        let cursor = self.tree.seek_raw(entry, Ordering::Forward)?;
+    pub fn delete(&self, entry: &EntryKey) -> bool {
+        let cursor = self.tree.seek_raw(entry, Ordering::Forward);
         if cursor.current() != Some(entry) {
-            return Ok(false);
+            return false;
         }
 
         if !self.tree.deletion.insert(entry.clone()) {
-            return Ok(false);
+            return false;
         }
 
         if let Some(page) = cursor.page.as_ref() {
@@ -366,7 +386,7 @@ impl RangedTree {
         }
 
         self.tree.decrement_visible_len();
-        Ok(true)
+        true
     }
 
     /// Seek to a position in the tree
@@ -374,7 +394,7 @@ impl RangedTree {
         &self,
         entry: &EntryKey,
         ordering: Ordering,
-    ) -> ReadResult<RTCursor<DiskTreeKeySlice, DiskTreePtrSlice>> {
+    ) -> RTCursor<DiskTreeKeySlice, DiskTreePtrSlice> {
         self.tree.seek(entry, ordering)
     }
 
@@ -394,9 +414,9 @@ impl RangedTree {
     /// implementation walked a cursor count/2 steps from the start (O(n)),
     /// which made a single migration of a very large tree take minutes and
     /// starved the balancer at billion-key scale.
-    pub fn pivot_key(&self) -> ReadResult<Option<EntryKey>> {
+    pub fn pivot_key(&self) -> Option<EntryKey> {
         if self.count() < 2 {
-            return Ok(None);
+            return None;
         }
         self.tree.mid_key()
     }
@@ -466,8 +486,8 @@ impl RangedTree {
     }
 
     /// Merge keys from another source (for tree splitting/migration)
-    pub fn merge_keys(&self, keys: Vec<EntryKey>) -> ReadResult<()> {
-        self.tree.merge_with_keys(keys)
+    pub fn merge_keys(&self, keys: Vec<EntryKey>) {
+        self.tree.merge_with_keys(keys);
     }
 
     /// Copy-based split: build a new tree of COPIES of the live keys at or
@@ -498,10 +518,8 @@ impl RangedTree {
         pivot: &EntryKey,
         client: &Arc<AsyncClient>,
         home: &Id,
-    ) -> ReadResult<Option<(RangedTree, usize)>> {
-        let Some(so) = super::btree::split_off::copy_off(&self.tree, pivot, home)? else {
-            return Ok(None);
-        };
+    ) -> Option<(RangedTree, usize)> {
+        let so = super::btree::split_off::copy_off(&self.tree, pivot, home)?;
         let deletion = Arc::new(DeletionSet::with_capacity(0));
         let mut new_tree = DiskTree::from_root(
             so.new_root,
@@ -511,7 +529,7 @@ impl RangedTree {
             &deletion,
         );
         new_tree.set_writeback_client(client);
-        Ok(Some((RangedTree { tree: new_tree }, so.moved_len)))
+        Some((RangedTree { tree: new_tree }, so.moved_len))
     }
 
     /// Walk this tree's pages RAW (no tombstone filter, no id dedup) and
@@ -525,13 +543,13 @@ impl RangedTree {
     /// existing test. `tombstoned` is not a fault (a tombstoned key stays
     /// physically present until its page compacts); a large or growing
     /// count is a compaction-lag signal.
-    pub fn audit_raw(&self) -> ReadResult<(u64, u64, u64)> {
-        let mut cursor = self.tree.seek_raw(&min_entry_key(), Ordering::Forward)?;
+    pub fn audit_raw(&self) -> (u64, u64, u64) {
+        let mut cursor = self.tree.seek_raw(&min_entry_key(), Ordering::Forward);
         let mut total = 0u64;
         let mut duplicates = 0u64;
         let mut tombstoned = 0u64;
         let mut prev: Option<EntryKey> = None;
-        while let Some(key) = cursor.next()? {
+        while let Some(key) = cursor.next() {
             total += 1;
             if prev.as_ref() == Some(&key) {
                 duplicates += 1;
@@ -541,7 +559,7 @@ impl RangedTree {
             }
             prev = Some(key);
         }
-        Ok((total, duplicates, tombstoned))
+        (total, duplicates, tombstoned)
     }
 
     /// Get ideal capacity for this tree
@@ -558,6 +576,7 @@ impl RangedTree {
     pub fn head_id(&self) -> Id {
         self.tree.head_id()
     }
+
 }
 
 /// Schema for ranged tree persistence
@@ -629,27 +648,6 @@ mod tests {
         RangedTree {
             tree: DiskTree::new(&ds),
         }
-    }
-
-    #[test]
-    fn rev1_failed_undelete_keeps_the_tombstone() {
-        let tree = make_tree();
-        let key = EntryKey::from_id(&Id::from_parts(1, 10));
-        assert!(tree.insert(&key).unwrap());
-        assert!(tree.delete(&key).unwrap());
-        super::super::btree::revision_tests::install_version_writer::<
-            DiskTreeKeySlice,
-            DiskTreePtrSlice,
-        >(tree.tree.get_root());
-        let result = tree.insert(&key);
-        super::super::btree::revision_tests::clear_writer_hook();
-        assert_eq!(result, Err(ReadRetryExhausted));
-        assert!(
-            tree.tree.deletion.contains(&key),
-            "failed insert removed a live tombstone"
-        );
-        assert_eq!(tree.count(), 0);
-        assert!(!tree.contains(&key).unwrap());
     }
 
     fn make_feature(n: u64) -> Feature {
@@ -747,23 +745,23 @@ mod tests {
 
     #[test]
     fn pivot_key_empty_tree_is_none() {
-        assert!(make_tree().pivot_key().unwrap().is_none());
+        assert!(make_tree().pivot_key().is_none());
     }
 
     #[test]
     fn pivot_key_single_key_is_none() {
         let tree = make_tree();
-        tree.insert(&make_key(42)).unwrap();
-        assert!(tree.pivot_key().unwrap().is_none());
+        tree.insert(&make_key(42));
+        assert!(tree.pivot_key().is_none());
     }
 
     #[test]
     fn pivot_key_two_keys_returns_some() {
         let tree = make_tree();
-        tree.insert(&make_key(1)).unwrap();
-        tree.insert(&make_key(2)).unwrap();
+        tree.insert(&make_key(1));
+        tree.insert(&make_key(2));
         // Any tree with >=2 keys must produce a pivot; used to always return None (the bug).
-        assert!(tree.pivot_key().unwrap().is_some());
+        assert!(tree.pivot_key().is_some());
     }
 
     #[test]
@@ -771,11 +769,10 @@ mod tests {
         let tree = make_tree();
         let n = 100u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
         let pivot = tree
             .pivot_key()
-            .unwrap()
             .expect("pivot_key must return Some for 100 keys");
         assert!(
             pivot >= make_key(0) && pivot <= make_key(n - 1),
@@ -790,16 +787,15 @@ mod tests {
         let tree = make_tree();
         let n = 200u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
 
         let pivot = tree
             .pivot_key()
-            .unwrap()
             .expect("pivot_key must return Some for 200 keys");
 
         // Count keys strictly less than pivot (left side after split).
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut left = 0usize;
         if let Some(k) = cursor.current() {
             if k < &pivot {
@@ -807,7 +803,7 @@ mod tests {
             }
         }
         loop {
-            match cursor.next().unwrap() {
+            match cursor.next() {
                 Some(k) => {
                     if k < pivot {
                         left += 1;
@@ -835,17 +831,17 @@ mod tests {
         let tree = make_tree();
         let n = 50_000u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
-        let pivot = tree.pivot_key().unwrap().expect("pivot for 50k keys");
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let pivot = tree.pivot_key().expect("pivot for 50k keys");
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut left = 0usize;
         if let Some(k) = cursor.current() {
             if k < &pivot {
                 left += 1;
             }
         }
-        while let Some(k) = cursor.next().unwrap() {
+        while let Some(k) = cursor.next() {
             if k < pivot {
                 left += 1;
             }
@@ -865,7 +861,7 @@ mod tests {
         let tree = make_tree();
         let n = 1_000u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
 
         // A very small pivot forces retain() down the leftmost internal path,
@@ -873,9 +869,9 @@ mod tests {
         let pivot = make_key(1);
         tree.retain(&pivot);
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut retained = Vec::new();
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             retained.push(key);
         }
 
@@ -888,7 +884,7 @@ mod tests {
         let tree = make_tree();
         let n = 1_000u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
 
         // With BTREE_NODE_SIZE=128, key 128 should be the first key in the second
@@ -897,9 +893,9 @@ mod tests {
         let pivot = make_key(128);
         tree.retain(&pivot);
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut retained = Vec::new();
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             retained.push(key);
         }
 
@@ -913,16 +909,16 @@ mod tests {
         let tree = make_tree();
         let n = 1_024u64;
         for i in 0..n {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut seen = Vec::new();
 
         if let Some(key) = cursor.current() {
             seen.push(key.clone());
         }
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             if seen.last() != Some(&key) {
                 seen.push(key);
             }
@@ -939,36 +935,36 @@ mod tests {
         let key_2 = make_key(2);
         let key_3 = make_key(3);
 
-        assert!(tree.insert(&key_1).unwrap());
-        assert!(tree.insert(&key_2).unwrap());
-        assert!(tree.insert(&key_3).unwrap());
+        assert!(tree.insert(&key_1));
+        assert!(tree.insert(&key_2));
+        assert!(tree.insert(&key_3));
         assert_eq!(tree.count(), 3);
 
-        assert!(tree.delete(&key_2).unwrap());
-        assert!(!tree.delete(&key_2).unwrap());
+        assert!(tree.delete(&key_2));
+        assert!(!tree.delete(&key_2));
         assert_eq!(tree.count(), 2);
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut visible = Vec::new();
         if let Some(key) = cursor.current() {
             visible.push(key.clone());
         }
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             if visible.last() != Some(&key) {
                 visible.push(key);
             }
         }
         assert_eq!(visible, vec![key_1.clone(), key_3.clone()]);
 
-        assert!(tree.insert(&key_2).unwrap());
+        assert!(tree.insert(&key_2));
         assert_eq!(tree.count(), 3);
 
-        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut restored = Vec::new();
         if let Some(key) = cursor.current() {
             restored.push(key.clone());
         }
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             if restored.last() != Some(&key) {
                 restored.push(key);
             }
@@ -1036,19 +1032,17 @@ mod tests {
         let tree = RangedTree::create(&client, &tree_id).await;
 
         for value in 10..=12 {
-            assert!(tree
-                .insert(&make_field_key(
-                    SchemaUid(schema_id),
-                    field,
-                    value,
-                    Id::from_parts(5, value)
-                ))
-                .unwrap());
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(schema_id),
+                field,
+                value,
+                Id::from_parts(5, value)
+            )));
         }
         assert_eq!(tree.count(), 3);
 
         let deleted = make_field_key(SchemaUid(schema_id), field, 11, Id::from_parts(5, 11));
-        assert!(tree.delete(&deleted).unwrap());
+        assert!(tree.delete(&deleted));
         assert_eq!(tree.count(), 2);
 
         let start_key =
@@ -1061,9 +1055,9 @@ mod tests {
         );
 
         let collect_visible = |tree: &RangedTree| {
-            let mut cursor = tree.seek(&start_key, Ordering::Forward).unwrap();
+            let mut cursor = tree.seek(&start_key, Ordering::Forward);
             let mut visible = Vec::new();
-            while let Some(key) = cursor.next().unwrap() {
+            while let Some(key) = cursor.next() {
                 if key.prefix_gt(&end_key) {
                     break;
                 }
@@ -1133,11 +1127,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        client
-            .new_schema_with_id(page_schema())
-            .await
-            .unwrap()
-            .unwrap();
+        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
         client
             .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
             .await
@@ -1149,14 +1139,12 @@ mod tests {
         let field = 781;
         let tree = RangedTree::create(&client, &tree_id).await;
         for value in 0..300u64 {
-            assert!(tree
-                .insert(&make_field_key(
-                    SchemaUid(1),
-                    field,
-                    value,
-                    Id::from_parts(9, value)
-                ))
-                .unwrap());
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                field,
+                value,
+                Id::from_parts(9, value)
+            )));
         }
         // Persist the pages BEFORE deleting, so the tombstones are the only
         // record of the deletes -- exactly the window the journal covers.
@@ -1166,11 +1154,7 @@ mod tests {
             .map(|v| make_field_key(SchemaUid(1), field, v, Id::from_parts(9, v)))
             .collect();
         for key in &deleted {
-            assert!(
-                tree.delete(key).unwrap(),
-                "delete should land for {:?}",
-                key.id()
-            );
+            assert!(tree.delete(key), "delete should land for {:?}", key.id());
         }
         // The checkpoint the balancer runs every 60s: publish head + journal.
         tree.publish_head(&tree_id, &client)
@@ -1184,14 +1168,14 @@ mod tests {
             .expect("the tree should reload");
         for key in &deleted {
             assert!(
-                !reloaded.contains(key).unwrap(),
+                !reloaded.contains(key),
                 "RESURRECTION: {:?} was deleted before the reload and is visible again",
                 key.id()
             );
         }
-        let mut cursor = reloaded.seek(&*MIN_ENTRY_KEY, Ordering::Forward).unwrap();
+        let mut cursor = reloaded.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         let mut visible = 0usize;
-        while cursor.next().unwrap().is_some() {
+        while cursor.next().is_some() {
             visible += 1;
         }
         assert_eq!(
@@ -1265,14 +1249,12 @@ mod tests {
         let tree_id = Id::from_parts(902, 902);
         let tree = RangedTree::create(&client, &tree_id).await;
         for value in 20..=22 {
-            assert!(tree
-                .insert(&make_field_key(
-                    SchemaUid(1),
-                    778,
-                    value,
-                    Id::from_parts(6, value)
-                ))
-                .unwrap());
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                778,
+                value,
+                Id::from_parts(6, value)
+            )));
         }
         storage::wait_until_updated().await;
 
@@ -1375,14 +1357,12 @@ mod tests {
         // Three pages at BTREE_NODE_SIZE=128 for monotone inserts.
         let n = 300u64;
         for value in 0..n {
-            assert!(tree
-                .insert(&make_field_key(
-                    SchemaUid(schema_id),
-                    field,
-                    value,
-                    Id::from_parts(7, value)
-                ))
-                .unwrap());
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(schema_id),
+                field,
+                value,
+                Id::from_parts(7, value)
+            )));
         }
         storage::wait_until_updated().await;
         drop(tree);
@@ -1509,21 +1489,15 @@ mod tests {
 
         for i in 0..n {
             let id = Id::from_parts(1, i);
-            assert!(tree
-                .insert(&make_scan_key(SchemaUid(schema_id), id))
-                .unwrap());
-            assert!(tree
-                .insert(&make_field_key(SchemaUid(schema_id), field_id, i, id))
-                .unwrap());
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_id), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_id), field_id, i, id)));
         }
 
         let prefix = EntryKey::for_schema(SchemaUid(schema_id)).as_slice()[..16].to_vec();
-        let mut cursor = tree
-            .seek(
-                &EntryKey::for_schema(SchemaUid(schema_id)),
-                Ordering::Forward,
-            )
-            .unwrap();
+        let mut cursor = tree.seek(
+            &EntryKey::for_schema(SchemaUid(schema_id)),
+            Ordering::Forward,
+        );
         let mut seen = Vec::new();
 
         if let Some(key) = cursor.current() {
@@ -1531,7 +1505,7 @@ mod tests {
                 seen.push(key.id());
             }
         }
-        while let Some(key) = cursor.next().unwrap() {
+        while let Some(key) = cursor.next() {
             if key.as_slice()[..16] != prefix {
                 break;
             }
@@ -1554,32 +1528,22 @@ mod tests {
 
         for i in 0..n {
             let id = Id::from_parts(1, i);
-            assert!(tree
-                .insert(&make_scan_key(SchemaUid(schema_1), id))
-                .unwrap());
-            assert!(tree
-                .insert(&make_field_key(SchemaUid(schema_1), field_id, i, id))
-                .unwrap());
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_1), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_1), field_id, i, id)));
         }
 
         for i in 0..n {
             let id = Id::from_parts(2, i);
-            assert!(tree
-                .insert(&make_scan_key(SchemaUid(schema_2), id))
-                .unwrap());
-            assert!(tree
-                .insert(&make_field_key(SchemaUid(schema_2), field_id, i, id))
-                .unwrap());
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_2), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_2), field_id, i, id)));
         }
 
         for (schema_id, higher) in [(schema_1, 1u64), (schema_2, 2u64)] {
             let prefix = EntryKey::for_schema(SchemaUid(schema_id)).as_slice()[..16].to_vec();
-            let mut cursor = tree
-                .seek(
-                    &EntryKey::for_schema(SchemaUid(schema_id)),
-                    Ordering::Forward,
-                )
-                .unwrap();
+            let mut cursor = tree.seek(
+                &EntryKey::for_schema(SchemaUid(schema_id)),
+                Ordering::Forward,
+            );
             let mut seen = Vec::new();
 
             if let Some(key) = cursor.current() {
@@ -1587,7 +1551,7 @@ mod tests {
                     seen.push(key.id());
                 }
             }
-            while let Some(key) = cursor.next().unwrap() {
+            while let Some(key) = cursor.next() {
                 if key.as_slice()[..16] != prefix {
                     break;
                 }
@@ -1613,7 +1577,7 @@ mod tests {
         let tree = make_tree();
         // ideal_capacity = BTREE_NODE_SIZE^2 * 2, far more than 10 keys.
         for i in 0..10u64 {
-            tree.insert(&make_key(i)).unwrap();
+            tree.insert(&make_key(i));
         }
         assert!(!tree.oversized());
     }

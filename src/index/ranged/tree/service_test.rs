@@ -222,8 +222,8 @@ mod test {
         use crate::index::ranged::tree::btree::test::LevelBPlusTree;
         use crate::index::ranged::tree::btree::Ordering;
         use crate::index::ranged::tree::service::{Range, RangeTerm};
-        use crate::index::ranged::tree::tree::DeletionSet;
         use crate::index::ranged::trees::Cursor;
+        use crate::index::ranged::tree::tree::DeletionSet;
         use std::sync::Arc;
 
         fn deletion_set() -> Arc<DeletionSet> {
@@ -237,7 +237,7 @@ mod test {
         // Insert keys with values 0 to 50
         for i in 0..=50 {
             let key = create_entry_key(schema_id, field, i, Id::from_parts(1, i));
-            let inserted = tree.insert(&key).unwrap();
+            let inserted = tree.insert(&key);
             if i == 50 {
                 println!("Inserting value 50: inserted={}", inserted);
             }
@@ -248,11 +248,11 @@ mod test {
 
         // Verify all values are in the tree by scanning from MIN_ENTRY_KEY
         use crate::index::ranged::trees::min_entry_key;
-        let mut scan_cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+        let mut scan_cursor = tree.seek(&min_entry_key(), Ordering::Forward);
         let mut all_values = Vec::new();
         let mut count = 0;
         // Use next() which returns current then advances
-        while let Some(key) = scan_cursor.next().unwrap() {
+        while let Some(key) = scan_cursor.next() {
             let feature_value = {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&key.as_slice()[8..16]);
@@ -281,7 +281,7 @@ mod test {
         // Try seeking directly to value 50
         let key50_seek =
             EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(50));
-        let cursor50 = tree.seek(&key50_seek, Ordering::Forward).unwrap();
+        let cursor50 = tree.seek(&key50_seek, Ordering::Forward);
         println!(
             "Seek to value 50, current: {:?}",
             cursor50.current().map(|k| {
@@ -294,7 +294,7 @@ mod test {
         // Try seeking to value 49 and see what's next
         let key49_seek =
             EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(49));
-        let mut cursor49 = tree.seek(&key49_seek, Ordering::Forward).unwrap();
+        let mut cursor49 = tree.seek(&key49_seek, Ordering::Forward);
         println!(
             "Seek to value 49, current: {:?}",
             cursor49.current().map(|k| {
@@ -305,7 +305,7 @@ mod test {
         );
         // Call next() multiple times to see the pattern
         for i in 0..5 {
-            let next = cursor49.next().unwrap();
+            let next = cursor49.next();
             if let Some(k) = &next {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&k.as_slice()[8..16]);
@@ -319,7 +319,7 @@ mod test {
 
         // Also check what keys are actually in the tree around value 50
         let key50_full = create_entry_key(schema_id, field, 50, Id::from_parts(1, 50));
-        let cursor50_full = tree.seek(&key50_full, Ordering::Forward).unwrap();
+        let cursor50_full = tree.seek(&key50_full, Ordering::Forward);
         if let Some(k) = cursor50_full.current() {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&k.as_slice()[8..16]);
@@ -340,7 +340,7 @@ mod test {
         // Try to understand why cursor stops at 49
         // Check if value 50 is in a separate page that's not being reached
         let key49 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 49));
-        let mut cursor_at_49 = tree.seek(&key49, Ordering::Forward).unwrap();
+        let mut cursor_at_49 = tree.seek(&key49, Ordering::Forward);
         println!(
             "Cursor at 49, current: {:?}",
             cursor_at_49.current().map(|k| {
@@ -355,7 +355,7 @@ mod test {
         );
 
         // Try next() once
-        if let Some(key) = cursor_at_49.next().unwrap() {
+        if let Some(key) = cursor_at_49.next() {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&key.as_slice()[8..16]);
             let val = u64::from_be_bytes(bytes);
@@ -411,7 +411,7 @@ mod test {
         });
         println!("Seek entry key ID: {:?}", entry.id());
 
-        let mut tree_cursor = tree.seek(&entry, Ordering::Forward).unwrap();
+        let mut tree_cursor = tree.seek(&entry, Ordering::Forward);
         println!(
             "After seek, current: {:?}",
             tree_cursor.current().map(|k| {
@@ -424,7 +424,7 @@ mod test {
 
         // Collect keys using next() which returns current then advances
         while collected.len() < 100 {
-            if let Some(key) = tree_cursor.next().unwrap() {
+            if let Some(key) = tree_cursor.next() {
                 let feature_value = {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&key.as_slice()[8..16]);
@@ -574,7 +574,7 @@ mod test {
         // Insert keys with feature values 10..=100
         for i in 10..=100 {
             let key = create_entry_key(schema_id, field, i, Id::from_parts(2, i));
-            tree.insert(&key).unwrap();
+            tree.insert(&key);
         }
 
         println!("=== Tree state after insertion ===");
@@ -600,10 +600,10 @@ mod test {
             };
 
             let entry = range.key();
-            let mut tree_cursor = tree.seek(&entry, Ordering::Forward).unwrap();
+            let mut tree_cursor = tree.seek(&entry, Ordering::Forward);
             let mut collected = Vec::new();
 
-            while let Some(key) = tree_cursor.next().unwrap() {
+            while let Some(key) = tree_cursor.next() {
                 let feature_value = {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&key.as_slice()[8..16]);
@@ -837,7 +837,7 @@ mod test {
         // Insert keys with feature values 10..=100 (91 items to ensure oversized mem tree)
         for i in 10..=100 {
             let key = create_entry_key(schema_id, field, i, Id::from_parts(3, i));
-            tree.insert(&key).unwrap();
+            tree.insert(&key);
         }
 
         println!("=== Tree state after insertion ===");
@@ -862,10 +862,10 @@ mod test {
             };
 
             let entry = range.key();
-            let mut tree_cursor = tree.seek(&entry, Ordering::Backward).unwrap();
+            let mut tree_cursor = tree.seek(&entry, Ordering::Backward);
             let mut collected = Vec::new();
 
-            while let Some(key) = tree_cursor.next().unwrap() {
+            while let Some(key) = tree_cursor.next() {
                 let feature_value = {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&key.as_slice()[8..16]);
@@ -1368,13 +1368,13 @@ mod test {
 
         for i in 10..=100 {
             let key = create_entry_key(schema_id, field, i, Id::from_parts(4, i));
-            source_tree.insert(&key).unwrap();
+            source_tree.insert(&key);
         }
 
         let pivot = create_entry_key(schema_id, field, 60, Id::from_parts(0, 0));
-        let mut cursor = source_tree.seek(&pivot, Ordering::Forward).unwrap();
+        let mut cursor = source_tree.seek(&pivot, Ordering::Forward);
         let mut moved_keys = Vec::new();
-        while let Some(entry) = cursor.next().unwrap() {
+        while let Some(entry) = cursor.next() {
             moved_keys.push(entry);
         }
         assert!(
@@ -1382,7 +1382,7 @@ mod test {
             "expected to move some keys into the split target"
         );
 
-        target_tree.merge_keys(moved_keys.clone()).unwrap();
+        target_tree.merge_keys(moved_keys.clone());
         storage::wait_until_updated().await;
         target_tree
             .publish_head(&target_tree_id, &client)

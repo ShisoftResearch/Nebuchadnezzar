@@ -51,7 +51,7 @@ fn bench_insert_sequential() {
     let tree = BenchTree::new(&deletion_set());
     let start = Instant::now();
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     report("insert_sequential", n, start);
     assert_eq!(tree.len(), n as usize);
@@ -66,7 +66,7 @@ fn bench_insert_random() {
     let tree = BenchTree::new(&deletion_set());
     let start = Instant::now();
     for i in &keys {
-        tree.insert(&key_of(*i)).unwrap();
+        tree.insert(&key_of(*i));
     }
     report("insert_random", n, start);
     assert_eq!(tree.len(), n as usize);
@@ -81,7 +81,7 @@ fn bench_insert_parallel_random() {
     let tree = Arc::new(BenchTree::new(&deletion_set()));
     let start = Instant::now();
     keys.par_iter().for_each(|i| {
-        tree.insert(&key_of(*i)).unwrap();
+        tree.insert(&key_of(*i));
     });
     report("insert_parallel_rand", n, start);
     assert_eq!(tree.len(), n as usize);
@@ -93,14 +93,14 @@ fn bench_point_seek() {
     let n = bench_n();
     let tree = BenchTree::new(&deletion_set());
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     let mut order: Vec<u64> = (0..n).collect();
     order.shuffle(&mut rand::rng());
     let start = Instant::now();
     for i in &order {
         let k = key_of(*i);
-        let cursor = tree.seek(&k, Ordering::Forward).unwrap();
+        let cursor = tree.seek(&k, Ordering::Forward);
         assert_eq!(cursor.current(), Some(&k));
     }
     report("point_seek", n, start);
@@ -112,14 +112,14 @@ fn bench_scan() {
     let n = bench_n();
     let tree = BenchTree::new(&deletion_set());
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     const ROUNDS: u64 = 10;
     let start = Instant::now();
     for _ in 0..ROUNDS {
-        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
         let mut count = 0u64;
-        while cursor.next().unwrap().is_some() {
+        while cursor.next().is_some() {
             count += 1;
         }
         assert_eq!(count, n);
@@ -145,7 +145,7 @@ fn bench_memory_per_key_sequential() {
     let tree = BenchTree::new(&deletion_set());
     let before = rss_kb();
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     let after = rss_kb();
     println!(
@@ -165,7 +165,7 @@ fn bench_memory_per_key_random() {
     let tree = BenchTree::new(&deletion_set());
     let before = rss_kb();
     for i in &keys {
-        tree.insert(&key_of(*i)).unwrap();
+        tree.insert(&key_of(*i));
     }
     let after = rss_kb();
     println!(
@@ -182,15 +182,15 @@ fn bench_scan_ids() {
     let n = bench_n();
     let tree = BenchTree::new(&deletion_set());
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     const ROUNDS: u64 = 10;
     let start = Instant::now();
     for _ in 0..ROUNDS {
-        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
         let mut count = 0u64;
         let mut sum = 0u64;
-        while let Some(id) = cursor.next_id().unwrap() {
+        while let Some(id) = cursor.next_id() {
             sum = sum.wrapping_add(id.bits());
             count += 1;
         }
@@ -209,10 +209,10 @@ fn bench_split_methods() {
 
     let tree = BenchTree::new(&deletion_set());
     for i in 0..n {
-        tree.insert(&key_of(i)).unwrap();
+        tree.insert(&key_of(i));
     }
     let start = Instant::now();
-    let r = copy_off(&tree, &mid, &Id::rand()).unwrap();
+    let r = copy_off(&tree, &mid, &Id::rand());
     let e_copy = start.elapsed();
     let moved = r.map(|s| s.moved_len).unwrap_or(0);
     let start = Instant::now();

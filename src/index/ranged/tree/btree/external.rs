@@ -172,7 +172,6 @@ where
                 read_node(&node_ref, |node: &NodeReadHandler<KS, PS>| {
                     Self::neighbor_step(&**node, forward)
                 })
-                .unwrap_or(NeighborStep::Found(Id::unit_id()))
             } else {
                 // Unvalidated walk (must not wait leftward); pin so a
                 // condemned tombstone's memory stays readable.
@@ -352,16 +351,9 @@ where
         let pos = self.search(&key);
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
-        // Consume the tombstone under the existing page latch, after all
-        // fallible optimistic reads. Compaction uses this latch too.
-        let undeleted = tree.deletion.remove(&key);
-        if undeleted {
-            crate::index::ranged::tree::tree::UNDELETES.fetch_add(1, Relaxed);
-            debug!("UNDELETE consumed a tombstone for {:?}", key.id());
-        }
         if self.len > pos && self.keys.cmp_at(pos, &key) == std::cmp::Ordering::Equal {
             trace!("inserting existing key");
-            return if undeleted { Some(None) } else { None };
+            return None;
         }
         Some(if self.len == KS::slice_len() {
             // need to split

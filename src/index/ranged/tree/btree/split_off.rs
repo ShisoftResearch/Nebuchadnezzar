@@ -54,11 +54,7 @@ pub struct SplitOff {
 /// routing inconsistency waiting for a cluster: `locate_tree_server` keys on
 /// the TREE id's slot, which the caller draws fresh, while the pages sat in
 /// the source's.
-pub fn copy_off<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
-    pivot: &EntryKey,
-    home: &Id,
-) -> ReadResult<Option<SplitOff>>
+pub fn copy_off<KS, PS>(tree: &BPlusTree<KS, PS>, pivot: &EntryKey, home: &Id) -> Option<SplitOff>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -67,13 +63,13 @@ where
     let anchor = *home;
     let mut all: Vec<EntryKey> = Vec::new();
     {
-        let mut cursor = tree.seek(pivot, Ordering::Forward)?;
-        while let Some(key) = cursor.next()? {
+        let mut cursor = tree.seek(pivot, Ordering::Forward);
+        while let Some(key) = cursor.next() {
             all.push(key);
         }
     }
     if all.is_empty() {
-        return Ok(None);
+        return None;
     }
     let moved_len = all.len();
     let mut constructor = TreeConstructor::<KS, PS>::new();
@@ -104,12 +100,12 @@ where
         external::make_changed(&leaf_ref, tree);
         prev_ref = Some(leaf_ref);
     }
-    Ok(Some(SplitOff {
+    Some(SplitOff {
         new_root: constructor.root(),
         new_height: constructor.levels(),
         moved_len,
         new_head_id: head_id.expect("non-empty copy implies a head"),
-    }))
+    })
 }
 
 /// Drain every key out of `tree`, emptying each leaf UNDER ITS OWN LATCH as
