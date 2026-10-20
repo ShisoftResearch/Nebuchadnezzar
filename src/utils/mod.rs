@@ -25,3 +25,5 @@ pub fn thread_id() -> u64 {
 pub mod lock_profile;
 
 pub(crate) mod keyed_state;
+#[cfg(multisite_test)]
+pub mod multisite;

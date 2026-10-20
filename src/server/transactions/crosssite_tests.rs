@@ -669,12 +669,13 @@ fn holds_status(cluster: &Cluster, index: usize, tid: &TxnId) -> bool {
 /// Whether site `index` holds the status cell of `tid` and its COMMIT is
 /// synced.
 fn status_synced(cluster: &Cluster, index: usize, tid: &TxnId) -> bool {
-    cluster
-        .site(index)
-        .chunks()
-        .txn_status()
-        .get(tid)
-        .is_some_and(|entry| entry.self_synced)
+    let entry = cluster.site(index).chunks().txn_status().get(tid);
+    bifrost::doubt_trace!(
+        "test_status_poll site={} index={} tid={:?} present={} self_synced={} held_segments={}",
+        cluster.site(index).server_id, index, tid, entry.is_some(),
+        entry.as_ref().is_some_and(|entry| entry.self_synced), held_for(cluster, index, tid)
+    );
+    entry.is_some_and(|entry| entry.self_synced)
 }
 
 /// Segments of site `index` that `tid` keeps in progress (D20).
@@ -1309,6 +1310,7 @@ async fn an_unsynced_commit_answers_committing() {
         .store(true, std::sync::atomic::Ordering::Release);
     let b_dir = cluster.temp[B].path().to_path_buf();
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, true);
+    bifrost::doubt_trace!("test_sync_paused tid={:?}", tid);
     assert!(matches!(
         txn.commit(tid.clone()).await,
         Ok(Ok(EndResult::Success))
@@ -1316,11 +1318,53 @@ async fn an_unsynced_commit_answers_committing() {
     data_site(&cluster, B).status_release_round(false).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committing);
     crate::ram::durability::pause_receipt_syncs_under(&b_dir, false);
+    bifrost::doubt_trace!("test_sync_resumed tid={:?}", tid);
     wait_status_synced(&cluster, B, &tid).await;
     assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committed);
     super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
         .store(false, std::sync::atomic::Ordering::Release);
     wait_released(&cluster, B, &tid).await;
+    cluster.shutdown().await;
+}
+
+/// Release removes a synced record before a later poll can observe it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_synced_commit_keeps_its_committed_outcome() {
+    let (cluster, client) = Cluster::start("crosssite_c13b_release_control").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 14_600, 1).await;
+    drop(client);
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(matches!(
+        txn.commit(tid.clone()).await,
+        Ok(Ok(EndResult::Success))
+    ));
+    for index in [A, B] {
+        cluster.site(index).chunks().sync_all().unwrap();
+        wait_status_synced(&cluster, index, &tid).await;
+        assert!(status_synced(&cluster, index, &tid));
+        assert_eq!(held_for(&cluster, index, &tid), 0);
+        assert_eq!(outcome_on(&cluster, index, &tid), TxnOutcome::Committed);
+    }
+    // Deliver both confirmations before the next poll. No scheduler timing is required.
+    for (index, peer) in [(A, B), (B, A)] {
+        <super::data_site::DataManager as super::data_site::Service>::synced(
+            &data_site(&cluster, index),
+            cluster.site(peer).server_id,
+            vec![tid],
+        )
+        .await;
+        data_site(&cluster, index).status_release_round(false).await;
+        assert!(!holds_status(&cluster, index, &tid));
+        assert!(!status_synced(&cluster, index, &tid));
+        assert_eq!(held_for(&cluster, index, &tid), 0);
+        assert_eq!(outcome_on(&cluster, index, &tid), TxnOutcome::Committed);
+    }
+    assert_all_or_nothing(&cluster, &ids, &scores, "synced status release");
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "status release must retain both committed payloads");
+    super::data_site::SYNCED_NOTICES_SKIPPED_FOR_TEST
+        .store(false, std::sync::atomic::Ordering::Release);
     cluster.shutdown().await;
 }
 
@@ -2678,6 +2722,114 @@ async fn a_lost_end_answer_is_reported_as_outcome_unknown() {
     cluster.shutdown().await;
 }
 
+/// A site refusal does not undo another site's commit (D33).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_commit_outcome_store_full_can_already_be_committed() {
+    use crate::client::transaction::{Transaction, TxnError};
+    use std::cell::Cell;
+    let (cluster, client) = Cluster::start("client_commit_store_full").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let read_id = Id::from_parts(THERE as u64, 40_001);
+    client
+        .write_cell(cell_of(read_id, 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let manager = coordinator(&cluster).await;
+    for (seq, reader) in [(40_002, true), (40_003, false)] {
+        let tid = manager.begin().await.unwrap().unwrap();
+        let write_id = Id::from_parts(HERE as u64, seq);
+        if reader {
+            manager.read(tid, read_id).await.unwrap().unwrap();
+        }
+        manager
+            .write(tid, cell_of(write_id, seq))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        let txn = Transaction {
+            tid,
+            state: Cell::new(TxnState::Prepared),
+            client: manager.clone(),
+        };
+        let result = txn.commit().await;
+        // The writer decided COMMIT. A reader's cleanup refusal cannot undo it.
+        assert!(result.is_ok(), "the writer's decision must win: {result:?}");
+        assert_eq!(score_on(cluster.site(A), &write_id), Some(seq));
+        assert_eq!(
+            data_site(&cluster, A).txn_outcome(&tid),
+            TxnOutcome::Committed
+        );
+    }
+    cluster.shutdown().await;
+}
+
+/// The automatic transaction wrapper must not replay an uncertain commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_commit_outcome_wrapper_does_not_retry_or_abort() {
+    use crate::client::transaction::TxnError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (cluster, client) = Cluster::start("client_commit_no_replay").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    // The wrapper chooses any coordinator. Refresh each coordinator's route table.
+    for server in cluster.servers.iter().flatten() {
+        assert!(server.refresh_slot_placement().await);
+    }
+    let waiting = data_site(&cluster, A);
+    let prepared_site = cluster.site(A).clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let result = client
+        .transaction(move |txn| {
+            let seen = seen.clone();
+            let waiting = waiting.clone();
+            let prepared_site = prepared_site.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                txn.write(cell_of(Id::from_parts(HERE as u64, 40_004), 8))
+                    .await?;
+                txn.write(cell_of(Id::from_parts(THERE as u64, 40_004), 9))
+                    .await?;
+                txn.prepare().await?;
+                assert_eq!(
+                    score_on(&prepared_site, &Id::from_parts(HERE as u64, 40_004)),
+                    Some(8)
+                );
+                assert_eq!(waiting.txn_outcome(&txn.tid), TxnOutcome::InDoubt);
+                let limit = super::manager::stop_end_fanout_after_commit_point(txn.tid);
+                let result = txn.commit().await;
+                drop(limit);
+                assert_eq!(waiting.txn_outcome(&txn.tid), TxnOutcome::InDoubt);
+                assert_eq!(txn.state.get(), TxnState::Committed);
+                // A second call cannot turn the first uncertain result into a definite error.
+                assert!(matches!(txn.commit().await, Err(TxnError::OutcomeUnknown)));
+                result
+            }
+        })
+        .await;
+    assert!(
+        matches!(result, Err(TxnError::OutcomeUnknown)),
+        "{result:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        score_on(cluster.site(B), &Id::from_parts(THERE as u64, 40_004)),
+        Some(9)
+    );
+    // An abort would rewind A. The wrapper leaves it in doubt for peer resolution.
+    assert_eq!(
+        score_on(cluster.site(A), &Id::from_parts(HERE as u64, 40_004)),
+        Some(8)
+    );
+    cluster.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // The old version of an updated cell between `end` and the COMMIT sync
 // ---------------------------------------------------------------------------
@@ -3450,6 +3602,122 @@ async fn recovery_finds_a_participant_missing_from_the_ring_cache() {
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_finds_a_membership_only_participant_after_a_configuration_snapshot() {
     find_a_committed_participant_after_an_address_gap(true).await;
+}
+
+async fn review_f1_reader_report_case(partial: bool, refuse: bool) {
+    use crate::client::transaction::{Transaction, TxnError};
+    use std::cell::Cell;
+    let (cluster, client) = Cluster::start("review_f1_reader_report").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let writer_id = Id::from_parts(HERE as u64, 50_001);
+    let read_ids = [
+        Id::from_parts(THERE as u64, 50_001),
+        Id::from_parts(THERE as u64, 50_002),
+    ];
+    for id in &read_ids {
+        client.write_cell(cell_of(*id, 1)).await.unwrap().unwrap();
+    }
+    let manager = coordinator(&cluster).await;
+    let tid = manager.begin().await.unwrap().unwrap();
+    for id in read_ids.iter().take(if partial { 2 } else { 1 }) {
+        manager.read(tid, *id).await.unwrap().unwrap();
+    }
+    manager
+        .write(tid, cell_of(writer_id, 73))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    let writer = data_site(&cluster, A);
+    let reader = data_site(&cluster, B);
+    // A late END can reach a read-only participant after its local abort.
+    assert_eq!(
+        <super::data_site::DataManager as super::data_site::Service>::abort(&reader, tid, tid)
+            .await
+            .payload,
+        AbortResult::Success(None)
+    );
+    reader.set_cell_owner_for_test(
+        &read_ids[0],
+        Some(TxnPriority::new(
+            cluster.site(B).hlc.now(),
+            cluster.site(B).server_id,
+        )),
+    );
+    if refuse {
+        crate::ram::chunk::refuse_next_commit_for_test(cluster.site(A).chunks().base_addr, tid);
+    }
+    // B sorts first. Hold A's rollback until B has returned its lock report.
+    let writer_meta = writer.cell_meta_for_test(&writer_id);
+    let (release, held) = if refuse {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let guard = writer_meta.lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        (Some(release_tx), Some(held))
+    } else {
+        (None, None)
+    };
+    let watching_reader = reader.clone();
+    let ordered = tokio::spawn(async move {
+        wait_until("reader END finishes before writer rollback", 10, || {
+            !watching_reader.has_transaction_for_test(&tid)
+        })
+        .await;
+        if let Some(release) = release {
+            release.send(()).unwrap();
+        }
+    });
+    let txn = Transaction {
+        tid,
+        state: Cell::new(TxnState::Prepared),
+        client: manager,
+    };
+    let result = txn.commit_durable().await;
+    ordered.await.unwrap();
+    if let Some(held) = held {
+        held.join().unwrap();
+    }
+    reader.set_cell_owner_for_test(&read_ids[0], None);
+    println!("F1 result: {result:?}; partial reader report: {partial}; writer refusal: {refuse}");
+    if refuse {
+        assert_eq!(writer.txn_outcome(&tid), TxnOutcome::Aborted);
+        assert_eq!(score_on(cluster.site(A), &writer_id), None);
+    } else {
+        assert_eq!(writer.txn_outcome(&tid), TxnOutcome::Committed);
+        assert_eq!(score_on(cluster.site(A), &writer_id), Some(73));
+    }
+    cluster.shutdown().await;
+    if refuse {
+        assert!(
+            matches!(result, Err(TxnError::OutcomeUnknown)),
+            "a reader report hid writer rollback: {result:?}"
+        );
+    } else {
+        assert!(result.is_ok(), "committed writer control: {result:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_reader_exhausted_report_cannot_hide_writer_rollback() {
+    review_f1_reader_report_case(false, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_reader_partial_report_cannot_hide_writer_rollback() {
+    review_f1_reader_report_case(true, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_f1_committed_writer_control() {
+    review_f1_reader_report_case(false, false).await;
 }
 
 /// A completed removal must fence discovery even when a normal query is stale.

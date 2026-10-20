@@ -147,6 +147,7 @@ service! {
     rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
     rpc cell_scan_close(cursor: u64) -> ();
     rpc live_cell_count() -> u64;
+    rpc storage_chunk_count() -> u64;
     rpc fence_engage(families: &Vec<u32>, drain_ms: u64, lease_ms: u64) -> Result<u64, String>;
     rpc fence_renew(token: u64, lease_ms: u64) -> bool;
     rpc fence_release(token: u64) -> ();
@@ -1201,6 +1202,10 @@ impl Service for NebRPCService {
             })
         })();
         future::ready(result).boxed()
+    }
+
+    fn storage_chunk_count(&self) -> BoxFuture<'_, u64> {
+        future::ready(self.database_runtime.chunks().chunk_count() as u64).boxed()
     }
 
     fn live_cell_count(&self) -> BoxFuture<'_, u64> {

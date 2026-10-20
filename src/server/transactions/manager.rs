@@ -923,7 +923,8 @@ impl TransactionManager {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
                         super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
-                    self.sites_end(&tid, affected_objs, &data_sites, durable).await
+                    self.sites_end(&tid, affected_objs, &data_sites, durable)
+                        .await
                 }
                 Err(error) => Err(error),
             };
@@ -1913,6 +1914,8 @@ impl TransactionManager {
             );
             return Err(TMError::OutcomeUnknown);
         }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_before_end", tid);
         let participants: Vec<u64> = changed_objs
             .iter()
             .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
@@ -1920,7 +1923,9 @@ impl TransactionManager {
             .collect();
         let sites: Vec<u64> = changed_objs.keys().copied().collect();
         if participants.len() < 2 {
-            return self.end_sites(tid, &sites, data_sites, durable).await;
+            return self
+                .end_sites(tid, &sites, data_sites, durable, participants.first().copied())
+                .await;
         }
         // Multi-site: one site that closed its brackets decides the
         // transaction, because its COMMIT is durable and every site that got
@@ -1939,6 +1944,8 @@ impl TransactionManager {
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_after_end", tid);
         let mut committed = false;
         // A participant that refused but keeps the transaction decided (a
         // refused close: store full, WAL error) commits it later.
@@ -1984,7 +1991,10 @@ impl TransactionManager {
                 }
                 Err(error) => {
                     unreachable = true;
-                    debug!("site {} did not answer `end` for {:?}: {:?}", server_id, tid, error);
+                    debug!(
+                        "site {} did not answer `end` for {:?}: {:?}",
+                        server_id, tid, error
+                    );
                 }
             }
         }
@@ -2002,42 +2012,50 @@ impl TransactionManager {
         Ok(undecided_refusal.unwrap_or(EndResult::DecidedPending))
     }
 
-    /// `end` to each of `sites` in parallel; the first non-success wins.
+    /// End every site. A reader's cleanup report cannot decide a writer's outcome.
     async fn end_sites(
         &self,
         tid: &TxnId,
         sites: &[u64],
         data_sites: &DataSitesMap,
         durable: bool,
+        writer: Option<u64>,
     ) -> Result<EndResult, TMError> {
         let end_futures: FuturesUnordered<_> = sites
             .iter()
             .map(|server_id| {
                 let data_site = data_sites.get(server_id).unwrap();
-                async move { data_site.end(self.get_clock(), tid.clone(), durable).await }
+                async move {
+                    (
+                        *server_id,
+                        data_site.end(self.get_clock(), tid.clone(), durable).await,
+                    )
+                }
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
-        for result in end_results {
-            match result {
+        let mut writer_result = None;
+        let mut cleanup_result = None;
+        for (server_id, result) in end_results {
+            let result = match result {
                 Ok(result) => {
                     self.merge_clock(result.clock);
-                    let payload = result.payload;
-                    match payload {
-                        EndResult::Success => {}
-                        _ => {
-                            return Ok(payload);
-                        }
-                    }
+                    Ok(result.payload)
                 }
-                Err(e) => {
-                    debug!("Error on site end {:?}", e);
-                    return Err(TMError::OutcomeUnknown);
+                Err(error) => {
+                    debug!("Error on site end {:?}", error);
+                    Err(TMError::OutcomeUnknown)
                 }
+            };
+            if Some(server_id) == writer {
+                writer_result = Some(result);
+            } else if !matches!(result, Ok(EndResult::Success)) && cleanup_result.is_none() {
+                cleanup_result = Some(result);
             }
         }
-        Ok(EndResult::Success)
+        writer_result.unwrap_or_else(|| cleanup_result.unwrap_or(Ok(EndResult::Success)))
     }
+
     /// Best-effort, idempotent release of read pins on every server this
     /// transaction pinned a read on. Runs on commit/abort for both read-only and
     /// read-write transactions: a server the transaction only *read* (pinned) is
@@ -2119,7 +2137,12 @@ impl TransactionManager {
     }
 
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
-        txn.data.clear();
+        // Retired map nodes can keep this transaction alive. Release its cache.
+        {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase = super::phase_profile::guard(super::phase_profile::Phase::CacheRelease);
+            txn.data = HashMap::new();
+        }
         txn.affected_objects.clear();
         txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;
@@ -2598,6 +2621,34 @@ mod tests {
         assert!(result.is_ok(), "a held iteration entry must allow unrelated cleanup");
         for tid in created { manager.cleanup_transaction(&tid); }
         assert_eq!(manager.transaction_count(), 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_releases_cache_capacity_while_handle_is_retained() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_cache_capacity";
+        let server = start_manager_test_server(&address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let client = scoped_txn_client_for_database(&address, group, group).await;
+        let tid = client.begin().await.unwrap().unwrap();
+        let retained = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn = retained.lock().await;
+            txn.data.reserve(8192);
+            assert!(txn.data.capacity() >= 8192);
+        }
+        manager.cleanup_transaction(&tid);
+        assert_eq!(manager.transaction_count(), 0);
+        {
+            let txn = retained.lock().await;
+            assert_eq!(txn.state, TxnState::Cleanup);
+            assert_eq!(
+                txn.data.capacity(),
+                0,
+                "a retired map node must not retain the transaction cache allocation"
+            );
+        }
         server.shutdown().await;
     }
 
