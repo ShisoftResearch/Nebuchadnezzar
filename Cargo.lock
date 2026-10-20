@@ -366,7 +366,7 @@ source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494c
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 2.0.117",
 ]
 
 [[package]]
