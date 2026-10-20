@@ -966,21 +966,36 @@ impl TransactionManager {
         &self,
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
-        if !self.data_sites.contains_key(&server_id) {
-            let client = self.deps.get_member_by_server_id(server_id).await?;
-            return Ok(self.data_sites.get_or_insert(server_id, || {
-                data_site::AsyncServiceClient::new_with_service_id(
-                    data_site::generate_scoped_service_id(
-                        self.deps.database_runtime.group_name(),
-                        self.deps.database_runtime.database_name(),
-                    ),
-                    &client,
-                )
-            }));
+        self.get_data_site_with(server_id, |client| {
+            data_site::AsyncServiceClient::new_with_service_id(
+                data_site::generate_scoped_service_id(
+                    self.deps.database_runtime.group_name(),
+                    self.deps.database_runtime.database_name(),
+                ),
+                client,
+            )
+        })
+        .await
+    }
+
+    async fn get_data_site_with<F>(
+        &self,
+        server_id: u64,
+        create: F,
+    ) -> io::Result<Arc<data_site::AsyncServiceClient>>
+    where
+        F: Fn(&Arc<RPCClient>) -> Arc<data_site::AsyncServiceClient>,
+    {
+        if let Some(site) = self.data_sites.get(&server_id) {
+            return Ok(site);
         }
-        self.data_sites.get(&server_id).ok_or(io::Error::new(
-            io::ErrorKind::NotFound,
-            "data site not found",
+        let client = self.deps.get_member_by_server_id(server_id).await?;
+        // Publish a complete client. Lightning's constructor marker can be
+        // visible to contains_key while get still returns no client.
+        Ok(crate::utils::keyed_state::get_or_insert(
+            &self.data_sites,
+            server_id,
+            || create(&client),
         ))
     }
     async fn get_data_site_by_id(
@@ -2353,6 +2368,46 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_slow_data_site_constructor_does_not_publish_a_missing_client() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_manager_test_server(&address, "data_site_construction").await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let server_id = server.server_id;
+        assert!(manager.data_sites.get(&server_id).is_none());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_manager = manager.clone();
+        let service_id = data_site::generate_scoped_service_id(
+            manager.deps.database_runtime.group_name(),
+            manager.deps.database_runtime.database_name(),
+        );
+        let first = tokio::spawn(async move {
+            first_manager
+                .get_data_site_with(server_id, move |client| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    data_site::AsyncServiceClient::new_with_service_id(service_id, client)
+                })
+                .await
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if manager.data_sites.contains_key(&server_id) {
+            release_tx.send(()).unwrap();
+            first.await.unwrap().unwrap();
+            server.shutdown().await;
+            panic!("an incomplete data site client must not be advertised");
+        }
+        let second = manager.get_data_site(server_id).await;
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        let cached = manager.data_sites.get(&server_id);
+        server.shutdown().await;
+        let second = second.expect("a concurrent constructor must not look like a missing site");
+        assert!(Arc::ptr_eq(&first.unwrap(), &second));
+        assert!(Arc::ptr_eq(&cached.unwrap(), &second));
     }
 
     fn install_basic_schema(runtime: &Arc<crate::server::DatabaseRuntime>) -> Schema {
