@@ -101,6 +101,12 @@ impl StateMachineCmds for IdAllocSM {
             if slot == 0 {
                 continue;
             }
+            // Reserved for the status cells of multi-site transactions
+            // (`crate::ram::txn_status::STATUS_ORIGIN`): their ids are
+            // composed, never allocated.
+            if slot == crate::ram::txn_status::STATUS_ORIGIN {
+                continue;
+            }
             let entry = self.state.origins.entry(slot).or_default();
             if entry.retired {
                 continue;

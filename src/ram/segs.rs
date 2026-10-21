@@ -36,7 +36,16 @@ pub(crate) enum ArchiveOutcome {
 }
 
 pub static ARCHIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that a pin, a claim or a lease refused, then queued again.
 pub static SEAL_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that left a synced, mostly dead segment to the cleaner, then
+/// queued again. A wait is not a refusal: it takes no fsync.
+pub static SEAL_RECLAIM_WAIT_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Segments that wait for the cleaner now, and the most that waited at once.
+pub static SEAL_WAITING_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+pub static SEAL_WAITING_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Rotations whose seal job ran on the rotating writer: the queue was full.
+pub static SEAL_INLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Durability write accounting, for attributing disk write volume.
 ///
@@ -58,6 +67,10 @@ pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static BACKGROUND_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static DRAIN_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Forced syncs that the durability watermark already covered: another
+/// sync (a group sync or another transaction's) took these bytes to disk, so
+/// no `fsync` ran. Group commit on the forced path.
+pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
 /// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
@@ -73,6 +86,131 @@ static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
 static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// A test model of a power loss.
+///
+/// When enabled, every successful sync of a WAL file records the bytes it
+/// made durable. [`power_loss_model::copy_store_as_after_power_loss`] then
+/// builds a copy of a store in which each WAL file holds only those bytes:
+/// writes and truncations that no sync covered are gone, as after a power
+/// loss. Backup files are copied as they are: they are installed by rename
+/// after their own sync. The model does not cover directory entries.
+///
+/// Process-global. The test runner gives each test its own process.
+#[cfg(test)]
+pub(crate) mod power_loss_model {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static GROUP_SYNC_PAUSED: AtomicBool = AtomicBool::new(false);
+    static DURABLE: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Vec<u8>>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Start to record durable WAL bytes. Enable it before the first store
+    /// starts, or the WAL files written before have no durable image.
+    pub(crate) fn enable() {
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    /// Stop the group syncer, as a power loss inside its interval does.
+    /// Explicit syncs still run.
+    pub(crate) fn pause_group_sync(paused: bool) {
+        GROUP_SYNC_PAUSED.store(paused, Ordering::Release);
+    }
+
+    pub(super) fn group_sync_paused() -> bool {
+        GROUP_SYNC_PAUSED.load(Ordering::Acquire)
+    }
+
+    static FAILED_SYNC_DIRS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Fail every explicit WAL sync of a file under `prefix` with EIO, as a
+    /// disk that refuses the sync.
+    pub(crate) fn fail_wal_syncs_under(prefix: &Path, failing: bool) {
+        let mut dirs = FAILED_SYNC_DIRS.lock();
+        dirs.retain(|existing| existing != prefix);
+        if failing {
+            dirs.push(prefix.to_path_buf());
+        }
+    }
+
+    pub(crate) fn wal_sync_fails(path: &Option<String>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        let dirs = FAILED_SYNC_DIRS.lock();
+        !dirs.is_empty() && dirs.iter().any(|dir| Path::new(path).starts_with(dir))
+    }
+
+    /// `len` is the file length that the sync covered.
+    pub(crate) fn record_synced_len(path: &Option<String>, len: u64) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(mut bytes) = std::fs::read(path) else {
+            return;
+        };
+        bytes.truncate(len as usize);
+        DURABLE.lock().insert(path.clone(), bytes);
+    }
+
+    pub(crate) fn record_synced(path: &Option<String>, file: &std::fs::File) {
+        if let Ok(metadata) = file.metadata() {
+            record_synced_len(path, metadata.len());
+        }
+    }
+
+    fn copy_tree(from: &Path, to: &Path, wal: bool) -> std::io::Result<()> {
+        if !from.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target, wal)?;
+                continue;
+            }
+            if !wal {
+                std::fs::copy(entry.path(), &target)?;
+                continue;
+            }
+            let key = entry.path().to_string_lossy().to_string();
+            let durable = DURABLE.lock().get(&key).cloned();
+            let bytes = match durable {
+                Some(bytes) => bytes,
+                // Never synced through a segment: only the header, which the
+                // file manager syncs when it creates the file, is durable.
+                None => {
+                    let mut bytes = std::fs::read(entry.path())?;
+                    bytes.truncate(crate::ram::wal_format::FILE_HEADER_SIZE);
+                    bytes
+                }
+            };
+            std::fs::write(&target, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Copy a store's WAL and backup directories as a power loss at this
+    /// instant would leave them.
+    pub(crate) fn copy_store_as_after_power_loss(
+        wal_from: &Path,
+        backup_from: &Path,
+        wal_to: &Path,
+        backup_to: &Path,
+    ) -> std::io::Result<()> {
+        copy_tree(backup_from, backup_to, false)?;
+        copy_tree(wal_from, wal_to, true)
+    }
+}
 
 #[cfg(test)]
 pub(crate) struct PauseRewindSync(usize);
@@ -138,7 +276,7 @@ fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     // Bytes journaled during this sync must enqueue another pass.
     seg.wal_sync_queued.store(false, Ordering::Release);
     #[cfg(test)]
-    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) {
+    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
         seg.wal_sync_queued.store(true, Ordering::Release);
         WAL_DIRTY.lock().push(seg.clone());
         return;
@@ -500,24 +638,74 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// Pooled 8 MiB staging buffers for `Segment::archive` (slab adopter #1).
-/// Bounded in practice by archiver concurrency; `cold_ranges` on so buffer
-/// memory returns to the OS when archiver threads retire.
-type ArchiveStagingBuf = [u8; SEGMENT_SIZE];
+/// At most 32 MiB of staging, including inline and shutdown archives.
+/// Lightning's slab allocator prefaults a 64 MiB range per calling thread.
+/// A shared buffer pool keeps this cost independent of the thread count.
+const ARCHIVE_STAGING_LIMIT: usize = 4;
 
-fn archive_staging_pool(
-) -> &'static std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>> {
-    static POOL: std::sync::OnceLock<
-        std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>>,
-    > = std::sync::OnceLock::new();
-    POOL.get_or_init(|| lightning::slab_pool::SlabPool::new("archive_staging", true))
+#[derive(Default)]
+struct ArchiveStagingState {
+    allocated: usize,
+    idle: Vec<Vec<u8>>,
 }
 
-/// Frees the staging buffer on every exit path (plain data, no destructor).
-struct ArchiveStagingGuard(lightning::slab_pool::SlabHandle<ArchiveStagingBuf>);
-impl Drop for ArchiveStagingGuard {
+#[derive(Default)]
+struct ArchiveStagingPool {
+    state: parking_lot::Mutex<ArchiveStagingState>,
+    available: parking_lot::Condvar,
+}
+
+impl ArchiveStagingPool {
+    fn acquire(&self) -> ArchiveStagingGuard<'_> {
+        // During snapshot, compression, and write, holders take no lock and wait for no thread.
+        let mut state = self.state.lock();
+        loop {
+            if let Some(buffer) = state.idle.pop() {
+                return ArchiveStagingGuard {
+                    pool: self,
+                    buffer: Some(buffer),
+                };
+            }
+            if state.allocated < ARCHIVE_STAGING_LIMIT {
+                state.allocated += 1;
+                drop(state);
+                return ArchiveStagingGuard {
+                    pool: self,
+                    buffer: Some(vec![0; SEGMENT_SIZE]),
+                };
+            }
+            self.available.wait(&mut state);
+        }
+    }
+}
+
+fn archive_staging_pool() -> &'static ArchiveStagingPool {
+    static POOL: std::sync::OnceLock<ArchiveStagingPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(ArchiveStagingPool::default)
+}
+
+/// Return the buffer on success, an I/O error, or a panic.
+struct ArchiveStagingGuard<'a> {
+    pool: &'a ArchiveStagingPool,
+    buffer: Option<Vec<u8>>,
+}
+
+impl ArchiveStagingGuard<'_> {
+    fn snapshot(&mut self, data: &[u8]) -> &[u8] {
+        let buffer = self.buffer.as_mut().unwrap();
+        buffer.copy_from_slice(data);
+        buffer
+    }
+}
+
+impl Drop for ArchiveStagingGuard<'_> {
     fn drop(&mut self) {
-        archive_staging_pool().free_forget(self.0);
+        self.pool
+            .state
+            .lock()
+            .idle
+            .push(self.buffer.take().unwrap());
+        self.pool.available.notify_one();
     }
 }
 
@@ -2021,6 +2209,7 @@ impl Segment {
             ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
             return Ok(ArchiveOutcome::Refused);
         }
+        let staging = archive_staging_pool().acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -2271,6 +2460,8 @@ image, not an empty segment; archiving it would persist the damage.",
                         let data_block =
                             slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
+                        let mut staging = staging;
+
                         // Read the append cursor BEFORE snapshotting the
                         // image, so the recorded length can never exceed the
                         // bytes captured. See the call to
@@ -2278,28 +2469,7 @@ image, not an empty segment; archiving it would persist the damage.",
                         let used_len_at_snapshot =
                             self.append_header.load(Ordering::Acquire) - self.addr;
 
-                        // Snapshot the segment into a pooled staging buffer
-                        // (slab adopter #1; Lightning docs/slab-pools-
-                        // design.md). Previously a per-archive 8 MiB
-                        // Vec::from — one large-block heap alloc + free per
-                        // archived segment, continuously for the life of an
-                        // import. The pool is bounded by archiver
-                        // concurrency and recycles the same slots.
-                        let staging = archive_staging_pool();
-                        let staging_handle = staging.alloc_with(|slot| {
-                            ptr::copy_nonoverlapping(
-                                data_block.as_ptr(),
-                                slot.as_mut_ptr() as *mut u8,
-                                SEGMENT_SIZE,
-                            );
-                        });
-                        // Plain-data buffer: freed via free_forget on every
-                        // exit path by this guard.
-                        let _staging_guard = ArchiveStagingGuard(staging_handle);
-                        let padded_data: &[u8] = slice::from_raw_parts(
-                            staging_handle.as_ptr() as *const u8,
-                            SEGMENT_SIZE,
-                        );
+                        let padded_data = staging.snapshot(data_block);
 
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
@@ -2344,6 +2514,10 @@ image, not an empty segment; archiving it would persist the damage.",
                         }
                     }
 
+                    #[cfg(test)]
+                    if power_loss_model::wal_sync_fails(&Some(tmp_backup_file.clone())) {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
                     file.sync_all()?;
                     drop(file);
 
@@ -2626,6 +2800,11 @@ image, not an empty segment; archiving it would persist the damage.",
                             .unwrap_or(error));
                     }
                     self.wal_bytes_synced.fetch_max(written, Release);
+                    #[cfg(test)]
+                    power_loss_model::record_synced_len(
+                        &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                        original_len + framed.len() as u64,
+                    );
                     trace!(
                         "WAL synced inline for segment {} ({} bytes)",
                         self.id,
@@ -2695,10 +2874,20 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     /// Remove decision records from a refused transaction's private tail.
+    ///
+    /// Synced. An unsynced truncation can be undone by a power loss, and
+    /// the COMMIT it removed then decides the transaction at recovery,
+    /// while the site already rolled it back and reported it failed.
     pub(crate) fn truncate_wal_to(&self, position: u64) -> io::Result<()> {
         let mut state = self.file_state.lock();
         if let Some(file) = &state.wal {
             file.set_len(position)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            crate::ram::segs::power_loss_model::record_synced(
+                &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                file,
+            );
         }
         state.wal_len = position;
         if let Some(d) = &state.durability {
@@ -2754,8 +2943,11 @@ image, not an empty segment; archiving it would persist the damage.",
             let reuse_watermark = true;
             #[cfg(test)]
             let reuse_watermark = std::env::var_os("NEB_TEST_DISABLE_WATERMARK_REUSE").is_none();
+            // The watermark is the durable length of this file, with its
+            // name published: a sync that covers every byte written so far
+            // has nothing to add. A forced sync reuses it too, so several
+            // transactions that commit on one segment share one `fsync`.
             if reuse_watermark
-                && !force
                 && state
                     .durability
                     .as_ref()
@@ -2763,6 +2955,9 @@ image, not an empty segment; archiving it would persist the damage.",
             {
                 self.wal_bytes_synced
                     .fetch_max(self.wal_bytes_written.load(Relaxed), Release);
+                if force {
+                    COVERED_FORCED_SYNCS.fetch_add(1, Relaxed);
+                }
                 return Ok(());
             }
             // A transaction can sync this segment while the timer waits for the lock.
@@ -2770,6 +2965,9 @@ image, not an empty segment; archiving it would persist the damage.",
                 return Ok(());
             }
             let Some(file) = &state.wal else {
+                if drain {
+                    return Self::sync_unopened_wal(&state, self.chunk_id, self.id, self.seq_id);
+                }
                 return Ok(());
             };
             let file = file.clone();
@@ -2787,12 +2985,22 @@ image, not an empty segment; archiving it would persist the damage.",
                 epoch,
             )
         };
+        #[cfg(test)]
+        let (model_path, model_len) = {
+            let state = self.file_state.lock();
+            (
+                state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                state.wal_len,
+            )
+        };
         // The descriptor keeps this WAL inode alive if an archive unlinks its name.
         // Appends remain ordered under file_state. This sync covers the records that
         // preceded it; later appends keep their own dirty bytes or force their own sync.
         let sync_started = std::time::Instant::now();
         #[cfg(test)]
-        let result = if durability.as_ref().is_some_and(|d| d.test_fail_sync()) {
+        let result = if durability.as_ref().is_some_and(|d| d.test_fail_sync())
+            || power_loss_model::wal_sync_fails(&model_path)
+        {
             Err(io::Error::from_raw_os_error(libc::EIO))
         } else {
             sync(&file)
@@ -2817,12 +3025,44 @@ image, not an empty segment; archiving it would persist the damage.",
         }
         result?;
         self.wal_bytes_synced.fetch_max(written, Release);
+        #[cfg(test)]
+        power_loss_model::record_synced_len(&model_path, model_len);
         FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
         if drain {
             DRAIN_WAL_SYNCS.fetch_add(1, Relaxed);
         } else if !force {
             BACKGROUND_WAL_SYNCS.fetch_add(1, Relaxed);
         }
+        Ok(())
+    }
+
+    /// Sync the WAL file of a segment that has not opened it: a segment that
+    /// recovery left with its WAL, as a head or after a failed archive. A
+    /// process crash can leave its bytes in the page cache only, and a start
+    /// answers `Committed` from them once `sync_all` returns (review finding
+    /// 6, TLA+ F1).
+    fn sync_unopened_wal(
+        state: &SegmentFileState,
+        chunk_id: usize,
+        id: u64,
+        seq_id: u64,
+    ) -> io::Result<()> {
+        let Some(path) = state.manager.wal_path(chunk_id, id, seq_id) else {
+            return Ok(());
+        };
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        if power_loss_model::wal_sync_fails(&Some(path.clone())) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        file.sync_all()?;
+        #[cfg(test)]
+        power_loss_model::record_synced(&Some(path), &file);
+        DRAIN_WAL_SYNCS.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -2858,9 +3098,12 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     /// Accept claims again: for an archive that decided not to seal after
-    /// all. A sealed segment's gate stays shut -- nothing may append to it.
+    /// all. The gate of a sealed or rotated segment stays shut -- nothing may
+    /// append to it.
     pub fn reopen_journal_gate(&self) {
-        if !self.is_sealed() {
+        // A rotated segment stays closed for the rest of its life, also after
+        // the seal job ends without a seal (the cleaner took it, or no backup).
+        if !self.is_sealed() && !self.protection.rotated.load(Ordering::Acquire) {
             self.pending_journals
                 .fetch_and(!JOURNAL_GATE_CLOSED, Ordering::AcqRel);
         }
@@ -3453,6 +3696,15 @@ impl SegmentReferenceGuard {
         Some(Self { segment })
     }
 
+    /// Keep the segment in progress for the cleaner until `tokens` are synced.
+    pub(crate) fn pin_until_covered(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        tokens: std::sync::Arc<Vec<crate::ram::durability::Receipt>>,
+    ) {
+        self.segment.protection.pin_until_covered(txn, tokens);
+    }
+
     /// Get the segment ID
     pub fn segment_id(&self) -> u64 {
         self.segment.id
@@ -4020,6 +4272,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_staging_buffers_are_bounded_across_threads() {
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let addresses = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        // Replace every worker twice. The buffers belong to the pool, not TLS.
+        for _ in 0..3 {
+            let barrier = Arc::new(std::sync::Barrier::new(ARCHIVE_STAGING_LIMIT));
+            let workers: Vec<_> = (0..ARCHIVE_STAGING_LIMIT)
+                .map(|worker| {
+                    let pool = pool.clone();
+                    let addresses = addresses.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let source = vec![worker as u8 + 1; SEGMENT_SIZE];
+                        for _ in 0..8 {
+                            let mut staging = pool.acquire();
+                            let data = staging.snapshot(&source);
+                            addresses.lock().insert(data.as_ptr() as usize);
+                            barrier.wait();
+                            assert_eq!(data, source.as_slice());
+                            drop(staging);
+                            barrier.wait();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+        assert_eq!(
+            addresses.lock().len(),
+            ARCHIVE_STAGING_LIMIT,
+            "archive staging exceeded the 32 MiB buffer budget"
+        );
+    }
+
+    #[test]
+    fn archive_staging_waits_at_capacity_and_reuses_a_returned_buffer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let mut held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_pool = pool.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let staging = waiter_pool.acquire();
+            acquired_tx
+                .send(staging.buffer.as_ref().unwrap().as_ptr() as usize)
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        let returned = held.pop().unwrap();
+        let address = returned.buffer.as_ref().unwrap().as_ptr() as usize;
+        drop(returned);
+        let acquired = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("staging waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(acquired, address);
+    }
+
+    #[test]
+    fn archive_staging_returns_a_buffer_after_a_panic() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let panic_pool = pool.clone();
+        let panic = std::thread::spawn(move || {
+            let _staging = panic_pool.acquire();
+            panic!("panic with an archive staging buffer");
+        })
+        .join()
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"panic with an archive staging buffer")
+        );
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+            acquired_tx.send(held.len()).unwrap();
+        });
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ARCHIVE_STAGING_LIMIT
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn seal_waits_for_in_flight_sync_and_credits_all_covered_bytes() {
         use std::io::Read;
         let dir = tempfile::TempDir::new().unwrap();
@@ -4169,6 +4521,41 @@ mod tests {
         assert!(seg.durability_failure().is_some());
         assert!(seg.sync_wal(false).is_err());
         assert!(seg.write_wal(seg.addr + 16, 8, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forced_sync_after_a_retraction_is_not_covered_by_the_old_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let retract_to = seg.wal_append_position();
+        let (result, receipts) =
+            crate::ram::durability::capture(|| seg.write_wal(seg.addr + 8, 64, false));
+        result.unwrap();
+        crate::ram::durability::wait(receipts).await.unwrap();
+        let high = seg.durable_file().unwrap().watermark();
+        assert!(high > retract_to, "test setup: the watermark covers the long frame");
+        seg.truncate_wal_to(retract_to).unwrap();
+        seg.write_wal(seg.addr + 8, 8, false).unwrap();
+        assert!(
+            seg.wal_append_position() <= high,
+            "test setup: the new bytes end below the old watermark"
+        );
+        let mut synced = false;
+        seg.sync_wal_with(true, |file| {
+            synced = true;
+            file.sync_all()
+        })
+        .unwrap();
+        assert!(
+            synced,
+            "bytes appended after a retraction must get their own sync, not the old watermark"
+        );
     }
 
     #[tokio::test]

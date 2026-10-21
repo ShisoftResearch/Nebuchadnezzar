@@ -200,7 +200,7 @@ async fn run() {
                 if !wanted(&name) {
                     continue;
                 }
-                server.chunks().sync_all();
+                server.chunks().sync_all().expect("sync the store");
                 let before = syncs();
                 let metrics_before = metrics();
                 let headers_before = wal_files(&server);
@@ -298,7 +298,7 @@ async fn run() {
                 }
                 let secs = started.elapsed().as_secs_f64();
                 // Include the eventual drain in sync accounting, outside acknowledgement time.
-                server.chunks().sync_all();
+                server.chunks().sync_all().expect("sync the store");
                 let data_syncs = syncs() - before;
                 let after = metrics();
                 let delta: Vec<u64> = after

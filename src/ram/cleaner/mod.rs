@@ -397,7 +397,7 @@ pub struct SegmentCandidate {
 impl SegmentCandidate {
     pub(crate) fn for_cleaner(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
         // Avoid excluding prepare/decision syncs for an ineligible segment.
-        if segment.protection.in_progress()
+        if segment.protection.blocks_cleaner()
             || segment.is_head_owned()
             || segment.pending_journal_count() != 0
             || segment.wal_sync_queued.load(Ordering::Acquire)
@@ -407,7 +407,7 @@ impl SegmentCandidate {
         if !segment.protection.claim_cleaner() {
             return None;
         }
-        if segment.protection.in_progress()
+        if segment.protection.blocks_cleaner()
             || segment.is_head_owned()
             || segment.pending_journal_count() != 0
             || segment.wal_sync_queued.load(Ordering::Acquire)

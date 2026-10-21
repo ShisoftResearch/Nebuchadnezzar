@@ -11,6 +11,8 @@ pub mod chunk;
 pub mod cleaner;
 pub mod compression;
 pub mod entry;
+pub mod txn_status;
+pub mod fence;
 pub mod file_manager;
 pub mod io;
 pub mod qsbr;

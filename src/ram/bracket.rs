@@ -70,15 +70,97 @@ pub fn short_txn_id(txn: &TxnId) -> u64 {
     txn.ts ^ txn.node.rotate_left(32)
 }
 
-/// BEGIN content: just the transaction id.
-pub fn encode_begin(txn: &TxnId) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TXN_ID_SIZE);
+/// The format of a BEGIN record.
+///
+/// Version 1 held the transaction id only. Version 2 adds the participant
+/// set, so that a site that restarts in doubt knows which site is the commit
+/// point of the transaction. Recovery refuses any other version with
+/// [`BracketFormatError`]; it does not read version 1.
+pub const BEGIN_FORMAT_VERSION: u8 = 2;
+
+/// BEGIN content, version 2:
+///
+/// ```text
+/// txn id        16 bytes
+/// version       u8       BEGIN_FORMAT_VERSION
+/// reserved      u8
+/// count         u16      number of participants
+/// participants  u64 * count, server ids
+/// padding       to 8-byte alignment
+/// ```
+///
+/// Every part of a transaction carries the same participant set. The set
+/// comes from the coordinator at prepare. The commit point is its lowest id.
+pub fn encode_begin(txn: &TxnId, participants: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TXN_ID_SIZE + 4 + participants.len() * size_of::<u64>());
     encode_txn_id(txn, &mut out);
+    out.push(BEGIN_FORMAT_VERSION);
+    out.push(0);
+    out.extend_from_slice(&(participants.len() as u16).to_le_bytes());
+    for participant in participants {
+        out.extend_from_slice(&participant.to_le_bytes());
+    }
+    pad_to_alignment(&mut out);
     out
 }
 
-pub fn decode_begin(content: &[u8]) -> Option<TxnId> {
-    decode_txn_id(content)
+/// Why a bracket record cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BracketFormatError {
+    /// The record is shorter than its fields say.
+    Truncated,
+    /// The record has a format version that this build does not read.
+    UnsupportedBeginVersion(u8),
+}
+
+impl std::fmt::Display for BracketFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BracketFormatError::Truncated => write!(f, "the BEGIN record is truncated"),
+            BracketFormatError::UnsupportedBeginVersion(version) => write!(
+                f,
+                "the BEGIN record has format version {version}; this build reads only version \
+                 {BEGIN_FORMAT_VERSION}. Import the store again from its source."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BracketFormatError {}
+
+/// A decoded BEGIN: the transaction and its participant set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Begin {
+    pub txn: TxnId,
+    pub participants: Vec<u64>,
+}
+
+pub fn decode_begin(content: &[u8]) -> Result<Begin, BracketFormatError> {
+    // Version 1 was the transaction id alone. Name it, so the error says
+    // which format the store holds.
+    if content.len() == TXN_ID_SIZE {
+        return Err(BracketFormatError::UnsupportedBeginVersion(1));
+    }
+    let txn = decode_txn_id(content).ok_or(BracketFormatError::Truncated)?;
+    let fixed = TXN_ID_SIZE + 4;
+    if content.len() < fixed {
+        return Err(BracketFormatError::Truncated);
+    }
+    let version = content[TXN_ID_SIZE];
+    if version != BEGIN_FORMAT_VERSION {
+        return Err(BracketFormatError::UnsupportedBeginVersion(version));
+    }
+    let count = u16::from_le_bytes([content[TXN_ID_SIZE + 2], content[TXN_ID_SIZE + 3]]) as usize;
+    if content.len() < fixed + count * size_of::<u64>() {
+        return Err(BracketFormatError::Truncated);
+    }
+    let participants = (0..count)
+        .map(|index| {
+            let at = fixed + index * size_of::<u64>();
+            u64::from_le_bytes(content[at..at + size_of::<u64>()].try_into().unwrap())
+        })
+        .collect();
+    Ok(Begin { txn, participants })
 }
 
 /// COMMIT content: the transaction id, then the manifest.
@@ -164,7 +246,9 @@ mod tests {
     #[test]
     fn bracket_records_round_trip() {
         let txn = test_hlc(0x0102_0304_0506_0708, 0x1122_3344_5566_7788);
-        assert_eq!(decode_begin(&encode_begin(&txn)).unwrap(), txn);
+        let begin = decode_begin(&encode_begin(&txn, &[7, 3, u64::MAX])).unwrap();
+        assert_eq!(begin.txn, txn);
+        assert_eq!(begin.participants, vec![7, 3, u64::MAX]);
 
         let manifest = vec![
             ManifestEntry { chunk_id: 0, seq_id: 1 },
@@ -205,7 +289,10 @@ mod tests {
     fn every_bracket_record_is_eight_byte_aligned() {
         let txn = test_hlc(11, 12);
         let align = crate::ram::entry::ENTRY_HEAD_SIZE;
-        assert_eq!(encode_begin(&txn).len() % align, 0, "BEGIN");
+        for participants in 0..5u64 {
+            let ids: Vec<u64> = (0..participants).collect();
+            assert_eq!(encode_begin(&txn, &ids).len() % align, 0, "BEGIN");
+        }
         assert_eq!(encode_txn_cont(&txn, 5).len() % align, 0, "TXN_CONT");
         for members in 0..8usize {
             let manifest: Vec<_> = (0..members)
@@ -238,6 +325,28 @@ mod tests {
         let (decoded, manifest) = decode_commit(&encode_commit(&txn, &[])).unwrap();
         assert_eq!(decoded, txn);
         assert!(manifest.is_empty());
+    }
+
+    /// A BEGIN of another format version is refused with a typed error. The
+    /// id-only form of version 1 is not read.
+    #[test]
+    fn a_begin_of_another_version_is_refused() {
+        let txn = test_hlc(5, 6);
+        let mut old = Vec::new();
+        encode_txn_id(&txn, &mut old);
+        assert_eq!(
+            decode_begin(&old),
+            Err(BracketFormatError::UnsupportedBeginVersion(1))
+        );
+        let mut future = encode_begin(&txn, &[1]);
+        future[TXN_ID_SIZE] = BEGIN_FORMAT_VERSION + 1;
+        assert_eq!(
+            decode_begin(&future),
+            Err(BracketFormatError::UnsupportedBeginVersion(BEGIN_FORMAT_VERSION + 1))
+        );
+        let mut short = encode_begin(&txn, &[1, 2]);
+        short.truncate(TXN_ID_SIZE + 4 + 8);
+        assert_eq!(decode_begin(&short), Err(BracketFormatError::Truncated));
     }
 
     /// The whole point of the fixed tail: the entry is exactly 24 bytes, so

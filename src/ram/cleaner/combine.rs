@@ -191,7 +191,8 @@ impl CombinedCleaner {
                 if !seg.no_references() {
                     return None;
                 }
-
+                // The in-progress rule (D20, D28) is checked in one place,
+                // after the claim: `SegmentCandidate::for_cleaner`.
                 SegmentCandidate::for_cleaner(&seg)
             })
             .collect_vec();

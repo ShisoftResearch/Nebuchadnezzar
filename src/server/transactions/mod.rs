@@ -1,3 +1,12 @@
+//! Transactions: the coordinator (`manager`) and the participant (`data_site`).
+//!
+//! Contract: a cell takes plain (non-transactional) writes or transactions,
+//! not both. If a caller mixes them on one cell, Neb does not guarantee that
+//! an acknowledged plain write or delete survives the resolution of an
+//! in-doubt transaction: after a restart with a transaction T in doubt, the
+//! plain write and T's write can get the same version, and only one is kept;
+//! an acknowledged delete is undone when the resolution installs T's cell.
+
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use bifrost::hlc::Hlc;
@@ -8,6 +17,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod corruption_tests;
+#[cfg(test)]
+mod crosssite_tests;
 pub mod data_site;
 pub mod manager;
 #[cfg(test)]
@@ -132,6 +143,9 @@ pub enum TxnState {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone)]
 pub enum TxnOutcome {
     Committed,
+    /// The site was told to commit, and its COMMIT is not synced yet (TLA+
+    /// F1): ask again. Never a reason to abort.
+    Committing,
     Aborted,
     /// This peer is in doubt too: it prepared and is waiting for a decision
     /// it never received.
@@ -196,6 +210,10 @@ pub enum EndResult {
         failures: Vec<LockReleaseFailure>,
     },
     Success,
+    /// A multi-site transaction is decided COMMIT, but every site refused
+    /// to close its brackets for now. Each site keeps it decided and
+    /// finishes the close later. The client must not retry it.
+    DecidedPending,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -240,6 +258,10 @@ pub enum TMError {
     AssertionError,
     InvalidTransactionState(TxnState),
     Other,
+    /// `end` was sent and the coordinator cannot tell whether the transaction
+    /// committed: a site did not answer (D33). The transaction is still
+    /// all-or-nothing; the caller must read the outcome again.
+    OutcomeUnknown,
 }
 
 pub async fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
@@ -260,6 +282,67 @@ pub async fn new_async_client_for_database(
     Ok(manager::AsyncServiceClient::new_with_service_id(
         service_id, &client,
     ))
+}
+
+/// A participant's answer to `fence` (D29).
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum FenceAnswer {
+    /// The site was told to commit: wait, and ask again.
+    Committing,
+    /// The site recorded the fence durably. From now on it refuses the
+    /// coordinator's `end` and any `prepare` of the transaction.
+    Fenced,
+    /// The site aborted the transaction.
+    Aborted,
+    /// The site holds no part of the transaction, and recorded the fence so a
+    /// later `prepare` of it is refused.
+    Unknown,
+}
+
+/// The outcome an operator forces on an in-doubt transaction.
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum ForcedOutcome {
+    Commit,
+    Abort,
+}
+
+/// The result of `force_resolve` on one site.
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub enum ForceResolveResult {
+    /// The transaction was in doubt here and now has the forced outcome.
+    Resolved,
+    /// The transaction is not in doubt here: unknown, or already decided.
+    NotInDoubt,
+    /// The outcome could not be applied; the transaction stays in doubt.
+    Failed(String),
+}
+
+/// Operator tool: force the outcome of one in-doubt transaction on the site
+/// at `address`, for a participant that is lost for good.
+///
+/// A site in doubt waits for every participant without a time limit (D29).
+/// If one participant never comes back, call this once for each surviving
+/// participant, with one outcome for all of them.
+///
+/// WARNING: if the lost participant comes back with its data and a different
+/// outcome, the transaction is torn. Use it only for a participant whose data
+/// is gone.
+pub async fn force_resolve_in_doubt(
+    address: &String,
+    group_name: &str,
+    database_name: &str,
+    tid: TxnId,
+    outcome: ForcedOutcome,
+) -> io::Result<ForceResolveResult> {
+    let client = DEFAULT_CLIENT_POOL.get(address).await?;
+    let site = data_site::AsyncServiceClient::new_with_service_id(
+        data_site::generate_scoped_service_id(group_name, database_name),
+        &client,
+    );
+    site.force_resolve(tid, outcome)
+        .await
+        .map(|response| response.payload)
+        .map_err(|error| io::Error::other(format!("force_resolve RPC failed: {:?}", error)))
 }
 
 /// Shared test-support constructor for transaction ids. Placed at module top

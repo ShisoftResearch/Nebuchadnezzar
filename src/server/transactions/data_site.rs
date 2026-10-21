@@ -116,6 +116,83 @@ fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDela
     PREPARE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Test hook (review R4): `fence_here` of this transaction stops between
+/// the fence record and the object lookup until the test releases it.
+#[cfg(test)]
+pub(crate) struct FenceGapHook {
+    pub(crate) tid: TxnId,
+    pub(crate) entered: AtomicBool,
+    pub(crate) released: AtomicBool,
+}
+
+#[cfg(test)]
+static FENCE_GAP_HOOK: Mutex<Option<Arc<FenceGapHook>>> = parking_lot::const_mutex(None);
+
+#[cfg(test)]
+pub(crate) fn install_fence_gap_hook(tid: TxnId) -> Arc<FenceGapHook> {
+    let hook = Arc::new(FenceGapHook {
+        tid,
+        entered: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    });
+    *FENCE_GAP_HOOK.lock() = Some(hook.clone());
+    hook
+}
+
+#[cfg(test)]
+fn wait_in_fence_gap(tid: &TxnId) {
+    let hook = {
+        let mut slot = FENCE_GAP_HOOK.lock();
+        match slot.as_ref() {
+            Some(hook) if &hook.tid == tid => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(hook) = hook {
+        hook.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !hook.released.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Test hook (review finding 1): a `prepare` of this cell waits before it
+/// takes the transaction object, where the fence check ran before the fix,
+/// as a thread that the scheduler stops there.
+#[cfg(test)]
+static PREPARE_AFTER_FENCE_CHECK_HOOKS: OnceLock<
+    Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_prepare_delay_after_fence_check(tid: TxnId, id: Id) -> PrepareDelayHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    PREPARE_AFTER_FENCE_CHECK_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .insert(key.clone(), state.clone());
+    PrepareDelayHandle { key, state }
+}
+
+#[cfg(test)]
+fn take_prepare_delay_after_fence_check(
+    tid: &TxnId,
+    prepared_ops: &[PrepareOp],
+) -> Option<Arc<PrepareDelayState>> {
+    let mut hooks = PREPARE_AFTER_FENCE_CHECK_HOOKS.get()?.lock();
+    let key = prepared_ops
+        .iter()
+        .map(|op| (tid.clone(), op.id))
+        .find(|key| hooks.contains_key(key))?;
+    hooks.remove(&key)
+}
+
 #[cfg(test)]
 pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelayHandle {
     let key = (tid, id);
@@ -259,16 +336,6 @@ pub static TERMINATION_COMMITTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How long an in-doubt transaction keeps its write heads while a
-/// participant stays silent, before this node gives up and presumes abort.
-fn termination_answer_grace() -> std::time::Duration {
-    std::env::var("NEB_TERMINATION_ANSWER_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(30))
-}
-
 fn txn_lease_timeout() -> std::time::Duration {
     std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
         .ok()
@@ -276,6 +343,14 @@ fn txn_lease_timeout() -> std::time::Duration {
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(120))
 }
+
+/// Test only: time spent pinning old-version segments at COMMIT.
+#[cfg(test)]
+pub(crate) static PIN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test only: skip the old-version pin, to show that the window is real.
+#[cfg(test)]
+pub(crate) static PIN_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct Transaction {
     state: TxnState,
@@ -290,14 +365,8 @@ struct Transaction {
     /// Pinned versions of LARGE cells read under repeatable-read semantics.
     pinned_reads: PinnedReadSet,
     /// Every server that will hold a bracket for this transaction, learned
-    /// from the coordinator at prepare.
-    ///
-    /// IN MEMORY ONLY, and deliberately so. A participant that survives to be
-    /// in doubt still has this and can ask its peers directly; one that
-    /// restarts has lost it and must fall back to asking every member of the
-    /// cluster. Persisting it would mean a second durable write in the
-    /// prepare path -- paid by every transaction, to serve a case that is
-    /// already covered by the broadcast.
+    /// from the coordinator at prepare. Each BEGIN record also carries it, so
+    /// a site that restarts still knows the participants of a transaction.
     participants: Vec<u64>,
     /// This site was told to COMMIT and has started writing COMMIT records.
     ///
@@ -307,6 +376,52 @@ struct Transaction {
     /// tear it. Set under the transaction lock before the first record is
     /// written, and checked by every abort path under the same lock.
     decided_commit: bool,
+    /// A COMMIT of this site is durable, or the commit point passed. False
+    /// while `decided_commit` is set only on a commit point whose COMMIT may
+    /// or may not be on disk: it answers `InDoubt` then.
+    commit_durable: bool,
+    /// A participant fenced this transaction here (D29), and the fence is
+    /// synced in the fence log. The coordinator's `end` is refused from now
+    /// on; only termination may commit it, after a participant reports it
+    /// committed.
+    fenced: bool,
+    /// The coordinator asked for a durable commit (D7): the COMMIT is synced
+    /// before `end` answers, also on a retry of a refused close.
+    durable_commit: bool,
+    /// A close of this object tried to write the status cell. Before the
+    /// first try no status cell of the transaction can exist here, so the
+    /// close does not search the probes for one (D44).
+    status_cell_attempted: bool,
+}
+
+/// Test hook: a site does not send `synced` notices, as one whose notices
+/// were lost. The slow sweep must release its status cells.
+#[cfg(test)]
+pub(crate) static SYNCED_NOTICES_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: the participant fence treats these server ids as down, as if
+/// they did not answer. The cluster harness cannot stop two of its three
+/// raft members at once (`bifrost/src/raft/mod.rs:2987`), so a test that
+/// restarts one participant while another is down marks that one silent.
+#[cfg(test)]
+pub(crate) fn silent_peers_for_test() -> &'static Mutex<std::collections::BTreeSet<u64>> {
+    static SILENT: std::sync::OnceLock<Mutex<std::collections::BTreeSet<u64>>> =
+        std::sync::OnceLock::new();
+    SILENT.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Test hook for TLA+ F2 (C15): the prepare round does not sync the
+/// entries before the yes vote.
+#[cfg(test)]
+pub(crate) static PREPARE_SYNC_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What the participant fence decided about an in-doubt transaction.
+pub(crate) enum InDoubtDecision {
+    Commit,
+    Abort,
+    Wait,
 }
 
 #[derive(Debug)]
@@ -370,16 +485,37 @@ pub struct DataManager {
     /// other half committed.
     ///
     /// Bounded and ordered. `TxnId` is an HLC, so oldest-first eviction is
-    /// just the front of the map, and the retention that matters is measured
-    /// against how long a coordinator can be gone before the lease sweeper
-    /// gives up -- seconds, against tens of thousands of entries.
+    /// just the front of the map. Eviction alone is not safe for a commit: a
+    /// peer can stay in doubt for longer than any bound, for example while it
+    /// is down. So a commit with other participants is also kept in the
+    /// store's decision evidence (`crate::ram::evidence`), durably and until
+    /// no participant holds it open; this map is the fast path.
     decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
-    /// When each in-doubt transaction was first found unresolvable because a
-    /// participant would not answer. Bounds how long its write heads stay
-    /// held: a hostage head is a writer slot gone from its chunk with no
-    /// refill path, so waiting forever trades one wrong answer for a
-    /// different one.
-    in_doubt_since: Mutex<BTreeMap<TxnId, std::time::Instant>>,
+}
+
+/// How often a site asks the participants that did not report their COMMIT
+/// synced; the fallback for a lost `synced` notice. See
+/// `status_release_round`.
+fn settle_sweep_interval() -> std::time::Duration {
+    std::env::var("NEB_SETTLE_SWEEP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+/// What `close_committed_brackets` did.
+enum CloseOutcome {
+    /// Every bracket is closed: the transaction is committed here.
+    Closed,
+    /// The transaction was rolled back and is over here.
+    RolledBack(EndResult),
+    /// The transaction stays decided COMMIT, keeps its locks and heads, and
+    /// the sweeper finishes the close. The value is what `end` reports.
+    Pending(EndResult),
+    /// A participant fenced the transaction here: `end` is refused, and the
+    /// transaction stays in doubt for the participant fence to decide.
+    Fenced,
 }
 
 /// How many finished transactions a site remembers the fate of. Sized to
@@ -404,7 +540,9 @@ service! {
     rpc abort(clock: Hlc, tid: TxnId) -> DataSiteResponse<AbortResult>;
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
-    rpc end(clock: Hlc, tid: TxnId) -> DataSiteResponse<EndResult>;
+    // `durable` (D7): the COMMIT is synced before the reply. Otherwise
+    // (default, D19 option 1) it is appended and its sync is queued.
+    rpc end(clock: Hlc, tid: TxnId, durable: bool) -> DataSiteResponse<EndResult>;
 
     // Cooperative termination: what does this site know about T's fate?
     //
@@ -412,13 +550,43 @@ service! {
     // coordinator. That is the whole point -- the coordinator is the thing
     // that went away.
     rpc txn_status(tid: TxnId) -> DataSiteResponse<TxnOutcome>;
+
+    // Participant `from` synced its COMMIT of each of `tids` (TLA+ F4).
+    // Batched; a site tombstones its status cell of a transaction when every
+    // participant reported.
+    rpc synced(from: u64, tids: Vec<TxnId>) -> DataSiteResponse<()>;
+
+    // The participant fence (D29): refuse the coordinator's `end` and any
+    // `prepare` of `tid` from now on, recorded durably before the answer.
+    rpc fence(tid: TxnId) -> DataSiteResponse<FenceAnswer>;
+
+    // Operator tool: decide one in-doubt transaction on this site, when a
+    // participant is lost for good. See `ForceResolveResult`.
+    rpc force_resolve(tid: TxnId, outcome: ForcedOutcome) -> DataSiteResponse<ForceResolveResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
 
 service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
+
+
 impl DataManager {
+    #[cfg(test)]
+    pub(crate) fn cell_meta_for_test(&self, id: &Id) -> CellMetaMutex {
+        self.cell_meta_mutex(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cell_owner_for_test(&self, id: &Id, owner: Option<TxnPriority>) {
+        self.cell_meta_mutex(id).lock().owner = owner;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_transaction_for_test(&self, tid: &TxnId) -> bool {
+        self.find_transaction(tid).is_some()
+    }
+
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
         hlc: Arc<bifrost::hlc::HlcSource>,
@@ -432,7 +600,6 @@ impl DataManager {
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             decided: Mutex::new(BTreeMap::new()),
-            in_doubt_since: Mutex::new(BTreeMap::new()),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -443,9 +610,26 @@ impl DataManager {
                     cleanup_signal.store(false, Relaxed);
                 }
                 manager_clone
-                    .sweep_idle_transactions(txn_lease_timeout(), termination_answer_grace())
+                    .sweep_idle_transactions(txn_lease_timeout())
                     .await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        // The status-cell release (TLA+ F4): each second, find the status
+        // cells whose COMMIT got synced, announce them, and tombstone the
+        // ones every participant reported; each sweep interval, ask the
+        // participants that did not report. Separate from the lease sweep,
+        // so a peer that is slow to answer does not delay it.
+        let manager_clone = manager.clone();
+        tokio::spawn(async move {
+            let mut last_sweep = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sweep = last_sweep.elapsed() >= settle_sweep_interval();
+                if sweep {
+                    last_sweep = std::time::Instant::now();
+                }
+                manager_clone.status_release_round(sweep).await;
             }
         });
 
@@ -487,6 +671,10 @@ impl DataManager {
                 pinned_reads: PinnedReadSet::default(),
                 participants: Vec::new(),
                 decided_commit: false,
+                commit_durable: false,
+                fenced: false,
+                durable_commit: false,
+                status_cell_attempted: false,
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -881,10 +1069,11 @@ impl DataManager {
     /// A transaction holding write heads past `idle` has lost its
     /// coordinator, or is about to be told something late. In order:
     ///
-    /// 1. Ask the other participants (cooperative termination) and finish
-    ///    the ones a peer reports committed. Runs first because closing a
+    /// 1. Run the participant fence (`terminate_in_doubt_transactions`) and
+    ///    finish the ones it decides commit. Runs first because closing a
     ///    bracket needs the leases every later step gives up.
-    /// 2. Presume abort for the rest this site knows: the same rollback,
+    /// 2. Abort the ones it decides abort, and the ones of this site alone:
+    ///    the same rollback,
     ///    rewind and release an explicit abort performs, under the same
     ///    transaction lock -- which is also what makes a slow owner safe. An
     ///    apply still running holds that lock, so the sweep waits for it
@@ -892,12 +1081,8 @@ impl DataManager {
     ///    `end` finds the transaction gone and is refused, rather than told
     ///    it committed something whose spans were just disowned.
     /// 3. Retire whatever is left: leases no participant object knows about.
-    pub(crate) async fn sweep_idle_transactions(
-        &self,
-        idle: std::time::Duration,
-        grace: std::time::Duration,
-    ) {
-        let hold = self.terminate_in_doubt_transactions(idle, grace).await;
+    pub(crate) async fn sweep_idle_transactions(&self, idle: std::time::Duration) {
+        let hold = self.terminate_in_doubt_transactions(idle).await;
         let store = self.chunks().address_range();
         for tid in crate::ram::chunk::transactions_with_idle_leases(idle, &store) {
             if hold.contains(&tid) {
@@ -944,9 +1129,11 @@ impl DataManager {
                 );
             }
         }
+        self.record_decision(tid, TxnOutcome::Aborted);
         self.wipe_out_transaction(tid);
         true
     }
+
     /// The commit decision's physical half: every bracket gets its COMMIT,
     /// fsynced, and only then do the heads go back to the pool.
     ///
@@ -956,33 +1143,195 @@ impl DataManager {
     /// written after that would commit nothing -- while a ram layer that finds
     /// no leases answers `Ok`. So a transaction that is gone, or no longer in
     /// the applied-and-undecided state, is refused here and the coordinator
-    /// is not told it committed. A failed append retracts the decision records
-    /// and rolls the prepared writes back before the metadata locks are released.
-    fn close_committed_brackets(&self, tid: &TxnId) -> Result<(), EndResult> {
+    /// is not told it committed.
+    ///
+    /// What a refused COMMIT means:
+    ///
+    /// * With other participants, the transaction stays decided. The
+    ///   coordinator sends the decision to every participant at once, so
+    ///   another site can already hold a durable COMMIT, and a rollback here
+    ///   would tear the transaction. Its entries, locks and heads stay, and
+    ///   the lease sweeper finishes it (`terminate_in_doubt_transactions`).
+    /// * With no other participant (Q4), it rolls back only if no COMMIT
+    ///   fsync succeeded and the retraction is synced. If one COMMIT fsync
+    ///   succeeded, recovery commits the transaction from it, so it stays
+    ///   decided and the client is told `Success`. If the retraction could
+    ///   not be synced, a COMMIT can come back after a power loss, so it stays
+    ///   decided and the client is told the refusal.
+    fn close_committed_brackets(&self, tid: &TxnId, durable: bool) -> CloseOutcome {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_detail = super::phase_profile::guard(super::phase_profile::Phase::DecisionClose);
         let Some(txn_lock) = self.find_transaction(tid) else {
-            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
+            return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
         };
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Committed {
-            return Err(EndResult::CheckFailed(CheckError::CannotEnd));
+            return CloseOutcome::RolledBack(EndResult::CheckFailed(CheckError::CannotEnd));
         }
-        let store = self.chunks().address_range();
-        if let Err(error) = self.chunks().commit_transaction_brackets(tid) {
-            // Metadata locks still belong to this participant.
-            // Restore the prepared writes before readers can acquire them.
-            let rollback = self.abort_locked(tid, &mut txn);
-            error!(
-                "refused COMMIT for {:?}: {:?}; rollback: {:?}",
-                tid, error, rollback
+        if txn.fenced {
+            // A participant in doubt fenced this site before the decision
+            // arrived (D29): the coordinator's `end` is refused, and the
+            // participant fence decides the transaction.
+            warn!(
+                "`end` for {:?} refused: a participant fenced this site",
+                tid
             );
-            return Err(match error {
-                WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
-                    EndResult::StoreFull(error)
-                }
-                _ => EndResult::WriteError(error),
-            });
+            return CloseOutcome::Fenced;
         }
+        // A durable `end` (D7) makes every later retry durable too.
+        txn.durable_commit |= durable;
+        let durable = txn.durable_commit;
+        let store = self.chunks().address_range();
+        let multi_site = self.has_other_participants(&txn.participants);
+        let mut status = None;
+        if multi_site {
+            // Before the first record, as `decided_commit` promises: from
+            // here no abort path can run. The coordinator sent `end` to every
+            // site at once, so another site may already be committed.
+            txn.decided_commit = true;
+            txn.commit_durable = true;
+            // The status cell, inside the bracket, before the COMMIT, under
+            // the same sync (D31).
+            let first_attempt = !txn.status_cell_attempted;
+            txn.status_cell_attempted = true;
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("before_status_record", tid);
+            match self.write_status_cell(tid, &txn.participants, &store, first_attempt) {
+                Ok(placed) => status = Some(placed),
+                Err(error) => {
+                    error!(
+                        "cannot write the status cell of {:?}: {:?}; the transaction is \
+                         decided and its close is retried",
+                        tid, error
+                    );
+                    return CloseOutcome::Pending(EndResult::StoreFull(error));
+                }
+            }
+        }
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_status_record", tid);
+        let segments: Vec<crate::ram::txn_status::SegmentRef> =
+            crate::ram::chunk::transaction_leased_segments(tid, &store)
+                .iter()
+                .map(|segment| (segment.chunk_id, segment.id))
+                .collect();
+        let closed = self
+            .chunks()
+            .commit_transaction_brackets_with_receipts(tid, durable);
+        let (synced, receipts) = match closed {
+            Ok(closed) => closed,
+            Err(refusal) => {
+            let reason = match refusal.error() {
+                WriteError::CannotAllocateSpace | WriteError::TransactionHeadUnavailable => {
+                    EndResult::StoreFull(refusal.error().clone())
+                }
+                other => EndResult::WriteError(other.clone()),
+            };
+            if multi_site {
+                txn.decided_commit = true;
+                txn.commit_durable = true;
+                error!(
+                    "refused COMMIT for {:?}: {:?}; another participant may already be \
+                     committed, so this site keeps the transaction decided and finishes it later",
+                    tid, reason
+                );
+                return CloseOutcome::Pending(reason);
+            }
+            return match refusal {
+                crate::ram::chunk::CommitRefusal::Durable(_) => {
+                    txn.decided_commit = true;
+                    txn.commit_durable = true;
+                    self.record_decision(tid, TxnOutcome::Committed);
+                    error!(
+                        "COMMIT for {:?} is durable but not every part closed: {:?}; the \
+                         transaction is committed and this site finishes the close later",
+                        tid, reason
+                    );
+                    CloseOutcome::Pending(EndResult::Success)
+                }
+                crate::ram::chunk::CommitRefusal::Unresolved(_) => {
+                    txn.decided_commit = true;
+                    error!(
+                        "refused COMMIT for {:?}: {:?}, and its retraction is not durable; the \
+                         transaction stays decided and the close is retried",
+                        tid, reason
+                    );
+                    CloseOutcome::Pending(reason)
+                }
+                crate::ram::chunk::CommitRefusal::Retracted(_) if txn.decided_commit => {
+                    CloseOutcome::Pending(if txn.commit_durable {
+                        EndResult::Success
+                    } else {
+                        reason
+                    })
+                }
+                crate::ram::chunk::CommitRefusal::Retracted(_) => {
+                    // Metadata locks still belong to this participant.
+                    // Restore the prepared writes before readers can acquire
+                    // them.
+                    let rollback = self.abort_locked(tid, &mut txn);
+                    error!(
+                        "refused COMMIT for {:?}: {:?}; rollback: {:?}",
+                        tid, reason, rollback
+                    );
+                    CloseOutcome::RolledBack(reason)
+                }
+            };
+            }
+        };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point_json("commit_closed", serde_json::json!({"tid":tid,"synced":synced}));
         txn.decided_commit = true;
+        txn.commit_durable = true;
+        // The COMMIT of a default transaction is only queued for a sync. A
+        // power loss before the sync rolls the transaction back, and then the
+        // OLD versions of its updated and removed cells are the cells. The
+        // guards below hold their segments only until `end`. So pin each of
+        // them in progress for the cleaner until the COMMIT receipts are
+        // synced (D20). The pin covers the old version, which is marked dead
+        // just below. If no receipt exists, the sync was forced: nothing to pin.
+        #[cfg(test)]
+        let pin_started = std::time::Instant::now();
+        #[cfg(test)]
+        let receipts = receipts.filter(|_| !PIN_DISABLED.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(receipts) = receipts.filter(|receipts| !receipts.is_empty()) {
+            let tokens = Arc::new(receipts.iter().map(|receipt| receipt.token()).collect::<Vec<_>>());
+            // One pin for each segment, however many cells the transaction
+            // took from it.
+            let mut keyed: Vec<((usize, u64), usize)> = txn
+                .segment_guards
+                .iter()
+                .enumerate()
+                .map(|(n, guard)| ((guard.chunk_id(), guard.segment_id()), n))
+                .collect();
+            keyed.sort_unstable();
+            keyed.dedup_by_key(|(key, _)| *key);
+            for (_, n) in keyed {
+                txn.segment_guards[n].pin_until_covered(tid, tokens.clone());
+            }
+        }
+        #[cfg(test)]
+        PIN_NANOS.fetch_add(
+            pin_started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some((chunk, id)) = status {
+            // Answered `Committing` until this site's COMMIT is synced, then
+            // `Committed` until every participant's is (TLA+ F1, F4).
+            self.chunks().txn_status().register(
+                tid.clone(),
+                crate::ram::txn_status::StatusEntry {
+                    id,
+                    chunk,
+                    participants: txn.participants.clone(),
+                    self_synced: synced,
+                    synced_peers: std::collections::BTreeSet::new(),
+                    segments,
+                    announced: false,
+                    since: std::time::Instant::now(),
+                },
+            );
+        }
         for (id, history) in &txn.history {
             if history.previous_location != 0 {
                 self.chunks().retire_transaction_version(
@@ -1003,39 +1352,41 @@ impl DataManager {
             );
         }
         drop(txn);
-        Ok(())
+        CloseOutcome::Closed
     }
 
-    /// Cooperative termination, participant side.
+    /// Cooperative termination, participant side: the participant fence
+    /// (D29).
     ///
     /// A participant whose coordinator went silent knows its entries are
-    /// durable and knows nothing else. Presuming abort -- what this site did
-    /// unconditionally before -- is safe only if no OTHER participant was
-    /// told to commit, and that is precisely what it cannot see on its own.
+    /// durable and knows nothing else. It never aborts alone. It runs
+    /// `decide_in_doubt` with the other participants: one `Committed` means
+    /// commit; abort only when every participant is fenced, aborted, or never
+    /// held the transaction; anything else means wait, with no time limit.
+    /// The heads and locks of a transaction that waits stay held.
     ///
-    /// So it asks. The participant set came from the coordinator at prepare
-    /// and lives in memory; a peer that was told answers `Committed` from its
-    /// decision record, and this site then closes its bracket instead of
-    /// abandoning it.
+    /// A transaction of one site has nobody to ask and nobody who could have
+    /// committed it apart from this site: it is not held, and the sweeper
+    /// presumes abort. A decided transaction whose close was refused retries
+    /// the close.
     ///
-    /// What this does NOT fix: a site that has RESTARTED has lost both the
-    /// transaction object and the participant set, so it never gets here.
-    /// That case is recovery's, and it broadcasts rather than asks.
+    /// A site that has RESTARTED has lost the transaction object, so it
+    /// never gets here. That case is recovery's (see
+    /// `resolve_in_doubt_after_recovery`), and it runs the same protocol with
+    /// the participants its BEGIN records name.
     pub(crate) async fn terminate_in_doubt_transactions(
         &self,
         idle: std::time::Duration,
-        grace: std::time::Duration,
     ) -> std::collections::BTreeSet<TxnId> {
         let store = self.chunks().address_range();
         let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
-        // Transactions whose leases must NOT be released this round, because
-        // the question "did anyone commit this?" is still open. Releasing
-        // them would throw away the leases a commit needs.
+        // Transactions whose leases must NOT be released this round.
         let mut hold = std::collections::BTreeSet::new();
+        let me = self.database_runtime.rpc.server_id;
         for tid in candidates {
             // The transaction lock is READ and dropped before the network
             // call. Holding it across the await would also make this future
-            // non-Send, which is how the first version announced itself.
+            // non-Send.
             let Some((state, participants, decided_commit)) =
                 self.find_transaction(&tid).map(|txn_lock| {
                     let txn = txn_lock.lock();
@@ -1049,9 +1400,7 @@ impl DataManager {
             if decided_commit {
                 // This site was TOLD to commit and could not finish closing
                 // its brackets. There is nothing to ask anyone: finish it.
-                // Until that succeeds the heads stay held -- presuming abort
-                // now would tear a transaction one COMMIT may already decide.
-                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
                     .await
                     .payload;
                 if !matches!(ended, EndResult::Success) {
@@ -1069,171 +1418,497 @@ impl DataManager {
             if !matches!(state, TxnState::Prepared | TxnState::Committed) {
                 continue;
             }
-            let (outcome, all_answered) = self.ask_participants(&tid, &participants).await;
-            match outcome {
-                TxnOutcome::Committed => {
+            let peers: Vec<u64> = participants
+                .iter()
+                .copied()
+                .filter(|peer| *peer != me)
+                .collect();
+            if peers.is_empty() {
+                continue;
+            }
+            match self.decide_in_doubt(&tid, &peers).await {
+                InDoubtDecision::Commit => {
                     warn!(
                         "transaction {:?} was in doubt here and a participant reports it \
-                         COMMITTED; committing rather than presuming abort",
+                         COMMITTED; committing",
                         tid
                     );
-                    // Scoped, not just dropped: `Transaction` is not `Send`,
-                    // and the async capture analysis keeps a `let ... else`
-                    // binding alive across the await that follows even with an
-                    // explicit `drop`.
+                    // Scoped, not just dropped: `Transaction` is not `Send`.
                     let still_here = match self.find_transaction(&tid) {
                         Some(txn_lock) => {
-                            txn_lock.lock().state = TxnState::Committed;
+                            let mut txn = txn_lock.lock();
+                            txn.state = TxnState::Committed;
+                            // The fence blocks only the coordinator's `end`:
+                            // a committed peer decides the transaction.
+                            txn.fenced = false;
                             true
                         }
                         None => false,
                     };
                     if !still_here {
                         error!(
-                            "transaction {:?} was resolved COMMITTED by its peers but vanished \
-                             from this site before it could be committed",
+                            "transaction {:?} was resolved COMMITTED by a participant but \
+                             vanished from this site before it could be committed",
                             tid
                         );
                         continue;
                     }
-                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
                         .await
                         .payload;
                     if !matches!(ended, EndResult::Success) {
                         error!(
-                            "transaction {:?} was resolved COMMITTED by its peers but this site \
-                             could not end it: {:?}. Its bracket stays open and the next start \
-                             will ask again.",
+                            "transaction {:?} was resolved COMMITTED but this site could not \
+                             end it yet: {:?}; holding its heads",
                             tid, ended
-                        );
-                        continue;
-                    }
-                    self.in_doubt_since.lock().remove(&tid);
-                    TERMINATION_COMMITTED.fetch_add(1, Relaxed);
-                }
-                _ if !all_answered => {
-                    // SILENCE IS NOT A VOTE. A participant that could not be
-                    // reached has not said "not committed", so the heads stay
-                    // held and this runs again next second -- but not
-                    // forever: a hostage head is a writer slot gone from its
-                    // chunk with no refill path, so the wait is bounded and
-                    // the give-up is loud.
-                    let waited = {
-                        let mut since = self.in_doubt_since.lock();
-                        let first = since
-                            .entry(tid.clone())
-                            .or_insert_with(std::time::Instant::now);
-                        first.elapsed()
-                    };
-                    if waited < grace {
-                        debug!(
-                            "transaction {:?} is in doubt and not every participant has answered; \
-                             holding its heads ({:?} of {:?})",
-                            tid, waited, grace
                         );
                         hold.insert(tid);
                         continue;
                     }
-                    error!(
-                        "transaction {:?} stayed in doubt for {:?}: not every participant \
-                         answered. Presuming abort, which is the only thing this node can do \
-                         alone -- if a peer did commit it, this store has lost its half.",
-                        tid, waited
+                    TERMINATION_COMMITTED.fetch_add(1, Relaxed);
+                }
+                InDoubtDecision::Abort => {
+                    warn!(
+                        "transaction {:?} was in doubt here and every participant is fenced, \
+                         aborted, or never held it; aborting",
+                        tid
                     );
-                    self.in_doubt_since.lock().remove(&tid);
                     TERMINATION_ABORTED.fetch_add(1, Relaxed);
                 }
-                TxnOutcome::Aborted | TxnOutcome::Unknown | TxnOutcome::InDoubt => {
-                    // Every participant answered and none had committed it.
-                    // Presume abort, which is what happened before -- but now
-                    // it is a conclusion rather than an assumption, and the
-                    // log says which.
-                    warn!(
-                        "transaction {:?} was in doubt here and all {} participant(s) report \
-                         {:?}; presuming abort",
-                        tid,
-                        participants.len(),
-                        outcome
+                InDoubtDecision::Wait => {
+                    debug!(
+                        "transaction {:?} is in doubt and its participants do not decide it \
+                         yet; holding its heads",
+                        tid
                     );
-                    self.in_doubt_since.lock().remove(&tid);
-                    TERMINATION_ABORTED.fetch_add(1, Relaxed);
+                    hold.insert(tid);
                 }
             }
         }
-        // Anything not held this round is no longer in doubt -- decided, or
-        // gone because its `end` finally arrived. Without this the map keeps
-        // an entry per transaction that was ever waiting on a silent peer,
-        // for the life of the process.
-        self.in_doubt_since
-            .lock()
-            .retain(|tid, _| hold.contains(tid));
         hold
     }
 
-    /// Ask every other participant what became of `tid`.
+    /// The participant fence for one in-doubt transaction (D29).
     ///
-    /// Resolution rule, in order: one `Committed` decides the transaction, so
-    /// the first is returned immediately. Failing that an explicit `Aborted`
-    /// is a real decision and is reported as one. Everything else -- peers in
-    /// doubt, peers that never heard of it, peers that cannot be reached --
-    /// is `Unknown`, which the caller presumes abort on.
+    /// 1. Ask every other participant. One `Committed` decides commit: only a
+    ///    coordinator that decided commit sends `end`. A peer that is silent
+    ///    does not stop the others from being asked. If no peer answered
+    ///    `Committed`, a silent peer or a `Committing` answer means wait.
+    /// 2. Fence this site, then every other participant. A fenced site
+    ///    refuses the coordinator's `end` under its transaction lock, so
+    ///    `end` and the fence are ordered on each site.
+    /// 3. Abort only if every participant answered `Fenced`, `Aborted` or
+    ///    `Unknown`: then no site holds a COMMIT and no site can ever get one
+    ///    from the coordinator. `Unknown` is a real answer because a site
+    ///    that committed keeps its status cell until every participant's
+    ///    COMMIT is synced (D31, TLA+ F4). `Committing` or silence means wait.
     ///
-    /// A `Committed` cannot be wrong: only `end` writes a decision record,
-    /// and only a coordinator that decided commit sends `end`.
-    async fn ask_participants(&self, tid: &TxnId, participants: &[u64]) -> (TxnOutcome, bool) {
-        let Some(txn_manager) = self.database_runtime.txn_manager() else {
-            return (TxnOutcome::Unknown, true);
+    /// Works for a live transaction and for a bracket in doubt after a
+    /// restart; both fence this site durably first.
+    pub(crate) async fn decide_in_doubt(&self, tid: &TxnId, peers: &[u64]) -> InDoubtDecision {
+        bifrost::doubt_trace!(
+            "resolve site={} tid={:?} peers={:?}",
+            self.database_runtime.rpc.server_id,
+            tid,
+            peers
+        );
+        let Some(txn_manager) = self.database_runtime.txn_manager().cloned() else {
+            return InDoubtDecision::Wait;
         };
-        let me = self.database_runtime.rpc.server_id;
-        let mut saw_abort = false;
-        let peers: Vec<u64> = participants
-            .iter()
-            .copied()
-            .filter(|peer| *peer != me)
-            .collect();
-        let mut answered = 0usize;
-        for peer in peers.iter().copied() {
-            let site = match txn_manager.data_site_for(peer).await {
-                Ok(site) => site,
+        // Ask every peer: one `Committed` decides commit, also while another
+        // peer is silent (review R5). Silence or `Committing` means wait, but
+        // only after every reachable peer was asked.
+        let mut sites = Vec::with_capacity(peers.len());
+        let mut wait = false;
+        for peer in peers {
+            #[cfg(test)]
+            if silent_peers_for_test().lock().contains(peer) {
+                bifrost::doubt_trace!("silent_test_peer tid={:?} peer={}", tid, peer);
+                wait = true;
+                continue;
+            }
+            match txn_manager.data_site_for(*peer).await {
+                Ok(site) => {
+                    bifrost::doubt_trace!("peer_client tid={:?} peer={} ok", tid, peer);
+                    sites.push((*peer, site));
+                }
                 Err(error) => {
+                    bifrost::doubt_trace!(
+                        "peer_client tid={:?} peer={} error={:?}",
+                        tid,
+                        peer,
+                        error
+                    );
                     debug!(
                         "cannot reach participant {} to resolve {:?}: {}",
                         peer, tid, error
                     );
-                    continue;
+                    wait = true;
                 }
-            };
+            }
+        }
+        for (peer, site) in &sites {
+            bifrost::doubt_trace!("status_query tid={:?} peer={}", tid, peer);
             match site.txn_status(tid.clone()).await {
                 Ok(response) => {
                     self.update_clock(response.clock);
-                    answered += 1;
+                    bifrost::doubt_trace!(
+                        "status_answer tid={:?} peer={} outcome={:?}",
+                        tid,
+                        peer,
+                        response.payload
+                    );
                     match response.payload {
-                        TxnOutcome::Committed => return (TxnOutcome::Committed, true),
-                        TxnOutcome::Aborted => saw_abort = true,
-                        TxnOutcome::InDoubt | TxnOutcome::Unknown => {}
+                        TxnOutcome::Committed => return InDoubtDecision::Commit,
+                        // Decided, not synced yet (F1): ask again later.
+                        TxnOutcome::Committing => wait = true,
+                        _ => {}
                     }
                 }
+                Err(error) => {
+                    bifrost::doubt_trace!(
+                        "status_error tid={:?} peer={} error={:?}",
+                        tid,
+                        peer,
+                        error
+                    );
+                    debug!(
+                        "participant {} did not answer about {:?}: {:?}",
+                        peer, tid, error
+                    );
+                    wait = true;
+                }
+            }
+        }
+        if wait {
+            return InDoubtDecision::Wait;
+        }
+        match self.fence_here(tid) {
+            FenceAnswer::Fenced | FenceAnswer::Unknown | FenceAnswer::Aborted => {}
+            FenceAnswer::Committing => return InDoubtDecision::Wait,
+        }
+        for (peer, site) in &sites {
+            match site.fence(tid.clone()).await {
+                Ok(response) => {
+                    self.update_clock(response.clock);
+                    match response.payload {
+                        FenceAnswer::Fenced | FenceAnswer::Aborted | FenceAnswer::Unknown => {}
+                        FenceAnswer::Committing => return InDoubtDecision::Wait,
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "participant {} did not answer the fence of {:?}: {:?}",
+                        peer, tid, error
+                    );
+                    return InDoubtDecision::Wait;
+                }
+            }
+        }
+        InDoubtDecision::Abort
+    }
+
+    /// Fence `tid` on this site: after this, the coordinator's `end` and a
+    /// `prepare` of it are refused here. The fence is synced before the
+    /// answer `Fenced` or `Unknown` is given. `Committing` means the site
+    /// cannot be fenced: it was told to commit, or the fence could not be
+    /// made durable; the asker waits.
+    pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
+        let decided = self.decided.lock().get(tid).copied();
+        match decided {
+            Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
+            Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
+            _ => {}
+        }
+        if self.chunks().txn_status().get(tid).is_some() {
+            return FenceAnswer::Committing;
+        }
+        // Recorded BEFORE the object lookup. A `prepare` checks the fence
+        // under the transaction lock, after it takes the object: so a
+        // `prepare` that has not taken the object yet sees this record, and
+        // one that has is found below.
+        if let Err(error) = self.chunks().fences().record(tid) {
+            error!("cannot record the fence of {:?}: {}", tid, error);
+            return FenceAnswer::Committing;
+        }
+        #[cfg(test)]
+        wait_in_fence_gap(tid);
+        if let Some(txn_lock) = self.find_transaction(tid) {
+            let mut txn = txn_lock.lock();
+            if txn.decided_commit {
+                return FenceAnswer::Committing;
+            }
+            if txn.state == TxnState::Aborted {
+                return FenceAnswer::Aborted;
+            }
+            // Under the transaction lock, so `close_committed_brackets` sees
+            // either no fence and closes first (then this answers
+            // `Committing`), or the fence and refuses.
+            txn.fenced = true;
+            return FenceAnswer::Fenced;
+        }
+        if self.chunks().txn_status().resolving_participants(tid).is_some() {
+            // In doubt after a restart: its parts are here, undecided.
+            FenceAnswer::Fenced
+        } else {
+            FenceAnswer::Unknown
+        }
+    }
+
+    /// Operator tool: decide an in-doubt transaction here, when a
+    /// participant is lost for good. See `ForceResolveResult`.
+    ///
+    /// WARNING: the operator asserts that the lost participant never comes
+    /// back with its data. If it does, and its outcome differs, the
+    /// transaction is torn.
+    pub(crate) async fn force_resolve_here(
+        &self,
+        tid: &TxnId,
+        outcome: ForcedOutcome,
+    ) -> ForceResolveResult {
+        // Read and dropped before any await: `Transaction` is not `Send`.
+        let live = self.find_transaction(tid).map(|txn_lock| {
+            let txn = txn_lock.lock();
+            (txn.state, txn.decided_commit)
+        });
+        if let Some((state, decided_commit)) = live {
+            if decided_commit {
+                return ForceResolveResult::NotInDoubt;
+            }
+            error!(
+                "OPERATOR force-resolve: transaction {:?} is resolved {:?} here without its \
+                 lost participant",
+                tid, outcome
+            );
+            return match (outcome, state) {
+                (ForcedOutcome::Commit, TxnState::Committed) => {
+                    if let Some(txn_lock) = self.find_transaction(tid) {
+                        txn_lock.lock().fenced = false;
+                    }
+                    match <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
+                        .await
+                        .payload
+                    {
+                        EndResult::Success => ForceResolveResult::Resolved,
+                        other => ForceResolveResult::Failed(format!("{:?}", other)),
+                    }
+                }
+                (ForcedOutcome::Commit, other) => ForceResolveResult::Failed(format!(
+                    "the transaction is {:?} here, so it has no durable entries to commit",
+                    other
+                )),
+                (ForcedOutcome::Abort, _) => {
+                    self.presume_abort(tid);
+                    ForceResolveResult::Resolved
+                }
+            };
+        }
+        let Some(bracket) = self.chunks().take_unresolved(tid) else {
+            return ForceResolveResult::NotInDoubt;
+        };
+        error!(
+            "OPERATOR force-resolve: transaction {:?}, in doubt after recovery, is resolved {:?} \
+             here without its lost participant",
+            tid, outcome
+        );
+        let commit = matches!(outcome, ForcedOutcome::Commit);
+        if crate::server::finish_in_doubt_bracket(&self.database_runtime, bracket, commit) {
+            ForceResolveResult::Resolved
+        } else {
+            ForceResolveResult::Failed(String::from(
+                "the resolved COMMIT could not be written; the transaction stays in doubt",
+            ))
+        }
+    }
+
+    /// Write the status cell of `tid` into its bracket, in the lowest chunk
+    /// it already leases here, so no bracket part is added. A retry finds the
+    /// cell it wrote before. Returns the chunk and the id.
+    fn write_status_cell(
+        &self,
+        tid: &TxnId,
+        participants: &[u64],
+        store: &std::ops::Range<usize>,
+        first_attempt: bool,
+    ) -> Result<(usize, Id), WriteError> {
+        let chunks = self.chunks();
+        let chunk_id = crate::ram::chunk::transaction_leased_segments(tid, store)
+            .iter()
+            .map(|segment| segment.chunk_id)
+            .min()
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        let chunk = chunks
+            .list
+            .get(chunk_id)
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        // A retry can find the cell of an earlier attempt; it keeps that cell
+        // and its id. The first attempt has nothing to find: the first free
+        // probe is the id.
+        if !first_attempt {
+            if let Some((id, _)) = chunk.find_status_cell(tid) {
+                return Ok((chunk_id, id));
+            }
+        }
+        let id = chunk
+            .free_status_id(tid)
+            .ok_or(WriteError::CannotAllocateSpace)?;
+        let mut cell = crate::ram::txn_status::status_cell(tid, &id, participants);
+        {
+            let _scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+                tid.clone(),
+                participants.to_vec(),
+            );
+            chunk.write_status_cell(&mut cell)?;
+        }
+        // Synced with the COMMIT records, not on its own.
+        drop(crate::ram::chunk::take_transactional_segments());
+        Ok((chunk_id, id))
+    }
+
+    fn has_other_participants(&self, participants: &[u64]) -> bool {
+        let me = self.database_runtime.rpc.server_id;
+        participants.iter().any(|peer| *peer != me)
+    }
+
+    /// Whether this site's COMMIT and status cell of `txn` are synced: no
+    /// segment of its bracket holds the transaction in progress any more
+    /// (D20). Remembered in the registry once true.
+    fn status_entry_synced(&self, txn: &TxnId, entry: &crate::ram::txn_status::StatusEntry) -> bool {
+        if entry.self_synced {
+            return true;
+        }
+        let chunks = self.chunks();
+        let pending = entry.segments.iter().any(|(chunk_id, segment_id)| {
+            chunks
+                .list
+                .get(*chunk_id)
+                .and_then(|chunk| chunk.segs.get(&(*segment_id as usize)))
+                .is_some_and(|segment| segment.protection.holds_transaction(txn))
+        });
+        bifrost::doubt_trace!(
+            "status_sync site={} tid={:?} remembered={} pending={} segments={:?}",
+            self.database_runtime.rpc.server_id, txn, entry.self_synced, pending, entry.segments
+        );
+        if !pending {
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point("status_synced", txn);
+            chunks.txn_status().mark_self_synced(txn);
+        }
+        !pending
+    }
+
+    /// One release round for the status cells of this site (TLA+ F4).
+    ///
+    /// 1. A status cell whose own COMMIT is now synced (no segment of the
+    ///    transaction is in progress for it any more) becomes `self_synced`.
+    /// 2. A newly synced one is announced to the other participants with one
+    ///    batched `synced` RPC per peer.
+    /// 3. A status cell is tombstoned when this site and every other
+    ///    participant reported their COMMIT synced: from then on nobody can
+    ///    be in doubt about the transaction.
+    /// 4. With `sweep`, a status cell older than the sweep interval asks the
+    ///    participants that did not report: `Committed` (synced, F1) or
+    ///    `Unknown`/`Aborted` (nothing open there) counts as reported;
+    ///    `Committing`, `InDoubt` or silence does not.
+    pub(crate) async fn status_release_round(&self, sweep: bool) -> usize {
+        let chunks = self.chunks().clone();
+        let registry = chunks.txn_status();
+        let me = self.database_runtime.rpc.server_id;
+        bifrost::doubt_trace!("release_round site={} sweep={}", me, sweep);
+        let mut notices: HashMap<u64, Vec<TxnId>> = HashMap::new();
+        for (txn, entry) in registry.entries() {
+            if !self.status_entry_synced(&txn, &entry) {
+                continue;
+            }
+            #[cfg(test)]
+            if SYNCED_NOTICES_SKIPPED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            if !entry.announced {
+                for peer in entry.participants.iter().filter(|peer| **peer != me) {
+                    notices.entry(*peer).or_default().push(txn.clone());
+                }
+                registry.mark_announced(&txn);
+            }
+        }
+        if let Some(txn_manager) = self.database_runtime.txn_manager().cloned() {
+            for (peer, tids) in notices {
+                match txn_manager.data_site_for(peer).await {
+                    Ok(site) => {
+                        if let Err(error) = site.synced(me, tids).await {
+                            debug!("site {} did not take the synced notice: {:?}", peer, error);
+                        }
+                    }
+                    Err(error) => debug!("cannot reach site {} for a synced notice: {}", peer, error),
+                }
+            }
+            if sweep {
+                let min_age = settle_sweep_interval();
+                for (txn, entry) in registry.entries() {
+                    if !entry.self_synced || entry.since.elapsed() < min_age {
+                        continue;
+                    }
+                    for peer in entry
+                        .participants
+                        .iter()
+                        .filter(|peer| **peer != me && !entry.synced_peers.contains(*peer))
+                    {
+                        let Ok(site) = txn_manager.data_site_for(*peer).await else {
+                            continue;
+                        };
+                        if let Ok(response) = site.txn_status(txn.clone()).await {
+                            self.update_clock(response.clock);
+                            if matches!(
+                                response.payload,
+                                TxnOutcome::Committed | TxnOutcome::Unknown | TxnOutcome::Aborted
+                            ) {
+                                registry.note_peer_synced(&txn, *peer);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut released = 0;
+        for (txn, entry) in registry.entries() {
+            let all_synced = entry.self_synced
+                && entry
+                    .participants
+                    .iter()
+                    .filter(|peer| **peer != me)
+                    .all(|peer| entry.synced_peers.contains(peer));
+            bifrost::doubt_trace!(
+                "release_check site={} tid={:?} self_synced={} peers={:?} synced_peers={:?} all_synced={}",
+                me, txn, entry.self_synced, entry.participants, entry.synced_peers, all_synced
+            );
+            if !all_synced {
+                continue;
+            }
+            let Some(chunk) = chunks.list.get(entry.chunk) else {
+                continue;
+            };
+            #[cfg(multisite_test)]
+            crate::utils::multisite::point_json("before_status_release", serde_json::json!({"tid":txn,"participants":entry.participants,"synced_peers":entry.synced_peers,"self_synced":entry.self_synced}));
+            match chunk.remove_status_cell(&entry.id) {
+                Ok(()) => {
+                    registry.remove(&txn);
+                    bifrost::doubt_trace!("status_released site={} tid={:?}", me, txn);
+                    released += 1;
+                }
                 Err(error) => debug!(
-                    "participant {} did not answer about {:?}: {:?}",
-                    peer, tid, error
+                    "cannot tombstone the status cell of {:?} yet: {:?}",
+                    txn, error
                 ),
             }
         }
-        let all_answered = answered == peers.len();
-        if saw_abort {
-            (TxnOutcome::Aborted, all_answered)
-        } else {
-            (TxnOutcome::Unknown, all_answered)
-        }
+        released
     }
 
     /// Remember what this site decided, so a peer in doubt can be told.
     ///
-    /// Recorded at `end` and at `abort`, which are the only two places a
-    /// decision reaches a participant. NOT at `commit`: that runs in the
-    /// prepare phase and makes entries durable without deciding anything, so
-    /// recording there would answer "committed" for a transaction that is
-    /// about to be aborted.
+    /// Recorded at `end`, at `abort`, at a presumed abort, and when the
+    /// commit point answers a transaction it never decided. Bounded: see
+    /// `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
         let mut decided = self.decided.lock();
         decided.insert(tid.clone(), outcome);
@@ -1245,27 +1920,52 @@ impl DataManager {
         }
     }
 
+    /// Test hook: record as many later, unrelated decisions as the decision
+    /// memory holds, the way that many finished transactions would.
+    #[cfg(test)]
+    pub(crate) fn fill_decision_memory_with_later_decisions(&self) {
+        for _ in 0..DECISION_MEMORY {
+            self.record_decision(&self.hlc.now(), TxnOutcome::Aborted);
+        }
+    }
+
     /// What this site can say about a transaction, for a peer resolving it.
+    ///
+    /// `Committed` comes only from a SYNCED record (TLA+ F1): a status cell
+    /// whose COMMIT is synced, or a finished commit. An unsynced COMMIT, or a
+    /// decided close that is refused or still running, answers `Committing`:
+    /// the asker waits. A power loss here could still drop such a record, and
+    /// a peer that acted on it would tear the transaction.
     pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
+        if let Some(entry) = self.chunks().txn_status().get(tid) {
+            return if self.status_entry_synced(tid, &entry) {
+                #[cfg(multisite_test)]
+                crate::utils::multisite::point_json("status_answer", serde_json::json!({"tid":tid,"outcome":"Committed","self_synced":entry.self_synced}));
+                TxnOutcome::Committed
+            } else {
+                TxnOutcome::Committing
+            };
+        }
+        let live = self.find_transaction(tid).map(|txn| {
+            let txn = txn.lock();
+            (txn.state, txn.decided_commit)
+        });
+        match live {
+            Some((_, true)) => return TxnOutcome::Committing,
+            Some((TxnState::Aborted, false)) => return TxnOutcome::Aborted,
+            Some(_) => return TxnOutcome::InDoubt,
+            None => {}
+        }
+        if self.chunks().txn_status().resolving_participants(tid).is_some() {
+            return TxnOutcome::InDoubt;
+        }
+        // A finished multi-site commit is answered from its status cell
+        // above until every participant is synced; a single-site one is never
+        // asked about.
         if let Some(outcome) = self.decided.lock().get(tid) {
             return *outcome;
         }
-        // A RESTART empties the live record but not the segments. Without
-        // this a site that durably committed answers "never heard of it"
-        // about its own committed transaction, and the peer asking reads that
-        // as abort -- tearing the transaction the durable COMMIT existed to
-        // preserve.
-        if self.chunks().committed_at_recovery(tid) {
-            return TxnOutcome::Committed;
-        }
-        // Still live here. Anything short of a decision is in doubt --
-        // including `TxnState::Committed`, which only means the entries are
-        // durable.
-        match self.find_transaction(tid).map(|txn| txn.lock().state) {
-            Some(TxnState::Aborted) => TxnOutcome::Aborted,
-            Some(_) => TxnOutcome::InDoubt,
-            None => TxnOutcome::Unknown,
-        }
+        TxnOutcome::Unknown
     }
 
     async fn cell_meta_cleanup(&self) {
@@ -1339,7 +2039,11 @@ impl DataManager {
         self.update_clock(*clock);
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
-        let committing = meta.owner.is_some();
+        // A cell of a bracket that is in doubt after a restart has no owner
+        // here, and its committed version may still come (review R1): a read
+        // waits as it waits for a prepared writer.
+        let committing = meta.owner.is_some()
+            || self.chunks().txn_status().is_in_doubt_cell(id.bits());
 
         // Use the more recent timestamp between the transaction ID and the incoming clock
         // This allows transactions to proceed even if their original timestamp is stale
@@ -1457,6 +2161,8 @@ impl DataManager {
         expected_owner: Option<&TxnPriority>,
         affected_cell_ids: &[Id],
     ) -> (usize, Vec<LockReleaseFailure>) {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_detail = super::phase_profile::guard(super::phase_profile::Phase::ReleaseLocks);
         let mut released_count = 0;
         let mut failures = Vec::new();
         let current_time = get_time();
@@ -1627,7 +2333,10 @@ impl DataManager {
         // A scope rather than a set/reset pair: an unwind skips a reset, and
         // a thread left naming a dead transaction leases its next ORDINARY
         // write into that transaction's bracket, where recovery discards it.
-        let txn_scope = crate::ram::chunk::TransactionScope::enter(tid.clone());
+        let txn_scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+            tid.clone(),
+            txn.participants.clone(),
+        );
         // A panic between BEGIN and the decision is an ABORT of this
         // transaction, and is carried out as one -- index rolled back, spans
         // rewound, heads released -- before the panic continues. Left to
@@ -1834,6 +2543,16 @@ impl DataManager {
         // four-cell transaction spread over four chunks came back 3/4.
         let mut sync_failure = None;
         let entry_segments = crate::ram::chunk::take_transactional_segments();
+        #[cfg(test)]
+        let entry_segments = if PREPARE_SYNC_SKIPPED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+            Vec::new()
+        } else {
+            entry_segments
+        };
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("before_p0", tid);
+        #[cfg(feature = "occ_phase_profile")]
+        let sync_phase = super::phase_profile::guard(super::phase_profile::Phase::PrepareSync);
         for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -1848,6 +2567,8 @@ impl DataManager {
                 );
             }
         }
+        #[cfg(feature = "occ_phase_profile")]
+        drop(sync_phase);
         // NO bracket COMMIT here, for the same reason there is no commit
         // marker here: despite its name this runs in the coordinator's
         // PREPARE phase, and a durable COMMIT is the participant saying "this
@@ -1878,6 +2599,8 @@ impl DataManager {
             return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
         }
 
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("after_p0", tid);
         // NO commit marker here, deliberately.
         //
         // Despite its name, this runs in the coordinator's PREPARE phase
@@ -2101,6 +2824,111 @@ mod tests {
     use futures::future::join_all;
     use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
+
+    /// One server holds both the coordinator and the only data participant.
+    async fn d74_one_site_commit_case(case: u8) {
+        use crate::client::transaction::{Transaction as ClientTransaction, TxnError};
+        use std::cell::Cell;
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "d74_one_site_client";
+        let wal = tempfile::TempDir::new().unwrap();
+        let server = start_wal_lease_test_server(&address, group, wal.path()).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let site = runtime.data_site().unwrap();
+        let client = crate::server::transactions::new_async_client_for_database(&address, group, group)
+            .await
+            .unwrap();
+        let tid = client.begin().await.unwrap().unwrap();
+        let id = Id::allocated(0, 0, 99400 + case as u64);
+        client
+            .write(tid, counter_cell(schema.vid.get(), id, 73, "one site"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(
+            site.find_transaction(&tid).unwrap().lock().participants,
+            vec![server.server_id]
+        );
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+        let txn = ClientTransaction {
+            tid,
+            state: Cell::new(TxnState::Prepared),
+            client,
+        };
+        let result = match case {
+            0 => {
+                // The coordinator stops before END. Its state is then gone, but END can arrive later.
+                let stop =
+                    crate::server::transactions::manager::stop_end_fanout_before_commit_point(tid);
+                assert!(matches!(
+                    txn.commit_durable().await,
+                    Err(TxnError::OutcomeUnknown)
+                ));
+                drop(stop);
+                let retry = txn.commit_durable().await;
+                println!("D74 one-site result before delayed END: {retry:?}");
+                assert_eq!(site.txn_outcome(&tid), TxnOutcome::InDoubt);
+                assert_eq!(
+                    <DataManager as Service>::end(&site, tid, tid, true)
+                        .await
+                        .payload,
+                    EndResult::Success
+                );
+                retry
+            }
+            1 => {
+                // A lock now belongs to a later owner. COMMIT still closes before release is refused.
+                site.cell_meta_mutex(&id).lock().owner =
+                    Some(TxnPriority::new(site.hlc.now(), server.server_id));
+                let result = txn.commit_durable().await;
+                site.cell_meta_mutex(&id).lock().owner = None;
+                println!("D74 one-site result after lock-release refusal: {result:?}");
+                result
+            }
+            _ => txn.commit_durable().await,
+        };
+        assert_eq!(site.txn_outcome(&tid), TxnOutcome::Committed);
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().data["score"]
+                .u64()
+                .copied(),
+            Some(73)
+        );
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&tid, &runtime.chunks().address_range()),
+            0
+        );
+        println!("D74 one-site transaction committed with exact payload 73");
+        server.shutdown().await;
+        if case == 0 {
+            assert!(
+                matches!(result, Err(TxnError::OutcomeUnknown)),
+                "{result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "known commit must succeed: {result:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_retry_before_delayed_end_stays_unknown() {
+        d74_one_site_commit_case(0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_lock_release_failure_is_a_known_commit() {
+        d74_one_site_commit_case(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d74_one_site_known_commit_control() {
+        d74_one_site_commit_case(2).await;
+    }
 
     #[test]
     fn pinned_read_set_records_and_returns_entry() {
@@ -2370,7 +3198,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort, AbortResult::Success(None));
-        let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -2476,7 +3304,7 @@ mod tests {
         let seg = segment_holding(&runtime, &cell);
         assert!(seg.bracket_is_open());
         let begin_at = runtime.chunks().address_of(&cell)
-            - (crate::ram::entry::ENTRY_HEAD_SIZE + crate::ram::bracket::TXN_ID_SIZE);
+            - (crate::ram::entry::ENTRY_HEAD_SIZE + crate::ram::bracket::encode_begin(&tid, &[]).len());
         assert_eq!(
             entry_type_at(begin_at).0,
             crate::ram::entry::EntryType::BEGIN
@@ -2498,7 +3326,7 @@ mod tests {
         assert!(seg.try_own(), "the head must be back in the pool");
         seg.release_own();
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -2586,7 +3414,7 @@ mod tests {
         );
         assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 0);
         assert_no_open_bracket(&runtime);
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -2648,7 +3476,7 @@ mod tests {
             DMCommitResult::Success
         );
         assert_eq!(
-            <DataManager as Service>::end(&manager, older, older)
+            <DataManager as Service>::end(&manager, older, older, false)
                 .await
                 .payload,
             EndResult::Success
@@ -2859,7 +3687,7 @@ mod tests {
             "rollback did not restore the index entry set"
         );
         assert_eq!(
-            <DataManager as Service>::end(&manager, tid.clone(), tid)
+            <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
             EndResult::Success
@@ -3071,7 +3899,7 @@ mod tests {
             }
         }
         assert_eq!(
-            <DataManager as Service>::end(&manager, tid, tid)
+            <DataManager as Service>::end(&manager, tid, tid, false)
                 .await
                 .payload,
             EndResult::Success
@@ -3085,7 +3913,7 @@ mod tests {
         }
         // Both outcomes release the transaction's protection of the source.
         assert_eq!(source.references_count(), 0);
-        runtime.chunks().sync_all();
+        runtime.chunks().sync_all().unwrap();
         server.shutdown().await;
         let recovered = NebServer::new_from_opts(
             &opts,
@@ -3230,7 +4058,7 @@ mod tests {
         for tid in &holders {
             abort_and_end_local(&manager, tid).await;
         }
-        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone())
+        let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3283,7 +4111,7 @@ mod tests {
         );
         assert_no_open_bracket(&runtime);
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3316,7 +4144,7 @@ mod tests {
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .sweep_idle_transactions(Duration::ZERO, Duration::ZERO)
+                    .sweep_idle_transactions(Duration::ZERO)
                     .await
             })
         };
@@ -3339,7 +4167,7 @@ mod tests {
         assert_no_open_bracket(&runtime);
 
         // The owner wakes up with a commit decision. It must be refused.
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_ne!(
@@ -3383,7 +4211,7 @@ mod tests {
         );
         assert_eq!(crate::ram::chunk::transaction_lease_count(&tid, &store), 1);
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -3553,7 +4381,7 @@ mod tests {
             "the delete must be refused or applied, not fail with something else: {applied:?}"
         );
         if applied == DMCommitResult::Success {
-            let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
                 .await
                 .payload;
             thaw_wal_dir(&frozen);
@@ -3725,7 +4553,7 @@ mod tests {
             DMCommitResult::Success
         );
         let frozen = refuse_wal_appends(&runtime, wal.path());
-        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid, false)
             .await
             .payload;
         thaw_wal_dir(&frozen);
@@ -3865,7 +4693,7 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
             }
         }
-        let result = <DataManager as Service>::end(&manager, tid.clone(), tid)
+        let result = <DataManager as Service>::end(&manager, tid.clone(), tid, false)
             .await
             .payload;
         assert!(
@@ -4065,7 +4893,7 @@ mod tests {
             .await,
             DMCommitResult::Success
         );
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -4563,7 +5391,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -4634,7 +5462,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -4724,7 +5552,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -4811,7 +5639,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -4942,7 +5770,7 @@ mod tests {
         let results = join_all(tids.iter().cloned().map(|tid| {
             let manager = manager.clone();
             async move {
-                <DataManager as Service>::end(&manager, tid.clone(), tid)
+                <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                     .await
                     .payload
             }
@@ -4978,7 +5806,7 @@ mod tests {
             .state = TxnState::Committed;
 
         let end_result =
-            <DataManager as Service>::end(&default_manager, shared_tid.clone(), shared_tid.clone())
+            <DataManager as Service>::end(&default_manager, shared_tid.clone(), shared_tid.clone(), false)
                 .await
                 .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -4998,7 +5826,7 @@ mod tests {
             &analytics_manager,
             shared_tid.clone(),
             shared_tid.clone(),
-        )
+         false,)
         .await
         .payload;
         assert_eq!(analytics_end, EndResult::Success);
@@ -5028,12 +5856,12 @@ mod tests {
 
         let (left, right) = tokio::join!(
             async move {
-                <DataManager as Service>::end(&left_manager, left_clock, left_tid)
+                <DataManager as Service>::end(&left_manager, left_clock, left_tid, false)
                     .await
                     .payload
             },
             async move {
-                <DataManager as Service>::end(&right_manager, right_clock, right_tid)
+                <DataManager as Service>::end(&right_manager, right_clock, right_tid, false)
                     .await
                     .payload
             }
@@ -5381,7 +6209,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_result, AbortResult::Success(None));
-        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end_result, EndResult::Success);
@@ -5485,7 +6313,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
         assert_eq!(end_t2, EndResult::Success);
@@ -5494,7 +6322,7 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t1, AbortResult::Success(None));
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -5588,7 +6416,7 @@ mod tests {
             txn.coordinator_id = Some(23);
         }
 
-        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
@@ -5714,12 +6542,12 @@ mod tests {
             .await
             .payload;
         assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
         assert_eq!(end_t2, EndResult::Success);
 
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -5767,7 +6595,7 @@ mod tests {
         .await;
         assert_eq!(commit_t1, DMCommitResult::Success);
 
-        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
         assert_eq!(end_t1, EndResult::Success);
@@ -6513,13 +7341,30 @@ impl Service for DataManager {
                 Self::await_prepare_delay(&state).await;
             }
 
+            #[cfg(test)]
+            if let Some(state) = take_prepare_delay_after_fence_check(&tid, &prepared_ops) {
+                Self::await_prepare_delay(&state).await;
+            }
             let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
                 prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
             let requester = TxnPriority::new(tid.clone(), coordinator_id);
 
+            let mut refused_unprepared = false;
             let result = 'result: {
                 let txn_lock = self.get_or_create_transaction(&tid);
                 let mut txn = txn_lock.lock();
+                // A fenced transaction is never prepared again (D29). Under
+                // the transaction lock: `fence_here` records the fence before
+                // it looks for this object, so either this check sees the
+                // fence, or the fencer finds the object, waits for this lock
+                // and sets `txn.fenced`. Free while nothing is fenced: the log
+                // keeps a count.
+                if txn.fenced || self.chunks().fences().is_fenced(&tid) {
+                    // An object this `prepare` just made, or one of reads only:
+                    // nothing else ends it.
+                    refused_unprepared = txn.state == TxnState::Started;
+                    break 'result DMPrepareResult::StateError(TxnState::Aborted);
+                }
                 match txn.state {
                     TxnState::Started => {}
                     TxnState::Prepared => {
@@ -6531,7 +7376,21 @@ impl Service for DataManager {
                     }
                     _ => break 'result DMPrepareResult::StateError(txn.state),
                 }
+                // A cell of a bracket that is in doubt after a restart has no
+                // lock owner here, and its committed version may still come
+                // (review finding 2). Wait for the resolution.
+                {
+                    let registry = self.chunks().txn_status();
+                    if prepared_ops
+                        .iter()
+                        .any(|op| registry.is_in_doubt_cell(op.id.bits()))
+                    {
+                        break 'result DMPrepareResult::Wait;
+                    }
+                }
 
+                #[cfg(feature = "occ_phase_profile")]
+                let acquire_phase = super::phase_profile::guard(super::phase_profile::Phase::ParticipantAcquireLocks);
                 let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
                 let mut cell_guards = Vec::with_capacity(prepared_ops.len());
 
@@ -6591,6 +7450,8 @@ impl Service for DataManager {
                     meta.lock_acquired_at = Some(lock_time);
                 }
 
+                #[cfg(feature = "occ_phase_profile")]
+                drop(acquire_phase);
                 txn.certified = prepared_ops_by_id;
                 txn.affected_cells = txn.certified.keys().copied().collect();
                 txn.coordinator_id = Some(coordinator_id);
@@ -6600,6 +7461,9 @@ impl Service for DataManager {
                 debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
                 DMPrepareResult::Success
             };
+            if refused_unprepared {
+                self.wipe_out_transaction(&tid);
+            }
 
             self.response_with(result).await
         }
@@ -6677,10 +7541,62 @@ impl Service for DataManager {
     }
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
         let outcome = self.txn_outcome(&tid);
+        #[cfg(feature = "c3doubt_trace")]
+        {
+            let entry = self.chunks().txn_status().get(&tid);
+            bifrost::doubt_trace!(
+                "status_cell site={} tid={:?} present={} synced={}",
+                self.database_runtime.rpc.server_id,
+                tid,
+                entry.is_some(),
+                entry
+                    .as_ref()
+                    .map(|e| self.status_entry_synced(&tid, e))
+                    .unwrap_or(false)
+            );
+        }
+        bifrost::doubt_trace!(
+            "status_serve site={} tid={:?} outcome={:?}",
+            self.database_runtime.rpc.server_id,
+            tid,
+            outcome
+        );
         async move { self.response_with(outcome).await }.boxed()
     }
 
-    fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+    fn synced(&self, from: u64, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
+        let registry = self.chunks().txn_status();
+        for tid in &tids {
+            registry.note_peer_synced(tid, from);
+        }
+        self.response_with(())
+    }
+
+    fn fence(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<FenceAnswer>> {
+        let answer = self.fence_here(&tid);
+        self.response_with(answer)
+    }
+
+    fn force_resolve(
+        &self,
+        tid: TxnId,
+        outcome: ForcedOutcome,
+    ) -> BoxFuture<'_, DataSiteResponse<ForceResolveResult>> {
+        async move {
+            let result = self.force_resolve_here(&tid, outcome).await;
+            self.response_with(result).await
+        }
+        .boxed()
+    }
+
+    fn end(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        durable: bool,
+    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("during_end", &tid);
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
@@ -6710,12 +7626,20 @@ impl Service for DataManager {
         };
 
         if txn_state == TxnState::Committed {
-            if let Err(reason) = self.close_committed_brackets(&tid) {
-                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
-                self.record_decision(&tid, TxnOutcome::Aborted);
-                self.wipe_out_transaction(&tid);
-                self.cleanup_signal.store(true, Relaxed);
-                return self.response_with(reason);
+            match self.close_committed_brackets(&tid, durable) {
+                CloseOutcome::Closed => {}
+                // Still decided and still holding its locks and heads.
+                CloseOutcome::Pending(report) => return self.response_with(report),
+                CloseOutcome::Fenced => {
+                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
+                }
+                CloseOutcome::RolledBack(reason) => {
+                    self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
+                    self.record_decision(&tid, TxnOutcome::Aborted);
+                    self.wipe_out_transaction(&tid);
+                    self.cleanup_signal.store(true, Relaxed);
+                    return self.response_with(reason);
+                }
             }
         }
 

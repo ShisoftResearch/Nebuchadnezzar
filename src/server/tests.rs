@@ -3374,7 +3374,12 @@ fn a_final_peer_discard_releases_segment_pins() {
     let segment = chunks.list[0].segments().pop().unwrap();
     segment.protection.retain_transaction(&txn);
     assert_eq!(chunks.pinned_segments(), 1);
-    let bracket = crate::ram::recovery::InDoubtBracket { txn, chunks: vec![0], cells: vec![] };
+    let bracket = crate::ram::recovery::InDoubtBracket {
+        txn,
+        chunks: vec![0],
+        cells: vec![],
+        participants: vec![],
+    };
     super::discard_in_doubt(&chunks, &bracket, "all peers returned a final abort");
     assert_eq!(chunks.pinned_segments(), 0);
     assert_eq!(chunks.pinned_bytes(), 0);

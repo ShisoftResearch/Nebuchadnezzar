@@ -5,6 +5,12 @@
 //! `NEB_IWP_ONLY` selects comma-separated rows, such as `update_1,delete_16`.
 //! `compare_1,compare_16` uses successful CAS on distinct seeded cells.
 //! `NEB_IWP_INDEXES` selects none, hashed, or mixed (ranged and hashed).
+//! `NEB_IWP_DB_SIZE` overrides store capacity in bytes.
+//! `NEB_IWP_CHUNK_SIZE` overrides the chunk size of the write rows in bytes.
+//! `NEB_IWP_WRITERS` sets the writer count of the multi-writer rows
+//! (default: 16), such as `delete_32`.
+//! `NEB_IWP_LOCALITIES` spreads the cells over that many localities, so over
+//! that many chunks (default: 1, every cell at locality 3).
 //! Output includes throughput, latency percentiles, and peak RSS.
 use dovahkiin::types::*;
 use futures::FutureExt;
@@ -37,7 +43,7 @@ fn counters() -> [u64; 4] {
         ALLOCATION_EXHAUSTED.load(Ordering::Relaxed),
     ]
 }
-fn extended_counters() -> [u64; 8] {
+fn extended_counters() -> [u64; 10] {
     [
         neb::ram::cleaner::CAS_FULL_PASSES.load(Ordering::Relaxed),
         neb::ram::cleaner::CAS_RECLAIMED_BYTES.load(Ordering::Relaxed),
@@ -47,15 +53,27 @@ fn extended_counters() -> [u64; 8] {
         neb::ram::segs::FORCED_WAL_SYNCS.load(Ordering::Relaxed),
         neb::client::TRANSACTION_RETRIES.load(Ordering::Relaxed),
         neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed),
+        neb::ram::segs::SEAL_RECLAIM_WAIT_RETRIES.load(Ordering::Relaxed),
+        neb::ram::segs::SEAL_INLINE.load(Ordering::Relaxed),
     ]
 }
 
 const SCHEMA: u32 = 7402;
 const SEED_VERSION: u64 = 2;
+fn cell_id(id: u64) -> Id {
+    static SPREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let spread = *SPREAD.get_or_init(|| {
+        std::env::var("NEB_IWP_LOCALITIES")
+            .map(|v| v.parse().expect("NEB_IWP_LOCALITIES must be a count"))
+            .unwrap_or(1)
+    });
+    Id::from_parts(3 + id % spread.max(1), id)
+}
+
 fn cell(id: u64, value: u64) -> OwnedCell {
     let mut data = OwnedValue::Map(OwnedMap::new());
     data["value"] = OwnedValue::U64(value);
-    OwnedCell::new_with_id(SchemaVid(SCHEMA), &Id::from_parts(3, id), data)
+    OwnedCell::new_with_id(SchemaVid(SCHEMA), &cell_id(id), data)
 }
 async fn phase(
     client: Arc<AsyncClient>,
@@ -66,6 +84,11 @@ async fn phase(
     measured: bool,
 ) {
     let before = counters();
+    // The peak of waiting segments is per phase: restart it at the current level.
+    neb::ram::segs::SEAL_WAITING_PEAK.store(
+        neb::ram::segs::SEAL_WAITING_SEGMENTS.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     let extended_before = extended_counters();
     if measured {
         println!("IWP phase_begin {kind}_{writers}{} page_images={} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={}",
@@ -102,7 +125,7 @@ async fn phase(
                     "compare" => {
                         let result = client
                             .compare_version_and_update_cell(
-                                Id::from_parts(3, id),
+                                cell_id(id),
                                 SEED_VERSION,
                                 cell(id, 1 + seq % 8),
                             )
@@ -117,11 +140,7 @@ async fn phase(
                         result.unwrap();
                     }
                     "delete" => {
-                        client
-                            .remove_cell(Id::from_parts(3, id))
-                            .await
-                            .unwrap()
-                            .unwrap();
+                        client.remove_cell(cell_id(id)).await.unwrap().unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -144,8 +163,9 @@ async fn phase(
             .zip(extended_before)
             .map(|(after, before)| after - before)
             .collect();
-        println!("IWP_COUNTERS {kind}_{writers}{} cas_full_passes={} cas_reclaimed_bytes={} archive_refusals={} seal_retries={} namespace_syncs={} forced_wal_syncs={} transaction_retries={} rotations={}",
-            if hot { "_hot" } else { "" }, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7]);
+        println!("IWP_COUNTERS {kind}_{writers}{} cas_full_passes={} cas_reclaimed_bytes={} archive_refusals={} seal_retries={} namespace_syncs={} forced_wal_syncs={} transaction_retries={} rotations={} seal_wait_retries={} seal_inline={} seal_waiting_peak={}",
+            if hot { "_hot" } else { "" }, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8], delta[9],
+            neb::ram::segs::SEAL_WAITING_PEAK.load(Ordering::Relaxed));
         println!("IWP {kind}_{writers}{} ops={} secs={secs:.6} ops_per_sec={:.3} p50_us={:.3} p95_us={:.3} p99_us={:.3} page_images_per_sec={:.3} dead_bytes={} cleaner_reclaimed_bytes={} store_full_refusals={} cas_conflicts={}",
         if hot { "_hot" } else { "" }, times.len(), times.len() as f64 / secs,
         times[times.len()/2] as f64 / 1000.0, times[times.len()*95/100] as f64 / 1000.0,
@@ -153,8 +173,23 @@ async fn phase(
         (after[0] - before[0]) as f64 / secs, after[1] - before[1], after[2] - before[2], after[3] - before[3], cas_conflicts.load(Ordering::Relaxed));
     }
 }
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-async fn main() {
+fn writers() -> u64 {
+    std::env::var("NEB_IWP_WRITERS")
+        .map(|v| v.parse().expect("NEB_IWP_WRITERS must be a count"))
+        .unwrap_or(16)
+}
+
+fn main() {
+    // At least one runtime thread per writer, so the writers run at once.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(writers().max(16) as usize)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
+}
+
+async fn async_main() {
     let limit = std::env::var("NEB_IWP_TIME_LIMIT_SECS")
         .map(|v| v.parse::<u64>().expect("invalid benchmark time limit"))
         .unwrap_or(300);
@@ -238,13 +273,17 @@ async fn run() {
             chunk_size: if startup {
                 512 * 1024 * 1024
             } else {
-                128 * 1024 * 1024
+                std::env::var("NEB_IWP_CHUNK_SIZE")
+                    .map(|value| value.parse().expect("NEB_IWP_CHUNK_SIZE must be bytes"))
+                    .unwrap_or(128 * 1024 * 1024)
             },
-            db_size: if startup {
-                16 * 1024 * 1024 * 1024
-            } else {
-                512 * 1024 * 1024
-            },
+            db_size: std::env::var("NEB_IWP_DB_SIZE")
+                .map(|value| value.parse().expect("NEB_IWP_DB_SIZE must be bytes"))
+                .unwrap_or(if startup {
+                    16 * 1024 * 1024 * 1024
+                } else {
+                    512 * 1024 * 1024
+                }),
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into()),
@@ -308,7 +347,7 @@ async fn run() {
             while !read_finished.load(Ordering::Acquire) {
                 let started = Instant::now();
                 reader
-                    .read_cell(Id::from_parts(3, 16_000_000 + sequence % count))
+                    .read_cell(cell_id(16_000_000 + sequence % count))
                     .await
                     .unwrap()
                     .unwrap();
@@ -331,7 +370,7 @@ async fn run() {
             neb::ram::chunk::ROTATIONS.load(Ordering::Relaxed) - rotations
         );
     }
-    for writers in [1, 16] {
+    for writers in [1, writers()] {
         let insert = wanted(&format!("insert_{writers}"));
         let update = wanted(&format!("update_{writers}"));
         let delete = wanted(&format!("delete_{writers}"));

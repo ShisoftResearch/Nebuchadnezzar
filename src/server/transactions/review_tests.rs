@@ -143,7 +143,7 @@ async fn occ_reader_validates_after_a_newer_writer_aborts() {
         DMCommitResult::Success
     );
     assert_eq!(
-        <DataManager as Service>::end(&manager, reader, reader)
+        <DataManager as Service>::end(&manager, reader, reader, false)
             .await
             .payload,
         EndResult::Success
@@ -173,7 +173,7 @@ async fn pinned_read_of_the_superseded_version_survives_commit_and_a_full_clean(
     let writer = server.hlc.now();
     review_apply_update(&manager, &schema, &writer, id, version).await;
     assert_eq!(
-        <DataManager as Service>::end(&manager, writer, writer)
+        <DataManager as Service>::end(&manager, writer, writer, false)
             .await
             .payload,
         EndResult::Success
@@ -310,12 +310,12 @@ async fn rollback_failure_on_one_cell_retires_heads_and_recovery_discards_the_br
         );
     }
     assert_eq!(
-        <DataManager as Service>::end(&manager, tid, tid)
+        <DataManager as Service>::end(&manager, tid, tid, false)
             .await
             .payload,
         EndResult::Success
     );
-    runtime.chunks().sync_all();
+    runtime.chunks().sync_all().unwrap();
     server.shutdown().await;
     let recovered = review_server(&opts, "review_failed_restore").await;
     recovered.meta().schemas.register_internal_schema(schema);
@@ -338,7 +338,7 @@ async fn applied_undecided_delete_killed_before_end_recovers_the_old_cell() {
         let schema = install_prepare_test_schema(&runtime);
         let manager = DataManager::new(runtime.clone(), server.hlc.clone());
         let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
-        runtime.chunks().sync_all();
+        runtime.chunks().sync_all().unwrap();
         let tid = server.hlc.now();
         assert_eq!(
             prepare_ops_local(
@@ -359,7 +359,7 @@ async fn applied_undecided_delete_killed_before_end_recovers_the_old_cell() {
             DMCommitResult::Success
         );
         assert!(runtime.chunks().read_cell(&id).is_err());
-        runtime.chunks().sync_all();
+        runtime.chunks().sync_all().unwrap();
         std::fs::write(path.join("applied"), version.to_string()).unwrap();
         loop {
             std::thread::park();

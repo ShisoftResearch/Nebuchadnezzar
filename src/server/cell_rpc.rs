@@ -101,6 +101,14 @@ service! {
     rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_verified(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr, checks: &Vec<crate::index::verification::IndexCheck>) -> Vec<Result<OwnedCell, ReadError>>;
+    // Plain writes: `write_cell`, `update_cell`, `upsert_cell`,
+    // `upsert_all_cells`, `remove_cell` and their durable and captured forms.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc head_cell(key: Id) -> Result<CellHeader, ReadError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -111,13 +119,22 @@ service! {
     rpc drop_migrated_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
     rpc receive_migrated_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc push_cells_to(keys: &Vec<Id>, target: u64) -> Result<Vec<Id>, String>;
-    rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
+    // Refused with `SlotInDoubt` while a slot holds a cell of a bracket in
+    // doubt after a restart: such a cell must not move (review R2).
+    rpc cell_ids_in_slots(slots: &Vec<u32>) -> Result<Vec<Id>, crate::ram::txn_status::SlotInDoubt>;
     rpc slot_live_bytes(slots: &Vec<u32>) -> Vec<u64>;
     rpc total_live_bytes() -> u64;
     rpc can_admit_bytes(bytes: u64) -> bool;
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64, applied_index: u64) -> ();
     rpc note_slot_owners(owners: &Vec<(u32, u64)>, applied_index: u64) -> ();
+    // Plain compare-and-set writes.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -129,10 +146,18 @@ service! {
     rpc cell_scan_next(cursor: u64, max: u32) -> Result<CellScanPage, String>;
     rpc cell_scan_close(cursor: u64) -> ();
     rpc live_cell_count() -> u64;
+    rpc storage_chunk_count() -> u64;
     rpc fence_engage(families: &Vec<u32>, drain_ms: u64, lease_ms: u64) -> Result<u64, String>;
     rpc fence_renew(token: u64, lease_ms: u64) -> bool;
     rpc fence_release(token: u64) -> ();
 
+    // Plain writes, durable and captured forms.
+    // Contract: a cell takes plain (non-transactional) writes or transactions,
+    // not both. If a caller mixes them on one cell, Neb does not guarantee that
+    // an acknowledged plain write or delete survives the resolution of an
+    // in-doubt transaction: after a restart with a transaction T in doubt, the
+    // plain write and T's write can get the same version, and only one is kept;
+    // an acknowledged delete is undone when the resolution installs T's cell.
     rpc write_cell_durable(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell_durable(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -666,7 +691,10 @@ impl Service for NebRPCService {
         .boxed()
     }
 
-    fn cell_ids_in_slots(&self, slots: &Vec<u32>) -> BoxFuture<'_, Vec<Id>> {
+    fn cell_ids_in_slots(
+        &self,
+        slots: &Vec<u32>,
+    ) -> BoxFuture<'_, Result<Vec<Id>, crate::ram::txn_status::SlotInDoubt>> {
         // Slots are `u32` on the wire because that is what the placement state
         // machine speaks, and `u16` at the storage layer because a Neb slot IS
         // an id's locality, which is 15 bits. A value too large to be a
@@ -1103,6 +1131,10 @@ impl Service for NebRPCService {
             })
         })();
         future::ready(result).boxed()
+    }
+
+    fn storage_chunk_count(&self) -> BoxFuture<'_, u64> {
+        future::ready(self.database_runtime.chunks().chunk_count() as u64).boxed()
     }
 
     fn live_cell_count(&self) -> BoxFuture<'_, u64> {

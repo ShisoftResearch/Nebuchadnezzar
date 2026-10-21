@@ -871,6 +871,12 @@ where
     pub fn node_ref(&self) -> &NodeCellRef {
         &self.node_ref
     }
+
+    #[cfg(test)]
+    pub(super) fn current_version_for_test(&self) -> usize {
+        self.node_ref.deref::<KS, PS>().cc.load(Acquire)
+    }
+
 }
 
 impl<KS, PS> Default for NodeReadHandler<KS, PS>

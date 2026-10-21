@@ -37,15 +37,14 @@ type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 static END_FANOUT_LIMIT: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<TxnId, EndFanoutPlan>>> =
     std::sync::OnceLock::new();
 
-/// Which participants a dying coordinator manages to tell.
+/// Where a dying coordinator stops in the decision fan-out.
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum EndFanoutPlan {
-    /// The first N in participant order.
-    First(usize),
-    /// One named server, so a test can choose WHICH participant is left in
-    /// doubt rather than depending on map order.
-    Only(u64),
+    /// No site is told.
+    BeforeCommitPoint,
+    /// Only the participant with the lowest server id is told.
+    AfterCommitPoint,
 }
 
 #[cfg(test)]
@@ -58,8 +57,8 @@ fn end_fanout_limit(tid: &TxnId) -> Option<EndFanoutPlan> {
     end_fanout_limits().lock().get(tid).copied()
 }
 
-/// Make the coordinator stop after telling `sites` participants, as if it died
-/// there. Removed when the handle drops.
+/// Make the coordinator stop in the decision fan-out, as if it died there.
+/// Removed when the handle drops.
 #[cfg(test)]
 pub(crate) struct EndFanoutLimit(TxnId);
 
@@ -70,20 +69,22 @@ impl Drop for EndFanoutLimit {
     }
 }
 
+/// The coordinator decides and stops before it tells any site.
 #[cfg(test)]
-pub(crate) fn stop_end_fanout_after(tid: TxnId, sites: usize) -> EndFanoutLimit {
+pub(crate) fn stop_end_fanout_before_commit_point(tid: TxnId) -> EndFanoutLimit {
     end_fanout_limits()
         .lock()
-        .insert(tid.clone(), EndFanoutPlan::First(sites));
+        .insert(tid.clone(), EndFanoutPlan::BeforeCommitPoint);
     EndFanoutLimit(tid)
 }
 
-/// Tell exactly one named participant and stop. Everyone else is in doubt.
+/// The coordinator tells the participant with the lowest server id, and
+/// stops. Every other participant is in doubt.
 #[cfg(test)]
-pub(crate) fn stop_end_fanout_after_server(tid: TxnId, server_id: u64) -> EndFanoutLimit {
+pub(crate) fn stop_end_fanout_after_commit_point(tid: TxnId) -> EndFanoutLimit {
     end_fanout_limits()
         .lock()
-        .insert(tid.clone(), EndFanoutPlan::Only(server_id));
+        .insert(tid.clone(), EndFanoutPlan::AfterCommitPoint);
     EndFanoutLimit(tid)
 }
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
@@ -253,9 +254,35 @@ impl TransactionManagerDeps {
 
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
         let consh = self.consh.clone();
-        self.member_pool
+        let cached = self
+            .member_pool
             .get_by_id(server_id, move |_| consh.try_server_name(server_id))
+            .await;
+        if !matches!(&cached, Err(error) if error.kind() == io::ErrorKind::NotFound) {
+            return cached;
+        }
+        // Recovery must reach stored participants even when the derived ring
+        // missed their membership notification during a restart. Order new
+        // discovery after completed removals; an ordinary voter query can lag.
+        let (member, _) = self
+            .consh
+            .membership()
+            .ordered_member(server_id)
             .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("cannot locate transaction participant {server_id}: {error:?}"),
+                )
+            })?;
+        match member.filter(|member| member.id == server_id) {
+            Some(member) => {
+                self.member_pool
+                    .get_by_id(server_id, move |_| Some(member.address))
+                    .await
+            }
+            None => cached,
+        }
     }
 
     pub fn schemas(&self) -> &crate::ram::schema::LocalSchemasCache {
@@ -331,6 +358,9 @@ service! {
 
     rpc prepare(tid: TxnId) -> Result<TMPrepareResult, TMError>;
     rpc commit(tid: TxnId) -> Result<EndResult, TMError>;
+    // `commit`, with the COMMIT synced at every participant before the reply
+    // (D7). A plain `commit` appends it and queues the sync (D19 option 1).
+    rpc commit_durable(tid: TxnId) -> Result<EndResult, TMError>;
     rpc abort(tid: TxnId) -> Result<AbortResult, TMError>;
 }
 
@@ -569,39 +599,10 @@ impl Service for TransactionManager {
         .boxed()
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
-        async move {
-            let txn_lock = self.get_transaction(&tid)?;
-            let mut txn = txn_lock.lock().await;
-            self.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = &txn.affected_objects;
-            let result = match {
-                #[cfg(feature = "occ_phase_profile")]
-                let _phase_guard =
-                    super::phase_profile::guard(super::phase_profile::Phase::EndParticipantLookup);
-                self.data_sites_for_objs(affected_objs).await
-            } {
-                Ok(data_sites) => {
-                    #[cfg(feature = "occ_phase_profile")]
-                    let _phase_guard =
-                        super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
-                    self.sites_end(&tid, affected_objs, &data_sites).await
-                }
-                Err(error) => Err(error),
-            };
-            // Fire-and-forget release of read pins on servers this transaction
-            // only read (pinned but not written). Write servers already dropped
-            // their pins in `end`, so they are excluded. Queued so it never adds
-            // latency to the commit path; the periodic flusher batches the RPCs.
-            // Write-only transactions (no pins) skip this entirely.
-            if !txn.pinned_servers.is_empty() {
-                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
-                pinned_servers.retain(|server_id| !txn.affected_objects.contains_key(server_id));
-                self.queue_pin_release(tid.clone(), pinned_servers);
-            }
-            self.cleanup_transaction_guarded(&tid, &mut txn);
-            result
-        }
-        .boxed()
+        self.commit_with(tid, false)
+    }
+    fn commit_durable(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
+        self.commit_with(tid, true)
     }
     fn abort(&self, tid: TxnId) -> BoxFuture<'_, Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
@@ -879,6 +880,42 @@ impl Service for TransactionManager {
 }
 
 impl TransactionManager {
+    fn commit_with(&self, tid: TxnId, durable: bool) -> BoxFuture<'_, Result<EndResult, TMError>> {
+        async move {
+            let txn_lock = self.get_transaction(&tid)?;
+            let mut txn = txn_lock.lock().await;
+            self.ensure_txn_state(&txn, TxnState::Prepared)?;
+            let affected_objs = &txn.affected_objects;
+            let result = match {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard =
+                    super::phase_profile::guard(super::phase_profile::Phase::EndParticipantLookup);
+                self.data_sites_for_objs(affected_objs).await
+            } {
+                Ok(data_sites) => {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
+                    self.sites_end(&tid, affected_objs, &data_sites, durable)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            // Fire-and-forget release of read pins on servers this transaction
+            // only read (pinned but not written). Write servers already dropped
+            // their pins in `end`, so they are excluded. Queued so it never adds
+            // latency to the commit path; the periodic flusher batches the RPCs.
+            // Write-only transactions (no pins) skip this entirely.
+            if !txn.pinned_servers.is_empty() {
+                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                pinned_servers.retain(|server_id| !txn.affected_objects.contains_key(server_id));
+                self.queue_pin_release(tid.clone(), pinned_servers);
+            }
+            self.cleanup_transaction_guarded(&tid, &mut txn);
+            result
+        }
+        .boxed()
+    }
     /// A client for another server's data site.
     ///
     /// Public to the crate because the PARTICIPANT side needs it too: an
@@ -888,6 +925,14 @@ impl TransactionManager {
         &self,
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+        bifrost::doubt_trace!(
+            "peer_lookup site={} peer={} ring={:p} version={} cached={}",
+            self.deps.server_id,
+            server_id,
+            &*self.deps.consh,
+            self.deps.consh.trace_version(),
+            self.data_sites.contains_key(&server_id)
+        );
         self.get_data_site(server_id).await
     }
 
@@ -1681,9 +1726,20 @@ impl TransactionManager {
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<AbortResult, TMError> {
-        let abort_futures: FuturesUnordered<_> = changed_objs
+        let sites: Vec<u64> = changed_objs.keys().copied().collect();
+        self.abort_sites(tid, &sites, data_sites).await
+    }
+
+    /// `abort`, then `end`, on each of `sites`.
+    async fn abort_sites(
+        &self,
+        tid: &TxnId,
+        sites: &[u64],
+        data_sites: &DataSitesMap,
+    ) -> Result<AbortResult, TMError> {
+        let abort_futures: FuturesUnordered<_> = sites
             .iter()
-            .map(|(server_id, _)| {
+            .map(|server_id| {
                 let server_id = *server_id;
                 let data_site = data_sites.get(&server_id).unwrap().clone();
                 async move {
@@ -1737,7 +1793,7 @@ impl TransactionManager {
                 async move {
                     (
                         server_id,
-                        data_site.end(self.get_clock(), tid.clone()).await,
+                        data_site.end(self.get_clock(), tid.clone(), false).await,
                     )
                 }
             })
@@ -1784,72 +1840,180 @@ impl TransactionManager {
             Some(rollback_failures)
         }))
     }
+    /// The decision COMMIT: `end` to every site, in parallel.
     async fn sites_end(
         &self,
         tid: &TxnId,
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
+        durable: bool,
     ) -> Result<EndResult, TMError> {
-        // A coordinator that dies mid-decision, on demand.
-        //
-        // This is the one window 2PC cannot survive without a termination
-        // protocol: the decision is made, some participants are told, and the
-        // rest are left holding prepared entries they cannot resolve. It is
-        // invisible from any single node, so without an injection point there
-        // is no way to demonstrate the bug OR to prove a fix.
-        //
-        // `AffectedObjs` is a BTreeMap keyed by server id, so "the first N"
-        // is a stable set across runs.
+        // A coordinator that dies mid-decision, on demand. Invisible from any
+        // single node, so without an injection point there is no way to
+        // demonstrate the hazard OR to prove the fix.
         #[cfg(test)]
-        if let Some(limit) = end_fanout_limit(tid) {
-            let told: Vec<u64> = match limit {
-                EndFanoutPlan::First(sites) => changed_objs.keys().take(sites).copied().collect(),
-                EndFanoutPlan::Only(server_id) => changed_objs
-                    .keys()
-                    .copied()
-                    .filter(|id| *id == server_id)
-                    .collect(),
+        if let Some(plan) = end_fanout_limit(tid) {
+            let lowest = changed_objs
+                .iter()
+                .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
+                .map(|(server, _)| *server)
+                .min();
+            let told: Vec<u64> = match plan {
+                EndFanoutPlan::BeforeCommitPoint => Vec::new(),
+                EndFanoutPlan::AfterCommitPoint => lowest.into_iter().collect(),
             };
             for server_id in &told {
                 let data_site = data_sites.get(server_id).unwrap();
-                let _ = data_site.end(self.get_clock(), tid.clone()).await;
+                let _ = data_site.end(self.get_clock(), tid.clone(), durable).await;
             }
             warn!(
-                "TEST: coordinator for {:?} stops after telling {} of {} participants",
-                tid,
-                told.len(),
-                changed_objs.len()
+                "TEST: coordinator for {:?} stops after telling {:?}",
+                tid, told
             );
-            return Err(TMError::RPCErrorFromCellServer);
+            return Err(TMError::OutcomeUnknown);
         }
-        let end_futures: FuturesUnordered<_> = changed_objs
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_before_end", tid);
+        let participants: Vec<u64> = changed_objs
             .iter()
-            .map(|(ref server_id, _)| {
-                let data_site = data_sites.get(*server_id).unwrap();
-                async move { data_site.end(self.get_clock(), tid.clone()).await }
+            .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
+            .map(|(server, _)| *server)
+            .collect();
+        let sites: Vec<u64> = changed_objs.keys().copied().collect();
+        if participants.len() < 2 {
+            return self
+                .end_sites(tid, &sites, data_sites, durable, participants.first().copied())
+                .await;
+        }
+        // Multi-site: one site that closed its brackets decides the
+        // transaction, because its COMMIT is durable and every site that got
+        // `end` keeps the transaction decided.
+        let end_futures: FuturesUnordered<_> = sites
+            .iter()
+            .map(|server_id| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap();
+                async move {
+                    (
+                        server_id,
+                        data_site.end(self.get_clock(), tid.clone(), durable).await,
+                    )
+                }
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
-        for result in end_results {
+        #[cfg(multisite_test)]
+        crate::utils::multisite::point("coordinator_after_end", tid);
+        let mut committed = false;
+        // A participant that refused but keeps the transaction decided (a
+        // refused close: store full, WAL error) commits it later.
+        let mut decided_elsewhere = false;
+        // A refusal that is not a decision: the site was fenced by a
+        // participant in doubt, or no longer holds the transaction (D29).
+        let mut undecided_refusal = None;
+        let mut unreachable = false;
+        let mut lock_report = None;
+        for (server_id, result) in end_results {
+            let is_participant = participants.contains(&server_id);
             match result {
-                Ok(result) => {
-                    self.merge_clock(result.clock);
-                    let payload = result.payload;
-                    match payload {
-                        EndResult::Success => {}
-                        _ => {
-                            return Ok(payload);
+                Ok(response) => {
+                    self.merge_clock(response.clock);
+                    match response.payload {
+                        EndResult::Success => committed |= is_participant,
+                        report @ (EndResult::SomeLocksNotReleased { .. }
+                        | EndResult::LockReleaseRetriesExhausted { .. }) => {
+                            committed |= is_participant;
+                            lock_report.get_or_insert(report);
+                        }
+                        refusal @ (EndResult::CheckFailed(_) | EndResult::DecidedPending) => {
+                            if matches!(refusal, EndResult::DecidedPending) {
+                                decided_elsewhere |= is_participant;
+                            } else {
+                                warn!(
+                                    "site {} refused `end` for {:?}: {:?}; the participant \
+                                     fence decides the transaction",
+                                    server_id, tid, refusal
+                                );
+                                undecided_refusal.get_or_insert(refusal);
+                            }
+                        }
+                        refusal => {
+                            decided_elsewhere |= is_participant;
+                            error!(
+                                "site {} refused to close {:?} for now: {:?}; it keeps the \
+                                 transaction decided",
+                                server_id, tid, refusal
+                            );
                         }
                     }
                 }
-                Err(e) => {
-                    debug!("Error on site end {:?}", e);
-                    return Err(TMError::RPCErrorFromCellServer);
+                Err(error) => {
+                    unreachable = true;
+                    debug!(
+                        "site {} did not answer `end` for {:?}: {:?}",
+                        server_id, tid, error
+                    );
                 }
             }
         }
-        Ok(EndResult::Success)
+        if committed {
+            return Ok(lock_report.unwrap_or(EndResult::Success));
+        }
+        if decided_elsewhere {
+            return Ok(EndResult::DecidedPending);
+        }
+        if unreachable {
+            // `end` was sent and a site did not answer: it may have
+            // committed (D33). The caller must read the outcome again.
+            return Err(TMError::OutcomeUnknown);
+        }
+        Ok(undecided_refusal.unwrap_or(EndResult::DecidedPending))
     }
+
+    /// End every site. A reader's cleanup report cannot decide a writer's outcome.
+    async fn end_sites(
+        &self,
+        tid: &TxnId,
+        sites: &[u64],
+        data_sites: &DataSitesMap,
+        durable: bool,
+        writer: Option<u64>,
+    ) -> Result<EndResult, TMError> {
+        let end_futures: FuturesUnordered<_> = sites
+            .iter()
+            .map(|server_id| {
+                let data_site = data_sites.get(server_id).unwrap();
+                async move {
+                    (
+                        *server_id,
+                        data_site.end(self.get_clock(), tid.clone(), durable).await,
+                    )
+                }
+            })
+            .collect();
+        let end_results: Vec<_> = end_futures.collect().await;
+        let mut writer_result = None;
+        let mut cleanup_result = None;
+        for (server_id, result) in end_results {
+            let result = match result {
+                Ok(result) => {
+                    self.merge_clock(result.clock);
+                    Ok(result.payload)
+                }
+                Err(error) => {
+                    debug!("Error on site end {:?}", error);
+                    Err(TMError::OutcomeUnknown)
+                }
+            };
+            if Some(server_id) == writer {
+                writer_result = Some(result);
+            } else if !matches!(result, Ok(EndResult::Success)) && cleanup_result.is_none() {
+                cleanup_result = Some(result);
+            }
+        }
+        writer_result.unwrap_or_else(|| cleanup_result.unwrap_or(Ok(EndResult::Success)))
+    }
+
     /// Best-effort, idempotent release of read pins on every server this
     /// transaction pinned a read on. Runs on commit/abort for both read-only and
     /// read-write transactions: a server the transaction only *read* (pinned) is
@@ -1938,7 +2102,12 @@ impl TransactionManager {
     }
 
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
-        txn.data.clear();
+        // Retired map nodes can keep this transaction alive. Release its cache.
+        {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase = super::phase_profile::guard(super::phase_profile::Phase::CacheRelease);
+            txn.data = HashMap::new();
+        }
         txn.affected_objects.clear();
         txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;
@@ -2222,6 +2391,68 @@ mod tests {
         OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data))
     }
 
+    async fn prepare_with_a_ring_address_gap(fresh_ring: bool) {
+        use super::Service as _;
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "manager_ring_address_gap";
+        let server = start_manager_test_server(&address, group).await;
+        let runtime = server.current_database();
+        install_basic_schema(&runtime);
+        let ring = if fresh_ring {
+            // An incomplete first group read leaves the configured owner's
+            // address absent. Its stored slot still names that owner.
+            let ring = ConsistentHashing::new_with_id(
+                crate::server::CONS_HASH_ID,
+                group,
+                &server.raft_client,
+                &server.membership,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ring.nodes_count(), 0);
+            ring.set_slot_overrides(Some(vec![server.server_id]), 1);
+            ring
+        } else {
+            server.consh.clone()
+        };
+        let manager = TransactionManager::new(Arc::new(TransactionManagerDeps {
+            database_runtime: runtime,
+            server_id: server.server_id,
+            consh: ring,
+            member_pool: Arc::new(ClientPool::new()),
+            hlc: server.hlc.clone(),
+        }));
+        let tid = manager.begin().await.unwrap();
+        let written = manager
+            .write(tid.clone(), counter_cell(1, Id::from_parts(0, 71), 7))
+            .await;
+        assert!(matches!(written, Ok(TxnExecResult::Accepted(()))));
+        let prepared = manager.prepare(tid.clone()).await;
+        warn!(
+            "C3DOUBT manager control: fresh_ring={}, prepare={:?}",
+            fresh_ring, prepared
+        );
+        let _ = manager.abort(tid).await;
+        manager.shutdown.store(true, Ordering::Relaxed);
+        server.shutdown().await;
+        assert!(
+            matches!(prepared, Ok(TMPrepareResult::Success)),
+            "the configured owner must be reachable: {:?}",
+            prepared
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_locates_a_configured_owner_after_an_incomplete_ring_read() {
+        prepare_with_a_ring_address_gap(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_prepare_locates_an_owner_with_a_current_ring() {
+        prepare_with_a_ring_address_gap(false).await;
+    }
+
     #[test]
     fn changed_existing_replacement_builds_update_commit_op() {
         let id = Id::allocated(0, 0, 7001);
@@ -2280,6 +2511,34 @@ mod tests {
         assert!(!TransactionManager::abort_cleanup_complete(&Ok(
             AbortResult::Success(Some(vec![]))
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_releases_cache_capacity_while_handle_is_retained() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_cache_capacity";
+        let server = start_manager_test_server(&address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let client = scoped_txn_client_for_database(&address, group, group).await;
+        let tid = client.begin().await.unwrap().unwrap();
+        let retained = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn = retained.lock().await;
+            txn.data.reserve(8192);
+            assert!(txn.data.capacity() >= 8192);
+        }
+        manager.cleanup_transaction(&tid);
+        assert_eq!(manager.transaction_count(), 0);
+        {
+            let txn = retained.lock().await;
+            assert_eq!(txn.state, TxnState::Cleanup);
+            assert_eq!(
+                txn.data.capacity(),
+                0,
+                "a retired map node must not retain the transaction cache allocation"
+            );
+        }
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

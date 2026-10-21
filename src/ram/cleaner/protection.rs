@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Test only: restore the pin without pruning, as the first fix had it.
+#[cfg(test)]
+pub(crate) static NO_PRUNE_ON_PIN: AtomicBool = AtomicBool::new(false);
+
 const CLEANING: usize = 1 << (usize::BITS - 1);
 const RETIRED: usize = 1 << (usize::BITS - 2);
 
@@ -16,6 +20,17 @@ pub(crate) struct Protection {
     pub head: AtomicBool,
     /// Set before rotation unpublishes the head; cleared after the seal job.
     pub seal_pending: AtomicBool,
+    /// Set when the seal job has drained the segment and synced its WAL. From
+    /// then on, the cleaner may reclaim the segment before its archive.
+    pub synced: AtomicBool,
+    /// Seal attempts that left a synced, mostly dead segment to the cleaner.
+    pub reclaim_waits: AtomicUsize,
+    /// Set when the seal job closes the segment for appends. It never clears:
+    /// a rotated segment never takes another append, so nothing reopens its
+    /// journal gate.
+    pub rotated: AtomicBool,
+    /// Set while the segment is counted in `SEAL_WAITING_SEGMENTS`.
+    waiting: AtomicBool,
     activity: AtomicUsize,
     transactions: Mutex<HashMap<TxnId, Option<Arc<Vec<Receipt>>>>>,
 }
@@ -32,12 +47,35 @@ impl Protection {
         self.transactions.lock().insert(txn.clone(), Some(receipts));
     }
 
-    pub fn abort_transaction(&self, txn: &TxnId) {
-        self.transactions.lock().remove(txn);
+    /// Keep this segment in progress until `tokens` are covered by a sync.
+    ///
+    /// Used for the segment of an OLD version that `txn` replaced or removed.
+    /// If the COMMIT of `txn` is lost in a power loss, recovery rolls the
+    /// transaction back, and the old version is the cell. The entry stays
+    /// until the COMMIT is durable.
+    ///
+    /// `tokens` hold no WAL descriptor (`Receipt::token`). Covered entries
+    /// are removed here, so a segment that the cleaner never examines keeps
+    /// only the pins that are still uncovered, plus the new one.
+    pub fn pin_until_covered(&self, txn: &TxnId, tokens: Arc<Vec<Receipt>>) {
+        let mut transactions = self.transactions.lock();
+        #[cfg(test)]
+        let prune = !NO_PRUNE_ON_PIN.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let prune = true;
+        if prune {
+            Self::prune(&mut transactions);
+        }
+        transactions.insert(txn.clone(), Some(tokens));
     }
 
-    pub fn transaction_pending(&self) -> bool {
-        let mut transactions = self.transactions.lock();
+    /// The number of transactions that keep this segment in progress.
+    #[cfg(test)]
+    pub fn pin_count(&self) -> usize {
+        self.transactions.lock().len()
+    }
+
+    fn prune(transactions: &mut HashMap<TxnId, Option<Arc<Vec<Receipt>>>>) {
         transactions.retain(|_, decision| {
             decision.as_ref().map_or(true, |receipts| {
                 !receipts
@@ -45,12 +83,60 @@ impl Protection {
                     .all(|receipt| receipt.file.covers_receipt(receipt.offset, receipt.epoch))
             })
         });
+    }
+
+    pub fn abort_transaction(&self, txn: &TxnId) {
+        self.transactions.lock().remove(txn);
+    }
+
+    /// Whether `txn` still keeps this segment in progress: in flight, or
+    /// decided with receipts that a sync has not covered yet.
+    pub fn holds_transaction(&self, txn: &TxnId) -> bool {
+        self.transaction_pending();
+        self.transactions.lock().contains_key(txn)
+    }
+
+    pub fn transaction_pending(&self) -> bool {
+        let mut transactions = self.transactions.lock();
+        Self::prune(&mut transactions);
         !transactions.is_empty()
+    }
+
+    /// Count this segment as waiting for the cleaner. True on the first call.
+    pub fn enter_wait(&self) -> bool {
+        let first = !self.waiting.swap(true, Ordering::AcqRel);
+        if first {
+            let now = crate::ram::segs::SEAL_WAITING_SEGMENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::ram::segs::SEAL_WAITING_PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+        first
+    }
+
+    /// Stop counting this segment as waiting. Safe to call more than once.
+    pub fn leave_wait(&self) {
+        if self.waiting.swap(false, Ordering::AcqRel) {
+            crate::ram::segs::SEAL_WAITING_SEGMENTS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn in_progress(&self) -> bool {
         self.head.load(Ordering::Acquire)
             || self.seal_pending.load(Ordering::Acquire)
+            || self.activity.load(Ordering::Acquire) & !CLEANING != 0
+            || self.transaction_pending()
+    }
+
+    /// The cleaner must not select, claim or remove this segment.
+    ///
+    /// Like `in_progress`, except that a seal job blocks the cleaner only until
+    /// it has drained the segment and synced its WAL. The seal job closes the
+    /// journal gate of the segment before that drain, and the gate stays closed
+    /// (`rotated`). So after `synced`, the segment takes no append, and its WAL
+    /// holds every acknowledged write. A reclaim then makes its archive
+    /// unnecessary. The cleaner claim and the archive exclude each other.
+    pub fn blocks_cleaner(&self) -> bool {
+        self.head.load(Ordering::Acquire)
+            || (self.seal_pending.load(Ordering::Acquire) && !self.synced.load(Ordering::Acquire))
             || self.activity.load(Ordering::Acquire) & !CLEANING != 0
             || self.transaction_pending()
     }
@@ -209,5 +295,35 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::TimedOut
         );
+    }
+
+    /// A pin holds no WAL descriptor: an unlinked WAL file is not kept open.
+    #[test]
+    fn a_pin_token_holds_no_wal_descriptor() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(directory.path().join("wal")).unwrap();
+        file.write_all(&[7; 16]).unwrap();
+        let descriptor = Arc::new(file);
+        let durable = crate::ram::durability::DurableFile::new(0, 1, 1);
+        durable
+            .open(&descriptor, 0, directory.path().to_str().unwrap())
+            .unwrap();
+        durable.observe(16);
+        let receipt = Receipt {
+            file: durable,
+            offset: 16,
+            epoch: 0,
+            descriptor: Some(descriptor.clone()),
+        };
+        let token = receipt.token();
+        assert!(token.descriptor.is_none());
+        let protection = Protection::default();
+        let txn = crate::server::transactions::test_hlc(9844, 1);
+        protection.pin_until_covered(&txn, Arc::new(vec![token]));
+        drop(receipt);
+        // The test holds one reference. A pin that kept the receipt would
+        // hold a second one.
+        assert_eq!(Arc::strong_count(&descriptor), 1);
     }
 }
