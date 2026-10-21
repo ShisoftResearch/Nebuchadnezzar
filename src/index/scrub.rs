@@ -2551,10 +2551,13 @@ mod tests {
         let _ = env_logger::try_init();
         let dir = crash_scratch();
         let group = "index_crash_reconcile";
+        // One address for every start of this store: a restart reuses it.
+        // Reopening a store under another address is the explicit restore.
+        let addr = crate::utils::test_port::unique_localhost_addr();
         let (server, client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
         )
         .await;
@@ -2622,7 +2625,7 @@ mod tests {
         let (server, client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
         )
         .await;
@@ -2696,7 +2699,7 @@ mod tests {
         let (server, _client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
         )
         .await;
@@ -3878,13 +3881,16 @@ mod tests {
         let _ = env_logger::try_init();
         let dir = crash_scratch();
         let group = "hash_index_crash_reconcile";
+        // One address for every start of this store: a restart reuses it.
+        // Reopening a store under another address is the explicit restore.
+        let addr = crate::utils::test_port::unique_localhost_addr();
         let updated = HASH_CRASH_CELLS / 2;
         let new_sku = |i: u64| 10_000 + i;
 
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             true,
         )
@@ -3912,7 +3918,7 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             false,
         )
@@ -3986,7 +3992,7 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             true,
         )
@@ -4086,7 +4092,7 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             true,
         )
@@ -4169,10 +4175,13 @@ mod tests {
 
         let dir = crash_scratch();
         let group = "clean_shutdown_index_counterexample";
+        // One address for every start of this store: a restart reuses it.
+        // Reopening a store under another address is the explicit restore.
+        let addr = crate::utils::test_port::unique_localhost_addr();
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             true,
         )
@@ -4204,7 +4213,7 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             false,
         )
@@ -4225,7 +4234,7 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             true,
             true,
         )
