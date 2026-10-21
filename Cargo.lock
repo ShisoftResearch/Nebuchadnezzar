@@ -263,9 +263,9 @@ name = "bifrost"
 version = "0.1.0"
 dependencies = [
  "async-std",
- "bifrost_hasher 0.1.0",
- "bifrost_plugins 0.1.0",
- "bifrost_proc_macro 0.1.0",
+ "bifrost_hasher",
+ "bifrost_plugins",
+ "bifrost_proc_macro",
  "byteorder",
  "bytes",
  "crc32fast",
@@ -287,46 +287,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "bifrost"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "async-std",
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_proc_macro 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "byteorder",
- "bytes",
- "crc32fast",
- "futures",
- "futures-timer",
- "lazy_static",
- "lightning-containers",
- "log",
- "num_cpus",
- "parking_lot",
- "rand 0.10.0",
- "serde",
- "serde_cbor",
- "serde_json",
- "thread-id",
- "threadpool",
- "tokio",
- "tokio-stream",
- "tokio-util",
-]
-
-[[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "bifrost_hasher"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
 dependencies = [
  "twox-hash",
 ]
@@ -335,17 +297,7 @@ dependencies = [
 name = "bifrost_plugins"
 version = "0.1.0"
 dependencies = [
- "bifrost_hasher 0.1.0",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "bifrost_plugins"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
+ "bifrost_hasher",
  "quote",
  "syn 2.0.117",
 ]
@@ -357,16 +309,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "bifrost_proc_macro"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.4",
 ]
 
 [[package]]
@@ -762,9 +704,9 @@ name = "dovahkiin"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
+ "bifrost",
+ "bifrost_hasher",
+ "bifrost_plugins",
  "byteorder",
  "lazy_static",
  "log",
@@ -1973,10 +1915,10 @@ dependencies = [
  "ahash",
  "async-std",
  "async-trait",
- "bifrost 0.1.0",
- "bifrost_hasher 0.1.0",
- "bifrost_plugins 0.1.0",
- "bifrost_proc_macro 0.1.0",
+ "bifrost",
+ "bifrost_hasher",
+ "bifrost_plugins",
+ "bifrost_proc_macro",
  "bincode 2.0.1",
  "bincode_derive",
  "byteorder",
