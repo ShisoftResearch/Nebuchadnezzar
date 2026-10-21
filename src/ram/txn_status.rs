@@ -32,10 +32,10 @@ use crate::ram::cell::OwnedCell;
 use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, Type};
 use crate::server::transactions::TxnId;
+use crate::utils::keyed_state::KeyedState;
 use bifrost_hasher::hash_str;
 use dovahkiin::types::key_hash;
-use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 pub const TXN_STATUS_SCHEMA: &str = "_NEB_TXN_STATUS";
 const TS_FIELD: &str = "TS";
@@ -48,8 +48,7 @@ pub const STATUS_ORIGIN: u16 = 0xFFF;
 pub const STATUS_PROBES: u64 = 8;
 
 lazy_static! {
-    pub static ref TXN_STATUS_SCHEMA_ID: SchemaVid =
-        SchemaVid(key_hash(TXN_STATUS_SCHEMA) as u32);
+    pub static ref TXN_STATUS_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(TXN_STATUS_SCHEMA) as u32);
 }
 
 /// The hidden schema of status cells. Registered locally on every store,
@@ -111,7 +110,11 @@ impl std::fmt::Display for StatusCellError {
         match self {
             StatusCellError::NotAStatusCell => write!(f, "the cell is not a status cell"),
             StatusCellError::Field(name) => {
-                write!(f, "the status cell field {} is missing or has another type", name)
+                write!(
+                    f,
+                    "the status cell field {} is missing or has another type",
+                    name
+                )
             }
             StatusCellError::Participants(count) => write!(
                 f,
@@ -198,128 +201,141 @@ pub struct StatusEntry {
     pub since: std::time::Instant,
 }
 
-#[derive(Default)]
-struct State {
-    live: BTreeMap<TxnId, StatusEntry>,
-    ids: HashSet<u64>,
-    /// In doubt after recovery, and not resolved yet: the participants.
-    resolving: BTreeMap<TxnId, Vec<u64>>,
-    /// The cell ids of each in-doubt bracket, and how many in-doubt
-    /// brackets hold each id. A `prepare` that writes one of these ids waits
-    /// until the bracket is resolved (review finding 2).
-    resolving_cells: BTreeMap<TxnId, Vec<u64>>,
-    in_doubt_cells: std::collections::HashMap<u64, usize>,
+struct Resolving {
+    participants: Vec<u64>,
+    cells: Vec<u64>,
 }
 
-/// The status cells of one store, and the transactions it resolves.
-#[derive(Default)]
+/// Each transaction owns its status and recovery state. Ordered side indexes
+/// support sweeps. Cell counters use keyed lookups only.
 pub struct TxnStatusRegistry {
-    state: Mutex<State>,
-    /// How many cell ids `in_doubt_cells` holds: the common path pays one
-    /// atomic load.
+    live: KeyedState<TxnId, StatusEntry>,
+    ids: KeyedState<u64, usize>,
+    resolving: KeyedState<TxnId, Resolving>,
+    in_doubt_cells: KeyedState<u64, usize>,
     in_doubt_cell_count: std::sync::atomic::AtomicUsize,
 }
-
+impl Default for TxnStatusRegistry {
+    fn default() -> Self {
+        Self {
+            live: KeyedState::ordered(),
+            ids: KeyedState::default(),
+            resolving: KeyedState::ordered(),
+            in_doubt_cells: KeyedState::default(),
+            in_doubt_cell_count: Default::default(),
+        }
+    }
+}
 impl TxnStatusRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn register(&self, txn: TxnId, entry: StatusEntry) {
-        let mut state = self.state.lock();
-        state.ids.insert(entry.id.bits());
-        if let Some(old) = state.live.insert(txn, entry) {
-            if !state.live.values().any(|other| other.id == old.id) {
-                state.ids.remove(&old.id.bits());
-            }
+        let mut state = crate::profile_lock!(H09, self.live.entry(&txn));
+        *self.ids.entry(&entry.id.bits()).get_or_insert(0) += 1;
+        if let Some(old) = state.replace(entry) {
+            Self::release_id(&self.ids, old.id.bits());
         }
     }
 
+    fn release_id(map: &KeyedState<u64, usize>, id: u64) -> bool {
+        let mut count = map.entry(&id);
+        if let Some(value) = count.as_mut() {
+            *value -= 1;
+            if *value == 0 {
+                count.take();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn get(&self, txn: &TxnId) -> Option<StatusEntry> {
-        self.state.lock().live.get(txn).cloned()
+        self.live.get(txn)?.as_ref().cloned()
     }
 
     pub fn remove(&self, txn: &TxnId) -> Option<StatusEntry> {
-        let mut state = self.state.lock();
-        let entry = state.live.remove(txn)?;
-        state.ids.remove(&entry.id.bits());
+        let mut state = crate::profile_lock!(H09, self.live.get(txn)?);
+        let entry = state.take()?;
+        Self::release_id(&self.ids, entry.id.bits());
         Some(entry)
     }
 
-    /// Whether `id` is a status cell of this store: scans and migration skip
-    /// it.
     pub fn is_status_id(&self, id: u64) -> bool {
-        let state = self.state.lock();
-        !state.ids.is_empty() && state.ids.contains(&id)
+        self.ids.get(&id).is_some_and(|entry| entry.is_some())
     }
 
     pub fn note_peer_synced(&self, txn: &TxnId, peer: u64) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
-            entry.synced_peers.insert(peer);
+        if let Some(mut state) = self.live.get(txn) {
+            if let Some(entry) = state.as_mut() {
+                entry.synced_peers.insert(peer);
+            }
         }
     }
 
     pub fn mark_self_synced(&self, txn: &TxnId) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
-            entry.self_synced = true;
-        }
-    }
-
-    pub fn mark_announced(&self, txn: &TxnId) {
-        if let Some(entry) = self.state.lock().live.get_mut(txn) {
-            entry.announced = true;
-        }
-    }
-
-    pub fn entries(&self) -> Vec<(TxnId, StatusEntry)> {
-        self.state
-            .lock()
-            .live
-            .iter()
-            .map(|(txn, entry)| (txn.clone(), entry.clone()))
-            .collect()
-    }
-
-    /// `txn` is in doubt after recovery: its bracket writes `cells` (id
-    /// bits) here.
-    pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>, mut cells: Vec<u64>) {
-        cells.sort_unstable();
-        cells.dedup();
-        let mut state = self.state.lock();
-        state.resolving.insert(txn.clone(), participants);
-        for id in &cells {
-            *state.in_doubt_cells.entry(*id).or_insert(0) += 1;
-        }
-        if let Some(old) = state.resolving_cells.insert(txn, cells) {
-            Self::forget_cells(&mut state, &old);
-        }
-        self.in_doubt_cell_count
-            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
-    }
-
-    pub fn end_resolving(&self, txn: &TxnId) {
-        let mut state = self.state.lock();
-        state.resolving.remove(txn);
-        if let Some(cells) = state.resolving_cells.remove(txn) {
-            Self::forget_cells(&mut state, &cells);
-        }
-        self.in_doubt_cell_count
-            .store(state.in_doubt_cells.len(), std::sync::atomic::Ordering::Release);
-    }
-
-    fn forget_cells(state: &mut State, cells: &[u64]) {
-        for id in cells {
-            if let Some(holders) = state.in_doubt_cells.get_mut(id) {
-                *holders -= 1;
-                if *holders == 0 {
-                    state.in_doubt_cells.remove(id);
-                }
+        if let Some(mut state) = self.live.get(txn) {
+            if let Some(entry) = state.as_mut() {
+                entry.self_synced = true;
             }
         }
     }
 
-    /// The first slot of `slots` that holds a cell of a bracket in doubt
-    /// after recovery. One atomic load while no bracket is in doubt.
+    pub fn mark_announced(&self, txn: &TxnId) {
+        if let Some(mut state) = self.live.get(txn) {
+            if let Some(entry) = state.as_mut() {
+                entry.announced = true;
+            }
+        }
+    }
+
+    pub fn entries(&self) -> Vec<(TxnId, StatusEntry)> {
+        self.live
+            .keys()
+            .filter_map(|txn| self.get(&txn).map(|entry| (txn, entry)))
+            .collect()
+    }
+
+    /// Publish protection before publishing the transaction in the sweep index.
+    pub fn begin_resolving(&self, txn: TxnId, participants: Vec<u64>, mut cells: Vec<u64>) {
+        cells.sort_unstable();
+        cells.dedup();
+        let mut state = crate::profile_lock!(H09, self.resolving.entry(&txn));
+        for id in &cells {
+            let mut count = self.in_doubt_cells.entry(id);
+            if count.is_none() {
+                self.in_doubt_cell_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            *count.get_or_insert(0) += 1;
+        }
+        if let Some(old) = state.replace(Resolving {
+            participants,
+            cells,
+        }) {
+            self.forget_cells(&old.cells);
+        }
+    }
+
+    pub fn end_resolving(&self, txn: &TxnId) {
+        let Some(mut state) = self.resolving.get(txn) else {
+            return;
+        };
+        if let Some(old) = state.take() {
+            self.forget_cells(&old.cells);
+        }
+    }
+
+    fn forget_cells(&self, cells: &[u64]) {
+        for id in cells {
+            if Self::release_id(&self.in_doubt_cells, *id) {
+                self.in_doubt_cell_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
     pub fn in_doubt_slot(&self, slots: &std::collections::HashSet<u16>) -> Option<SlotInDoubt> {
         if self
             .in_doubt_cell_count
@@ -328,23 +344,18 @@ impl TxnStatusRegistry {
         {
             return None;
         }
-        let state = self.state.lock();
-        for (txn, cells) in &state.resolving_cells {
-            for id in cells {
+        self.resolving.keys().find_map(|txn| {
+            let state = self.resolving.get(&txn)?;
+            state.as_ref()?.cells.iter().find_map(|id| {
                 let slot = Id::from_bits(*id).locality();
-                if slots.contains(&slot) {
-                    return Some(SlotInDoubt {
-                        slot: slot as u32,
-                        txn: txn.clone(),
-                    });
-                }
-            }
-        }
-        None
+                slots.contains(&slot).then(|| SlotInDoubt {
+                    slot: slot as u32,
+                    txn: txn.clone(),
+                })
+            })
+        })
     }
 
-    /// Whether `id` is a cell of a bracket that is in doubt after recovery.
-    /// One atomic load while no bracket is in doubt.
     pub fn is_in_doubt_cell(&self, id: u64) -> bool {
         if self
             .in_doubt_cell_count
@@ -353,21 +364,24 @@ impl TxnStatusRegistry {
         {
             return false;
         }
-        self.state.lock().in_doubt_cells.contains_key(&id)
+        self.in_doubt_cells
+            .get(&id)
+            .is_some_and(|entry| entry.is_some())
     }
 
     pub fn resolving(&self) -> Vec<TxnId> {
-        self.state.lock().resolving.keys().cloned().collect()
+        self.resolving.keys().collect()
     }
 
     pub fn resolving_participants(&self, txn: &TxnId) -> Option<Vec<u64>> {
-        self.state.lock().resolving.get(txn).cloned()
+        self.resolving
+            .get(txn)?
+            .as_ref()
+            .map(|entry| entry.participants.clone())
     }
 
-    /// `(status cells, resolving)` counts.
     pub fn counts(&self) -> (usize, usize) {
-        let state = self.state.lock();
-        (state.live.len(), state.resolving.len())
+        (self.live.keys().count(), self.resolving.keys().count())
     }
 }
 
@@ -375,6 +389,79 @@ impl TxnStatusRegistry {
 mod tests {
     use super::*;
     use crate::server::transactions::test_hlc;
+
+    #[test]
+    fn transaction_status_entries_resolve_independently() {
+        let registry = std::sync::Arc::new(TxnStatusRegistry::new());
+        let first = test_hlc(1, 1);
+        let second = test_hlc(2, 1);
+        let cell = Id::from_parts(7, 8).bits();
+        registry.begin_resolving(first.clone(), vec![1, 2], vec![cell]);
+        let held = registry.resolving.entry(&first);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = registry.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.begin_resolving(second_copy.clone(), vec![1, 3], vec![cell]);
+            assert_eq!(
+                worker.resolving_participants(&second_copy),
+                Some(vec![1, 3])
+            );
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        registry.end_resolving(&first);
+        assert!(
+            registry.is_in_doubt_cell(cell),
+            "another transaction still protects this cell"
+        );
+        registry.end_resolving(&second);
+        assert!(!registry.is_in_doubt_cell(cell));
+        assert_eq!(registry.counts(), (0, 0));
+    }
+
+    #[test]
+    fn concurrent_resolvers_keep_shared_cell_protection_until_the_last_owner() {
+        let registry = TxnStatusRegistry::new();
+        let cell = Id::from_parts(7, 8).bits();
+        let last = test_hlc(100, 1);
+        registry.begin_resolving(last.clone(), vec![1, 2], vec![cell]);
+        let ready = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for node in 1..=8 {
+                let registry = &registry;
+                let ready = &ready;
+                scope.spawn(move || {
+                    let txn = test_hlc(node, 1);
+                    registry.begin_resolving(txn.clone(), vec![1, 2], vec![cell, cell]);
+                    ready.wait();
+                    // Replacing one resolver must retain the other references.
+                    registry.begin_resolving(txn.clone(), vec![2, 3], vec![cell]);
+                    registry.end_resolving(&txn);
+                    assert!(registry.is_in_doubt_cell(cell));
+                });
+            }
+        });
+        assert_eq!(registry.resolving(), vec![last.clone()]);
+        assert_eq!(
+            registry
+                .in_doubt_cell_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        registry.end_resolving(&last);
+        assert!(!registry.is_in_doubt_cell(cell));
+        assert_eq!(registry.counts(), (0, 0));
+        assert_eq!(
+            registry
+                .in_doubt_cell_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 
     #[test]
     fn a_status_cell_round_trips_and_its_ids_are_reserved() {

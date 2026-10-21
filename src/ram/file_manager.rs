@@ -1,13 +1,17 @@
 use crate::ram::compression;
+use crate::ram::segs::ArchiveStagingPool;
+use lightning::map::PtrHashMap;
 use std::fs::{self, create_dir_all, remove_file, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Unified file manager for segment file operations
 /// Centralizes all file path generation, directory management, and file I/O
 pub struct SegmentFileManager {
     backup_storage: Option<String>,
     wal_storage: Option<String>,
+    archive_staging: PtrHashMap<usize, Arc<ArchiveStagingPool>>,
 }
 
 impl SegmentFileManager {
@@ -15,7 +19,12 @@ impl SegmentFileManager {
         Self {
             backup_storage: backup_storage.map(|p| Self::normalize_path(&p)),
             wal_storage: wal_storage.map(|p| Self::normalize_path(&p)),
+            archive_staging: PtrHashMap::with_capacity(16),
         }
+    }
+
+    pub(crate) fn archive_staging_pool(&self, chunk: usize) -> Arc<ArchiveStagingPool> {
+        crate::utils::keyed_state::get_or_insert(&self.archive_staging, chunk, || Arc::new(ArchiveStagingPool::default()))
     }
 
     fn normalize_path(path: &str) -> String {

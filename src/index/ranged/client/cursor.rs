@@ -80,8 +80,7 @@ fn bump_entry_key(key: &EntryKey, ordering: Ordering) -> Option<EntryKey> {
 /// results and no complaint anywhere. In a steady state (no splits, no
 /// merges) this counter should barely move; a climbing rate is the alarm
 /// for duplicates that `RangedTree::audit_raw` then localizes.
-pub static SCAN_DEDUP_DROPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static SCAN_DEDUP_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Total dedup drops observed by scans in this process.
 pub fn scan_dedup_drops() -> u64 {
@@ -347,7 +346,7 @@ impl ClientCursor {
                 // "nothing follows" is what returned short answers with no
                 // error. Retry it exactly like a Migrating reply.
                 last_retry_reason = Some(format!("next tree unresolved: {}", reason));
-                self.query_client.placement.write().remove(current_key);
+                self.query_client.placement.remove(current_key);
                 let _ = self.query_client.refresh_key_mapping(current_key).await;
                 debug!(
                     "Ranged cursor retry {} for key {:?}: next tree unresolved ({})",
@@ -478,7 +477,7 @@ impl ClientCursor {
                                 retried + 1
                             );
                         }
-                        self.query_client.placement.write().remove(&tree_key);
+                        self.query_client.placement.remove(&tree_key);
                         if (retried + 1) % MIGRATION_REFRESH_INTERVAL == 0 {
                             let _ = self.query_client.refresh_key_mapping(current_key).await;
                         }
@@ -504,7 +503,7 @@ impl ClientCursor {
                             "tree not found or out of bound during cursor refill (unloaded or migrated)"
                                 .to_string(),
                         );
-                        self.query_client.placement.write().remove(&tree_key);
+                        self.query_client.placement.remove(&tree_key);
                         if (retried + 1) % MIGRATION_REFRESH_INTERVAL == 0 {
                             let _ = self.query_client.refresh_key_mapping(current_key).await;
                         }
@@ -535,7 +534,7 @@ impl ClientCursor {
                                 retried + 1
                             );
                         }
-                        self.query_client.placement.write().remove(&tree_key);
+                        self.query_client.placement.remove(&tree_key);
                         let _ = self.query_client.refresh_key_mapping(current_key).await;
                         debug!(
                             "Ranged cursor retry {} for key {:?}: {}",

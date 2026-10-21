@@ -11,7 +11,7 @@ use bifrost::utils::time::get_time;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
-use lightning::linked_list::LinkedList;
+use crossbeam_skiplist::SkipSet;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
@@ -466,10 +466,10 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: parking_lot::RwLock<HashMap<Id, CellMetaMutex>>,
+    cells: crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
-    cell_list: LinkedList<Id>,
-    txns_sorted: Mutex<BTreeSet<TxnId>>,
+    cell_list: SkipSet<Id>,
+    txns_sorted: SkipSet<TxnId>,
     database_runtime: Arc<DatabaseRuntime>,
     cleanup_signal: Arc<AtomicBool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
@@ -490,7 +490,8 @@ pub struct DataManager {
     /// is down. So a commit with other participants is also kept in the
     /// store's decision evidence (`crate::ram::evidence`), durably and until
     /// no participant holds it open; this map is the fast path.
-    decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
+    decided: LFMap<TxnId, TxnOutcome>,
+    decision_order: SkipSet<TxnId>,
 }
 
 /// How often a site asks the participants that did not report their COMMIT
@@ -520,6 +521,8 @@ enum CloseOutcome {
 
 /// How many finished transactions a site remembers the fate of. Sized to
 /// outlast the in-doubt window by orders of magnitude rather than tuned.
+/// An ordered side index selects the globally oldest remembered transaction.
+/// Durable status and fence records remain authoritative after eviction.
 const DECISION_MEMORY: usize = 64 * 1024;
 
 service! {
@@ -593,13 +596,14 @@ impl DataManager {
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: parking_lot::RwLock::new(HashMap::with_capacity(256)),
+            cells: Default::default(),
             txns: LFMap::with_capacity(128),
-            cell_list: LinkedList::new(),
-            txns_sorted: Mutex::new(BTreeSet::new()),
+            cell_list: SkipSet::new(),
+            txns_sorted: SkipSet::new(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
-            decided: Mutex::new(BTreeMap::new()),
+            decided: LFMap::with_capacity(128),
+            decision_order: SkipSet::new(),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -678,15 +682,19 @@ impl DataManager {
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
-                self.txns_sorted.lock().insert(tid.clone());
+                self.txns_sorted.insert(tid.clone());
                 return txn;
             }
         }
     }
+    fn transaction_ids(&self) -> Vec<TxnId> {
+        self.txns_sorted.iter().map(|entry| entry.value().clone()).collect()
+    }
+
     /// Prepared transactions that carry at least one write. A fencer drains
     /// these before it reports the fence engaged, because each can still commit.
     pub fn prepared_writer_count(&self) -> usize {
-        let tids: Vec<TxnId> = self.txns_sorted.lock().iter().cloned().collect();
+        let tids: Vec<TxnId> = self.transaction_ids();
         tids.iter()
             .filter(|tid| {
                 self.find_transaction(tid).is_some_and(|txn| {
@@ -730,26 +738,20 @@ impl DataManager {
     }
 
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
-        self.cells.read().get(id).cloned()
+        crate::profile_lock!(H07, self.cells.entry(id)).as_ref().cloned()
     }
 
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        if let Some(meta) = self.existing_cell_meta_mutex(id) {
-            return meta;
-        }
-        let mut cells = self.cells.write();
-        cells
-            .entry(*id)
-            .or_insert_with(|| {
-                self.cell_list.push_back(*id);
-                Arc::new(Mutex::new(CellMeta {
-                    read: TxnId::default(),
-                    write: TxnId::default(),
-                    owner: None,
-                    lock_acquired_at: None,
-                }))
-            })
-            .clone()
+        let mut entry = crate::profile_lock!(H07, self.cells.entry(id));
+        entry.get_or_insert_with(|| {
+            self.cell_list.insert(*id);
+            Arc::new(Mutex::new(CellMeta {
+                read: TxnId::default(),
+                write: TxnId::default(),
+                owner: None,
+                lock_acquired_at: None,
+            }))
+        }).clone()
     }
     fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
@@ -940,7 +942,7 @@ impl DataManager {
             drop(pins);
         }
         let _ = self.txns.remove(tid);
-        self.txns_sorted.lock().remove(tid);
+        self.txns_sorted.remove(tid);
     }
 
     /// Restore the cell index, pad the spans, then release the leased heads.
@@ -1614,7 +1616,7 @@ impl DataManager {
     /// cannot be fenced: it was told to commit, or the fence could not be
     /// made durable; the asker waits.
     pub(crate) fn fence_here(&self, tid: &TxnId) -> FenceAnswer {
-        let decided = self.decided.lock().get(tid).copied();
+        let decided = self.decided.get(tid);
         match decided {
             Some(TxnOutcome::Committed) => return FenceAnswer::Committing,
             Some(TxnOutcome::Aborted) => return FenceAnswer::Aborted,
@@ -1910,18 +1912,17 @@ impl DataManager {
     /// commit point answers a transaction it never decided. Bounded: see
     /// `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
-        let mut decided = self.decided.lock();
-        decided.insert(tid.clone(), outcome);
-        while decided.len() > DECISION_MEMORY {
-            let Some(oldest) = decided.keys().next().cloned() else {
-                break;
-            };
-            decided.remove(&oldest);
+        self.decided.insert(tid.clone(), outcome);
+        self.decision_order.insert(tid.clone());
+        while self.decision_order.len() > DECISION_MEMORY {
+            let Some(oldest) = self.decision_order.front() else { break };
+            if oldest.remove() {
+                self.decided.remove(oldest.value());
+            }
         }
     }
 
-    /// Test hook: record as many later, unrelated decisions as the decision
-    /// memory holds, the way that many finished transactions would.
+    /// Test hook: evict earlier decisions with later decisions.
     #[cfg(test)]
     pub(crate) fn fill_decision_memory_with_later_decisions(&self) {
         for _ in 0..DECISION_MEMORY {
@@ -1962,44 +1963,36 @@ impl DataManager {
         // A finished multi-site commit is answered from its status cell
         // above until every participant is synced; a single-site one is never
         // asked about.
-        if let Some(outcome) = self.decided.lock().get(tid) {
-            return *outcome;
+        if let Some(outcome) = self.decided.get(tid) {
+            return outcome;
         }
         TxnOutcome::Unknown
     }
 
     async fn cell_meta_cleanup(&self) {
-        let oldest_transaction = {
-            self.txns_sorted
-                .lock()
-                .iter()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| self.hlc.now())
-        };
+        let oldest_transaction = self.txns_sorted.front()
+            .map(|entry| entry.value().clone()).unwrap_or_else(|| self.hlc.now());
         let mut cells_to_evict = Vec::new();
 
         // First pass: collect cells with their metadata (while holding locks)
-        for cell_id_ref in self.cell_list.iter_front() {
-            let cell_id = cell_id_ref.deref();
+        for cell_id_ref in self.cell_list.iter() {
+            let cell_id = *cell_id_ref.value();
             if let Some(cell_meta) = self.existing_cell_meta_mutex(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction && meta.read < oldest_transaction {
                     cells_to_evict.push((cell_id_ref, cell_meta.clone()));
-                } else {
-                    // Cells are ordered by activity, stop at first active one
-                    break;
                 }
+                // The side index orders IDs, so an active cell does not end the scan.
             } else {
                 // Cell not in map but in list - just remove from list
                 cell_id_ref.remove();
             }
         }
 
-        // Reference acquisition and removal share the map lock. A reference
-        // borrowed before prepare must stay mapped even before it has an owner.
+        // Borrow and removal share only this cell's entry guard. A borrowed
+        // reference must stay mapped even before prepare gives it an owner.
         for (cell_id_ref, cell_meta) in cells_to_evict {
-            let cell_id = cell_id_ref.deref();
+            let cell_id = *cell_id_ref.value();
             #[cfg(test)]
             {
                 let delay = prepare_delay_hooks()
@@ -2010,9 +2003,9 @@ impl DataManager {
                 }
             }
             let meta = cell_meta.lock();
-            let mut cells = self.cells.write();
+            let mut cells = crate::profile_lock!(H07, self.cells.entry(&cell_id));
             let same_meta = cells
-                .get(&cell_id)
+                .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &cell_meta));
             // These 2 references belong to the map and this cleanup candidate.
             // Any other reference belongs to an operation that can acquire an owner.
@@ -2022,7 +2015,7 @@ impl DataManager {
                 && meta.read < oldest_transaction
                 && meta.owner.is_none()
             {
-                cells.remove(&cell_id);
+                cells.take();
                 cell_id_ref.remove();
             }
         }
@@ -5098,7 +5091,7 @@ mod tests {
             "release_read_pins must wipe a pin-only participant transaction"
         );
         assert!(
-            !manager.txns_sorted.lock().contains(&tid),
+            !manager.txns_sorted.contains(&tid),
             "release_read_pins must drop the txns_sorted entry too"
         );
 
@@ -5310,7 +5303,7 @@ mod tests {
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
         assert!(manager.find_transaction(&tid).is_none());
-        assert_eq!(manager.cells.read().len(), 0);
+        assert!(manager.cell_list.is_empty());
         server.shutdown().await;
     }
 
@@ -5719,7 +5712,7 @@ mod tests {
             "all concurrent lookups of the same txn id should return the same transaction entry"
         );
         assert_eq!(manager.txns.len(), 1);
-        assert_eq!(manager.txns_sorted.lock().len(), 1);
+        assert_eq!(manager.transaction_ids().len(), 1);
         assert!(manager.txns.get(&tid).is_some());
 
         server.shutdown().await;
@@ -5746,7 +5739,7 @@ mod tests {
         assert!(matches!(response, TxnExecResult::Accepted(_)));
         assert!(manager.find_transaction(&tid).is_none());
         assert_eq!(manager.txns.len(), 0);
-        assert!(manager.txns_sorted.lock().is_empty());
+        assert!(manager.transaction_ids().is_empty());
 
         server.shutdown().await;
     }
@@ -5765,7 +5758,7 @@ mod tests {
             txn.lock().state = TxnState::Committed;
         }
         assert_eq!(manager.txns.len(), tids.len());
-        assert_eq!(manager.txns_sorted.lock().len(), tids.len());
+        assert_eq!(manager.transaction_ids().len(), tids.len());
 
         let results = join_all(tids.iter().cloned().map(|tid| {
             let manager = manager.clone();
@@ -5781,7 +5774,7 @@ mod tests {
             assert_eq!(result, EndResult::Success);
         }
         assert_eq!(manager.txns.len(), 0);
-        assert!(manager.txns_sorted.lock().is_empty());
+        assert!(manager.transaction_ids().is_empty());
 
         server.shutdown().await;
     }
@@ -5811,14 +5804,14 @@ mod tests {
                 .payload;
         assert_eq!(end_result, EndResult::Success);
         assert!(default_manager.txns.get(&shared_tid).is_none());
-        assert!(!default_manager.txns_sorted.lock().contains(&shared_tid));
+        assert!(!default_manager.txns_sorted.contains(&shared_tid));
 
         assert!(
             analytics_manager.txns.get(&shared_tid).is_some(),
             "ending one database transaction must not remove another database's transaction entry"
         );
         assert!(
-            analytics_manager.txns_sorted.lock().contains(&shared_tid),
+            analytics_manager.txns_sorted.contains(&shared_tid),
             "ending one database transaction must not remove another database's sorted bookkeeping"
         );
 
@@ -5831,7 +5824,7 @@ mod tests {
         .payload;
         assert_eq!(analytics_end, EndResult::Success);
         assert!(analytics_manager.txns.get(&shared_tid).is_none());
-        assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
+        assert!(!analytics_manager.txns_sorted.contains(&shared_tid));
 
         server.shutdown().await;
     }
@@ -5883,7 +5876,7 @@ mod tests {
         }
 
         assert!(manager.txns.get(&tid).is_none());
-        assert!(!manager.txns_sorted.lock().contains(&tid));
+        assert!(!manager.txns_sorted.contains(&tid));
 
         server.shutdown().await;
     }
@@ -7055,6 +7048,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn decision_iteration_allows_unrelated_publication() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_transaction_test_server(&address, "decision_shards").await;
+        let manager = data_manager_for_database(&server, &address, "decision_shards").await;
+        let first = test_hlc(1, 1);
+        let second = test_hlc(2, 1);
+        manager.record_decision(&first, TxnOutcome::Aborted);
+        let held = manager.decision_order.get(&first).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.record_decision(&second_copy, TxnOutcome::Aborted);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "a held ordered entry must allow decision publication");
+        assert_eq!(manager.txn_outcome(&second), TxnOutcome::Aborted);
+        manager.fill_decision_memory_with_later_decisions();
+        assert_eq!(manager.txn_outcome(&second), TxnOutcome::Unknown);
+        assert_eq!(manager.decision_order.len(), DECISION_MEMORY);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn participant_transaction_iteration_allows_unrelated_creation() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = start_transaction_test_server(&address, "participant_txn_shards").await;
+        let manager = data_manager_for_database(&server, &address, "participant_txn_shards").await;
+        let first = test_hlc(1, 1);
+        let second = test_hlc(2, 1);
+        manager.get_or_create_transaction(&first);
+        let held = manager.txns_sorted.get(&first).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.get_or_create_transaction(&second_copy);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "a held iteration entry must allow unrelated creation");
+        let ids = manager.transaction_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&first) && ids.contains(&second));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelated_cell_metadata_lookups_do_not_share_a_write_gate() {
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_metadata_shards";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let first = Id::allocated(0, 0, 99001);
+        let second = Id::allocated(0, 0, 99002);
+        let held = manager.cells.entry(&first);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let thread = std::thread::spawn(move || {
+            let one = worker.cell_meta_mutex(&second);
+            let two = worker.cell_meta_mutex(&second);
+            assert!(Arc::ptr_eq(&one, &two));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "an unrelated cell must make progress");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cell_meta_cleanup_must_not_orphan_a_borrowed_update_meta() {
         let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_cleanup_borrowed_update";
@@ -7504,7 +7574,10 @@ impl Service for DataManager {
                 #[cfg(feature = "occ_phase_profile")]
                 let _phase_guard = phase_guard;
                 let (payload, request_results) = scoped_commit.await;
-                let pending_results = IndexBuilder::await_indices().await;
+                let pending_results = match self.database_runtime.indexer() {
+                    Some(indexer) => indexer.await_indices().await,
+                    None => Vec::new(),
+                };
                 self.warn_on_index_wait_results(
                     &tid_for_logs,
                     request_results

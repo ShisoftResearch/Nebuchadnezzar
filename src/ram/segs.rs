@@ -1,5 +1,4 @@
 use crate::ram::chunk::Chunk;
-#[cfg(feature = "compress_backups")]
 use crate::ram::compression;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
@@ -73,14 +72,14 @@ pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
-/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
-/// dedicated thread fsyncs the whole set every `wal_sync_interval_ms` —
+/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). A
+/// dispatcher schedules independent segment jobs every `wal_sync_interval_ms`,
 /// replacing per-segment inline timer syncs (6,302 blocking fsyncs/s across an
-/// import's ~63 active segments) with O(dirty) syncs per tick on one thread.
+/// import's ~63 active segments) with O(dirty) independent jobs per tick.
 /// Entries hold `AArc`s, so segment lifecycle is a non-issue: an archived
 /// segment syncs as a no-op (its WAL file handle is gone) and drops.
-static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
-    parking_lot::Mutex::new(Vec::new());
+static WAL_DIRTY: crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>> =
+    crossbeam::queue::SegQueue::new();
 
 #[cfg(test)]
 static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
@@ -241,14 +240,13 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
     if !enqueue {
         return;
     }
-    WAL_DIRTY.lock().push(seg.clone());
+    WAL_DIRTY.push(seg.clone());
 
     static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SYNCER.get_or_init(|| {
         std::thread::Builder::new()
             .name("wal-syncer".into())
             .spawn(|| {
-                use rayon::prelude::*;
                 // Fsyncs for independent segments can run together, as they
                 // do for committing writers. A single sync thread otherwise
                 // becomes the throughput limit.
@@ -261,26 +259,54 @@ pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
                     std::thread::sleep(std::time::Duration::from_millis(
                         wal_sync_interval_ms().max(1) as u64,
                     ));
-                    let dirty = std::mem::take(&mut *WAL_DIRTY.lock());
-                    pool.install(|| dirty.into_par_iter().for_each(sync_dirty_segment));
+                    dispatch_dirty_segments(&WAL_DIRTY, &pool);
                 }
             })
             .expect("spawn wal-syncer");
     });
 }
+fn dispatch_dirty_segments(
+    dirty: &crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>>,
+    pool: &rayon::ThreadPool,
+) {
+    // A retry goes to the next pass. Independent segments need not wait for
+    // every sync from the previous pass to finish.
+    for _ in 0..dirty.len() {
+        let Some(seg) = dirty.pop() else { break };
+        if seg
+            .wal_sync_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            dirty.push(seg);
+            continue;
+        }
+        pool.spawn(move || {
+            struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Running<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _running = Running(&seg.wal_sync_running);
+            sync_dirty_segment(seg.clone());
+        });
+    }
+}
+
 fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
     let Some(_job) = seg.protection.job() else {
-        WAL_DIRTY.lock().push(seg.clone());
+        WAL_DIRTY.push(seg.clone());
         return;
     };
-    // Bytes journaled during this sync must enqueue another pass.
-    seg.wal_sync_queued.store(false, Ordering::Release);
     #[cfg(test)]
     if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
-        seg.wal_sync_queued.store(true, Ordering::Release);
-        WAL_DIRTY.lock().push(seg.clone());
+        WAL_DIRTY.push(seg.clone());
         return;
     }
+    // Bytes journaled during this sync must enqueue another pass. The
+    // dispatcher keeps that pass queued until this segment's job finishes.
+    seg.wal_sync_queued.store(false, Ordering::Release);
     if seg.wal_pending_bytes() > 0 {
         if let Err(e) = seg.sync_wal(false) {
             error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
@@ -638,59 +664,72 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// At most 32 MiB of staging, including inline and shutdown archives.
-/// Lightning's slab allocator prefaults a 64 MiB range per calling thread.
-/// A shared buffer pool keeps this cost independent of the thread count.
+/// At most 32 MiB of staging across all chunks and stores in this process.
+/// Idle buffers share the same bound. Per-chunk pools retain their identity;
+/// a lock-free reserve lets another owner reuse an idle buffer without a sweep.
 const ARCHIVE_STAGING_LIMIT: usize = 4;
 
-#[derive(Default)]
-struct ArchiveStagingState {
-    allocated: usize,
-    idle: Vec<Vec<u8>>,
+struct ArchiveStagingReserve {
+    budget: Arc<crate::utils::budget::Budget>,
+    idle: crossbeam::queue::ArrayQueue<Vec<u8>>,
 }
 
-#[derive(Default)]
-struct ArchiveStagingPool {
-    state: parking_lot::Mutex<ArchiveStagingState>,
-    available: parking_lot::Condvar,
+fn archive_staging_reserve() -> Arc<ArchiveStagingReserve> {
+    static RESERVE: arc_swap::ArcSwapOption<ArchiveStagingReserve> =
+        arc_swap::ArcSwapOption::const_empty();
+    if let Some(reserve) = RESERVE.load_full() {
+        return reserve;
+    }
+    let candidate = Arc::new(ArchiveStagingReserve {
+        budget: crate::utils::budget::Budget::new(ARCHIVE_STAGING_LIMIT),
+        idle: crossbeam::queue::ArrayQueue::new(ARCHIVE_STAGING_LIMIT),
+    });
+    let previous = RESERVE.compare_and_swap(
+        &None::<Arc<ArchiveStagingReserve>>,
+        Some(Arc::clone(&candidate)),
+    );
+    previous.as_ref().cloned().unwrap_or(candidate)
+}
+
+pub(crate) struct ArchiveStagingPool {
+    reserve: Arc<ArchiveStagingReserve>,
+}
+
+impl Default for ArchiveStagingPool {
+    fn default() -> Self {
+        Self { reserve: archive_staging_reserve() }
+    }
 }
 
 impl ArchiveStagingPool {
-    fn acquire(&self) -> ArchiveStagingGuard<'_> {
-        // During snapshot, compression, and write, holders take no lock and wait for no thread.
-        let mut state = self.state.lock();
-        loop {
-            if let Some(buffer) = state.idle.pop() {
-                return ArchiveStagingGuard {
-                    pool: self,
-                    buffer: Some(buffer),
-                };
-            }
-            if state.allocated < ARCHIVE_STAGING_LIMIT {
-                state.allocated += 1;
-                drop(state);
-                return ArchiveStagingGuard {
-                    pool: self,
-                    buffer: Some(vec![0; SEGMENT_SIZE]),
-                };
-            }
-            self.available.wait(&mut state);
+    fn acquire(self: &Arc<Self>) -> ArchiveStagingGuard {
+        #[cfg(feature = "lock_profile")]
+        let capacity_wait =
+            crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
+        // Claim before allocation. Return the buffer before releasing this claim.
+        // Thus both live and idle buffers stay within the same four-slot reserve.
+        let permit = self.reserve.budget.acquire_blocking();
+        let buffer = self.reserve.idle.pop().unwrap_or_else(|| vec![0; SEGMENT_SIZE]);
+        ArchiveStagingGuard {
+            pool: Arc::clone(self),
+            #[cfg(feature = "lock_profile")]
+            _profile: capacity_wait.acquired(()),
+            buffer: Some(buffer),
+            _permit: permit,
         }
     }
 }
 
-fn archive_staging_pool() -> &'static ArchiveStagingPool {
-    static POOL: std::sync::OnceLock<ArchiveStagingPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(ArchiveStagingPool::default)
-}
-
-/// Return the buffer on success, an I/O error, or a panic.
-struct ArchiveStagingGuard<'a> {
-    pool: &'a ArchiveStagingPool,
+/// Return the buffer and its quota on success, an I/O error, or a panic.
+struct ArchiveStagingGuard {
+    #[cfg(feature = "lock_profile")]
+    _profile: crate::utils::lock_profile::Guard<()>,
+    pool: Arc<ArchiveStagingPool>,
     buffer: Option<Vec<u8>>,
+    _permit: crate::utils::budget::Permit,
 }
 
-impl ArchiveStagingGuard<'_> {
+impl ArchiveStagingGuard {
     fn snapshot(&mut self, data: &[u8]) -> &[u8] {
         let buffer = self.buffer.as_mut().unwrap();
         buffer.copy_from_slice(data);
@@ -698,14 +737,10 @@ impl ArchiveStagingGuard<'_> {
     }
 }
 
-impl Drop for ArchiveStagingGuard<'_> {
+impl Drop for ArchiveStagingGuard {
     fn drop(&mut self) {
-        self.pool
-            .state
-            .lock()
-            .idle
-            .push(self.buffer.take().unwrap());
-        self.pool.available.notify_one();
+        assert!(self.pool.reserve.idle.push(self.buffer.take().unwrap()).is_ok());
+        // Field drop releases the quota only after the buffer is reusable.
     }
 }
 
@@ -848,6 +883,7 @@ pub struct Segment {
     /// Set while this segment sits in the WAL syncer's dirty registry, so a
     /// segment is enqueued at most once per syncer pass.
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
+    wal_sync_running: std::sync::atomic::AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
     /// Entries that have taken space in this segment but have not yet written
@@ -1156,6 +1192,7 @@ impl Segment {
             wal_bytes_synced: AtomicUsize::new(0),
             wal_bytes_written: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_running: std::sync::atomic::AtomicBool::new(false),
             // A segment born cold has no image in its mapping either: the
             // backup is all there is until something promotes it.
             block_residency: parking_lot::RwLock::new(BlockResidency {
@@ -2209,7 +2246,8 @@ impl Segment {
             ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
             return Ok(ArchiveOutcome::Refused);
         }
-        let staging = archive_staging_pool().acquire();
+        let manager = self.file_state.lock().manager.clone();
+        let staging = manager.archive_staging_pool(self.chunk_id).acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -4272,6 +4310,110 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_staging_capacity_is_independent_between_chunks_and_stores() {
+        let first_store = Arc::new(SegmentFileManager::new(None, None));
+        let second_store = Arc::new(SegmentFileManager::new(None, None));
+        let saturated = first_store.archive_staging_pool(0);
+        // D106 restores the shared cap. Leave headroom for two other owners;
+        // saturation of the process budget must block every owner.
+        let held: Vec<_> = (0..2).map(|_| saturated.acquire()).collect();
+        assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool(0)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = first_store.clone();
+        let thread = std::thread::spawn(move || {
+            let _other_chunk = worker.archive_staging_pool(1).acquire();
+            let _other_store = second_store.archive_staging_pool(0).acquire();
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "unrelated chunks must have independent archive capacity");
+    }
+
+    #[test]
+    fn archive_staging_total_across_chunks_and_two_stores_is_32_mib() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let mut held = Vec::new();
+        let mut addresses = std::collections::HashSet::new();
+        for chunk in 0..4 {
+            let pool = stores[chunk % 2].archive_staging_pool(chunk);
+            held.push(pool.acquire());
+            addresses.insert(held.last().unwrap().buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+        let extra_store = Arc::clone(&stores[1]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let buffer = extra_store.archive_staging_pool(99).acquire();
+            acquired_tx.send(buffer.buffer.as_ref().unwrap().as_ptr() as usize).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        drop(held.pop());
+        let address = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(error) => panic!("archive waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout), "process staging exceeded 32 MiB across stores");
+        addresses.insert(address);
+        drop(held);
+        // Retain every per-chunk pool while cycling owners. Idle memory must
+        // share the same four buffers, rather than growing by owner count.
+        for chunk in 4..128 {
+            let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+            addresses.insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn concurrent_archive_owners_share_four_buffers_and_wake_after_release() {
+        use std::sync::atomic::AtomicUsize;
+        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let active = AtomicUsize::new(0);
+        let addresses = parking_lot::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|scope| {
+            for chunk in 0..32 {
+                let stores = &stores;
+                let active = &active;
+                let addresses = &addresses;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+                        assert!(active.fetch_add(1, SeqCst) < 4);
+                        addresses.lock().insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+                        std::thread::yield_now();
+                        active.fetch_sub(1, SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(active.load(SeqCst), 0);
+        assert!(addresses.lock().len() <= 4);
+    }
+
+    #[test]
+    fn cancelling_a_parked_archive_claim_does_not_leak_staging() {
+        use futures::FutureExt;
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let held: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        let mut pending = Box::pin(pool.reserve.budget.acquire());
+        assert!(pending.as_mut().now_or_never().is_none());
+        drop(pending);
+        drop(held);
+        let recovered: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        assert!(pool.reserve.budget.try_acquire().is_none());
+        drop(recovered);
+    }
+
+    #[test]
     fn archive_staging_buffers_are_bounded_across_threads() {
         let pool = Arc::new(ArchiveStagingPool::default());
         let addresses = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
@@ -4437,6 +4579,61 @@ mod tests {
     }
 
     #[test]
+    fn wal_dispatch_does_not_wait_for_an_unrelated_segments_io() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let first = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        let second = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        for seg in [&first, &second] {
+            Segment::store_padding_header(seg.addr, 8);
+            seg.write_wal(seg.addr, 8, false).unwrap();
+            seg.wal_sync_queued.store(true, Ordering::Release);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let queue = crossbeam::queue::SegQueue::new();
+        let held = first.file_state.lock();
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert!(first.wal_sync_running.load(Ordering::Acquire));
+        // A newly dirty segment belongs to a later pass. It must complete
+        // while the preceding pass still waits for another segment's I/O.
+        queue.push(second.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while second.wal_sync_running.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let independent_finished = second.wal_pending_bytes() == 0;
+        assert_eq!(first.wal_pending_bytes(), 8);
+        // A new request for the blocked segment stays queued, without
+        // consuming a second worker or creating an unbounded job backlog.
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert_eq!(queue.len(), 1);
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while first.wal_sync_running.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            independent_finished,
+            "another segment must sync before the blocked segment is released"
+        );
+        assert_eq!(first.wal_pending_bytes(), 0);
+        assert!(!first.wal_sync_running.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn wal_sync_leaves_later_appends_dirty_and_replays_them_after_the_next_sync() {
         let dir = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(SegmentFileManager::new(
@@ -4539,7 +4736,10 @@ mod tests {
         result.unwrap();
         crate::ram::durability::wait(receipts).await.unwrap();
         let high = seg.durable_file().unwrap().watermark();
-        assert!(high > retract_to, "test setup: the watermark covers the long frame");
+        assert!(
+            high > retract_to,
+            "test setup: the watermark covers the long frame"
+        );
         seg.truncate_wal_to(retract_to).unwrap();
         seg.write_wal(seg.addr + 8, 8, false).unwrap();
         assert!(

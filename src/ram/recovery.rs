@@ -8,9 +8,10 @@ use super::segs::{
 };
 use super::tombstone::Tombstone;
 use crate::ram::types::Id;
+use crate::utils::keyed_state::KeyedState;
+use crossbeam::queue::SegQueue;
 use lightning::aarc::Arc as AArc;
 use lightning::map::WordMap;
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
@@ -434,20 +435,17 @@ fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AAr
 /// bracketed entries are BUFFERED here and applied once every segment has
 /// been read and every COMMIT is known.
 pub struct BracketLedger {
-    parts:
-        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
-    closed_parts:
-        Mutex<HashMap<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>>,
+    parts: KeyedState<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>,
+    closed_parts: KeyedState<crate::server::transactions::TxnId, std::collections::HashSet<(usize, u64)>>,
     /// Every (chunk, seq) this recovery discovered. A manifest member counts
     /// as present iff it is here.
     present: std::collections::HashSet<(u16, u64)>,
-    pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
-    commits:
-        Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
+    pending: KeyedState<crate::server::transactions::TxnId, Vec<PendingBracketCell>>,
+    commits: KeyedState<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>,
     /// The participant set each BEGIN names, per transaction.
-    participants: Mutex<HashMap<crate::server::transactions::TxnId, Vec<u64>>>,
+    participants: KeyedState<crate::server::transactions::TxnId, Vec<u64>>,
     /// Every status cell entry the scan met, by chunk.
-    status_cells: Mutex<Vec<(usize, Id)>>,
+    status_cells: SegQueue<(usize, Id)>,
     /// Every plain (unbracketed) tombstone the scan met, newest version per
     /// `(chunk, hash)`. Segment order is NOT write order across segments (a
     /// chunk writes into several heads at once), so the scan cannot decide
@@ -455,16 +453,16 @@ pub struct BracketLedger {
     /// this lets the settle step re-decide with the tombstone's identity
     /// (victim segment and version), and lets bracketed writes, which are
     /// applied later, respect it.
-    plain_deletes: Mutex<Vec<(IdKey, DeleteMark)>>,
+    plain_deletes: SegQueue<(IdKey, DeleteMark)>,
     /// Equal-version ties, see `DeleteBook::ties`.
-    ties: Mutex<HashMap<IdKey, u32>>,
+    ties: KeyedState<IdKey, u32>,
     /// Plain cells the scan discarded for carrying a LOWER version than what
     /// was already installed although they sit LATER in write order. That is
     /// either a stale copy, or a re-created id (versions restart at 1) whose
     /// predecessor was deleted by a bracket the scan could not yet apply.
     /// Settled after the brackets, when the deletes are known.
-    late_losers: Mutex<Vec<PendingBracketCell>>,
-    resolved_rewrites: Mutex<Vec<InDoubtBracket>>,
+    late_losers: SegQueue<PendingBracketCell>,
+    resolved_rewrites: SegQueue<InDoubtBracket>,
 }
 
 #[derive(Clone)]
@@ -500,47 +498,56 @@ impl PendingBracketCell {
     }
 }
 
+// Call only after replay workers have joined. No registry guard spans settlement I/O.
+fn take_replay_map<K, V>(map: &KeyedState<K, V>) -> HashMap<K, V>
+where K: Clone + std::hash::Hash + Eq + Ord + Send + Sync + 'static {
+    map.keys().filter_map(|key| map.get(&key)?.take().map(|value| (key, value))).collect()
+}
+
+fn drain_replay_queue<T>(queue: &SegQueue<T>) -> Vec<T> {
+    std::iter::from_fn(|| queue.pop()).collect()
+}
+
 impl BracketLedger {
     pub fn new(files: &[SegmentFileInfo]) -> Self {
         BracketLedger {
-            parts: Mutex::new(HashMap::new()),
-            closed_parts: Mutex::new(HashMap::new()),
+            parts: KeyedState::ordered(),
+            closed_parts: KeyedState::ordered(),
             present: files
                 .iter()
                 .map(|file| (file.chunk_id as u16, file.seq_id))
                 .collect(),
-            pending: Mutex::new(HashMap::new()),
-            commits: Mutex::new(HashMap::new()),
-            participants: Mutex::new(HashMap::new()),
-            status_cells: Mutex::new(Vec::new()),
-            plain_deletes: Mutex::new(Vec::new()),
-            ties: Mutex::new(HashMap::new()),
-            late_losers: Mutex::new(Vec::new()),
-            resolved_rewrites: Mutex::new(Vec::new()),
+            pending: KeyedState::ordered(),
+            commits: KeyedState::ordered(),
+            participants: KeyedState::ordered(),
+            status_cells: SegQueue::new(),
+            plain_deletes: SegQueue::new(),
+            ties: KeyedState::ordered(),
+            late_losers: SegQueue::new(),
+            resolved_rewrites: SegQueue::new(),
         }
     }
 
     fn note_late_loser(&self, cell: PendingBracketCell) {
-        self.late_losers.lock().push(cell);
+        self.late_losers.push(cell);
     }
 
     fn note_plain_delete(&self, chunk_id: usize, hash: u64, mark: DeleteMark) {
         // A flat list while the scan runs: one entry per tombstone in the
         // store, so it must not pay for a hash table's growth spikes. It is
         // indexed once the scan's per-chunk version maps are gone.
-        self.plain_deletes.lock().push(((chunk_id, hash), mark));
+        self.plain_deletes.push(((chunk_id, hash), mark));
     }
 
     /// A second cell entry with the very same version as the one installed.
     fn note_tie(&self, chunk_id: usize, hash: u64) {
-        *self.ties.lock().entry((chunk_id, hash)).or_insert(0) += 1;
+        *crate::profile_lock!(C08_ties, self.ties.entry(&(chunk_id, hash)))
+            .get_or_insert(0) += 1;
     }
 
     fn note_pending(&self, txn: &crate::server::transactions::TxnId, cell: PendingBracketCell) {
-        self.pending
-            .lock()
-            .entry(txn.clone())
-            .or_insert_with(Vec::new)
+        crate::profile_lock!(C08_pending, self.pending.entry(txn))
+            .get_or_insert_with(Vec::new)
             .push(cell);
     }
 
@@ -549,16 +556,14 @@ impl BracketLedger {
         txn: &crate::server::transactions::TxnId,
         manifest: Vec<crate::ram::bracket::ManifestEntry>,
     ) {
-        self.commits.lock().insert(txn.clone(), manifest);
+        *crate::profile_lock!(C08_commits, self.commits.entry(txn)) = Some(manifest);
     }
 
     /// Every part of a transaction names the same set; the first one seen
     /// is kept.
     fn note_participants(&self, txn: &crate::server::transactions::TxnId, participants: Vec<u64>) {
-        self.participants
-            .lock()
-            .entry(txn.clone())
-            .or_insert(participants);
+        crate::profile_lock!(C08_participants, self.participants.entry(txn))
+            .get_or_insert(participants);
     }
 
     /// Apply every committed bracket and report the rest.
@@ -574,25 +579,27 @@ impl BracketLedger {
     /// told to commit. Both halves are handed back so the store can ask its
     /// peers before deciding: see [`RecoveredBrackets`].
     pub(crate) fn settle(&self, chunks: &[Chunk]) -> Result<RecoveredBrackets, SettleError> {
-        let mut commits = std::mem::take(&mut *self.commits.lock());
-        let mut participants = std::mem::take(&mut *self.participants.lock());
+        let mut commits = take_replay_map(&self.commits);
+        let mut participants = take_replay_map(&self.participants);
+        let mut pending = take_replay_map(&self.pending);
+        let parts = take_replay_map(&self.parts);
+        let closed = take_replay_map(&self.closed_parts);
+        let status_cells = drain_replay_queue(&self.status_cells);
         // An open bracket of a transaction whose status cell this store holds
         // is committed (D31): a status cell in the index came from a
         // committed bracket, and it survives the compaction that drops the
         // COMMIT of a closed part. Plain status cells are in the index by now.
-        let found_before = self.found_status_cells(chunks)?;
+        let found_before = Self::found_status_cells(chunks, &status_cells)?;
         // A status cell inside an open bracket decides it too: a site writes
         // it only after the transaction is decided COMMIT (the coordinator's
         // `end`, or a participant's `Committed`), and a fenced site never
         // writes it.
-        let status_ids: std::collections::HashSet<(usize, u64)> = self
-            .status_cells
-            .lock()
+        let status_ids: std::collections::HashSet<(usize, u64)> = status_cells
             .iter()
             .map(|(chunk_id, id)| (*chunk_id, id.bits()))
             .collect();
         if !status_ids.is_empty() {
-            for (txn, cells) in self.pending.lock().iter() {
+            for (txn, cells) in pending.iter() {
                 let own_status_cell = cells.iter().any(|cell| {
                     !cell.tombstone
                         && status_ids.contains(&(cell.chunk_id, cell.hash))
@@ -612,7 +619,7 @@ impl BracketLedger {
             }
         }
         for found in &found_before {
-            if !commits.contains_key(&found.txn) && self.pending.lock().contains_key(&found.txn) {
+            if !commits.contains_key(&found.txn) && pending.contains_key(&found.txn) {
                 info!(
                     "transaction {:?} has an open bracket here and its status cell; it is \
                      committed",
@@ -621,9 +628,8 @@ impl BracketLedger {
                 commits.insert(found.txn.clone(), Vec::new());
             }
         }
-        let closed = self.closed_parts.lock();
         let mut incomplete = std::collections::HashSet::new();
-        for (txn, parts) in self.parts.lock().iter() {
+        for (txn, parts) in parts.iter() {
             // A missing local decision cannot be replaced by lease absence.
             // Keep every part, including the surviving COMMIT, until settlement.
             if !parts
@@ -638,9 +644,6 @@ impl BracketLedger {
                 }
             }
         }
-        drop(closed);
-        let parts = self.parts.lock();
-        let mut pending = std::mem::take(&mut *self.pending.lock());
         // Floors count physical tombstones, including undecided brackets.
         // Their versions constrain a future create without deciding the bracket.
         for cells in pending.values() {
@@ -688,7 +691,7 @@ impl BracketLedger {
                 );
             }
             if incomplete.contains(&txn) {
-                self.resolved_rewrites.lock().push(InDoubtBracket {
+                self.resolved_rewrites.push(InDoubtBracket {
                     txn: txn.clone(),
                     chunks: cells.iter().map(|cell| cell.chunk_id).collect(),
                     cells: cells.clone(),
@@ -705,8 +708,8 @@ impl BracketLedger {
         // back) and a re-create before the delete it follows (the id was
         // lost).
         let mut plain_deletes = DeleteBook::from_scan(
-            std::mem::take(&mut *self.plain_deletes.lock()),
-            std::mem::take(&mut *self.ties.lock()),
+            drain_replay_queue(&self.plain_deletes),
+            take_replay_map(&self.ties),
         );
         for &((chunk_id, hash), mark) in &plain_deletes.plain {
             chunks[chunk_id].note_deleted_version(hash, mark.version);
@@ -715,7 +718,7 @@ impl BracketLedger {
         apply_bracketed_cells(chunks, committed_cells, Some(&mut plain_deletes))?;
         // A late loser comes back only if it is provably a re-create (see
         // `DeleteMark::kills`); otherwise the version rule keeps it out.
-        let late_losers = std::mem::take(&mut *self.late_losers.lock());
+        let late_losers = drain_replay_queue(&self.late_losers);
         apply_bracketed_cells(chunks, late_losers, Some(&mut plain_deletes))?;
         // What is left has no COMMIT anywhere, and that now means exactly one
         // thing: the transaction was in flight when the store stopped.
@@ -753,7 +756,7 @@ impl BracketLedger {
         Ok(RecoveredBrackets {
             committed: committed_txns,
             in_doubt,
-            status_cells: self.found_status_cells(chunks)?,
+            status_cells: Self::found_status_cells(chunks, &status_cells)?,
         })
     }
 
@@ -761,12 +764,12 @@ impl BracketLedger {
     /// A live cell in the status schema that does not decode stops the start
     /// (AGENTS.md §10.1): it may decide a transaction.
     fn found_status_cells(
-        &self,
         chunks: &[Chunk],
+        status_cells: &[(usize, Id)],
     ) -> Result<Vec<crate::ram::txn_status::FoundStatusCell>, SettleError> {
         let mut seen = std::collections::HashSet::new();
         let mut found = Vec::new();
-        for (chunk_id, id) in self.status_cells.lock().iter() {
+        for (chunk_id, id) in status_cells.iter() {
             if !seen.insert((*chunk_id, id.bits())) {
                 continue;
             }
@@ -782,11 +785,13 @@ impl BracketLedger {
             if cell.header.schema != *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
                 continue;
             }
-            let (txn, participants) = crate::ram::txn_status::decode_status_cell(&cell)
-                .map_err(|error| SettleError::StatusCell {
-                    chunk: *chunk_id,
-                    id: *id,
-                    error,
+            let (txn, participants) =
+                crate::ram::txn_status::decode_status_cell(&cell).map_err(|error| {
+                    SettleError::StatusCell {
+                        chunk: *chunk_id,
+                        id: *id,
+                        error,
+                    }
                 })?;
             found.push(crate::ram::txn_status::FoundStatusCell {
                 txn,
@@ -1897,11 +1902,8 @@ fn scan_segment_from_data(
                 match crate::ram::bracket::decode_begin(content) {
                     Ok(begin) => {
                         ledger.note_participants(&begin.txn, begin.participants);
-                        ledger
-                            .parts
-                            .lock()
-                            .entry(begin.txn.clone())
-                            .or_default()
+                        crate::profile_lock!(C08_parts, ledger.parts.entry(&begin.txn))
+                            .get_or_insert_with(Default::default)
                             .insert((chunk.id, seg_id));
                         open_bracket = Some((cursor + entry_size, begin.txn));
                     }
@@ -1933,12 +1935,12 @@ fn scan_segment_from_data(
                         // not decided in this segment: a cross-chunk
                         // transaction is committed as a whole, so the ledger
                         // settles it once every COMMIT is known.
-                        ledger
-                            .closed_parts
-                            .lock()
-                            .entry(commit_txn.clone())
-                            .or_default()
-                            .insert((chunk.id, seg_id));
+                        crate::profile_lock!(
+                            C08_closed_parts,
+                            ledger.closed_parts.entry(&commit_txn)
+                        )
+                        .get_or_insert_with(Default::default)
+                        .insert((chunk.id, seg_id));
                         ledger.note_commit(&commit_txn, manifest);
                         open_bracket = None;
                     }
@@ -1993,7 +1995,7 @@ fn scan_segment_from_data(
                     &mut first_missing_schema_id,
                 )?;
                 if cell_header.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
-                    ledger.status_cells.lock().push((chunk.id, cell_header.id));
+                    ledger.status_cells.push((chunk.id, cell_header.id));
                 }
                 // The id floor is raised even for a transaction that turns
                 // out uncommitted: the id reached disk, so reissuing it would
@@ -2051,7 +2053,7 @@ fn scan_segment_from_data(
                 &mut first_missing_schema_id,
             )?;
             if cell_header.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID {
-                ledger.status_cells.lock().push((chunk.id, cell_header.id));
+                ledger.status_cells.push((chunk.id, cell_header.id));
             }
             let hash = cell_header.id.bits();
             let new_version = cell_header.version;
@@ -2410,7 +2412,7 @@ pub fn recover_chunks(
 
     info!("Processing {} segment files...", files.len());
 
-    let all_stashed_tombstones: Mutex<Vec<StashedTombstone>> = Mutex::new(Vec::new());
+    let all_stashed_tombstones: SegQueue<Vec<StashedTombstone>> = SegQueue::new();
     let hot_count = std::sync::atomic::AtomicUsize::new(0);
     let cold_count = std::sync::atomic::AtomicUsize::new(0);
     let segments_processed = std::sync::atomic::AtomicUsize::new(0);
@@ -2652,11 +2654,11 @@ pub fn recover_chunks(
                         .unwrap_or(false);
 
                     let undecided_wal = !file_info.is_backup && {
-                        let parts = bracket_ledger.parts.lock();
-                        let closed = bracket_ledger.closed_parts.lock();
-                        parts.iter().any(|(txn, members)| {
-                            members.contains(&(chunk_id, file_info.seg_id))
-                                && !closed.get(txn).is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id)))
+                        bracket_ledger.parts.keys().any(|txn| {
+                            let member = bracket_ledger.parts.get(&txn).is_some_and(|parts|
+                                parts.as_ref().is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id))));
+                            member && !bracket_ledger.closed_parts.get(&txn).is_some_and(|closed|
+                                closed.as_ref().is_some_and(|members| members.contains(&(chunk_id, file_info.seg_id))))
                         })
                     };
                     let recover_as_cold = if undecided_wal {
@@ -2758,7 +2760,7 @@ pub fn recover_chunks(
                 }
 
                 if !local_stashed.is_empty() {
-                    all_stashed_tombstones.lock().extend(local_stashed);
+                    all_stashed_tombstones.push(local_stashed);
                 }
                 Ok(())
             },
@@ -2806,7 +2808,7 @@ pub fn recover_chunks(
         chunk.reset_write_heads_after_recovery()?;
     }
 
-    for bracket in std::mem::take(&mut *bracket_ledger.resolved_rewrites.lock()) {
+    for bracket in drain_replay_queue(&bracket_ledger.resolved_rewrites) {
         rewrite_resolved_entries(chunks, &bracket.cells).map_err(|error| {
             io::Error::other(format!("resolved transaction rewrite failed: {error:?}"))
         })?;
@@ -2840,8 +2842,8 @@ pub fn recover_chunks(
     );
 
     // Merge and apply stashed tombstones
-    let stashed = all_stashed_tombstones.into_inner();
-    let merged_tombstones = merge_stashed_tombstones(vec![stashed]);
+    let stashed = drain_replay_queue(&all_stashed_tombstones);
+    let merged_tombstones = merge_stashed_tombstones(stashed);
     apply_stashed_tombstones(&merged_tombstones, chunks, origin_floors)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -2905,6 +2907,72 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn replay_transactions_progress_with_independent_entries() {
+        let ledger = BracketLedger::new(&[]);
+        let first = crate::server::transactions::test_hlc(99801, 1);
+        let second = crate::server::transactions::test_hlc(99802, 1);
+        let held = ledger.pending.entry(&first);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ledger.note_pending(
+                    &second,
+                    PendingBracketCell {
+                        chunk_id: 0,
+                        hash: 1,
+                        tombstone: false,
+                        addr: 0,
+                        version: 1,
+                        content_length: 0,
+                        target_seq: 0,
+                    },
+                );
+                ledger.note_commit(&second, vec![]);
+                ledger.note_participants(&second, vec![1, 2]);
+                tx.send(()).unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(held);
+            result.unwrap();
+        });
+        assert_eq!(
+            take_replay_map(&ledger.pending)
+                .remove(&second)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(take_replay_map(&ledger.commits).contains_key(&second));
+        assert_eq!(take_replay_map(&ledger.participants)[&second], vec![1, 2]);
+    }
+
+    #[test]
+    fn concurrent_replay_batches_keep_every_tombstone_and_latest_version() {
+        let queue = SegQueue::new();
+        std::thread::scope(|scope| {
+            for version in 1..=8 {
+                let queue = &queue;
+                scope.spawn(move || {
+                    queue.push(
+                        (0..100)
+                            .map(|hash| StashedTombstone {
+                                hash,
+                                version,
+                                chunk_id: 0,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            }
+        });
+        let batches = drain_replay_queue(&queue);
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 800);
+        let merged = merge_stashed_tombstones(batches);
+        assert_eq!(merged.len(), 100);
+        assert!(merged.iter().all(|t| t.version == 8));
+    }
 
     const TEST_SEGMENT_SIZE: usize = 8 * 1024 * 1024; // 8MB
     const DATA_SIZE: usize = 1024; // 1KB per cell
@@ -3856,7 +3924,10 @@ mod tests {
         }
 
         let txn = crate::server::transactions::test_hlc(4242, 7);
-        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn, &[]));
+        let begin = bracket_entry_bytes(
+            EntryType::BEGIN,
+            &crate::ram::bracket::encode_begin(&txn, &[]),
+        );
         let manifest = vec![crate::ram::bracket::ManifestEntry {
             chunk_id: 0,
             seq_id: 0,
@@ -3962,7 +4033,10 @@ mod tests {
         chunk.meta.schemas.debug_only_new_schema(schema.clone());
 
         let txn = crate::server::transactions::test_hlc(909, 3);
-        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn, &[]));
+        let begin = bracket_entry_bytes(
+            EntryType::BEGIN,
+            &crate::ram::bracket::encode_begin(&txn, &[]),
+        );
         let id = Id::allocated(30, 0, 1);
         let mut cell = OwnedCell {
             header: CellHeader::new(schema.vid, &id),
@@ -5001,7 +5075,10 @@ mod tests {
         if let Ok(chunks) = &started {
             warn!(
                 "TEST: the start came up and registered {:?}",
-                chunks.txn_status().get(&txn).map(|entry| entry.participants)
+                chunks
+                    .txn_status()
+                    .get(&txn)
+                    .map(|entry| entry.participants)
             );
             chunks.stop_background();
         }
@@ -5295,7 +5372,9 @@ mod tests {
             assert_ne!(part2.id, part1.id, "test setup: a second part must open");
             drop(scope);
 
-            chunks.commit_transaction_brackets(&txn, true).expect("commit");
+            chunks
+                .commit_transaction_brackets(&txn, true)
+                .expect("commit");
             crate::ram::chunk::release_transaction_leases(&txn, &chunks.address_range())
                 .expect("release after commit");
 

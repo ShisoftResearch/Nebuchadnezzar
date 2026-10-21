@@ -510,6 +510,15 @@ async fn reconcile_cell_entries(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    reconcile_cell_entries_inner(chunks, indexers, mode, #[cfg(test)] None).await
+}
+
+async fn reconcile_cell_entries_inner(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    #[cfg(test)] mut after_snapshot: Option<&mut (dyn FnMut(&crate::ram::chunk::Chunk) + Send)>,
+) -> ScrubReport {
     const BATCH_CELLS: usize = 1024;
 
     let mut total = ScrubReport::default();
@@ -518,6 +527,10 @@ async fn reconcile_cell_entries(
         // so resolve each ID when we visit it. New segments and later writes
         // cannot extend this finite walk.
         let ids = chunk.live_cell_ids();
+        #[cfg(test)]
+        if let Some(hook) = after_snapshot.as_mut() {
+            hook(chunk);
+        }
         for ids in ids.chunks(BATCH_CELLS) {
             // Release all cell guards before the index RPCs.
             let mut batch: Vec<EntryKey> = Vec::new();
@@ -2030,7 +2043,7 @@ mod tests {
         )
         .await;
         write_products(&client, 40).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let report = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
@@ -2065,7 +2078,7 @@ mod tests {
         )
         .await;
         write_products(&client, 40).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
 
@@ -2220,7 +2233,7 @@ mod tests {
         for seq in 0..RACE_CELLS {
             client.write_cell(race_cell(seq, 0)).await.unwrap().unwrap();
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         // The test drives the combines, so the background cleaner must not take
         // the dead space first.
         server.cleaner().pause();
@@ -2269,39 +2282,27 @@ mod tests {
             "precondition: {holed}"
         );
 
-        // Keep combining while the walk runs: rewrite a rotating slice of the
-        // even cells, which makes their segments dead-heavy again, then ask for
-        // a full collection, which accepts any segment with dead space.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hammer_stop = stop.clone();
-        let hammer_chunks = server.chunks().clone();
-        let hammer = tokio::task::spawn_blocking(move || {
-            let mut cleaned = 0usize;
-            let mut round = 0u64;
-            while !hammer_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for k in 0..200u64 {
-                    let seq = 2 * ((round * 200 + k) % (RACE_CELLS / 2));
-                    let mut cell = race_cell(seq, round + 1);
-                    let _ = hammer_chunks.update_cell(&mut cell);
-                }
-                cleaned += hammer_chunks
-                    .list
-                    .iter()
-                    .filter(|chunk| crate::ram::cleaner::Cleaner::clean(chunk, true, true))
-                    .count();
-                round += 1;
-            }
-            cleaned
-        });
-
-        let repaired = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let cleaned = hammer.await.unwrap();
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        // Move cells on another thread after the walk captures its IDs.
+        // The hook belongs only to this invocation and cannot affect other tests.
+        let mut cleaned = 0usize;
+        let mut move_after_snapshot = |chunk: &crate::ram::chunk::Chunk| {
+            let selected = chunk.segments();
+            chunk.rotate_heads_for_scrub_test();
+            cleaned += std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &selected).0
+                }).join().unwrap()
+            });
+        };
+        let mut repaired = prune_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
+        repaired.merge(&reconcile_cell_entries_inner(
+            server.chunks(), indexers, ScrubMode::Repair, Some(&mut move_after_snapshot),
+        ).await);
+        server.await_index_tasks().await;
 
         let after = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
         println!(
-            "combine passes={cleaned} reconcile derived={} repaired={} verify={after}",
+            "combine reclaimed_bytes={cleaned} reconcile derived={} repaired={} verify={after}",
             repaired.entries_derived, repaired.entries_repaired
         );
         assert!(
@@ -2392,7 +2393,7 @@ mod tests {
         )
         .await;
         write_products(&client, 20).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let over_rpc = client.scrub_index(false).await.unwrap();
         println!("scrub over rpc: {}", over_rpc);
@@ -2426,7 +2427,7 @@ mod tests {
         )
         .await;
         write_products(&client, 25).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let first = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Repair).await;
@@ -2569,7 +2570,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         // Checkpoint the index: durable from here, and the write-back hub is
         // stopped, so what follows cannot reach disk.
@@ -2590,7 +2591,7 @@ mod tests {
         for i in updated..CRASH_CELLS {
             client.remove_cell(ids[i as usize]).await.unwrap().unwrap();
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         // The live store agrees with itself before the kill: the in-memory tree
         // already dropped the old keys. Without this, the assertions after the
@@ -2732,7 +2733,7 @@ mod tests {
         )
         .await;
         write_products(&client, 30).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let baseline = scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
@@ -3419,7 +3420,7 @@ mod tests {
                 }
             }
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         assert!(
             crate::index::ranged::tree::btree::storage::wait_until_updated().await,
             "movement fixture did not drain page writeback"
@@ -3598,7 +3599,7 @@ mod tests {
         }
         // Drain page writes so the controlled combine is the only movement.
         // Captured receipts remain pending across the checkpoint and combine.
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         crate::index::ranged::tree::service::local_tree_service("scrub_movement", "scrub_movement")
             .unwrap()
             .flush_all_trees()
@@ -3686,7 +3687,7 @@ mod tests {
         )
         .await;
         write_products(&client, 30).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Repair).await;
@@ -3720,7 +3721,7 @@ mod tests {
         )
         .await;
         write_hash_products(&client, 40).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let baseline = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
@@ -3794,7 +3795,7 @@ mod tests {
         )
         .await;
         write_hash_products(&client, 30).await;
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
 
         let indexers = &server.indexer().unwrap().clients;
         let baseline = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
@@ -3895,7 +3896,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         for i in 0..HASH_CRASH_CELLS {
             assert!(
                 bucket_ids(&client, sku_bucket(i))
@@ -4947,7 +4948,7 @@ mod tests {
             server.chunks().write_cell(&mut cell).unwrap();
             cells.push((cell, schema));
         }
-        crate::index::builder::IndexBuilder::await_all_indices().await;
+        server.await_index_tasks().await;
         let heads: Vec<_> = cells
             .iter()
             .map(|(cell, schema)| {

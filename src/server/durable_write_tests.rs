@@ -418,7 +418,7 @@ async fn durable_ack_captured_calls_wait_once_for_the_aggregate() {
         crate::ram::durability::WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before,
         end_before as u64
     );
-    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    assert!(rpc.captured_receipts.is_empty());
     server.shutdown().await;
 }
 
@@ -442,7 +442,7 @@ async fn durable_ack_captured_receipts_fail_on_sync_expiry_and_restart() {
             crate::ram::durability::DurabilityError::Sync { .. }
         ))
     ));
-    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    assert!(rpc.captured_receipts.is_empty());
     // Missing tokens cannot be mistaken for records created after restart.
     let fresh = super::CapturedReceipts::default();
     let missing = Id::from_parts(fresh.incarnation.wrapping_add(1), 1);
@@ -454,16 +454,16 @@ async fn durable_ack_captured_receipts_fail_on_sync_expiry_and_restart() {
     let (server, rpc) = fixture(&dir).await;
     let (_, tokens) = rpc.write_cell_captured(cell(1, 1)).await;
     rpc.captured_receipts
-        .lock()
         .entries
-        .get_mut(&tokens[0])
+        .entry(&tokens[0])
+        .as_mut()
         .unwrap()
         .1 -= std::time::Duration::from_secs(600);
     assert!(matches!(
         rpc.finish_captured_receipts(tokens, true).await,
         Err(WriteError::Durability(_))
     ));
-    assert!(rpc.captured_receipts.lock().entries.is_empty());
+    assert!(rpc.captured_receipts.is_empty());
     server.shutdown().await;
     let dir = tempfile::tempdir().unwrap();
     let (server, rpc) = fixture(&dir).await;
@@ -610,12 +610,93 @@ async fn compose_durable_receipts_preserve_verified_reads() {
             accepted[0].as_ref().unwrap().data["value"],
             OwnedValue::U64(2)
         );
-        if !rpc.captured_receipts.lock().entries.is_empty() {
+        if !rpc.captured_receipts.is_empty() {
             rpc.finish_captured_receipts(tokens.clone(), true)
                 .await
                 .unwrap();
         }
     }
     assert_covered(&server);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_receipt_tokens_can_finish_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let (result, first) = rpc.write_cell_captured(cell(1, 1)).await;
+    result.unwrap();
+    let all = first.clone();
+    let (result, independent) = rpc.write_cell_captured(cell(2, 2)).await;
+    result.unwrap();
+    assert!(independent.iter().all(|token| !first.contains(token)));
+    let held = rpc.captured_receipts.entries.entry(&first[0]);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = rpc.clone();
+    let thread = std::thread::spawn(move || {
+        let (receipts, _, _) = worker.captured_receipts.take(independent).unwrap();
+        done_tx.send(receipts).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    crate::ram::durability::wait(result.unwrap()).await.unwrap();
+    rpc.finish_captured_receipts(all, true).await.unwrap();
+    assert!(rpc.captured_receipts.is_empty());
+    assert_covered(&server);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cell_scan_cursors_progress_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    rpc.write_cell(cell(1, 1)).await.unwrap();
+    let first = rpc.cell_scan_open().await;
+    let second = rpc.cell_scan_open().await;
+    let first_scan = rpc.cell_scans.get(first).unwrap();
+    let held = first_scan.lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = rpc.clone();
+    let thread = std::thread::spawn(move || {
+        let page = futures::executor::block_on(worker.cell_scan_next(second, 100)).unwrap();
+        assert!(page.ids.contains(&cell(1, 1).id()));
+        assert!(page.done);
+        assert!(futures::executor::block_on(worker.cell_scan_next(second, 100)).is_err());
+        done_tx.send(()).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    rpc.cell_scan_close(first).await;
+    assert!(rpc.cell_scan_next(first, 100).await.is_err());
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_lease_tokens_allow_independent_renewals() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, rpc) = fixture(&dir).await;
+    let first = rpc.fence_engage(&vec![], 1000, 10000).await.unwrap();
+    let second = first + 1;
+    let held = rpc.fence_leases.holds.entry(&first);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = rpc.clone();
+    let thread = std::thread::spawn(move || {
+        assert!(!futures::executor::block_on(
+            worker.fence_renew(second, 10000)
+        ));
+        done_tx.send(()).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    assert!(result.is_ok());
+    rpc.fence_release(first).await;
+    let next = rpc.fence_engage(&vec![], 1000, 10000).await.unwrap();
+    assert!(rpc.fence_renew(next, 10000).await);
+    rpc.fence_release(next).await;
     server.shutdown().await;
 }

@@ -1371,6 +1371,15 @@ impl DatabaseRuntime {
         self.indexer.as_ref()
     }
 
+    /// Wait for unscoped index tasks from this database's local client.
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        match self.indexer() {
+            Some(indexer) => indexer.await_all_indices().await,
+            None => Vec::new(),
+        }
+    }
+
+
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
@@ -1423,23 +1432,13 @@ pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     /// The databases this server hosts, besides its default one.
     ///
-    /// A plain `RwLock<HashMap>`, deliberately, where this used to be a
-    /// `PtrHashMap`. That map's `remove` returns a CLONE and leaves the original
-    /// in the retired node -- correct, since a concurrent reader may still be
-    /// dereferencing it, but it means removal is not a release and the value
-    /// dies only on node reuse or map drop. This map outlives its removals, so
-    /// every database ever unloaded stayed resident for the life of the process,
-    /// entire memory store included. See
-    /// `server::tests::ptr_hash_map_remove_does_not_release_the_value`.
-    ///
-    /// Nothing is lost by the change: the map is written only when a database is
-    /// loaded or unloaded, and read on the same path plus status and shutdown.
-    /// It is not on any request path -- a request reaches its runtime through the
-    /// scoped RPC service that already holds it -- so there is no lock-free
-    /// requirement here to trade away.
-    database_runtimes: parking_lot::RwLock<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
+    /// Immutable snapshots keep load/unload publication separate from readers.
+    /// Replacing a snapshot releases its runtime Arcs when its readers finish.
+    /// Lightning's deferred node reclamation would retain removed runtime values.
+    /// Requests already hold their scoped runtime through their RPC service.
+    database_runtimes: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
-    runtime_init_lock: tokio::sync::Mutex<()>,
+    runtime_initializers: lightning::map::PtrHashMap<String, Arc<tokio::sync::Mutex<()>>>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
     /// `None` when tiered memory is disabled.
@@ -1893,7 +1892,7 @@ impl NebServer {
             );
             // Owner for index tasks spawned outside any request scope; request
             // handlers deliberately await only their own work.
-            IndexBuilder::spawn_pending_index_reaper();
+            builder.spawn_pending_index_reaper();
             Some(builder)
         } else {
             None
@@ -2079,15 +2078,21 @@ impl NebServer {
     /// Every runtime this server hosts, snapshotted so callers do not hold the
     /// lock while touching a runtime.
     fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().values().cloned().collect()
+        self.database_runtimes.load().values().cloned().collect()
     }
 
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().get(database_name).cloned()
+        self.database_runtimes.load().get(database_name).cloned()
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
         self.database_runtime.clone()
+    }
+
+    fn runtime_initializer(&self, database: &str) -> Arc<tokio::sync::Mutex<()>> {
+        crate::utils::keyed_state::get_or_insert(&self.runtime_initializers, database.to_owned(), || {
+            Arc::new(tokio::sync::Mutex::new(()))
+        })
     }
 
     pub async fn ensure_database_runtime(
@@ -2098,7 +2103,8 @@ impl NebServer {
             return Ok(runtime);
         }
 
-        let _guard = self.runtime_init_lock.lock().await;
+        let initializer = self.runtime_initializer(database_name);
+        let _guard = crate::profile_lock!(C01_init, initializer.lock().await);
         if let Some(runtime) = self.database(database_name) {
             return Ok(runtime);
         }
@@ -2131,9 +2137,11 @@ impl NebServer {
                 .insert(database_name.to_string());
         }
 
-        self.database_runtimes
-            .write()
-            .insert(database_name.to_string(), database_runtime.clone());
+        self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(database_name.to_string(), database_runtime.clone());
+            next
+        });
 
         Ok(database_runtime)
     }
@@ -2148,7 +2156,12 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime = self.database_runtimes.write().remove(database_name);
+        let previous = self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(database_name);
+            next
+        });
+        let runtime = previous.get(database_name).cloned();
 
         let Some(runtime) = runtime else {
             return false;
@@ -2159,7 +2172,7 @@ impl NebServer {
         }
 
         if runtime.indexer().is_some() {
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = runtime.await_index_tasks().await;
 
             if let Some(indexer) = runtime.indexer() {
                 if let Err(e) = indexer.graceful_shutdown().await {
@@ -2197,8 +2210,8 @@ impl NebServer {
         // original in the retired node, so unloading never released the runtime
         // at all -- 14 databases loaded and unloaded left 14 runtimes reachable
         // and 14 `stats-sweeper` threads running, and 10 further load/unload
-        // cycles reclaimed none of them. The map is a plain `RwLock<HashMap>`
-        // now and the runtime does drop, which is asserted by
+        // cycles reclaimed none of them. Published snapshots now release the
+        // runtime after their readers finish. This is asserted by
         // `unloading_a_database_gives_its_threads_back`.
         runtime.chunks().stop_background();
         // And forget its tree service. Nothing else retires it, and it holds every
@@ -2324,7 +2337,7 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        self.database_runtimes.read().keys().cloned().collect()
+        self.database_runtimes.load().keys().cloned().collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -2346,6 +2359,11 @@ impl NebServer {
     pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
         self.database_runtime.indexer()
     }
+
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        self.database_runtime.await_index_tasks().await
+    }
+
 
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
@@ -2433,7 +2451,7 @@ impl NebServer {
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = self.await_index_tasks().await;
             info!("All pending index tasks completed");
 
 
@@ -2559,9 +2577,7 @@ impl NebServer {
         // FlyWire connectome databases: after a SIGTERM restart the recently
         // written sidecar cells were unreadable while older, already-evicted
         // cells read fine.
-        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self
-            .database_runtimes
-            .read()
+        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self.database_runtimes.load()
             .iter()
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();
@@ -2752,7 +2768,7 @@ impl NebServer {
             database_runtimes: {
                 let mut runtimes = std::collections::HashMap::with_capacity(16);
                 runtimes.insert(database_name.to_string(), database_runtime.clone());
-                let runtimes = parking_lot::RwLock::new(runtimes);
+                let runtimes = arc_swap::ArcSwap::from_pointee(runtimes);
                 runtimes
             },
             registered_schema_services: {
@@ -2770,7 +2786,7 @@ impl NebServer {
                 }
                 registered
             },
-            runtime_init_lock: tokio::sync::Mutex::new(()),
+            runtime_initializers: lightning::map::PtrHashMap::with_capacity(16),
             host_options: opts.clone(),
             shared_memory_pool,
             shared_tiered_manager,

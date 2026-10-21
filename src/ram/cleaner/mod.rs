@@ -31,14 +31,14 @@ thread_local! {
 /// backpressure comes from waking the background thread and, near capacity,
 /// from its pressure-proportional pacing.
 pub struct CleanerWake {
-    thread: parking_lot::Mutex<Option<thread::Thread>>,
+    thread: arc_swap::ArcSwapOption<thread::Thread>,
     pending: AtomicBool,
 }
 
 impl CleanerWake {
     pub fn new() -> Self {
         Self {
-            thread: parking_lot::Mutex::new(None),
+            thread: arc_swap::ArcSwapOption::empty(),
             pending: AtomicBool::new(false),
         }
     }
@@ -48,13 +48,13 @@ impl CleanerWake {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(thread) = self.thread.lock().as_ref() {
+        if let Some(thread) = self.thread.load().as_ref() {
             thread.unpark();
         }
     }
 
     fn register(&self, thread: thread::Thread) {
-        *self.thread.lock() = Some(thread);
+        self.thread.store(Some(Arc::new(thread)));
     }
 
     fn take_pending(&self) -> bool {
@@ -456,5 +456,35 @@ impl Deref for SegmentCandidate {
     type Target = Segment;
     fn deref(&self) -> &Self::Target {
         &self.segment
+    }
+}
+
+#[cfg(test)]
+mod wake_publication_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_wake_requests_reach_the_published_cleaner() {
+        let wake = Arc::new(CleanerWake::new());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_wake = wake.clone();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register(std::thread::current());
+            ready_tx.send(()).unwrap();
+            std::thread::park_timeout(std::time::Duration::from_secs(2));
+            done_tx.send(worker_wake.take_pending()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let wake = &wake;
+                scope.spawn(move || { for _ in 0..64 { wake.request(); } });
+            }
+        });
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+        wake.take_pending();
+        assert!(!wake.take_pending());
     }
 }

@@ -1,5 +1,4 @@
 //! Phase distributions for the abort probe. Enable only for profile runs.
-use parking_lot::Mutex;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -26,7 +25,8 @@ pub const PHASES: [Phase; 8] = [
     Phase::ForceSync,
 ];
 
-static SAMPLES: [Mutex<Vec<u64>>; 8] = [const { Mutex::new(Vec::new()) }; 8];
+static SAMPLES: [crossbeam::queue::SegQueue<u64>; 8] =
+    [const { crossbeam::queue::SegQueue::new() }; 8];
 
 pub struct Guard(Phase, Instant);
 
@@ -35,7 +35,7 @@ pub fn guard(phase: Phase) -> Guard {
 }
 
 pub fn record(phase: Phase, nanos: u64) {
-    SAMPLES[phase as usize].lock().push(nanos);
+    SAMPLES[phase as usize].push(nanos);
 }
 
 impl Drop for Guard {
@@ -48,7 +48,14 @@ impl Drop for Guard {
 pub fn take() -> Vec<(Phase, Vec<u64>)> {
     PHASES
         .into_iter()
-        .map(|phase| (phase, std::mem::take(&mut *SAMPLES[phase as usize].lock())))
+        .map(|phase| {
+            (
+                phase,
+                (0..SAMPLES[phase as usize].len())
+                    .filter_map(|_| SAMPLES[phase as usize].pop())
+                    .collect(),
+            )
+        })
         .collect()
 }
 
@@ -57,8 +64,34 @@ mod tests {
     use super::*;
     #[test]
     fn guard_records_a_sample() {
-        let before = SAMPLES[Phase::Rollback as usize].lock().len();
+        let before = SAMPLES[Phase::Rollback as usize].len();
         drop(guard(Phase::Rollback));
-        assert!(SAMPLES[Phase::Rollback as usize].lock().len() > before);
+        assert!(SAMPLES[Phase::Rollback as usize].len() > before);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_profile_producers_retain_every_sample() {
+        while SAMPLES[Phase::Padding as usize].pop().is_some() {}
+        std::thread::scope(|scope| {
+            for producer in 0..8 {
+                scope.spawn(move || {
+                    for sample in 0..1000 {
+                        record(Phase::Padding, producer * 1000 + sample);
+                    }
+                });
+            }
+        });
+        let mut samples = take()
+            .into_iter()
+            .find(|(phase, _)| *phase as usize == Phase::Padding as usize)
+            .unwrap()
+            .1;
+        samples.sort_unstable();
+        assert_eq!(samples, (0..8000).collect::<Vec<_>>());
     }
 }

@@ -2739,7 +2739,7 @@ mod cluster_tests {
             client.write_cell(cell).await.unwrap().unwrap();
             written.insert(id);
         }
-        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+        for server in &servers { server.await_index_tasks().await; }
 
         async fn scan_ids(client: &Arc<AsyncClient>, schema: SchemaUid) -> HashSet<Id> {
             let mut found = HashSet::new();
@@ -2785,7 +2785,7 @@ mod cluster_tests {
         for server in &servers {
             server.refresh_slot_placement().await;
         }
-        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+        for server in &servers { server.await_index_tasks().await; }
 
         let after = scan_ids(&client, SchemaUid(SCHEMA)).await;
         let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();

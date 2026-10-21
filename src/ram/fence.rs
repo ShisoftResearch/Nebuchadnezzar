@@ -6,7 +6,9 @@
 //! here, and syncs it, BEFORE it answers `Fenced`: the answer is a promise
 //! that must survive a crash and a power loss.
 //!
-//! The record is a small append-only file beside the WAL files:
+//! Records use 64 independent append-only files beside the WAL files.
+//! Version 2 assigns each transaction to a file with `fence_shard`.
+//! Version 1 is refused; this code does not read or migrate its single log.
 //!
 //! ```text
 //! header (8 bytes)
@@ -43,7 +45,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FENCE_LOG_MAGIC: [u8; 4] = *b"NEBF";
-pub const FENCE_LOG_VERSION: u8 = 1;
+pub const FENCE_LOG_VERSION: u8 = 2;
+const FENCE_SHARDS: usize = 64;
 const HEADER_SIZE: usize = 8;
 const RECORD_SIZE: usize = 20;
 pub const FENCE_LOG_FILE: &str = "txn-fences.nfence";
@@ -129,12 +132,22 @@ struct State {
     fenced: BTreeSet<TxnId>,
 }
 
-/// The fences of one store.
-pub struct FenceLog {
+struct FenceShard {
     path: Option<PathBuf>,
     state: Mutex<State>,
-    /// How many fences are held. `prepare` reads only this while it is zero,
-    /// so the commit path pays nothing when nothing is fenced.
+}
+
+fn fence_shard(txn: &TxnId) -> usize {
+    // This mapping is part of version 2. Keep it independent of Rust's Hash.
+    let mut key = txn.ts ^ txn.node.rotate_left(23);
+    key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    key = (key ^ (key >> 27)).wrapping_mul(0x94d049bb133111eb);
+    ((key ^ (key >> 31)) as usize) % FENCE_SHARDS
+}
+
+/// The fences of one store. Each mutex owns exactly one durable file.
+pub struct FenceLog {
+    shards: [FenceShard; FENCE_SHARDS],
     count: AtomicUsize,
 }
 
@@ -143,10 +156,18 @@ impl FenceLog {
     /// such a store keeps nothing over a restart anyway.
     pub fn new(wal_storage: Option<&str>) -> Self {
         FenceLog {
-            path: wal_storage.map(|dir| Path::new(dir).join(FENCE_LOG_FILE)),
-            state: Mutex::new(State {
-                file: None,
-                fenced: BTreeSet::new(),
+            shards: std::array::from_fn(|shard| FenceShard {
+                path: wal_storage.map(|dir| {
+                    Path::new(dir).join(if shard == 0 {
+                        FENCE_LOG_FILE.to_owned()
+                    } else {
+                        format!("txn-fences-{shard:02}.nfence")
+                    })
+                }),
+                state: Mutex::new(State {
+                    file: None,
+                    fenced: BTreeSet::new(),
+                }),
             }),
             count: AtomicUsize::new(0),
         }
@@ -156,59 +177,83 @@ impl FenceLog {
     /// store serves. `recover` false means a fresh store: the old log is
     /// dropped.
     pub fn load(&self, recover: bool) -> io::Result<BTreeSet<TxnId>> {
-        let Some(path) = &self.path else {
-            return Ok(BTreeSet::new());
-        };
-        if !recover || !path.exists() {
-            return Ok(BTreeSet::new());
+        let mut fences = BTreeSet::new();
+        if !recover {
+            return Ok(fences);
         }
-        let mut data = Vec::new();
-        File::open(path)?.read_to_end(&mut data)?;
-        parse(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        for shard in &self.shards {
+            let Some(path) = &shard.path else { continue };
+            let mut file = match File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            fences.extend(
+                parse(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            );
+        }
+        Ok(fences)
     }
 
     /// Keep `fences` and only those: write them to a new log, sync it, and
     /// put it in place of the old one.
     pub fn reset(&self, fences: BTreeSet<TxnId>) -> io::Result<()> {
-        let mut state = self.state.lock();
-        if let Some(path) = &self.path {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let staging = path.with_extension("nfence-new");
-            {
-                let mut file = File::create(&staging)?;
-                file.write_all(&header())?;
-                for txn in &fences {
-                    file.write_all(&record(txn))?;
-                }
-                file.sync_all()?;
-            }
-            std::fs::rename(&staging, path)?;
-            if let Some(dir) = path.parent() {
-                File::open(dir)?.sync_all()?;
-            }
-            #[cfg(test)]
-            crate::ram::segs::power_loss_model::record_synced_len(
-                &Some(path.to_string_lossy().to_string()),
-                (HEADER_SIZE + fences.len() * RECORD_SIZE) as u64,
-            );
-            state.file = Some(OpenOptions::new().append(true).open(path)?);
+        let count = fences.len();
+        let mut partitions: [BTreeSet<TxnId>; FENCE_SHARDS] =
+            std::array::from_fn(|_| BTreeSet::new());
+        for txn in fences {
+            partitions[fence_shard(&txn)].insert(txn);
         }
-        self.count.store(fences.len(), Ordering::Release);
-        state.fenced = fences;
+        for (i, (shard, fences)) in self.shards.iter().zip(partitions).enumerate() {
+            let mut state = crate::profile_lock!(H14, shard.state.lock());
+            if let Some(path) = &shard.path {
+                // Keep shard zero's header as the layout marker, even empty.
+                if i != 0 && fences.is_empty() && !path.exists() {
+                    state.file = None;
+                    state.fenced = fences;
+                    continue;
+                }
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let staging = path.with_extension("nfence-new");
+                {
+                    let mut file = File::create(&staging)?;
+                    file.write_all(&header())?;
+                    for txn in &fences {
+                        file.write_all(&record(txn))?;
+                    }
+                    file.sync_all()?;
+                }
+                std::fs::rename(&staging, path)?;
+                if let Some(dir) = path.parent() {
+                    File::open(dir)?.sync_all()?;
+                }
+                #[cfg(test)]
+                crate::ram::segs::power_loss_model::record_synced_len(
+                    &Some(path.to_string_lossy().to_string()),
+                    (HEADER_SIZE + fences.len() * RECORD_SIZE) as u64,
+                );
+                state.file = Some(OpenOptions::new().append(true).open(path)?);
+            }
+            state.fenced = fences;
+        }
+        self.count.store(count, Ordering::Release);
         Ok(())
     }
 
     /// Record a fence of `txn`, synced. Returns only when a power loss can
     /// no longer drop it.
     pub fn record(&self, txn: &TxnId) -> io::Result<()> {
-        let mut state = self.state.lock();
+        let shard = &self.shards[fence_shard(txn)];
+        let mut state = crate::profile_lock!(H14, shard.state.lock());
         if state.fenced.contains(txn) {
             return Ok(());
         }
         if state.file.is_none() {
-            if let Some(path) = &self.path {
+            if let Some(path) = &shard.path {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
@@ -232,7 +277,10 @@ impl FenceLog {
             if !FENCE_SYNC_SKIPPED_FOR_TEST.load(Ordering::Acquire) {
                 file.sync_data()?;
                 crate::ram::segs::power_loss_model::record_synced(
-                    &self.path.as_ref().map(|path| path.to_string_lossy().to_string()),
+                    &shard
+                        .path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
                     file,
                 );
             }
@@ -246,7 +294,9 @@ impl FenceLog {
         if self.count.load(Ordering::Acquire) == 0 {
             return false;
         }
-        self.state.lock().fenced.contains(txn)
+        crate::profile_lock!(H14, self.shards[fence_shard(txn)].state.lock())
+            .fenced
+            .contains(txn)
     }
 
     pub fn len(&self) -> usize {
@@ -305,6 +355,49 @@ mod tests {
             .unwrap();
         let again = FenceLog::new(Some(&path)).load(true).unwrap();
         assert_eq!(again, [test_hlc(2, 1)].into_iter().collect());
+    }
+
+    #[test]
+    fn independent_fence_files_do_not_wait_for_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(FenceLog::new(dir.path().to_str()));
+        log.reset(BTreeSet::new()).unwrap();
+        let first = test_hlc(1, 1);
+        let second = (2..1000)
+            .map(|n| test_hlc(n, 1))
+            .find(|tid| fence_shard(tid) != fence_shard(&first))
+            .unwrap();
+        let held = log.shards[fence_shard(&first)].state.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = log.clone();
+        let second_copy = second.clone();
+        let thread = std::thread::spawn(move || {
+            worker.record(&second_copy).unwrap();
+            assert!(worker.is_fenced(&second_copy));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            FenceLog::new(dir.path().to_str()).load(true).unwrap(),
+            [second].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_single_file_version_one_store_is_refused_with_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = header();
+        old[4] = 1;
+        std::fs::write(dir.path().join(FENCE_LOG_FILE), old).unwrap();
+        let error = FenceLog::new(dir.path().to_str()).load(true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.get_ref().unwrap().downcast_ref::<FenceLogError>(),
+            Some(&FenceLogError::UnsupportedVersion(1))
+        );
     }
 
     #[test]
