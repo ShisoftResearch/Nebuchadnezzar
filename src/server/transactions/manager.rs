@@ -2540,6 +2540,99 @@ mod tests {
         prepare_with_a_ring_address_gap(false).await;
     }
 
+    /// G5/F4 evidence: a commit refused with `CannotLocateCellServer` removes
+    /// the manager record but leaves the participant's prepare lock held. The
+    /// client abort then gets `TransactionNotFound`, and an immediate retry of
+    /// a conflicting transaction is refused until the lease sweeper presumes
+    /// abort. The classification stays `CommitNotApplied`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "G5/F4 evidence; behavior change pending a Codex Sol decision"]
+    async fn commit_cannot_locate_cell_server_leaves_a_conflicting_retry_refused() {
+        use super::Service as _;
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "manager_cannot_locate_at_commit";
+        let server = start_manager_test_server(&address, group).await;
+        let runtime = server.current_database();
+        install_basic_schema(&runtime);
+        let ring = ConsistentHashing::new_with_id(
+            crate::server::CONS_HASH_ID,
+            group,
+            &server.raft_client,
+            &server.membership,
+        )
+        .await
+        .unwrap();
+        // The slot names a server that is not a member, so the commit lookup
+        // fails while the participant is the real server.
+        let absent_server = u64::MAX;
+        ring.set_slot_overrides(Some(vec![absent_server]), 1);
+        let manager = TransactionManager::new(Arc::new(TransactionManagerDeps {
+            database_runtime: runtime.clone(),
+            server_id: server.server_id,
+            consh: ring,
+            member_pool: Arc::new(ClientPool::new()),
+            hlc: server.hlc.clone(),
+        }));
+        let participant = manager
+            .deps
+            .get_member_by_server_id(server.server_id)
+            .await
+            .unwrap();
+        let service_id = data_site::generate_scoped_service_id(
+            manager.deps.database_runtime.group_name(),
+            manager.deps.database_runtime.database_name(),
+        );
+        let client = data_site::AsyncServiceClient::new_with_service_id(service_id, &participant);
+        // A cached client lets prepare reach the participant even though the
+        // slot names an absent server.
+        manager.data_sites.insert(absent_server, client.clone());
+
+        let id = Id::from_parts(0, 71);
+        let tid = manager.begin().await.unwrap();
+        assert!(matches!(
+            manager.write(tid.clone(), counter_cell(1, id, 7)).await,
+            Ok(TxnExecResult::Accepted(()))
+        ));
+        assert!(matches!(
+            manager.prepare(tid.clone()).await,
+            Ok(TMPrepareResult::Success)
+        ));
+
+        // Commit cannot locate the participant: the manager removes its record.
+        manager.data_sites.remove(&absent_server);
+        assert!(matches!(
+            manager.commit(tid.clone()).await,
+            Err(TMError::CannotLocateCellServer)
+        ));
+        assert_eq!(manager.transaction_count(), 0);
+        assert!(matches!(
+            manager.abort(tid.clone()).await,
+            Err(TMError::TransactionNotFound)
+        ));
+
+        // The participant still holds the prepare lock. Put the client back so
+        // the retry reaches it, then prepare a conflicting transaction at once.
+        manager.data_sites.insert(absent_server, client);
+        let retry = manager.begin().await.unwrap();
+        assert!(matches!(
+            manager.write(retry.clone(), counter_cell(1, id, 8)).await,
+            Ok(TxnExecResult::Accepted(()))
+        ));
+        let refused = manager.prepare(retry.clone()).await;
+        warn!("G5/F4 control: immediate conflicting retry prepare = {:?}", refused);
+        assert!(
+            matches!(
+                refused,
+                Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+            ),
+            "the participant's prepare lock must refuse the retry: {:?}",
+            refused
+        );
+        manager.shutdown.store(true, Ordering::Relaxed);
+        server.shutdown().await;
+    }
+
     #[test]
     fn changed_existing_replacement_builds_update_commit_op() {
         let id = Id::allocated(0, 0, 7001);
