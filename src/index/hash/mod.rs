@@ -759,6 +759,7 @@ impl HashIndexer {
         &self,
         index_id: Id,
         check: Option<&crate::index::verification::IndexCheck>,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let mut result = Vec::new();
         let mut emitted = HashSet::new();
@@ -791,10 +792,23 @@ impl HashIndexer {
                     continue;
                 }
                 if let Some(check) = check {
-                    if !matches!(
-                        self.neb_client.read_indexed_cell(id, check.clone()).await,
-                        Ok(Ok(_))
-                    ) {
+                    let present = match verify {
+                        crate::index::verification::Verify::Exists => {
+                            let client = self.neb_client.locate_plain_server(id).await?;
+                            match client.existing_ids(&vec![id]).await?.pop() {
+                                Some(Ok(exists)) => exists,
+                                Some(Err(error)) => return Ok(Err(error)),
+                                None => return Ok(Err(ReadError::CellDoesNotExisted)),
+                            }
+                        }
+                        crate::index::verification::Verify::Predicate => matches!(
+                            self.neb_client
+                                .read_indexed_cell(id, check.clone())
+                                .await,
+                            Ok(Ok(_))
+                        ),
+                    };
+                    if !present {
                         continue;
                     }
                 }
@@ -818,7 +832,12 @@ impl HashIndexer {
         &self,
         index_id: Id,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        self.query_ids(index_id, None).await
+        self.query_ids(
+            index_id,
+            None,
+            crate::index::verification::Verify::Predicate,
+        )
+        .await
     }
 
     pub async fn query(
@@ -826,13 +845,19 @@ impl HashIndexer {
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let check = crate::index::verification::IndexCheck::Hashed {
             buckets: vec![index_id],
             field: field_id,
             value: value.clone(),
         };
-        self.query_ids(index_id, Some(&check)).await
+        self.query_ids(
+            index_id,
+            Some(&check),
+            verify,
+        )
+        .await
     }
 }
 
@@ -958,8 +983,9 @@ impl HashedIndexClient {
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        self.indexer.query(index_id, field_id, value).await
+        self.indexer.query(index_id, field_id, value, verify).await
     }
 }
 
@@ -1276,7 +1302,14 @@ mod tests {
         let value = OwnedValue::I64(42);
 
         // Query non-existent index
-        let result = indexer.query(index_id, field_id, &value).await;
+        let result = indexer
+            .query(
+                index_id,
+                field_id,
+                &value,
+                crate::index::verification::Verify::Predicate,
+            )
+            .await;
         assert!(result.is_ok());
         let ids = result.unwrap().unwrap();
         assert_eq!(ids.len(), 0);

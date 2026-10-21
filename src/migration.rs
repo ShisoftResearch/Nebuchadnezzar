@@ -2743,7 +2743,15 @@ mod cluster_tests {
 
         async fn scan_ids(client: &Arc<AsyncClient>, schema: SchemaUid) -> HashSet<Id> {
             let mut found = HashSet::new();
-            if let Ok(Some(mut cursor)) = client.ranged().scan_schema(schema, 64).await {
+            if let Ok(Some(mut cursor)) = client
+                .ranged()
+                .scan_schema(
+                    schema,
+                    64,
+                    crate::index::verification::Verify::Predicate,
+                )
+                .await
+            {
                 loop {
                     match cursor.next().await {
                         Ok(Some(id)) => {

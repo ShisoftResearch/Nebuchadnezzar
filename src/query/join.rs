@@ -148,7 +148,12 @@ impl<S: RowSource> IndexNestedLoopJoin<S> {
             self.probes += 1;
             let ids: Vec<Id> = match self
                 .client
-                .hashed_query(self.inner_schema, self.inner_field, &key)
+                .hashed_query(
+                    self.inner_schema,
+                    self.inner_field,
+                    &key,
+                    crate::index::verification::Verify::Predicate,
+                )
                 .await?
             {
                 Ok(ids) => ids,

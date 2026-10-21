@@ -2277,7 +2277,11 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(SchemaUid(schema_id), 64)
+            .scan_schema(
+                SchemaUid(schema_id),
+                64,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .expect("scan should not error")
         {
@@ -2494,7 +2498,11 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(SchemaUid(schema_id), 64)
+            .scan_schema(
+                SchemaUid(schema_id),
+                64,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .expect("scan should not error")
         {

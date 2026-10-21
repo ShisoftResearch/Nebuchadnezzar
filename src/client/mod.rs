@@ -1572,6 +1572,7 @@ impl AsyncClient {
     }
 
     pub async fn schema_by_id(&self, id: u32) -> Result<Option<Schema>, ExecError> {
+        crate::index::query_metrics::metadata();
         self.schema_client.get(&id).await
     }
 
@@ -1837,6 +1838,7 @@ impl AsyncClient {
     /// For callers that must see superseded layouts -- diagnostics, migration
     /// tooling, anything decoding cells written before an evolution.
     pub async fn get_all_schema_generations(&self) -> Result<Vec<Schema>, ExecError> {
+        crate::index::query_metrics::metadata();
         self.schema_client.get_all().await
     }
 
@@ -1866,7 +1868,7 @@ impl AsyncClient {
     /// let ranged = client.ranged();
     ///
     /// // Scan all documents in a schema
-    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100).await? {
+    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100, crate::index::verification::Verify::Predicate).await? {
     ///     while let Some(id) = cursor.next().await? {
     ///         let doc = client.read_cell(id).await?;
     ///     }

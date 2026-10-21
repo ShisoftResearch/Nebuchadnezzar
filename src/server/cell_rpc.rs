@@ -100,6 +100,7 @@ service! {
     rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>, need_header: bool) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc existing_ids(keys: &Vec<Id>) -> Vec<Result<bool, ReadError>>;
     rpc read_all_cells_verified(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr, checks: &Vec<crate::index::verification::IndexCheck>) -> Vec<Result<OwnedCell, ReadError>>;
     // Plain writes: `write_cell`, `update_cell`, `upsert_cell`,
     // `upsert_all_cells`, `remove_cell` and their durable and captured forms.
@@ -366,6 +367,7 @@ pub struct NebRPCService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("cell_rpc/idcontract_tests.rs");
 
     #[test]
     fn index_failure_turns_a_successful_write_into_index_incomplete() {
@@ -404,23 +406,25 @@ mod tests {
 
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
+        crate::index::query_metrics::reads(false, 1);
         future::ready(
             self.database_runtime
                 .chunks()
                 .read_cell(&key)
-                .map(|c| c.to_owned())
+                .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(false, &cell); cell})
                 .map_err(|e| self.redirect_read_if_not_owner(&key, e)),
         )
         .boxed()
     }
     fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        crate::index::query_metrics::reads(false, keys.len());
         future::ready(
             keys.into_iter()
                 .map(|id| {
                     self.database_runtime
                         .chunks()
                         .read_cell(&id)
-                        .map(|c| c.to_owned())
+                        .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(false, &cell); cell})
                         .map_err(|e| self.redirect_read_if_not_owner(id, e))
                 })
                 .collect(),
@@ -433,13 +437,14 @@ impl Service for NebRPCService {
         colums: &Vec<u64>,
         need_header: bool,
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        crate::index::query_metrics::reads(true, keys.len());
         future::ready(
             keys.into_iter()
                 .map(|id| {
                     self.database_runtime
                         .chunks()
                         .read_selected(&id, colums.as_slice(), need_header)
-                        .map(|c| c.to_owned())
+                        .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(true, &cell); cell})
                 })
                 .collect(),
         )
@@ -451,11 +456,12 @@ impl Service for NebRPCService {
         fields: &Vec<u64>,
         need_header: bool,
     ) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
+        crate::index::query_metrics::reads(true, 1);
         future::ready(
             self.database_runtime
                 .chunks()
                 .read_selected(&id, fields.as_slice(), need_header)
-                .map(|c| c.to_owned())
+                .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(true, &cell); cell})
                 .map_err(|e| self.redirect_read_if_not_owner(&id, e)),
         )
         .boxed()
@@ -1013,6 +1019,25 @@ impl Service for NebRPCService {
         proc: &Expr,
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         self.read_cells_checked(keys, colums, filter, proc, &[])
+    }
+
+    fn existing_ids(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<bool, ReadError>>> {
+        // The word guard serializes this check with publication and deletion.
+        // No segment address is dereferenced and no cold segment is promoted.
+        let result = keys
+            .iter()
+            .map(|id| {
+                if crate::index::verification::control("NEB_TEST_IDCONTRACT_SKIP_EXISTS") {
+                    return Ok(true);
+                }
+                match self.database_runtime.chunks().location_for_read(id) {
+                    Ok(_guard) => Ok(true),
+                    Err(ReadError::CellDoesNotExisted) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect();
+        future::ready(result).boxed()
     }
 
     fn read_all_cells_verified(
@@ -1619,6 +1644,10 @@ impl NebRPCService {
         proc: &Expr,
         checks: &[crate::index::verification::IndexCheck],
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        crate::index::query_metrics::reads(!colums.is_empty() && checks.is_empty(), keys.len());
+        if !checks.is_empty() {
+            crate::index::verification::record_verified_cell_reads(keys.len());
+        }
         let filter_empty = filter.is_empty();
         let proc_empty = proc.is_empty();
         let mut interpreter = if !filter_empty || !proc_empty {
@@ -1719,6 +1748,7 @@ impl NebRPCService {
                 }
                 // SharedCell (and its WordMutexGuard) is dropped here in all branches
             });
+            if let Ok(cell) = &owned { crate::index::query_metrics::payload(!colums.is_empty() && checks.is_empty(), cell); }
             cells.push(owned);
         }
 

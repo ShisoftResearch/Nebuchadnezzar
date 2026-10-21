@@ -149,6 +149,7 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
                     Some(&feature),
                     order,
                     8,
+                    crate::index::verification::Verify::Predicate,
                 )
                 .await
                 .unwrap()
@@ -170,7 +171,12 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
     }
     let all = collect(
         data_client
-            .query_ids(SchemaUid(SCHEMA), selection(0), QueryOrdering::Asc)
+            .query_ids(
+                SchemaUid(SCHEMA),
+                selection(0),
+                QueryOrdering::Asc,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap(),
     )
@@ -186,6 +192,7 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
                 None,
                 Some(2),
                 None,
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap(),
@@ -202,6 +209,7 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
                 None,
                 Some(1),
                 Some(1),
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap(),
@@ -260,7 +268,12 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
         );
     } else if !ranged {
         let direct = data_client
-            .hashed_query(SchemaUid(SCHEMA), hash_str(FIELD), &OwnedValue::U64(0))
+            .hashed_query(
+                SchemaUid(SCHEMA),
+                hash_str(FIELD),
+                &OwnedValue::U64(0),
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -285,6 +298,7 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
                 alias: "count".into(),
                 output_name: None,
             }],
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -294,7 +308,12 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
     );
     assert!(collect(
         data_client
-            .query_ids(SchemaUid(SCHEMA), selection(1), QueryOrdering::Asc)
+            .query_ids(
+                SchemaUid(SCHEMA),
+                selection(1),
+                QueryOrdering::Asc,
+                crate::index::verification::Verify::Predicate
+            )
             .await
             .unwrap()
     )
@@ -306,7 +325,12 @@ async fn publication_window(name: &str, index: IndexType, rows: bool) {
     assert_eq!(
         collect(
             data_client
-                .query_ids(SchemaUid(SCHEMA), selection(1), QueryOrdering::Asc)
+                .query_ids(
+                    SchemaUid(SCHEMA),
+                    selection(1),
+                    QueryOrdering::Asc,
+                    crate::index::verification::Verify::Predicate
+                )
                 .await
                 .unwrap()
         )
@@ -363,7 +387,12 @@ async fn verify_hash_schema_replacement() {
     let data_client = server.indexed_data_client();
     assert_eq!(
         data_client
-            .hashed_query(SchemaUid(SCHEMA), hash_str(FIELD), &OwnedValue::U64(0))
+            .hashed_query(
+                SchemaUid(SCHEMA),
+                hash_str(FIELD),
+                &OwnedValue::U64(0),
+                crate::index::verification::Verify::Predicate
+            )
             .await
             .unwrap()
             .unwrap(),
@@ -379,7 +408,8 @@ async fn verify_hash_schema_replacement() {
                     None,
                     None,
                     Some(1),
-                    None
+                    None,
+                    crate::index::verification::Verify::Predicate
                 )
                 .await
                 .unwrap()
@@ -392,7 +422,12 @@ async fn verify_hash_schema_replacement() {
     }
     assert_eq!(
         data_client
-            .hashed_query(SchemaUid(SCHEMA + 1), hash_str(FIELD), &OwnedValue::U64(0))
+            .hashed_query(
+                SchemaUid(SCHEMA + 1),
+                hash_str(FIELD),
+                &OwnedValue::U64(0),
+                crate::index::verification::Verify::Predicate
+            )
             .await
             .unwrap()
             .unwrap(),
@@ -566,14 +601,24 @@ async fn reordered_successful_updates(index: IndexType) {
     );
     let checked = collect(
         data_client
-            .query_ids(SchemaUid(SCHEMA), selection(1), QueryOrdering::Asc)
+            .query_ids(
+                SchemaUid(SCHEMA),
+                selection(1),
+                QueryOrdering::Asc,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap(),
     )
     .await;
     let final_ids = collect(
         data_client
-            .query_ids(SchemaUid(SCHEMA), selection(2), QueryOrdering::Asc)
+            .query_ids(
+                SchemaUid(SCHEMA),
+                selection(2),
+                QueryOrdering::Asc,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap(),
     )
@@ -598,4 +643,293 @@ async fn idxinflight_reordered_ranged_tasks_need_verification() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idxinflight_reordered_hash_tasks_need_verification() {
     reordered_successful_updates(IndexType::Hashed).await;
+}
+
+async fn idcontract_count(client: &IndexedDataClient, price: u64, verify: Verify) -> u64 {
+    let mut cursor = client
+        .aggregate(
+            SchemaUid(SCHEMA),
+            AggregateQuery {
+                selection: selection(price),
+                group_by_fields: vec![],
+                aggregates: vec![AggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field_id: None,
+                    alias: "count".into(),
+                }],
+                order_by: None,
+                limit: None,
+                offset: None,
+            },
+            vec![ProjectionItem::Aggregate {
+                alias: "count".into(),
+                output_name: None,
+            }],
+            verify,
+        )
+        .await
+        .unwrap();
+    let row = cursor.next().await.unwrap().unwrap();
+    *row.columns[0].1.u64().unwrap()
+}
+
+async fn idcontract_reordered(index: IndexType) {
+    let ranged = matches!(index, IndexType::Ranged);
+    let name = if ranged {
+        "idcontract_range"
+    } else {
+        "idcontract_hash"
+    };
+    let (server, client, _dir) = fixture(name, index).await;
+    let stale = Id::from_parts(3, 801);
+    let valid = Id::from_parts(3, 802);
+    client.write_cell(cell(stale, 0)).await.unwrap().unwrap();
+    client.write_cell(cell(valid, 1)).await.unwrap().unwrap();
+    let (first, first_tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().update_cell(&mut cell(stale, 1)));
+    first.unwrap();
+    let (second, second_tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().update_cell(&mut cell(stale, 2)));
+    second.unwrap();
+    assert!(!first_tasks.is_empty() && !second_tasks.is_empty());
+    for task in second_tasks.into_iter().chain(first_tasks) {
+        task.await.unwrap();
+    }
+    let indexed = server.indexed_data_client();
+    let before = super::read::cells_read_count();
+    let ids = collect(
+        indexed
+            .query_ids(
+                SchemaUid(SCHEMA),
+                selection(1),
+                QueryOrdering::Asc,
+                Verify::Exists,
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        ids,
+        vec![stale, valid],
+        "existence permits the reordered stale entry"
+    );
+    assert_eq!(idcontract_count(&indexed, 1, Verify::Exists).await, 2);
+    assert_eq!(
+        super::read::cells_read_count(),
+        before,
+        "existence queries and counts must not read cells"
+    );
+    assert_eq!(
+        collect(
+            indexed
+                .query_ids(
+                    SchemaUid(SCHEMA),
+                    selection(1),
+                    QueryOrdering::Asc,
+                    Verify::Predicate
+                )
+                .await
+                .unwrap()
+        )
+        .await,
+        vec![valid]
+    );
+    assert_eq!(idcontract_count(&indexed, 1, Verify::Predicate).await, 1);
+    assert_eq!(
+        idcontract_count(&indexed, 2, Verify::Exists).await,
+        1,
+        "count must include the true match"
+    );
+    let mut rows = indexed
+        .query(
+            SchemaUid(SCHEMA),
+            selection(1),
+            QueryOrdering::Asc,
+            vec![ProjectionField {
+                field_id: hash_str(FIELD),
+                alias: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.next().await.unwrap().unwrap().id, Some(valid));
+    assert!(rows.next().await.unwrap().is_none());
+    if ranged {
+        let feature = OwnedValue::U64(1).feature();
+        let mut cursor = client
+            .ranged()
+            .range_query(
+                SchemaUid(SCHEMA),
+                hash_str(FIELD),
+                Some(&feature),
+                Some(&feature),
+                crate::client::ScanOrder::Forward,
+                8,
+                Verify::Exists,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.current_block(), &vec![stale, valid]);
+        assert_eq!(cursor.next_cell().await.unwrap().unwrap().id(), valid);
+        assert!(cursor.next_cell().await.unwrap().is_none());
+    } else {
+        let mut ids = indexed
+            .hashed_query(
+                SchemaUid(SCHEMA),
+                hash_str(FIELD),
+                &OwnedValue::U64(1),
+                Verify::Exists,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![stale, valid]);
+    }
+    // Hold delete tasks so both the current entry and the stale entry remain.
+    let (deleted, tasks) =
+        IndexBuilder::collect_test_index_tasks(|| server.chunks().remove_cell(&stale));
+    deleted.unwrap();
+    for verify in [Verify::Exists, Verify::Predicate] {
+        assert_eq!(
+            collect(
+                indexed
+                    .query_ids(SchemaUid(SCHEMA), selection(1), QueryOrdering::Asc, verify)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            vec![valid]
+        );
+        assert_eq!(idcontract_count(&indexed, 1, verify).await, 1);
+        assert_eq!(idcontract_count(&indexed, 2, verify).await, 0);
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idcontract_reordered_hash() {
+    idcontract_reordered(IndexType::Hashed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idcontract_reordered_range() {
+    idcontract_reordered(IndexType::Ranged).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idcontract_count_contains_true_matches() {
+    assert_eq!(Verify::default(), Verify::Exists);
+    let (server, client, _dir) = fixture("idcontract_count", IndexType::Ranged).await;
+    client
+        .write_cell(cell(Id::from_parts(3, 900), 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let indexed = server.indexed_data_client();
+    for verify in [Verify::Exists, Verify::Predicate] {
+        assert_eq!(idcontract_count(&indexed, 1, verify).await, 1);
+        assert_eq!(idcontract_count(&indexed, 2, verify).await, 0);
+    }
+    let before = super::read::cells_read_count();
+    let result = indexed
+        .query_ids_with_options(
+            SchemaUid(SCHEMA),
+            selection(1),
+            QueryOrdering::Asc,
+            Some(hash_str(FIELD)),
+            None,
+            None,
+            None,
+            Verify::Exists,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(RPCError::IOError(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(super::read::cells_read_count(), before);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn idcontract_explicit_exists_refuses_value_dependent_shapes() {
+    let (server, client, _dir) = fixture("idcontract_refusals", IndexType::Hashed).await;
+    client
+        .write_cell(cell(Id::from_parts(3, 990), 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let indexed = server.indexed_data_client();
+    for func in [
+        AggregateFunction::CountField,
+        AggregateFunction::Sum,
+        AggregateFunction::Avg,
+        AggregateFunction::Min,
+        AggregateFunction::Max,
+    ] {
+        let query = AggregateQuery {
+            selection: selection(1),
+            group_by_fields: vec![],
+            aggregates: vec![AggregateSpec {
+                func,
+                field_id: Some(hash_str(FIELD)),
+                alias: "n".into(),
+            }],
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        assert!(
+            matches!(indexed.aggregate(SchemaUid(SCHEMA),query,vec![],Verify::Exists).await,
+            Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+        );
+    }
+    let grouped = AggregateQuery {
+        selection: selection(1),
+        group_by_fields: vec![hash_str(FIELD)],
+        aggregates: vec![AggregateSpec {
+            func: AggregateFunction::CountStar,
+            field_id: None,
+            alias: "n".into(),
+        }],
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    assert!(
+        matches!(indexed.aggregate(SchemaUid(SCHEMA),grouped,vec![],Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        matches!(indexed.query_ids_resumable(SchemaUid(SCHEMA),selection(1),10,None,Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        matches!(indexed.query_ids_with_options(SchemaUid(SCHEMA),selection(1),QueryOrdering::Asc,None,Some(vec![hash_str(FIELD)]),None,None,Verify::Exists).await,
+        Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+    );
+    for raw in [
+        "(= missing 1)",
+        "(and (= price 1) (= missing 2))",
+        "(text-match price \"one\")",
+    ] {
+        let expression = dovahkiin::integrated::lisp::parse_to_serde_expr(raw)
+            .unwrap()
+            .remove(0);
+        let capability = indexed
+            .id_query_capability(SchemaUid(SCHEMA), &expression, None, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(capability.verify(), Verify::Predicate);
+        assert!(
+            matches!(indexed.query_ids(SchemaUid(SCHEMA),expression,QueryOrdering::Asc,Verify::Exists).await,
+            Err(RPCError::IOError(error)) if error.kind()==std::io::ErrorKind::InvalidInput)
+        );
+    }
+    server.shutdown().await;
 }

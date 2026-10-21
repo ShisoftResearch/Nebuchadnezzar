@@ -28,6 +28,7 @@ pub struct CellIdQuery {
     range: ValueRange,
     ordering: Ordering,
     index_client: IndexerClients,
+    verify: crate::index::verification::Verify,
 }
 
 impl DataSource<Id, CellIdQuery> for CellIds {
@@ -55,6 +56,7 @@ impl DataSource<Id, CellIdQuery> for CellIds {
                     crate::index::verification::IndexCheck::Schema(schema),
                     crate::index::verification::IndexCheck::Ranged(range),
                 ],
+                params.verify,
             )
             .await
             .map_err(|error| format!("RPC error: {error:?}"))?;

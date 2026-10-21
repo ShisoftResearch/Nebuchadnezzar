@@ -11,6 +11,34 @@ use crate::ram::{
 };
 use serde::{Deserialize, Serialize};
 
+static VERIFIED_READ_BATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static VERIFIED_CELL_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Candidate cell reads requested for index verification.
+pub fn verified_cell_reads() -> usize {
+    VERIFIED_CELL_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RPC batches used for index verification.
+pub fn verified_read_batches() -> usize {
+    VERIFIED_READ_BATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn record_verified_cell_reads(count: usize) {
+    VERIFIED_READ_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    VERIFIED_CELL_READS.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Verification for hash and range index candidates.
+/// Existence permits stale predicates but never returns a missing cell.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Verify {
+    #[default]
+    Exists,
+    Predicate,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IndexCheck {
     Schema(SchemaUid),
@@ -30,6 +58,10 @@ pub(crate) fn matches<C: Cell>(
 where
     <C::Value as Value>::Out: ToOwnedValue,
 {
+    #[cfg(test)]
+    if control("NEB_TEST_IDCONTRACT_SKIP_VERIFY") {
+        return Ok(());
+    }
     if checks
         .iter()
         .any(|check| matches!(check, IndexCheck::Schema(uid) if schema.uid != *uid))
@@ -119,4 +151,18 @@ pub(crate) fn query_schema(schema: &Schema, checks: &[IndexCheck]) -> Schema {
         !indices.is_empty()
     });
     selected
+}
+
+/// Isolated negative controls are enabled before each test process starts.
+#[inline]
+pub(crate) fn control(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        std::env::var_os(name).is_some()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
+    }
 }

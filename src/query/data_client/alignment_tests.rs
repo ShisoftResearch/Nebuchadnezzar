@@ -739,6 +739,7 @@ async fn assert_query_alignment(
             None,
             query.limit,
             query.offset,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -1002,6 +1003,7 @@ async fn assert_aggregate_alignment(
                         }),
                 )
                 .collect(),
+            crate::index::verification::Verify::Predicate,
         ),
     )
     .await

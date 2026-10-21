@@ -3965,7 +3965,7 @@ mod tests {
         let dead = hash_product_id(updated);
         let dead_bucket = sku_bucket(updated);
         let answered = indexer
-            .query(dead_bucket, sku_field_id(), &OwnedValue::U64(updated))
+            .query(dead_bucket, sku_field_id(), &OwnedValue::U64(updated), crate::index::verification::Verify::Predicate)
             .await
             .unwrap()
             .unwrap();

@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod aggregate;
+mod capability;
 pub mod cursor;
 mod execute;
 mod ids;
@@ -32,11 +33,15 @@ use aggregate::{
     collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
     AggregateGroupState,
 };
+pub use capability::{IdQueryCapability, PredicateRequirement};
 pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor, ScanPage};
 use ids::sort_ids_by_query_order;
 pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
+pub use read::{cells_read_count, ScalarSelection, UnsupportedScalarSelection};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
+
+pub use crate::index::verification::Verify;
 
 const SCAN_BUFFER_SIZE: u16 = 64;
 
@@ -103,6 +108,13 @@ pub struct AggregateQuery {
 }
 
 impl IndexedDataClient {
+    fn requires_predicate(operation: &str) -> RPCError {
+        RPCError::IOError(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{operation} requires Verify::Predicate"),
+        ))
+    }
+
     fn hashed_query_rejects_value(value: &OwnedValue) -> bool {
         index_query_scalars(value).is_none()
     }
@@ -215,7 +227,16 @@ impl IndexedDataClient {
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
             .query_ids_with_options_cached(
-                schema, selection, ordering, None, None, None, None, &mut None, true,
+                schema,
+                selection,
+                ordering,
+                None,
+                None,
+                None,
+                None,
+                &mut None,
+                true,
+                Verify::Predicate,
             )
             .await?;
         let mut ids = vec![];
@@ -279,6 +300,7 @@ impl IndexedDataClient {
                 offset,
                 &mut None,
                 true,
+                Verify::Predicate,
             )
             .await?;
         let mut ids = vec![];
@@ -342,6 +364,7 @@ impl IndexedDataClient {
                 offset,
                 hit_table,
                 true,
+                Verify::Predicate,
             )
             .await?;
         let mut ids = vec![];
@@ -414,6 +437,7 @@ impl IndexedDataClient {
         schema: SchemaUid,
         query: AggregateQuery,
         projection: Vec<ProjectionItem>,
+        verify: Verify,
     ) -> Result<QueryResultCursor, RPCError> {
         if matches!(query.limit, Some(0)) {
             return Ok(QueryResultCursor {
@@ -422,6 +446,14 @@ impl IndexedDataClient {
             });
         }
 
+        let id_count = query.group_by_fields.is_empty()
+            && query
+                .aggregates
+                .iter()
+                .all(|spec| spec.func == AggregateFunction::CountStar);
+        if verify == Verify::Exists && !id_count {
+            return Err(Self::requires_predicate("value aggregates"));
+        }
         let validated = self.validate_aggregate_query(schema, &query).await?;
         let mut id_cursor = self
             .query_ids_with_options_cached(
@@ -433,7 +465,8 @@ impl IndexedDataClient {
                 None,
                 None,
                 &mut None,
-                true,
+                !id_count,
+                verify,
             )
             .await?;
         let mut ids = vec![];
@@ -447,7 +480,9 @@ impl IndexedDataClient {
             .enumerate()
             .map(|(index, field_id)| (*field_id, index))
             .collect::<HashMap<_, _>>();
-        let rows = if id_cursor.cells.is_empty() {
+        let rows = if id_count {
+            Vec::new()
+        } else if id_cursor.cells.is_empty() {
             self.read_projected_rows_from_ids(&ids, &required_fields)
                 .await
         } else {
@@ -500,6 +535,11 @@ impl IndexedDataClient {
             states.push(AggregateGroupState::new(&[], &validated));
         }
 
+        if id_count {
+            for _ in 0..ids.len() {
+                states[0].accumulate_row(&[], &field_positions, &validated);
+            }
+        }
         let mut aggregate_rows = states
             .into_iter()
             .map(|state| state.finalize(&query.group_by_fields, &validated))
@@ -527,8 +567,9 @@ impl IndexedDataClient {
         schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, None, None, None, None)
+        self.query_ids_with_options(schema, selection, ordering, None, None, None, None, verify)
             .await
     }
 
@@ -538,9 +579,10 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
         self.query_ids_with_options_and_hits(
-            schema, selection, ordering, None, None, None, None, hit_table,
+            schema, selection, ordering, None, None, None, None, hit_table, verify,
         )
         .await
     }
@@ -560,7 +602,11 @@ impl IndexedDataClient {
         selection: Expr,
         limit: usize,
         start_after: Option<Id>,
+        verify: Verify,
     ) -> Result<Option<ScanPage>, RPCError> {
+        if verify == Verify::Exists {
+            return Err(Self::requires_predicate("resumable filtered schema scan"));
+        }
         if selection.is_empty() {
             return Ok(None);
         }
@@ -584,6 +630,7 @@ impl IndexedDataClient {
         distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
         self.query_ids_with_options_and_hits(
             schema,
@@ -594,6 +641,7 @@ impl IndexedDataClient {
             limit,
             offset,
             &mut None,
+            verify,
         )
         .await
     }
@@ -608,7 +656,9 @@ impl IndexedDataClient {
         limit: Option<usize>,
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
+        crate::index::query_metrics::candidates();
         self.query_ids_with_options_cached(
             schema,
             selection,
@@ -619,6 +669,7 @@ impl IndexedDataClient {
             offset,
             hit_table,
             false,
+            verify,
         )
         .await
     }
@@ -634,6 +685,7 @@ impl IndexedDataClient {
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
         retain_cells: bool,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
         if matches!(limit, Some(0)) {
             return Ok(IdCursor {
@@ -654,6 +706,9 @@ impl IndexedDataClient {
             self.ensure_distinct_fields(schema, field_ids).await?;
         }
 
+        if verify == Verify::Exists && (order_by_field.is_some() || distinct_fields.is_some()) {
+            return Err(Self::requires_predicate("field ordering and distinct"));
+        }
         let explicit_order_by_field = order_by_field;
         let plan_limit = if explicit_order_by_field.is_some() || distinct_fields.is_some() {
             None
@@ -663,18 +718,21 @@ impl IndexedDataClient {
         let plan = self
             .indexed_predicate_plan(schema, &selection, order_by_field, plan_limit)
             .await;
-        let inferred_order_field = explicit_order_by_field
-            .is_none()
-            .then(|| {
-                plan.as_ref()
-                    .and_then(Self::infer_query_order_field_from_plan)
-            })
-            .flatten();
+        let inferred_order_field = (verify == Verify::Predicate
+            && explicit_order_by_field.is_none())
+        .then(|| {
+            plan.as_ref()
+                .and_then(Self::infer_query_order_field_from_plan)
+        })
+        .flatten();
         let preserve_relevance_order = explicit_order_by_field.is_none()
             && plan
                 .as_ref()
                 .map(|plan| plan.is_pure_relevance_ranked_scan())
                 .unwrap_or(false);
+        if verify == Verify::Exists && plan.is_none() && !selection.is_empty() {
+            return Err(Self::requires_predicate("unindexed selection"));
+        }
         let selection_requires_post_filter = !selection.is_empty();
         // Bounded schema scan: filter while walking the index and stop at the
         // limit, so memory follows the rows RETURNED rather than the rows
@@ -720,6 +778,7 @@ impl IndexedDataClient {
                         &mut verified_cells,
                         retain_cells,
                         &cache_fields,
+                        verify,
                     )
                     .await?,
                     false,
@@ -780,7 +839,9 @@ impl IndexedDataClient {
         } else {
             effective_limit
         };
-        let mut selected_ids = if requires_selection_filter {
+        let mut selected_ids = if requires_selection_filter && verify == Verify::Exists {
+            self.existing_ids(&ordered_candidate_ids).await?
+        } else if requires_selection_filter {
             self.filter_ids_by_selection_limit(
                 &ordered_candidate_ids,
                 schema,
@@ -834,8 +895,9 @@ impl IndexedDataClient {
         schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids(schema, selection, ordering).await
+        self.query_ids(schema, selection, ordering, verify).await
     }
 
     pub async fn scan_by_expr_ids_with_options<'a>(
@@ -847,6 +909,7 @@ impl IndexedDataClient {
         distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
+        verify: Verify,
     ) -> Result<IdCursor, RPCError> {
         self.query_ids_with_options(
             schema,
@@ -856,6 +919,7 @@ impl IndexedDataClient {
             distinct_fields,
             limit,
             offset,
+            verify,
         )
         .await
     }
@@ -969,6 +1033,7 @@ impl IndexedDataClient {
         schema: SchemaUid,
         field_id: u64,
         value: &OwnedValue,
+        verify: Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         if Self::hashed_query_rejects_value(value) {
             return Err(Self::hashed_query_invalid_input_error(
@@ -979,7 +1044,7 @@ impl IndexedDataClient {
         for index_id in Self::hashed_query_index_ids(schema, field_id, value) {
             match self
                 .index_clients
-                .hashed_query(index_id, field_id, value)
+                .hashed_query(index_id, field_id, value, verify)
                 .await?
             {
                 Ok(ids) => matched_ids.extend(ids),
