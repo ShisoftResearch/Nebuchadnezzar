@@ -1,9 +1,10 @@
+use crate::{index::verification::IndexCheck, ram::cell::OwnedCell};
 use std::io;
 
 use bifrost::rpc::RPCError;
 use dovahkiin::{
     ahash::HashMap,
-    types::{Id, OwnedValue},
+    types::{Id, Map, OwnedValue},
 };
 use itertools::Itertools;
 
@@ -34,17 +35,27 @@ impl IndexedDataClient {
     ) -> Result<Vec<Id>, RPCError> {
         match clause {
             IndexedClausePlan::HashedEq { field_id, value } => {
-                match self.hashed_query(schema, *field_id, value).await? {
-                    Ok(ids) => Ok(ids),
-                    Err(_) => Ok(Vec::new()),
+                let mut ids = Vec::new();
+                for bucket in Self::hashed_query_index_ids(schema, *field_id, value) {
+                    if let Ok(hits) = self
+                        .index_clients
+                        .hashed_client
+                        .indexer
+                        .candidates(bucket)
+                        .await?
+                    {
+                        ids = union_ids_ordered(ids, &hits);
+                    }
                 }
+                Ok(ids)
             }
             IndexedClausePlan::NullPresence { field_id } => {
                 let index_id = get_null_hash_id(schema, *field_id);
                 match self
                     .index_clients
                     .hashed_client
-                    .query(index_id, *field_id, &OwnedValue::Null)
+                    .indexer
+                    .candidates(index_id)
                     .await?
                 {
                     Ok(ids) => Ok(ids),
@@ -125,11 +136,24 @@ impl IndexedDataClient {
         plan: &IndexedPredicatePlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
+        cells: &mut HashMap<Id, OwnedCell>,
+        retain_cells: bool,
+        cache_fields: &[u64],
+        verify: super::Verify,
     ) -> Result<Vec<Id>, RPCError> {
         let mut all_ids = vec![];
         for disjunct in plan.disjuncts() {
             let ids = self
-                .execute_disjunct_ids(schema, disjunct, ordering, hit_table)
+                .execute_disjunct_ids(
+                    schema,
+                    disjunct,
+                    ordering,
+                    hit_table,
+                    cells,
+                    retain_cells,
+                    cache_fields,
+                    verify,
+                )
                 .await?;
             all_ids = union_ids_ordered(all_ids, &ids);
         }
@@ -145,7 +169,17 @@ impl IndexedDataClient {
         disjunct: &IndexedDisjunctPlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
+        cells: &mut HashMap<Id, OwnedCell>,
+        retain_cells: bool,
+        cache_fields: &[u64],
+        verify: super::Verify,
     ) -> Result<Vec<Id>, RPCError> {
+        if verify == super::Verify::Exists
+            && (!disjunct.residual().is_empty()
+                || disjunct.clauses().iter().any(Self::is_special_clause))
+        {
+            return Err(Self::requires_predicate("residual or relevance predicate"));
+        }
         let mut candidate_ids = if disjunct.clauses().is_empty() {
             self.scan_schema_ids(schema, ordering).await?
         } else {
@@ -160,7 +194,10 @@ impl IndexedDataClient {
             {
                 Ok(ids) => ids,
                 Err(e) => {
-                    if Self::is_special_clause(first) || Self::is_invalid_input_error(&e) {
+                    if verify == super::Verify::Exists
+                        || Self::is_special_clause(first)
+                        || Self::is_invalid_input_error(&e)
+                    {
                         return Err(e);
                     }
                     self.scan_schema_ids(schema, ordering).await?
@@ -174,7 +211,10 @@ impl IndexedDataClient {
                 {
                     Ok(ids) => ids,
                     Err(e) => {
-                        if Self::is_special_clause(candidate) || Self::is_invalid_input_error(&e) {
+                        if verify == super::Verify::Exists
+                            || Self::is_special_clause(candidate)
+                            || Self::is_invalid_input_error(&e)
+                        {
                             return Err(e);
                         }
                         candidate_ids = self.scan_schema_ids(schema, ordering).await?;
@@ -197,11 +237,74 @@ impl IndexedDataClient {
             candidate_ids
         };
 
-        if !disjunct.residual().is_empty() {
-            candidate_ids = self
-                .filter_ids_by_selection_limit(&candidate_ids, disjunct.residual(), None)
-                .await;
+        if verify == super::Verify::Exists
+            && !crate::index::verification::control("NEB_TEST_IDCONTRACT_FORCE_PREDICATE")
+        {
+            let ids = self.existing_ids(&candidate_ids).await?;
+            #[cfg(test)]
+            let ids = if crate::index::verification::control("NEB_TEST_IDCONTRACT_DROP_ID") {
+                ids.into_iter().skip(1).collect()
+            } else {
+                ids
+            };
+            return Ok(ids);
         }
+        let mut checks = vec![IndexCheck::Schema(schema)];
+        for clause in disjunct.clauses() {
+            match clause {
+                IndexedClausePlan::Ranged { field_id, range } => checks.push(IndexCheck::Ranged(
+                    range
+                        .clone()
+                        .to_key_range(schema, *field_id, Ordering::Forward),
+                )),
+                IndexedClausePlan::HashedEq { field_id, value } => {
+                    checks.push(IndexCheck::Hashed {
+                        buckets: Self::hashed_query_index_ids(schema, *field_id, value),
+                        field: *field_id,
+                        value: value.clone(),
+                    })
+                }
+                IndexedClausePlan::NullPresence { field_id } => checks.push(IndexCheck::Hashed {
+                    buckets: vec![get_null_hash_id(schema, *field_id)],
+                    field: *field_id,
+                    value: OwnedValue::Null,
+                }),
+                _ => {}
+            }
+        }
+        let mut verified_ids = Vec::new();
+        for batch in candidate_ids.chunks(usize::from(super::SCAN_BUFFER_SIZE)) {
+            let read = self
+                .read_cells_from_ids_checked(
+                    batch,
+                    &vec![],
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &checks,
+                )
+                .await;
+            for cell in read {
+                if super::read::cell_matches_selection(&cell, disjunct.residual()) {
+                    verified_ids.push(cell.id());
+                    if retain_cells {
+                        cells.insert(cell.id(), cell);
+                    } else if !cache_fields.is_empty() {
+                        let mut data = dovahkiin::types::OwnedMap::new();
+                        for field in cache_fields {
+                            data.insert_key_id(*field, cell[*field].clone());
+                        }
+                        cells.insert(
+                            cell.id(),
+                            OwnedCell {
+                                header: cell.header,
+                                data: OwnedValue::Map(data),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        candidate_ids = verified_ids;
         Ok(candidate_ids)
     }
 

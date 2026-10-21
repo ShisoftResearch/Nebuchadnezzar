@@ -51,11 +51,16 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
 
 #[test]
 fn node_size() {
-    // On-heap pointer plus node type tag (aligned), one word for concurrency
-    // control, and one for the write-back dirty flag (aligned).
+    // The node holds an atomic descriptor pointer, concurrency control,
+    // and aligned write-back flags. The immutable tag and payload pointer
+    // occupy a separate descriptor allocation; account for that too.
     assert_eq!(
         size_of::<Node<KeySlice, PtrSlice>>(),
-        size_of::<usize>() * 4
+        size_of::<usize>() * 3
+    );
+    assert_eq!(
+        size_of::<NodeData<KeySlice, PtrSlice>>(),
+        size_of::<usize>() * 2
     );
 }
 
@@ -74,6 +79,32 @@ fn init() {
     tree.insert(&entry_key);
     let cursor = tree.seek(&key, Ordering::Forward);
     assert_eq!(cursor.current().unwrap().id(), id);
+}
+
+#[test]
+fn copy_split_pages_keep_the_target_writeback_locality() {
+    let tree = LevelBPlusTree::new(&deletion_set());
+    for i in 0..100u64 {
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i + 1)));
+    }
+    let target = Id::from_parts(1234, 1);
+    let copy = super::split_off::copy_off(&tree, &MIN_ENTRY_KEY, &target).unwrap();
+    let copied = LevelBPlusTree::from_root(
+        copy.new_root, copy.new_head_id, copy.moved_len, copy.new_height,
+        &deletion_set(),
+    );
+    let mut cursor = copied.seek(&MIN_ENTRY_KEY, Ordering::Forward);
+    let mut count = 0;
+    loop {
+        if let Some(page) = &cursor.page {
+            assert_eq!(page.deref::<KeySlice, PtrSlice>().writeback_locality,
+                target.locality());
+        }
+        if cursor.next().is_none() { break; }
+        count += 1;
+    }
+    assert_eq!(count, 100);
+
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {

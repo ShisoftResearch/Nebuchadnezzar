@@ -4,7 +4,7 @@
 
 This implementation adds LZ4 compression to segment backup files to reduce disk I/O bottleneck when tiered memory is enabled. The compression is applied only to backup files (`.nbackup`), while WAL files (`.nlog`) remain uncompressed as they are streamed.
 
-**Compression is controlled by the `compress_backups` feature flag** (enabled by default). Decompression is always available to maintain backward compatibility with both compressed and uncompressed files.
+**Compression is controlled by the `compress_backups` feature flag** (enabled by default). Decompression is always available for compressed and uncompressed files.
 
 ## Implementation Details
 
@@ -32,8 +32,8 @@ Created a new compression utilities module with the following features:
 ```
 
 - **Magic number**: `[0x4E, 0x45, 0x42, 0x01]` ("NEB\x01")
-- Used to identify compressed files and maintain backward compatibility
-- Uncompressed files (legacy) are automatically detected and passed through
+- Used to identify compressed files
+- Uncompressed files are automatically detected and passed through
 
 #### API
 - `compress(data: &[u8]) -> io::Result<Vec<u8>>`: Compress data with magic header
@@ -71,7 +71,6 @@ Modified `SegmentFileManager::read_file()`:
 
 - **Auto-detection**: Checks file extension (`.nbackup` for backup files)
 - **Decompression**: Automatically decompresses backup files
-- **Backward compatibility**: Legacy uncompressed files are detected and used as-is
 - **WAL files**: Not compressed, returned as-is
 
 ```rust
@@ -98,7 +97,7 @@ temp_buffer = compression::decompress_if_compressed(&temp_buffer)?;
 ### Unit Tests (All Passing ✓)
 
 1. **test_compress_decompress**: Basic round-trip compression test
-2. **test_uncompressed_passthrough**: Legacy file compatibility
+2. **test_uncompressed_passthrough**: Uncompressed input
 3. **test_compression_ratio**: Verifies compression efficiency (8MB zeros → <1%)
 4. **test_segment_like_data**: Realistic segment data compression
 
@@ -128,13 +127,6 @@ All existing recovery tests pass, including:
 - **Minimal**: LZ4 is designed for speed over compression ratio
 - **Block format**: Entire segment compressed as single block (no streaming overhead)
 - **Unsafe profile**: Uses fastest available implementation (no array bounds checks)
-
-## Backward Compatibility
-
-✓ **Fully backward compatible**:
-- Old uncompressed backup files are automatically detected (no magic header)
-- Decompression is skipped for legacy files
-- No migration needed - new segments will be compressed, old ones remain readable
 
 ## Monitoring
 
@@ -183,7 +175,6 @@ neb = { version = "0.2.0", default-features = false, features = ["cleaner", "com
 This implementation successfully addresses the disk write bottleneck in tiered memory by adding LZ4 compression to segment backup files. The changes are:
 - **Configurable**: Feature flag controls compression (enabled by default)
 - **Non-invasive**: Only affects backup file I/O paths
-- **Backward compatible**: Old files continue to work, decompression always enabled
 - **Well-tested**: All existing tests pass with and without the feature
 - **Fast**: LZ4 block format with unsafe performance profile
 - **Simple**: Clean separation via compression module

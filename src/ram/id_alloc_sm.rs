@@ -14,6 +14,7 @@
 //!   a granted lease is replicated before the caller sees it — at
 //!   least as durable as any data that can reference the ids.
 
+use crate::utils::persisted::decode_persisted_or_halt;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
@@ -68,6 +69,7 @@ raft_state_machine! {
     def cmd claim_origin(holder: u64) -> Result<(u16, u64), String>;
     def cmd reclaim_origin(origin: u16, holder: u64) -> Result<u64, String>;
     def cmd lease_block(origin: u16, epoch: u64, floor: u64, span: u64) -> Result<GrantedLease, String>;
+    def cmd reserve_floor(origin: u16, floor: u64) -> Result<u64, String>;
     def qry last_lease_end(origin: u16) -> Option<u64>;
 }
 
@@ -97,6 +99,12 @@ impl StateMachineCmds for IdAllocSM {
             // zeros in the origin bits, so an origin-0 allocation could
             // collide with a shim-composed id (locality, seq) pair.
             if slot == 0 {
+                continue;
+            }
+            // Reserved for the status cells of multi-site transactions
+            // (`crate::ram::txn_status::STATUS_ORIGIN`): their ids are
+            // composed, never allocated.
+            if slot == crate::ram::txn_status::STATUS_ORIGIN {
                 continue;
             }
             let entry = self.state.origins.entry(slot).or_default();
@@ -166,6 +174,42 @@ impl StateMachineCmds for IdAllocSM {
         future::ready(result).boxed()
     }
 
+    /// Raise an origin's durable lease end to at least `floor`.
+    ///
+    /// This is the restore-side half of the allocator: ids imported from
+    /// another database name `(origin, sequence)` pairs this authority never
+    /// issued, and any later lease for that origin must start above them or it
+    /// would reissue a restored id. Unlike `lease_block` it needs no holder or
+    /// epoch -- the origin may belong to a server that has not joined yet -- so
+    /// it creates the slot's record if there is none. Monotone and idempotent:
+    /// a floor below the current lease end changes nothing.
+    ///
+    /// Origin 0 is refused (reserved for the shim plane, see `claim_origin`)
+    /// and so is a floor past the sequence space.
+    fn reserve_floor(&mut self, origin: u16, floor: u64) -> BoxFuture<'_, Result<u64, String>> {
+        let result = (|| {
+            if origin == 0 {
+                return Err("origin 0 is reserved and has no lease to raise".to_string());
+            }
+            if origin as u64 > ID_ORIGIN_MASK {
+                return Err(format!("origin {} exceeds the origin field", origin));
+            }
+            if floor > ID_SEQUENCE_MASK {
+                return Err(format!(
+                    "floor {} exceeds the sequence space of origin {}",
+                    floor, origin
+                ));
+            }
+            let entry = self.state.origins.entry(origin).or_default();
+            if entry.retired {
+                return Err(format!("origin {} is retired", origin));
+            }
+            entry.lease_end = entry.lease_end.max(floor);
+            Ok(entry.lease_end)
+        })();
+        future::ready(result).boxed()
+    }
+
     fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, Option<u64>> {
         future::ready(
             self.state
@@ -186,7 +230,7 @@ impl StateMachineCtl for IdAllocSM {
         utils::serde::serialize(&self.state)
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        self.state = utils::serde::deserialize(&data).unwrap();
+        self.state = decode_persisted_or_halt("id allocator snapshot", &data);
         future::ready(()).boxed()
     }
     fn recoverable(&self) -> bool {
@@ -207,6 +251,31 @@ impl IdAllocSM {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn recover_round_trips_a_snapshot() {
+        let mut sm = IdAllocSM::new(1);
+        let (slot, epoch) = block_on(sm.claim_origin(5)).unwrap();
+        let snapshot = sm.snapshot();
+        let mut restored = IdAllocSM::new(1);
+        block_on(restored.recover(snapshot));
+        assert_eq!(restored.state.origins.len(), 1);
+        assert!(restored.state.origins.contains_key(&slot));
+        assert_eq!(restored.state.origins[&slot].epoch, epoch);
+    }
+
+    #[test]
+    fn recover_halts_on_an_undecodable_snapshot() {
+        let mut sm = IdAllocSM::new(1);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(sm.recover(b"{\"origins\":{}}".to_vec()));
+        }))
+        .unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "id allocator snapshot");
+    }
 
     #[test]
     fn origin_zero_is_reserved_for_the_shim_plane() {
@@ -288,5 +357,47 @@ mod tests {
         // The restored authority still fences and still resumes above.
         let lease = block_on(restored.lease_block(slot, epoch, 0, 1 << 20)).unwrap();
         assert_eq!(lease.start, 1 << 20);
+    }
+
+    #[test]
+    fn reserve_floor_raises_lease_end_for_unclaimed_and_claimed_origins() {
+        let mut sm = IdAllocSM::new(6);
+        // An origin nobody has claimed: the record is created.
+        assert_eq!(block_on(sm.reserve_floor(9, 5_000)).unwrap(), 5_000);
+        assert_eq!(block_on(sm.last_lease_end(9)), Some(5_000));
+        // Monotone and idempotent.
+        assert_eq!(block_on(sm.reserve_floor(9, 100)).unwrap(), 5_000);
+        assert_eq!(block_on(sm.reserve_floor(9, 7_000)).unwrap(), 7_000);
+
+        // A server that later claims slots up to 9 gets leases above the floor.
+        let mut holder_slot = None;
+        for holder in 0..32u64 {
+            let (slot, epoch) = block_on(sm.claim_origin(holder + 1)).unwrap();
+            if slot == 9 {
+                holder_slot = Some((slot, epoch));
+                break;
+            }
+        }
+        let (slot, epoch) = holder_slot.expect("slot 9 is reached by sequential claims");
+        let lease = block_on(sm.lease_block(slot, epoch, 0, 1 << 20)).unwrap();
+        assert!(lease.start >= 7_000, "a lease may not start below a reserved floor");
+    }
+
+    #[test]
+    fn reserve_floor_refuses_reserved_and_out_of_range_input() {
+        let mut sm = IdAllocSM::new(7);
+        assert!(block_on(sm.reserve_floor(0, 1)).is_err());
+        assert!(block_on(sm.reserve_floor(1 << 12, 1)).is_err());
+        assert!(block_on(sm.reserve_floor(3, ID_SEQUENCE_MASK + 1)).is_err());
+    }
+
+    #[test]
+    fn reserve_floor_survives_a_snapshot() {
+        let mut sm = IdAllocSM::new(8);
+        block_on(sm.reserve_floor(4, 123_456)).unwrap();
+        let snap = StateMachineCtl::snapshot(&sm);
+        let mut restored = IdAllocSM::new(8);
+        block_on(StateMachineCtl::recover(&mut restored, snap));
+        assert_eq!(block_on(restored.last_lease_end(4)), Some(123_456));
     }
 }

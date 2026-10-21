@@ -794,7 +794,8 @@ fn test_wal_cleanup_after_archive() {
         .expect("Should have backup file path");
     info!("Expected backup file: {}", backup_file_name);
 
-    // Archive the segment
+    // Release the append head before archive.
+    chunk.release_append_heads_for_test();
     info!("Archiving segment...");
     let result = segment.archive().unwrap();
     assert!(result, "Archive should succeed");
@@ -887,7 +888,8 @@ fn test_wal_file_handle_properly_closed() {
 
     info!("Testing file handle closure for: {}", wal_file_path);
 
-    // Archive the segment
+    // Release the append head before archive.
+    chunk.release_append_heads_for_test();
     segment.archive().unwrap();
 
     // Try to open the WAL file path (should fail because it's deleted)
@@ -995,6 +997,7 @@ fn test_multiple_segments_wal_cleanup() {
         backup_files.len()
     );
 
+    chunk.release_append_heads_for_test();
     // Archive all segments
     for seg_id in &seg_ids {
         if let Some(segment) = chunk.segs.get(seg_id) {
@@ -1112,6 +1115,7 @@ fn test_archive_idempotency() {
         .backup_path(segment.chunk_id, segment.id, segment.seq_id)
         .expect("Should have backup file path");
 
+    chunk.release_append_heads_for_test();
     // First archive
     let result1 = segment.archive().unwrap();
     assert!(result1, "First archive should succeed");

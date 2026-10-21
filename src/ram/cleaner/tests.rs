@@ -85,9 +85,30 @@ pub fn full_clean_cycle_without_compact() {
 
     // combine only (compact cleaner removed)
     {
-        // Cleaner refuses to work on head segment; set head to dummy to include both segments
-        chunk.head_pool[0].store(1234, std::sync::atomic::Ordering::Relaxed);
+        // Relinquish the append heads before the cleaner selects sources.
+        chunk.rotate_heads_for_scrub_test();
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+        // The first pass removes the old cells. A later pass can remove their tombstones.
+        chunk.qsbr.suspended(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
+                chunk.drain_retired_segments();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(chunk.retired_segment_count(), 0);
+        });
+        let empty = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        chunk.put_segment(empty);
+        combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+        chunk.qsbr.suspended(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while chunk.retired_segment_count() > 0 && std::time::Instant::now() < deadline {
+                chunk.drain_retired_segments();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(chunk.retired_segment_count(), 0);
+        });
+        assert!(chunk.deleted_versions.is_empty());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {
@@ -251,7 +272,7 @@ pub fn combining_migrates_cells_left_in_a_superseded_generation() {
         );
     }
 
-    chunk.head_pool[0].store(1234, Ordering::Relaxed);
+    chunk.rotate_heads_for_scrub_test();
     combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
     assert_eq!(
         chunk.segments().len(),
@@ -285,7 +306,7 @@ pub fn combining_relocates_cells_it_cannot_migrate() {
     let chunk = &chunks.list[0];
 
     let survivors = provision_combinable_chunk(&chunks);
-    chunk.head_pool[0].store(1234, Ordering::Relaxed);
+    chunk.rotate_heads_for_scrub_test();
     combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
     assert_eq!(chunk.segments().len(), 1, "the combine did not run");
 
@@ -326,7 +347,7 @@ pub fn combining_declines_to_migrate_across_an_index_change() {
     let survivors = provision_combinable_chunk(&chunks);
     meta.schemas.apply_evolution(gen1);
 
-    chunk.head_pool[0].store(1234, Ordering::Relaxed);
+    chunk.rotate_heads_for_scrub_test();
     combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
     assert_eq!(chunk.segments().len(), 1, "the combine did not run");
 
@@ -339,4 +360,72 @@ pub fn combining_declines_to_migrate_across_an_index_change() {
         );
         assert_eq!(cell.data["id"].i32(), Some(&(id.bits() as i32)));
     }
+}
+
+#[test]
+fn cleaner_keeps_head_reserved_during_rotation() {
+    let chunks = Chunks::new_dummy(1, SEGMENT_SIZE * 4);
+    let chunk = &chunks.list[0];
+    let id = chunk.get_head_seg_id();
+    let segment = chunk.segs.get(&(id as usize)).unwrap();
+    let slot = &chunk.head_pool[0];
+    let old = slot.swap(u64::MAX - 1, Ordering::AcqRel);
+    assert!(!chunk.is_active_head(id));
+    assert!(super::SegmentCandidate::for_cleaner(&segment).is_none());
+    assert!(!segment.archive().unwrap());
+    chunk.remove_segment(id);
+    assert!(chunk.segs.get(&(id as usize)).is_some());
+    slot.store(old, Ordering::Release);
+    chunk.rotate_heads_for_scrub_test();
+    assert!(super::SegmentCandidate::for_cleaner(&segment).is_some());
+}
+
+#[test]
+fn cleaner_keeps_segment_during_archive() {
+    let chunks = Chunks::new_dummy(1, SEGMENT_SIZE * 4);
+    let chunk = &chunks.list[0];
+    let segment = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+    let id = segment.id;
+    chunk.put_segment(segment);
+    let segment = chunk.segs.get(&(id as usize)).unwrap();
+    let state = segment.file_state.lock();
+    std::thread::scope(|scope| {
+        let segment_ref = &segment;
+        let archive = scope.spawn(move || segment_ref.archive());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while segment.protection.jobs_drained() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let skipped = super::SegmentCandidate::for_cleaner(&segment).is_none();
+        chunk.remove_segment(id);
+        let retained = chunk.segs.get(&(id as usize)).is_some();
+        drop(state);
+        archive.join().unwrap().unwrap();
+        assert!(skipped);
+        assert!(retained);
+    });
+    let candidate = super::SegmentCandidate::for_cleaner(&segment).unwrap();
+    assert!(segment.protection.job().is_none());
+    drop(candidate);
+    assert!(segment.protection.job().is_some());
+}
+
+#[test]
+fn cleaner_keeps_queued_seal_segment() {
+    let chunks = Chunks::new_dummy(1, SEGMENT_SIZE * 4);
+    let chunk = &chunks.list[0];
+    let id = chunk.get_head_seg_id();
+    let segment = chunk.segs.get(&(id as usize)).unwrap();
+    segment
+        .protection
+        .seal_pending
+        .store(true, Ordering::Release);
+    chunk.head_pool[0].store(u64::MAX, Ordering::Release);
+    segment.protection.head.store(false, Ordering::Release);
+    assert!(super::SegmentCandidate::for_cleaner(&segment).is_none());
+    chunk.remove_segment(id);
+    assert!(chunk.segs.get(&(id as usize)).is_some());
+    chunk.finish_rotated_head(id, segment.seq_id);
+    assert!(super::SegmentCandidate::for_cleaner(&segment).is_some());
 }

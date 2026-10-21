@@ -3,14 +3,27 @@ use crate::ram::segs::Segment;
 use rayon::prelude::*;
 use std::env;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// Bytes removed from the chunk space charge by the combine cleaner.
+pub static CAS_FULL_PASSES: AtomicU64 = AtomicU64::new(0);
+pub static CAS_RECLAIMED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static CLEANER_RECLAIMED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub mod combine;
+pub(crate) mod protection;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GC_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(&Chunk)>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Foreground-to-cleaner wake signal. Allocation-pressure paths request a
 /// cleaning pass instead of running one synchronously: an inline combine on
@@ -18,14 +31,14 @@ mod tests;
 /// backpressure comes from waking the background thread and, near capacity,
 /// from its pressure-proportional pacing.
 pub struct CleanerWake {
-    thread: parking_lot::Mutex<Option<thread::Thread>>,
+    thread: arc_swap::ArcSwapOption<thread::Thread>,
     pending: AtomicBool,
 }
 
 impl CleanerWake {
     pub fn new() -> Self {
         Self {
-            thread: parking_lot::Mutex::new(None),
+            thread: arc_swap::ArcSwapOption::empty(),
             pending: AtomicBool::new(false),
         }
     }
@@ -35,13 +48,13 @@ impl CleanerWake {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(thread) = self.thread.lock().as_ref() {
+        if let Some(thread) = self.thread.load().as_ref() {
             thread.unpark();
         }
     }
 
     fn register(&self, thread: thread::Thread) {
-        *self.thread.lock() = Some(thread);
+        self.thread.store(Some(Arc::new(thread)));
     }
 
     fn take_pending(&self) -> bool {
@@ -221,6 +234,18 @@ impl Cleaner {
         };
         return cleaner;
     }
+    #[cfg(test)]
+    pub(crate) fn clean_with_test_probe(
+        chunk: &Chunk,
+        probe: impl FnOnce(&Chunk) + 'static,
+    ) -> bool {
+        TEST_GC_PROBE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(probe));
+        });
+        Self::clean(chunk, true, true)
+    }
+
     /// Returns true if any cleaning work reclaimed space or reduced segments.
     pub fn clean(chunk: &Chunk, full: bool, wait: bool) -> bool {
         trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
@@ -236,6 +261,17 @@ impl Cleaner {
             );
             return false;
         }
+        let cas_pass = full && crate::ram::chunk::CAS_ALLOCATING.with(|active| active.get());
+        if cas_pass {
+            CAS_FULL_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        TEST_GC_PROBE.with(|slot| {
+            let probe = slot.borrow_mut().take();
+            if let Some(probe) = probe {
+                probe(chunk);
+            }
+        });
         let num_segs = chunk.segs.len();
         trace!(
             "Cleaning chunk {}, full {}, segs {}, head seg {}",
@@ -293,6 +329,10 @@ impl Cleaner {
         }
 
         let combined_cleaned_space = combiner_cleaned_space;
+        if cas_pass {
+            CAS_RECLAIMED_BYTES.fetch_add(combiner_cleaned_space as u64, Ordering::Relaxed);
+        }
+        CLEANER_RECLAIMED_BYTES.fetch_add(combiner_cleaned_space as u64, Ordering::Relaxed);
         chunk
             .total_space
             .fetch_sub(combiner_cleaned_space, Ordering::Relaxed); // only subtract combiner cleaned space, compacter cleaned does not reclaim segments
@@ -351,9 +391,42 @@ impl Drop for Cleaner {
 
 pub struct SegmentCandidate {
     segment: lightning::aarc::Arc<Segment>,
+    cleaning: bool,
 }
 
 impl SegmentCandidate {
+    pub(crate) fn for_cleaner(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
+        // Avoid excluding prepare/decision syncs for an ineligible segment.
+        if segment.protection.blocks_cleaner()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        if !segment.protection.claim_cleaner() {
+            return None;
+        }
+        if segment.protection.blocks_cleaner()
+            || segment.is_head_owned()
+            || segment.pending_journal_count() != 0
+            || segment.wal_sync_queued.load(Ordering::Acquire)
+        {
+            segment.protection.release_cleaner();
+            return None;
+        }
+        match Self::new(segment) {
+            Some(mut candidate) => {
+                candidate.cleaning = true;
+                Some(candidate)
+            }
+            None => {
+                segment.protection.release_cleaner();
+                None
+            }
+        }
+    }
+
     pub fn new(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
         if !segment.incr_references() {
             return None;
@@ -364,6 +437,7 @@ impl SegmentCandidate {
         }
         Some(Self {
             segment: segment.clone(),
+            cleaning: false,
         })
     }
 }
@@ -372,6 +446,9 @@ impl Drop for SegmentCandidate {
     fn drop(&mut self) {
         self.segment.decr_references();
         self.segment.set_hot();
+        if self.cleaning {
+            self.segment.protection.release_cleaner();
+        }
     }
 }
 
@@ -379,5 +456,35 @@ impl Deref for SegmentCandidate {
     type Target = Segment;
     fn deref(&self) -> &Self::Target {
         &self.segment
+    }
+}
+
+#[cfg(test)]
+mod wake_publication_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_wake_requests_reach_the_published_cleaner() {
+        let wake = Arc::new(CleanerWake::new());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_wake = wake.clone();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register(std::thread::current());
+            ready_tx.send(()).unwrap();
+            std::thread::park_timeout(std::time::Duration::from_secs(2));
+            done_tx.send(worker_wake.take_pending()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let wake = &wake;
+                scope.spawn(move || { for _ in 0..64 { wake.request(); } });
+            }
+        });
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+        wake.take_pending();
+        assert!(!wake.take_pending());
     }
 }

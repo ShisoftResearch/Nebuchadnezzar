@@ -1,4 +1,5 @@
 use super::ServerOptions;
+use crate::utils::persisted::decode_persisted_or_halt;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
@@ -93,10 +94,10 @@ impl StateMachineCtl for DatabaseCatalogSM {
     }
 
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        if let Some(map) = utils::serde::deserialize::<HashMap<String, DatabaseCatalogEntry>>(&data)
-        {
-            self.map = map;
-        }
+        self.map = decode_persisted_or_halt::<HashMap<String, DatabaseCatalogEntry>>(
+            "database catalog snapshot",
+            &data,
+        );
         future::ready(()).boxed()
     }
 
@@ -177,6 +178,32 @@ mod tests {
     use crate::utils::test_temp::temp_path;
     use super::*;
 
+    #[test]
+    fn catalog_recover_round_trips_a_snapshot() {
+        let mut sm = DatabaseCatalogSM::new("g");
+        assert!(sm.map.is_empty(), "an absent snapshot starts empty");
+        sm.map
+            .insert("db".into(), DatabaseCatalogEntry { name: "db".into() });
+        let expected = sm.map.clone();
+        let snapshot = sm.snapshot();
+        let mut restored = DatabaseCatalogSM::new("g");
+        restored.recover(snapshot).now_or_never().unwrap();
+        assert_eq!(restored.map, expected);
+    }
+
+    #[test]
+    fn catalog_recover_halts_on_an_undecodable_snapshot() {
+        let mut sm = DatabaseCatalogSM::new("g");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sm.recover(b"{\"db\":{}}".to_vec()));
+        }))
+        .unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "database catalog snapshot");
+    }
+
     fn base_opts() -> ServerOptions {
         ServerOptions {
             chunk_size: 1024,
@@ -190,6 +217,31 @@ mod tests {
             enable_recovery: false,
             disable_storage_locks: true,
         }
+    }
+
+    /// Raft snapshots go through `utils::serde`: serde_json in debug, serde_cbor
+    /// in release. `cargo test` and `cargo test --release` cover both codecs.
+    #[test]
+    fn catalog_snapshot_round_trips_under_the_active_codec() {
+        let mut sm = DatabaseCatalogSM {
+            sm_id: 1,
+            map: HashMap::new(),
+        };
+        for name in ["alpha", "beta"] {
+            sm.map.insert(
+                name.to_string(),
+                DatabaseCatalogEntry {
+                    name: name.to_string(),
+                },
+            );
+        }
+        let snapshot = StateMachineCtl::snapshot(&sm);
+        let mut restored = DatabaseCatalogSM {
+            sm_id: 1,
+            map: HashMap::new(),
+        };
+        futures::executor::block_on(StateMachineCtl::recover(&mut restored, snapshot));
+        assert_eq!(restored.map, sm.map);
     }
 
     #[test]

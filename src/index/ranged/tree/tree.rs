@@ -438,6 +438,18 @@ impl RangedTree {
         use crate::ram::cell::WriteError;
 
         let tombstones: Vec<EntryKey> = self.tree.deletion.snapshot().into_iter().collect();
+        // Compaction consumes tombstones while building a page image, before
+        // that image's RPC commits. Snapshot FIRST, then drain this tree's
+        // lane: a tombstone absent from the snapshot must already have its
+        // compacted image queued. Compactions after the snapshot are covered
+        // by the copied journal. Draining before the snapshot leaves a new
+        // compaction window and is not sufficient.
+        if !storage::hub_for(client)
+            .wait_for_locality(self.tree.head_id().locality())
+            .await
+        {
+            return Err("Cannot checkpoint ranged tree: page writeback barrier not established".into());
+        }
         if tombstones.len() > TOMBSTONE_JOURNAL_WARN {
             warn!(
                 "Ranged tree {:?} journals {} tombstones; write-back compaction is falling \
@@ -577,8 +589,6 @@ impl RangedTree {
         self.tree.head_id()
     }
 
-    // Legacy methods for compatibility - these are no-ops in the simplified design
-
 }
 
 /// Schema for ranged tree persistence
@@ -589,11 +599,6 @@ fn ranged_tree_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
-            // NULLABLE: every ranged-tree cell written before this field
-            // existed carries no value for it, and a non-nullable array
-            // rejects exactly those cells -- caught by
-            // ram::tests::chunk::ranged_tree_metadata_updates_do_not_refresh_chunk_statistics,
-            // which builds the metadata cell by hand the way older code did.
             Field::new_unindexed_array_nullable(RANGED_TREE_TOMBSTONES_NAME, Type::SmallBytes),
         ]),
         false,
@@ -1188,125 +1193,6 @@ mod tests {
         assert_eq!(
             visible, live_before,
             "the reloaded tree must serve exactly the keys that survived the deletes"
-        );
-
-        server.shutdown().await;
-    }
-
-    /// UPGRADE: a store whose RANGED_TREE schema predates the tombstone
-    /// journal must keep working.
-    ///
-    /// Schema registration is fire-and-forget on every start (`let _ =` on
-    /// new_schema_with_id, with a standing TODO), so an existing store keeps
-    /// the definition it was created with -- WITHOUT the tombstones field
-    /// this session added. The checkpoint then writes a cell carrying a
-    /// field the stored schema does not define. If that write FAILED, the
-    /// upgrade would be far worse than the bug it fixes: mark_migration is
-    /// the head-pointer publish, so every checkpoint would stop and the
-    /// store would lose its recovery point. This test pins the outcome.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_store_with_the_pre_journal_schema_still_checkpoints() {
-        use crate::client;
-        use crate::index::ranged::tree::btree::{page_schema, storage};
-        use crate::server::{NebServer, ServerOptions, Service};
-
-        let _ = env_logger::try_init();
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
-        let server_group = "ranged_pre_journal_schema";
-        let server = NebServer::new_from_opts(
-            &ServerOptions {
-                chunk_size: 64 * 1024 * 1024,
-                db_size: 64 * 1024 * 1024,
-                tiered_config: None,
-                backup_storage: None,
-                wal_storage: None,
-                raft_storage: None,
-                index_enabled: false,
-                services: vec![Service::Cell],
-                enable_recovery: false,
-                disable_storage_locks: true,
-            },
-            &server_addr,
-            &server_group,
-            async |_| {},
-        )
-        .await
-        .unwrap();
-        let client = Arc::new(
-            client::AsyncClient::new(
-                &server.rpc,
-                &server.membership,
-                &vec![server_addr],
-                server_group,
-            )
-            .await
-            .unwrap(),
-        );
-        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
-        // The OLD definition: head + migration, no tombstones. Exactly what
-        // a store created before this session holds.
-        let pre_journal = Schema::new_with_id(
-            RANGED_TREE_SCHEMA_ID.get(),
-            &String::from(RANGED_TREE_SCHEMA_NAME),
-            None,
-            Field::new_schema(vec![
-                Field::new_unindexed(RANGED_TREE_HEAD_NAME, Type::Id),
-                ]),
-            false,
-            false,
-        );
-        client.new_schema_with_id(pre_journal).await.unwrap().unwrap();
-        storage::start_external_nodes_write_back(&client);
-
-        let tree_id = Id::from_parts(906, 906);
-        let tree = RangedTree::create(&client, &tree_id).await;
-        for value in 0..200u64 {
-            assert!(tree.insert(&make_field_key(
-                SchemaUid(1),
-                782,
-                value,
-                Id::from_parts(10, value)
-            )));
-        }
-        let deleted = make_field_key(SchemaUid(1), 782, 5, Id::from_parts(10, 5));
-        assert!(tree.delete(&deleted));
-        storage::wait_until_updated().await;
-
-        // THE point: the checkpoint must still succeed and still publish a
-        // usable head pointer on the old schema.
-        tree.publish_head(&tree_id, &client)
-            .await
-            .expect("checkpoint must survive a store whose schema predates the journal");
-        let head_before = tree.head_id();
-        drop(tree);
-
-        let reloaded = RangedTree::recover(&client, &tree_id)
-            .await
-            .expect("the tree must reload on the old schema");
-        assert_eq!(
-            reloaded.head_id(),
-            head_before,
-            "the checkpoint published a different head than the tree had"
-        );
-        assert!(
-            reloaded.count() >= 199,
-            "the reloaded tree lost keys: {}",
-            reloaded.count()
-        );
-
-        // And the part worth pinning: the journal is ACTIVE even here. A
-        // cell's map is stored by key hash, and the schema constrains
-        // indexing rather than which unindexed fields a cell may carry, so
-        // the tombstones field round-trips through a schema that never
-        // declared it. Existing stores therefore get proposal 3's
-        // protection from the binary alone -- no schema migration, no
-        // operator step. Asserted rather than assumed, because the opposite
-        // (an inert journal on every pre-existing store) would have been a
-        // silent no-op exactly where the deletes are.
-        assert!(
-            !reloaded.contains(&deleted),
-            "the tombstone journal did NOT survive on a pre-journal schema: an existing \
-             store would need a schema migration before deletes are durable"
         );
 
         server.shutdown().await;

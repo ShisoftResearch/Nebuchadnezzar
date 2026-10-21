@@ -267,7 +267,7 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id_1), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     let idx_data_client = server.indexed_data_client();
     {
@@ -308,7 +308,7 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id_2), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     {
         let mut cursor = idx_data_client
@@ -2116,7 +2116,12 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Desc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Desc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -2184,6 +2189,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
             None,
             Some(3),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2251,6 +2257,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
             None,
             Some(2),
             Some(1),
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2372,6 +2379,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
             None,
             None,
             Some(10),
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2428,6 +2436,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
             None,
             Some(2),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2483,6 +2492,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
             None,
             Some(2),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2543,6 +2553,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
             None,
             Some(0),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2599,6 +2610,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
             None,
             Some(2),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2659,6 +2671,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
             None,
             None,
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2677,6 +2690,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
             None,
             None,
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2695,6 +2709,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
             None,
             Some(8),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2773,6 +2788,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
             Some(vec![hash_str(GROUP_FIELD)]),
             Some(2),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -2825,7 +2841,12 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
     let selection = parse_to_serde_expr("(not (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -2892,7 +2913,12 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         parse_to_serde_expr("(and (>= SCORE 2u64) (not (= TAG 1u64)))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -2950,7 +2976,12 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(not (= SCORE 3u64))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3010,7 +3041,12 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(in TAG 1u64 3u64 5u64)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3068,7 +3104,12 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
     let selection = parse_to_serde_expr("(between SCORE 2u64 5u64)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3126,7 +3167,12 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
     let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3177,7 +3223,12 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
     let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3234,7 +3285,12 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
     let selection = parse_to_serde_expr("(is-not-null OPTIONAL_SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3292,7 +3348,12 @@ async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
     let selection = parse_to_serde_expr("(is-null SCORE)").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3404,7 +3465,12 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Desc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Desc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3471,6 +3537,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
             None,
             Some(3),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -3526,7 +3593,12 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
 
@@ -3658,6 +3730,7 @@ async fn hashed_query_test() {
             SchemaUid(schema_id_1),
             hash_str(DATA_1),
             &OwnedValue::U64(target_value),
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap()
@@ -3672,6 +3745,7 @@ async fn hashed_query_test() {
             SchemaUid(schema_id_1),
             hash_str(DATA_1),
             &OwnedValue::U64(target_value),
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -3699,7 +3773,12 @@ async fn hashed_query_test() {
     let field_id = hash_str(DATA_1);
 
     let query_result = idx_data_client
-        .hashed_query(SchemaUid(schema_id_1), field_id, &query_value)
+        .hashed_query(
+            SchemaUid(schema_id_1),
+            field_id,
+            &query_value,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3732,7 +3811,12 @@ async fn hashed_query_test() {
     let non_existent_value = OwnedValue::U64(9999u64);
 
     let empty_result = idx_data_client
-        .hashed_query(SchemaUid(schema_id_1), field_id, &non_existent_value)
+        .hashed_query(
+            SchemaUid(schema_id_1),
+            field_id,
+            &non_existent_value,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3788,7 +3872,12 @@ async fn hashed_query_test() {
     let string_field_id = hash_str(string_field_name);
 
     let string_query_result = idx_data_client
-        .hashed_query(SchemaUid(schema_id_2), string_field_id, &string_query_value)
+        .hashed_query(
+            SchemaUid(schema_id_2),
+            string_field_id,
+            &string_query_value,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3922,7 +4011,12 @@ async fn hashed_query_supports_array_values() {
     let field_id = hash_str(TAGS);
 
     let direct_scalar_matches = idx_data_client
-        .hashed_query(SchemaUid(schema_id), field_id, &OwnedValue::U64(11))
+        .hashed_query(
+            SchemaUid(schema_id),
+            field_id,
+            &OwnedValue::U64(11),
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3932,7 +4026,12 @@ async fn hashed_query_supports_array_values() {
     assert!(!direct_scalar_matches.contains(&contains_thirteen));
 
     let direct_array_matches = idx_data_client
-        .hashed_query(SchemaUid(schema_id), field_id, &query_array)
+        .hashed_query(
+            SchemaUid(schema_id),
+            field_id,
+            &query_array,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -3943,7 +4042,12 @@ async fn hashed_query_supports_array_values() {
     assert!(!direct_array_matches.contains(&non_match));
 
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), scalar_expr, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            scalar_expr,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut queried_ids = vec![];
@@ -3955,7 +4059,12 @@ async fn hashed_query_supports_array_values() {
     assert!(queried_ids.contains(&contains_eleven));
 
     let mut array_cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), array_expr, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            array_expr,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut array_query_ids = vec![];
@@ -4042,7 +4151,12 @@ async fn ranged_query_supports_array_values() {
 
     let idx_data_client = server.indexed_data_client();
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut matched_ids = vec![];
@@ -4110,6 +4224,7 @@ async fn hashed_query_rejects_map_values() {
             SchemaUid(schema_id),
             hash_str(DATA_1),
             &OwnedValue::Map(OwnedMap::new()),
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .expect_err("map hashed query value should be rejected");
@@ -4199,7 +4314,7 @@ async fn bm25_search_returns_ranked_results() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4327,7 +4442,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4350,7 +4465,12 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4438,7 +4558,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4461,7 +4581,12 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4553,7 +4678,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4576,6 +4701,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             None,
             Some(2),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -4652,7 +4778,7 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4667,7 +4793,12 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4785,7 +4916,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4821,7 +4952,12 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -4907,7 +5043,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -4954,6 +5090,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
             None,
             Some(3),
             None,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -5066,7 +5203,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
             .unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5089,7 +5226,12 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -5199,7 +5341,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
             .unwrap();
     }
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5230,7 +5372,12 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap();
     let mut ids = vec![];
@@ -5313,7 +5460,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
         .unwrap()
         .unwrap();
 
-    for task in IndexBuilder::await_indices().await {
+    for task in server.indexer().unwrap().await_indices().await {
         match task {
             Ok(Ok(())) => {}
             other => panic!("Index task failed: {:?}", other),
@@ -5328,7 +5475,12 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
 
     let query_res = server
         .indexed_data_client()
-        .query_ids(SchemaUid(schema_id), selection, QueryOrdering::Asc)
+        .query_ids(
+            SchemaUid(schema_id),
+            selection,
+            QueryOrdering::Asc,
+            crate::index::verification::Verify::Predicate,
+        )
         .await;
     assert!(
         query_res.is_err(),
@@ -5389,6 +5541,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
                 None,
                 Some(limit),
                 None,
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap();
@@ -5411,6 +5564,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
                 None,
                 Some(limit),
                 None,
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap();
@@ -5422,7 +5576,12 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(SchemaUid(schema_id), selection.clone(), QueryOrdering::Desc)
+            .query_ids(
+                SchemaUid(schema_id),
+                selection.clone(),
+                QueryOrdering::Desc,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -5519,6 +5678,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
                 None,
                 Some(limit),
                 None,
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap();
@@ -5540,6 +5700,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
                 None,
                 Some(limit),
                 None,
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap();
@@ -5551,7 +5712,12 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(SchemaUid(schema_id), selection.clone(), QueryOrdering::Desc)
+            .query_ids(
+                SchemaUid(schema_id),
+                selection.clone(),
+                QueryOrdering::Desc,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -5725,6 +5891,7 @@ async fn aggregate_groups_and_computes_builtins() {
                         output_name: None,
                     },
                 ],
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap(),
@@ -5914,6 +6081,7 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
                         output_name: Some("avg".to_string()),
                     },
                 ],
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap(),
@@ -6009,6 +6177,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
                         output_name: None,
                     },
                 ],
+                crate::index::verification::Verify::Predicate,
             )
             .await
             .unwrap(),
@@ -6095,7 +6264,7 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
 
     let idx_data_client = server.indexed_data_client();
@@ -6188,15 +6357,16 @@ mod resumable_scan {
         (server, client)
     }
 
-    async fn page(
-        server: &NebServer,
-        schema_id: u32,
-        limit: usize,
-        after: Option<Id>,
-    ) -> ScanPage {
+    async fn page(server: &NebServer, schema_id: u32, limit: usize, after: Option<Id>) -> ScanPage {
         server
             .indexed_data_client()
-            .query_ids_resumable(SchemaUid(schema_id), every_third(), limit, after)
+            .query_ids_resumable(
+                SchemaUid(schema_id),
+                every_third(),
+                limit,
+                after,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .unwrap()
             .expect("an unindexed selection is resumable")
@@ -6302,15 +6472,35 @@ mod resumable_scan {
         let indexed = parse_to_serde_expr(&format!("(= {} 4u64)", DATA_1)).unwrap()[0].clone();
         let client = server.indexed_data_client();
         assert!(client
-            .query_ids_resumable(SchemaUid(7103), indexed, 10, None)
+            .query_ids_resumable(
+                SchemaUid(7103),
+                indexed,
+                10,
+                None,
+                crate::index::verification::Verify::Predicate
+            )
             .await
             .unwrap()
             .is_none());
         assert!(client
-            .query_ids_resumable(SchemaUid(7103), Expr::nothing(), 10, None)
+            .query_ids_resumable(
+                SchemaUid(7103),
+                Expr::nothing(),
+                10,
+                None,
+                crate::index::verification::Verify::Predicate
+            )
             .await
             .unwrap()
             .is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn construction_across_ranged_index_partitions() {
+        crate::index::ranged::tree::btree::set_tree_depth(2);
+        let (server, _client) = fixture(7104, 40_000).await;
+        eprintln!("BTREE_CONSTRUCTION_COMPLETE rows_cells=40000");
         server.shutdown().await;
     }
 
@@ -6338,6 +6528,50 @@ mod resumable_scan {
         for limit in [97usize, 4096, 5000, 20_000] {
             let pages = pages(&server, 7104, limit).await;
             let got: Vec<Id> = pages.iter().flat_map(|p| p.ids.clone()).collect();
+            let expected: std::collections::HashSet<Id> = want.iter().copied().collect();
+            let mut seen = std::collections::HashMap::new();
+            let mut duplicates = vec![];
+            let mut outside_fixture = vec![];
+            let mut before_resume = vec![];
+            let mut after = None;
+            for (page_index, page) in pages.iter().enumerate() {
+                for (offset, id) in page.ids.iter().enumerate() {
+                    if let Some(first) = seen.insert(*id, (page_index, offset)) {
+                        duplicates.push((*id, first, (page_index, offset)));
+                    }
+                    if !expected.contains(id) {
+                        outside_fixture.push((*id, page_index, offset));
+                    }
+                    if after.is_some_and(|cursor| *id <= cursor) {
+                        before_resume.push((*id, page_index, offset, after));
+                    }
+                }
+                after = page.next_cursor;
+            }
+            eprintln!(
+                "SCANPAGE_DIAGNOSTIC {}",
+                serde_json::json!({
+                    "limit_cells": limit,
+                    "trees": trees,
+                    "returned_cells": got.len(),
+                    "expected_cells": want.len(),
+                    "duplicate_cells": duplicates,
+                    "outside_fixture_cells": outside_fixture,
+                    "before_resume_cells": before_resume,
+                })
+            );
+            if got != want {
+                eprintln!(
+                    "SCANPAGE_FAILED_PAGES {}",
+                    serde_json::to_string(
+                        &pages
+                            .iter()
+                            .map(|page| (&page.ids, page.next_cursor))
+                            .collect::<Vec<_>>()
+                    )
+                    .unwrap()
+                );
+            }
             assert_eq!(got.len(), want.len(), "pages of {limit} across {trees} trees");
             assert_eq!(got, want, "pages of {limit} across {trees} trees");
         }

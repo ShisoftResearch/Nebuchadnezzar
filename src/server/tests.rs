@@ -1278,11 +1278,12 @@ pub async fn schema_persistence_multiple_restarts() {
 
     let server_group = String::from("multi_restart_test");
 
+    // The store belongs to one address; reopening it under another address
+    // is the explicit restore (`NebServer::restore_from_opts`).
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     for restart_num in 1..=3 {
         info!("=== RESTART CYCLE {} ===", restart_num);
 
-        // Use a unique port for each cycle to avoid "Address already in use" errors
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1353,7 +1354,6 @@ pub async fn schema_persistence_multiple_restarts() {
     // Final verification: restart one more time and check all schemas exist
     info!("=== FINAL VERIFICATION ===");
     {
-        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -1981,7 +1981,7 @@ async fn unloading_a_database_gives_its_threads_back() {
     // `database_runtimes` was a `PtrHashMap`, whose `remove` returns a CLONE and
     // leaves the original in the retired node -- so removal was not a release and
     // every database ever unloaded stayed resident for the life of the process,
-    // memory store included. It is a plain `RwLock<HashMap>` now, which drops on
+    // memory store included. Its immutable registry snapshot now releases values on
     // removal like anything else; the map was never on a request path, so there
     // was no lock-free property to trade away.
     assert!(
@@ -2184,10 +2184,15 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
     drop(dynamic);
     drop(server);
 
-    let server = NebServer::new_from_opts(
+    // The second start uses another address. That is the explicit restore: it
+    // makes the new address the only voter of the stored configuration and
+    // re-points the slots of the old identity (nothing of this runs
+    // automatically).
+    let server = NebServer::restore_from_opts(
         &opts,
         &crate::utils::test_port::unique_localhost_addr(),
         group,
+        false,
         async |_| {},
     )
     .await
@@ -2214,6 +2219,234 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
         missing.len()
     );
     server.shutdown().await;
+}
+
+/// B part 1: a store reopened under another address does not start by itself
+/// (no automatic adoption of its slots), and it does not start empty. The start
+/// ends with a typed error. The explicit restore starts it, and the cell that
+/// was written under the old address reads back.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_reopened_under_a_new_address_needs_the_explicit_restore() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "restore_new_address_group";
+    const SCHEMA: u32 = 9181;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA,
+            "restore_new_address_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        )
+    };
+    let id = Id::allocated(1, 7, 1);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    server.meta().schemas.register_internal_schema(schema());
+    let mut cell = {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(77);
+        OwnedCell::new_with_id(SchemaVid(SCHEMA), &id, value)
+    };
+    server.chunks().write_cell(&mut cell).expect("write");
+    server.shutdown().await;
+    drop(server);
+
+    let other = crate::utils::test_port::unique_localhost_addr();
+    // Control: without the restore the start fails with an error. It is not an
+    // empty start and not a silent re-pointing of the slots.
+    let refused = NebServer::new_from_opts(&opts, &other, group, async |_| {}).await;
+    assert!(
+        refused.is_err(),
+        "a store of another address started without the explicit restore"
+    );
+    drop(refused);
+
+    let restored = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {})
+        .await
+        .expect("the explicit restore starts the store under the new address");
+    restored.meta().schemas.register_internal_schema(schema());
+    let value = restored.chunks().read_cell(&id).expect("the cell reads back").to_owned();
+    assert_eq!(value.data["DATA"].u64().copied(), Some(77));
+    restored.shutdown().await;
+}
+
+/// Opens a store, writes one cell, closes it. Returns the options and the id.
+#[cfg(target_os = "linux")]
+async fn a_closed_store_with_one_cell(
+    dir: &tempfile::TempDir,
+    group: &str,
+    schema_id: u32,
+    disable_storage_locks: bool,
+) -> (ServerOptions, Id, String) {
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks,
+    };
+    let schema = Schema::new_with_id(
+        schema_id,
+        "restore_store_schema",
+        None,
+        Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+        false,
+        false,
+    );
+    let id = Id::allocated(1, 7, 1);
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+        .await
+        .unwrap();
+    server.meta().schemas.register_internal_schema(schema);
+    let mut value = OwnedValue::Map(OwnedMap::new());
+    value["DATA"] = OwnedValue::U64(77);
+    let mut cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
+    server.chunks().write_cell(&mut cell).expect("write");
+    server.shutdown().await;
+    drop(server);
+    (opts, id, address)
+}
+
+/// IC2: the restore takes the storage locks before it writes the raft store.
+/// A live server that holds the store makes the restore fail, and the raft
+/// store stays as it was.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_restore_refuses_a_store_that_a_live_server_holds() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::TempDir::new().unwrap();
+    let group = "restore_locked_group";
+    let (opts, _id, live_addr) = a_closed_store_with_one_cell(&dir, group, 9182, false).await;
+    let live = NebServer::new_from_opts(&opts, &live_addr, group, async |_| {})
+        .await
+        .unwrap();
+    let before = dir_digest(&dir.path().join("raft"));
+    let other = crate::utils::test_port::unique_localhost_addr();
+    let refused = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {}).await;
+    assert!(
+        matches!(refused, Err(ServerError::CannotAcquireStorageLock(_))),
+        "the restore ran on a store that a live server holds"
+    );
+    drop(refused);
+    assert_eq!(
+        before,
+        dir_digest(&dir.path().join("raft")),
+        "the refused restore changed the raft store"
+    );
+    live.shutdown().await;
+}
+
+/// IC4: a restore that stopped after the raft step and before the slot step
+/// completes on the second run. The first step is run alone here, as a stop
+/// between the two steps leaves it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_that_stopped_halfway_completes_on_the_second_run() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::TempDir::new().unwrap();
+    let group = "restore_halfway_group";
+    const SCHEMA: u32 = 9183;
+    let (opts, id, old_address) = a_closed_store_with_one_cell(&dir, group, SCHEMA, true).await;
+    let other = crate::utils::test_port::unique_localhost_addr();
+    let layout = database::DatabaseStorageLayout::from_options(&opts, group, group);
+    let removed = raft::restore_sole_voter(
+        raft_storage_for_layout(&layout),
+        &other,
+        raft::DEFAULT_SERVICE_ID,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.iter().any(|plane| !plane.removed.is_empty()),
+        "test setup: the first step must remove the old voter"
+    );
+    let restored = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {})
+        .await
+        .expect("the second run completes the restore");
+    // The slot step: every slot names the new server, none names the old one.
+    // (The cell read below goes through the local chunk and does not use the
+    // table, so it cannot show this step.)
+    let (table, _) = crate::slots::load_owner_vec(
+        &restored.group_name,
+        &restored.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .unwrap();
+    let table = table.expect("the store has a slot placement table");
+    let heir = bifrost_hasher::hash_str(&other);
+    let old = bifrost_hasher::hash_str(&old_address);
+    assert!(
+        table.iter().all(|owner| *owner != old),
+        "a slot still names the old server"
+    );
+    assert!(
+        table.iter().filter(|owner| **owner == heir).count() > 0
+            && table.iter().all(|owner| *owner == 0 || *owner == heir),
+        "not every slot names the new server"
+    );
+    restored.meta().schemas.register_internal_schema(Schema::new_with_id(
+        SCHEMA,
+        "restore_store_schema",
+        None,
+        Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+        false,
+        false,
+    ));
+    let value = restored.chunks().read_cell(&id).expect("the cell reads back").to_owned();
+    assert_eq!(value.data["DATA"].u64().copied(), Some(77));
+    restored.shutdown().await;
+}
+
+/// A cheap digest of a directory tree: names and sizes.
+#[cfg(target_os = "linux")]
+fn dir_digest(path: &std::path::Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    fn walk(path: &std::path::Path, out: &mut Vec<(String, u64)>) {
+        if let Ok(read) = std::fs::read_dir(path) {
+            for entry in read.flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((entry.path().to_string_lossy().to_string(), meta.len()));
+                }
+            }
+        }
+    }
+    walk(path, &mut out);
+    out.sort();
+    out
 }
 
 /// The indexed sibling of the restart test above: the RANGED INDEX of a
@@ -2277,7 +2510,11 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(SchemaUid(schema_id), 64)
+            .scan_schema(
+                SchemaUid(schema_id),
+                64,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .expect("scan should not error")
         {
@@ -2290,9 +2527,10 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2360,7 +2598,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
                 .expect("secondary big write");
         }
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     assert_eq!(
         scan_count(&dynamic, tiny_schema_id).await,
         tiny_count as usize,
@@ -2380,7 +2618,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2494,7 +2732,11 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(SchemaUid(schema_id), 64)
+            .scan_schema(
+                SchemaUid(schema_id),
+                64,
+                crate::index::verification::Verify::Predicate,
+            )
             .await
             .expect("scan should not error")
         {
@@ -2507,9 +2749,10 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2533,7 +2776,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
                 .expect("tombstone-test write");
         }
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     for schema in [LOW_SCHEMA, MID_SCHEMA, HIGH_SCHEMA] {
         assert_eq!(
             scan_count(&dynamic, schema).await,
@@ -2551,7 +2794,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
             .remove_cell(&cell_id(MID_SCHEMA, index))
             .expect("tombstone-test delete");
     }
-    let _ = IndexBuilder::await_all_indices().await;
+    let _ = dynamic.await_index_tasks().await;
     assert_eq!(
         scan_count(&dynamic, MID_SCHEMA).await,
         0,
@@ -2569,7 +2812,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2615,4 +2858,1046 @@ fn tiered_eviction_without_backup_storage_is_refused() {
     assert!(check_tiered_eviction_can_archive(true, Some("/tmp/backup")).is_ok());
     // No tier, no requirement: an in-memory store needs nowhere to spill.
     assert!(check_tiered_eviction_can_archive(false, None).is_ok());
+}
+
+mod write_fence_server_tests {
+    use super::*;
+    use crate::ram::cell::WriteError;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const DATA: &str = "DATA";
+    const PROTECTED_SCHEMA: u32 = 4401;
+    const OTHER_SCHEMA: u32 = 4402;
+
+    async fn fenced_fixture(
+        group: &str,
+    ) -> (
+        Arc<NebServer>,
+        Arc<client::AsyncClient>,
+        Arc<DatabaseRuntime>,
+    ) {
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = group.to_string();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                &server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        for (id, name) in [(PROTECTED_SCHEMA, "protected"), (OTHER_SCHEMA, "other")] {
+            client
+                .new_schema_with_id(Schema::new_with_id(
+                    id,
+                    name,
+                    None,
+                    Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
+                    false,
+                    false,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let runtime = server.current_database();
+        (server, client, runtime)
+    }
+
+    fn cell(schema: u32, id: &Id, value: u64) -> OwnedCell {
+        let mut map = OwnedValue::Map(OwnedMap::new());
+        map[DATA] = OwnedValue::U64(value);
+        OwnedCell::new_with_id(SchemaVid(schema), id, map)
+    }
+
+    fn protected() -> HashSet<SchemaUid> {
+        [SchemaUid(PROTECTED_SCHEMA)].into_iter().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mutating_rpc_is_refused_for_a_protected_schema_and_reads_still_work() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_rpc_surface").await;
+        let kept = Id::from_parts(1, 1);
+        let victim = Id::from_parts(1, 2);
+        client
+            .write_cell(cell(PROTECTED_SCHEMA, &kept, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .write_cell(cell(PROTECTED_SCHEMA, &victim, 1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let hold = runtime
+            .engage_write_fence(protected(), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let fenced: Result<(), WriteError> = Err(WriteError::DatabaseFenced);
+        let fresh = Id::from_parts(1, 3);
+        assert_eq!(
+            client
+                .write_cell(cell(PROTECTED_SCHEMA, &fresh, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced.clone()
+        );
+        assert_eq!(
+            client
+                .update_cell(cell(PROTECTED_SCHEMA, &kept, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced.clone()
+        );
+        assert_eq!(
+            client
+                .upsert_cell(cell(PROTECTED_SCHEMA, &kept, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced.clone()
+        );
+        assert_eq!(client.remove_cell(victim).await.unwrap(), fenced.clone());
+        let batch = client
+            .upsert_all_cells(vec![cell(PROTECTED_SCHEMA, &kept, 9)])
+            .await
+            .unwrap();
+        assert_eq!(batch[0].clone().map(|_| ()), fenced.clone());
+
+        // Nothing changed, and reads are untouched.
+        assert_eq!(
+            *client.read_cell(kept).await.unwrap().unwrap().data[DATA]
+                .u64()
+                .unwrap(),
+            1
+        );
+        assert!(client.read_cell(victim).await.unwrap().is_ok());
+        assert!(client.read_cell(fresh).await.unwrap().is_err());
+
+        // A schema outside the protected set is unaffected.
+        let other = Id::from_parts(2, 1);
+        client
+            .write_cell(cell(OTHER_SCHEMA, &other, 5))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .update_cell(cell(OTHER_SCHEMA, &other, 6))
+            .await
+            .unwrap()
+            .unwrap();
+        client.remove_cell(other).await.unwrap().unwrap();
+
+        assert!(runtime.write_fence().refused_writes() >= 5);
+        drop(hold);
+        client
+            .update_cell(cell(PROTECTED_SCHEMA, &kept, 2))
+            .await
+            .unwrap()
+            .unwrap();
+        client.remove_cell(victim).await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_writer_racing_the_fence_is_refused_and_never_slips_through() {
+        use crate::server::write_fence::trace::Event;
+        let _ = env_logger::try_init();
+        let rounds: usize = env::var("NEB_FENCE_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        // `NEB_FENCE_UNBOUNDED=1`: the insert lane never evicts, so a fast build
+        // fills the (small) store. Used to measure that exhaustion, not by default.
+        let unbounded = env::var("NEB_FENCE_UNBOUNDED").as_deref() == Ok("1");
+        let (server, client, runtime) = fenced_fixture("fence_race").await;
+        let fence = runtime.write_fence().clone();
+
+        const WRITERS: u64 = 6;
+        // Lane by writer: 0,3 insert fresh ids (and evict old ones, so the live
+        // set stays bounded while every attempt still names a NEW id); 1,4 update
+        // a cell of their own in place; 2,5 remove and re-put the SAME four
+        // shared ids, so a remove and a create race on one id from two writers --
+        // the shape of the check-then-act hole.
+        let own = |w: u64| Id::from_parts(4, 100 + w);
+        let shared = |n: u64| Id::from_parts(4, 200 + (n % 4));
+        let snapshot_ids: Vec<Id> =
+            vec![own(1), own(4), shared(0), shared(1), shared(2), shared(3)];
+        for id in &snapshot_ids {
+            client
+                .write_cell(cell(PROTECTED_SCHEMA, id, 0))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        const EVICT_BEHIND: u64 = 1_500;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_ok: Arc<parking_lot::Mutex<Vec<(u64, u64, &'static str)>>> = Arc::default();
+        let refused = Arc::new(AtomicU64::new(0));
+        let succeeded = Arc::new(AtomicU64::new(0));
+        let space_exhausted = Arc::new(AtomicU64::new(0));
+        let inserts_ok = Arc::new(AtomicU64::new(0));
+
+        let mut writers = Vec::new();
+        for w in 0..WRITERS {
+            let client = client.clone();
+            let fence = fence.clone();
+            let stop = stop.clone();
+            let observed_ok = observed_ok.clone();
+            let refused = refused.clone();
+            let succeeded = succeeded.clone();
+            let space_exhausted = space_exhausted.clone();
+            let inserts_ok = inserts_ok.clone();
+            writers.push(tokio::spawn(async move {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let (lane, note, outcome) = match w % 3 {
+                        0 => {
+                            // A NEW id on every attempt, refused or not.
+                            let id = Id::from_parts(3, w * 10_000_000 + n);
+                            let put = client
+                                .write_cell(cell(PROTECTED_SCHEMA, &id, n))
+                                .await
+                                .unwrap()
+                                .map(|_| ());
+                            if put.is_ok() {
+                                inserts_ok.fetch_add(1, Ordering::Relaxed);
+                                if !unbounded && n > EVICT_BEHIND {
+                                    let old = Id::from_parts(3, w * 10_000_000 + n - EVICT_BEHIND);
+                                    // A delete of a cell created a moment ago;
+                                    // refused or absent is fine, both are recorded.
+                                    match client.remove_cell(old).await.unwrap() {
+                                        Ok(()) => observed_ok.lock().push((
+                                            old.bits(),
+                                            fence.trace_tick(),
+                                            "evict",
+                                        )),
+                                        Err(WriteError::DatabaseFenced)
+                                        | Err(WriteError::CellDoesNotExisted) => {}
+                                        Err(other) => panic!("unexpected evict error {other:?}"),
+                                    }
+                                }
+                            }
+                            ("insert", id.bits(), put)
+                        }
+                        1 => {
+                            let id = own(w);
+                            (
+                                "update",
+                                id.bits(),
+                                client
+                                    .update_cell(cell(PROTECTED_SCHEMA, &id, n))
+                                    .await
+                                    .unwrap()
+                                    .map(|_| ()),
+                            )
+                        }
+                        _ => {
+                            let id = shared(n + w);
+                            match client.remove_cell(id).await.unwrap() {
+                                Ok(()) => {
+                                    observed_ok.lock().push((
+                                        id.bits(),
+                                        fence.trace_tick(),
+                                        "remove",
+                                    ));
+                                    let put = client
+                                        .upsert_cell(cell(PROTECTED_SCHEMA, &id, n))
+                                        .await
+                                        .unwrap()
+                                        .map(|_| ());
+                                    ("put-after-remove", id.bits(), put)
+                                }
+                                // Absent: create it (fresh create), the other writer may be
+                                // racing to do the same.
+                                Err(WriteError::CellDoesNotExisted) => {
+                                    let put = client
+                                        .upsert_cell(cell(PROTECTED_SCHEMA, &id, n))
+                                        .await
+                                        .unwrap()
+                                        .map(|_| ());
+                                    ("create-absent", id.bits(), put)
+                                }
+                                Err(e) => ("remove", id.bits(), Err(e)),
+                            }
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            succeeded.fetch_add(1, Ordering::Relaxed);
+                            observed_ok.lock().push((note, fence.trace_tick(), lane));
+                        }
+                        Err(WriteError::DatabaseFenced) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            tokio::task::yield_now().await;
+                        }
+                        Err(WriteError::CellDoesNotExisted)
+                            if lane == "update" || lane == "put-after-remove" =>
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                        // A release build outruns the segment compactor on this small
+                        // store (every update leaves a dead version behind). The typed
+                        // error is a legitimate answer: nothing was written, the trace
+                        // still records the admission, and the invariants below hold.
+                        Err(WriteError::CannotAllocateSpace) => {
+                            space_exhausted.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(other) => panic!("unexpected write error in lane {lane}: {other:?}"),
+                    }
+                }
+            }));
+        }
+
+        async fn snapshot(
+            client: &Arc<client::AsyncClient>,
+            runtime: &Arc<DatabaseRuntime>,
+            ids: &[Id],
+        ) -> (usize, Vec<Option<(u64, u64)>>) {
+            let mut cells = Vec::new();
+            for id in ids {
+                cells.push(match client.read_cell(*id).await.unwrap() {
+                    Ok(c) => Some((c.header.version, *c.data[DATA].u64().unwrap())),
+                    Err(_) => None,
+                });
+            }
+            (runtime.chunks().count(), cells)
+        }
+
+        let mut changed_under_fence = 0usize;
+        for round in 0..rounds {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            let hold = runtime
+                .engage_write_fence(protected(), Duration::from_secs(10))
+                .await
+                .unwrap();
+            let before = snapshot(&client, &runtime, &snapshot_ids).await;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            let after = snapshot(&client, &runtime, &snapshot_ids).await;
+            if before != after {
+                changed_under_fence += 1;
+                eprintln!("round {round}: the store changed under an engaged fence: {before:?} -> {after:?}");
+            }
+            drop(hold);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.await.unwrap();
+        }
+        let final_cells = runtime.chunks().count();
+        let live_bytes = runtime.chunks().total_live_bytes();
+
+        // ---- the proof, from the fence's own record ---------------------------------
+        let mut events = fence.take_trace();
+        events.sort_by_key(|e| match e {
+            Event::Admit { tick, .. }
+            | Event::Done { tick, .. }
+            | Event::Published { tick, .. }
+            | Event::Returned { tick, .. }
+            | Event::Released { tick, .. } => *tick,
+        });
+        let mut published = std::collections::BTreeMap::new();
+        let mut returned = std::collections::BTreeMap::new();
+        let mut released = std::collections::BTreeMap::new();
+        for e in &events {
+            match e {
+                Event::Published { gate, tick } => {
+                    published.insert(*gate, *tick);
+                }
+                Event::Returned { gate, tick } => {
+                    returned.insert(*gate, *tick);
+                }
+                Event::Released { gate, tick } => {
+                    released.insert(*gate - 1, *tick);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(published.len(), rounds, "every round published a fence");
+        assert_eq!(returned.len(), rounds, "every engage returned");
+        let mut done_tick: std::collections::HashMap<(u64, u64), Vec<u64>> = Default::default();
+        for e in &events {
+            if let Event::Done { note, seen, tick } = e {
+                done_tick.entry((*note, *seen)).or_default().push(*tick);
+            }
+        }
+        let is_fresh_insert = |note: u64| {
+            let id = Id::from_bits(note);
+            id.locality() == 3
+        };
+        let mut admits = 0usize;
+        let mut post_flag_refused = 0usize;
+        let mut pre_flag_counted = 0usize;
+        let mut in_flight_at_publication = 0usize;
+        // Fresh-id inserts around each publication: ticks within +-WINDOW of it.
+        const WINDOW: u64 = 600;
+        let mut fresh_before: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut fresh_after: std::collections::BTreeMap<u64, usize> = Default::default();
+        for e in &events {
+            let Event::Admit {
+                note,
+                seen,
+                counted,
+                refused: was_refused,
+                tick,
+            } = *e
+            else {
+                continue;
+            };
+            admits += 1;
+            if is_fresh_insert(note) {
+                // The round this admission is nearest to.
+                for (&gate, &publish) in &published {
+                    if tick.abs_diff(publish) <= WINDOW {
+                        if tick < publish && counted {
+                            *fresh_before.entry(gate).or_default() += 1;
+                        }
+                        if tick >= publish && was_refused {
+                            *fresh_after.entry(gate).or_default() += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            if seen & 1 == 1 {
+                // I1: the decision read a published fence => it was refused.
+                assert!(
+                    was_refused && !counted,
+                    "a write whose decision saw fence {seen} was not refused: {e:?}"
+                );
+                post_flag_refused += 1;
+            } else {
+                // I2: the decision read the gate before the next fence was
+                // published => the write finished before that fence's drain
+                // returned.
+                assert!(counted && !was_refused);
+                pre_flag_counted += 1;
+                let next_fence = seen + 1;
+                if let (Some(&publish), Some(&ret)) =
+                    (published.get(&next_fence), returned.get(&next_fence))
+                {
+                    let done = done_tick
+                        .get(&(note, seen))
+                        .and_then(|ticks| ticks.iter().copied().filter(|t| *t > tick).min())
+                        .unwrap_or_else(|| panic!("a counted write never finished: {e:?}"));
+                    assert!(
+                        done < ret,
+                        "FENCE HOLE: a write admitted at tick {tick} (decision saw gate {seen}, before fence {next_fence} \
+                         was published at {publish}) finished at {done}, after engage returned at {ret}: {e:?}"
+                    );
+                    if done > publish {
+                        in_flight_at_publication += 1;
+                    }
+                }
+            }
+        }
+
+        // Observations by the writer tasks while a fence was held: each must trace
+        // back to an admission BEFORE that fence's publication.
+        let mut late_observations = 0usize;
+        let mut by_admit: std::collections::HashMap<u64, Vec<(u64, u64)>> = Default::default();
+        for e in &events {
+            if let Event::Admit {
+                note,
+                seen,
+                counted: true,
+                tick,
+                ..
+            } = e
+            {
+                by_admit.entry(*note).or_default().push((*seen, *tick));
+            }
+        }
+        for (note, observed_at, lane) in observed_ok.lock().iter() {
+            for (&gate, &ret) in &returned {
+                let rel = released.get(&gate).copied().unwrap_or(u64::MAX);
+                if ret < *observed_at && *observed_at < rel {
+                    late_observations += 1;
+                    let (seen, admit_tick) = by_admit
+                        .get(note)
+                        .and_then(|a| {
+                            a.iter()
+                                .filter(|(_, t)| *t < *observed_at)
+                                .max_by_key(|(_, t)| *t)
+                        })
+                        .copied()
+                        .expect("an ok write has an admission");
+                    let publish = published[&gate];
+                    assert!(
+                        seen < gate,
+                        "{lane} write of {note:#x} observed ok at {observed_at} under fence {gate}: admitted at {admit_tick} \
+                         seeing gate {seen}, fence published at {publish}: a write admitted AFTER publication succeeded"
+                    );
+                    if late_observations == 1 {
+                        let finished = done_tick
+                            .get(&(*note, seen))
+                            .and_then(|t| t.iter().copied().filter(|t| *t > admit_tick).min());
+                        eprintln!(
+                            "FENCE_RACE_TIMELINE first late observation: {lane} {note:#x}: admitted(saw gate {seen}) tick {admit_tick} \
+                             < published(gate {gate}) tick {publish} < finished {finished:?} < engage returned {ret} \
+                             < observed by its task {observed_at} < released {rel}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let fresh_b: Vec<usize> = (0..rounds as u64)
+            .map(|r| fresh_before.get(&(2 * r + 1)).copied().unwrap_or(0))
+            .collect();
+        let fresh_a: Vec<usize> = (0..rounds as u64)
+            .map(|r| fresh_after.get(&(2 * r + 1)).copied().unwrap_or(0))
+            .collect();
+        let (b_min, a_min) = (
+            fresh_b.iter().min().copied().unwrap_or(0),
+            fresh_a.iter().min().copied().unwrap_or(0),
+        );
+        let (b_sum, a_sum): (usize, usize) = (fresh_b.iter().sum(), fresh_a.iter().sum());
+        eprintln!(
+            "FENCE_RACE rounds={rounds} admits={admits} post_flag_refused={post_flag_refused} pre_flag_counted={pre_flag_counted} \
+             in_flight_at_publication={in_flight_at_publication} late_observations={late_observations} \
+             task_refused={} task_succeeded={} content_changed_rounds={changed_under_fence} \
+             fresh_insert_admits_within_{WINDOW}_ticks_before_publish(min/mean)={b_min}/{:.1} \
+             fresh_insert_refusals_within_{WINDOW}_ticks_after_publish(min/mean)={a_min}/{:.1} \
+             inserts_ok={} space_exhausted={} final_cells={final_cells} live_bytes={live_bytes} unbounded={unbounded}",
+            refused.load(Ordering::Relaxed),
+            succeeded.load(Ordering::Relaxed),
+            b_sum as f64 / rounds as f64,
+            a_sum as f64 / rounds as f64,
+            inserts_ok.load(Ordering::Relaxed),
+            space_exhausted.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            changed_under_fence, 0,
+            "the store (count, version or value) changed under an engaged fence"
+        );
+        assert!(post_flag_refused > 0, "the fence refused writers");
+        assert!(
+            pre_flag_counted > 0 && succeeded.load(Ordering::Relaxed) > 0,
+            "writers made progress between fences"
+        );
+        assert!(
+            b_sum > 0 && a_sum > 0,
+            "fresh-id inserts must straddle the publication (before: {b_sum}, after: {a_sum})"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cell_walk_visits_exactly_the_live_cells_with_bounded_pages() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("cell_walk").await;
+        // Neither fixture schema is scannable and the index service is off: the
+        // walk must not depend on the ranged index at all.
+        let mut expected = std::collections::BTreeSet::new();
+        for n in 0..2_000u64 {
+            let schema = if n % 2 == 0 {
+                PROTECTED_SCHEMA
+            } else {
+                OTHER_SCHEMA
+            };
+            // Spread over many localities so several chunks are populated.
+            let id = Id::from_parts(n % 97, n + 1);
+            client
+                .write_cell(cell(schema, &id, n))
+                .await
+                .unwrap()
+                .unwrap();
+            expected.insert(id.bits());
+        }
+        // Delete some: they must not be visited.
+        for n in (0..2_000u64).step_by(7) {
+            let id = Id::from_parts(n % 97, n + 1);
+            client.remove_cell(id).await.unwrap().unwrap();
+            expected.remove(&id.bits());
+        }
+
+        let mut scan = client.cell_id_scan().await.unwrap();
+        let mut seen = Vec::new();
+        let mut pages = 0usize;
+        while let Some(page) = scan.next_page(50).await.unwrap() {
+            assert!(page.len() <= 50, "a page never exceeds the requested size");
+            seen.extend(page.into_iter().map(|id| id.bits()));
+            pages += 1;
+        }
+        assert!(pages > 1, "paging actually paged");
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "no cell is visited twice");
+        assert_eq!(
+            sorted
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+
+        // The visited count is the number of live entries in the cell index.
+        let live: usize = (0..runtime.chunks().chunk_count())
+            .map(|chunk| runtime.chunks().live_cell_ids_of_chunk(chunk).len())
+            .sum();
+        assert_eq!(seen.len(), live);
+        assert_eq!(scan.not_owned_skipped(), 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_or_unknown_scan_cursor_is_an_error_not_an_empty_page() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("cell_walk_cursor").await;
+        let servers = {
+            let (members, _) = client
+                .conshash
+                .membership()
+                .all_members(true)
+                .await
+                .unwrap();
+            members
+        };
+        let rpc = client.client_by_server_id(servers[0].id).await.unwrap();
+        let cursor = rpc.cell_scan_open().await.unwrap();
+        rpc.cell_scan_close(cursor).await.unwrap();
+        assert!(rpc.cell_scan_next(cursor, 10).await.unwrap().is_err());
+        assert!(rpc.cell_scan_next(u64::MAX, 10).await.unwrap().is_err());
+        server.shutdown().await;
+    }
+
+    fn proc_status_kb(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with(field))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap()
+    }
+
+    /// Measures the transient memory of paging one chunk's ids. Ignored by
+    /// default (it writes millions of cells); run with
+    /// `NEB_WALK_CELLS=5000000 cargo test ... -- --ignored measure_cell_walk_memory`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn measure_cell_walk_memory() {
+        let cells: u64 = env::var("NEB_WALK_CELLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000_000);
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &"walk_memory".to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let runtime = server.current_database();
+        runtime
+            .meta()
+            .schemas
+            .debug_only_new_schema(Schema::new_with_id(
+                PROTECTED_SCHEMA,
+                "m",
+                None,
+                Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
+                false,
+                false,
+            ));
+        for n in 0..cells {
+            let mut c = cell(PROTECTED_SCHEMA, &Id::from_parts(5, n + 1), n);
+            runtime.chunks().write_cell(&mut c).unwrap();
+        }
+        let populated = (0..runtime.chunks().chunk_count())
+            .map(|i| (i, runtime.chunks().list[i].count()))
+            .filter(|(_, n)| *n > 0)
+            .collect::<Vec<_>>();
+        let (chunk, in_chunk) = populated[0];
+        // Reset the high-water mark, then page the chunk.
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let rss_before = proc_status_kb("VmRSS:");
+        let started = std::time::Instant::now();
+        let ids = runtime.chunks().live_cell_ids_of_chunk(chunk);
+        let elapsed = started.elapsed();
+        let hwm = proc_status_kb("VmHWM:");
+        let retained = proc_status_kb("VmRSS:") - rss_before;
+        println!(
+            "WALK_MEMORY cells_in_chunk={} ids={} elapsed_ms={} transient_peak_kb={} retained_kb={} peak_bytes_per_cell={:.1} retained_bytes_per_cell={:.1}",
+            in_chunk,
+            ids.len(),
+            elapsed.as_millis(),
+            hwm.saturating_sub(rss_before),
+            retained,
+            (hwm.saturating_sub(rss_before) * 1024) as f64 / in_chunk as f64,
+            (retained * 1024) as f64 / in_chunk as f64,
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cluster_fence_is_renewed_released_and_lapses_when_abandoned() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("fence_cluster").await;
+        let id = Id::from_parts(1, 1);
+        client
+            .write_cell(cell(PROTECTED_SCHEMA, &id, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let families = [PROTECTED_SCHEMA];
+
+        // Held and renewed well past one lease length: still fenced.
+        let fence = client
+            .engage_write_fence(
+                &families,
+                Duration::from_secs(5),
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(
+            client
+                .update_cell(cell(PROTECTED_SCHEMA, &id, 2))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            Err(WriteError::DatabaseFenced)
+        );
+        assert!(!fence.is_lost());
+        fence
+            .confirm()
+            .await
+            .expect("a fence renewed all along confirms");
+        // A second fence on the same database is refused, not stacked.
+        assert!(client
+            .engage_write_fence(&families, Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .is_err());
+        fence.release().await;
+        client
+            .update_cell(cell(PROTECTED_SCHEMA, &id, 3))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Abandoned (dropped without release): the lease lapses by itself.
+        let fence = client
+            .engage_write_fence(
+                &families,
+                Duration::from_secs(5),
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+        drop(fence);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        client
+            .update_cell(cell(PROTECTED_SCHEMA, &id, 4))
+            .await
+            .unwrap()
+            .unwrap();
+        server.shutdown().await;
+    }
+
+    /// A lease can lapse between two renewals: the member lifts the fence, writes
+    /// land, and the holder has not been told yet. The check a copy makes before
+    /// it trusts itself must see that, not only what a renewal noticed so far.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_that_lapses_unnoticed_is_caught_before_the_copy_is_trusted() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("fence_lapse_unnoticed").await;
+        let id = Id::from_parts(1, 1);
+        client
+            .write_cell(cell(PROTECTED_SCHEMA, &id, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fence = client
+            .engage_write_fence(
+                &[PROTECTED_SCHEMA],
+                Duration::from_secs(5),
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+        fence.stop_renewing_for_test();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        // The member lifted it: a write to the copied family lands.
+        client
+            .update_cell(cell(PROTECTED_SCHEMA, &id, 2))
+            .await
+            .unwrap()
+            .unwrap();
+        // No renewal ran, so the background flag cannot know...
+        assert!(!fence.is_lost());
+        // ...and the check a copy makes before trusting itself asks the members.
+        let refused = fence.confirm().await;
+        assert!(
+            refused.is_err(),
+            "a lapsed lease was confirmed: {refused:?}"
+        );
+        assert!(fence.is_lost(), "a failed confirmation is remembered");
+        server.shutdown().await;
+    }
+
+    /// The fence names families by the body a write carries. A body of an
+    /// unprotected family written over the id of a protected cell replaces that
+    /// cell all the same, so the stored cell's family has to count too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_write_cannot_replace_a_protected_cell_with_another_family() {
+        let _ = env_logger::try_init();
+        let (server, client, runtime) = fenced_fixture("fence_cross_family").await;
+        let id = Id::from_parts(1, 7);
+        client
+            .write_cell(cell(PROTECTED_SCHEMA, &id, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let version = client.head_cell(id).await.unwrap().unwrap().version;
+        let hold = runtime
+            .engage_write_fence(protected(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let fenced: Result<(), WriteError> = Err(WriteError::DatabaseFenced);
+        assert_eq!(
+            client
+                .upsert_cell(cell(OTHER_SCHEMA, &id, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced
+        );
+        assert_eq!(
+            client
+                .update_cell(cell(OTHER_SCHEMA, &id, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced
+        );
+        assert_eq!(
+            client
+                .compare_version_and_update_cell(id, version, cell(OTHER_SCHEMA, &id, 9))
+                .await
+                .unwrap()
+                .map(|_| ()),
+            fenced
+        );
+        let stored = client.read_cell(id).await.unwrap().unwrap();
+        assert_eq!(stored.header.schema, SchemaVid(PROTECTED_SCHEMA));
+        assert_eq!(*stored.data[DATA].u64().unwrap(), 1);
+        drop(hold);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_cell_count_matches_the_walk() {
+        let _ = env_logger::try_init();
+        let (server, client, _runtime) = fenced_fixture("live_count").await;
+        for n in 1..=300u64 {
+            client
+                .write_cell(cell(OTHER_SCHEMA, &Id::from_parts(n % 11, n), n))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut scan = client.cell_id_scan().await.unwrap();
+        let mut seen = 0u64;
+        while let Some(page) = scan.next_page(64).await.unwrap() {
+            seen += page.len() as u64;
+        }
+        assert_eq!(seen, client.live_cell_count().await.unwrap());
+        server.shutdown().await;
+    }
+}
+
+#[test]
+fn server_options_require_storage_lock_choice() {
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        raft_storage: None,
+        services: vec![],
+        index_enabled: false,
+        enable_recovery: false,
+        disable_storage_locks: false,
+    };
+    let mut wire = serde_json::to_value(&opts).unwrap();
+    let current: ServerOptions = serde_json::from_value(wire.clone()).unwrap();
+    assert!(!current.disable_storage_locks);
+    wire.as_object_mut()
+        .unwrap()
+        .remove("disable_storage_locks");
+    assert!(serde_json::from_value::<ServerOptions>(wire).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn database_catalog_initialization_retries_election_retry_exhaustion() {
+    let group = "catalog_election_retry";
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &address,
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let client = client::AsyncClient::new(&server.rpc, &server.membership, &vec![address], group)
+        .await
+        .unwrap();
+    let mut attempts = 0;
+    initialize_database_catalog(|| {
+        attempts += 1;
+        // Model the command's exhausted leader-discovery window. The next
+        // attempt uses the real catalog command after the plane is ready.
+        let first_attempt = attempts == 1;
+        let client = &client;
+        async move {
+            if first_attempt {
+                Err(sm_master::ExecError::TooManyRetry)
+            } else {
+                client.ensure_database().await
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        client.get_database(group).await.unwrap().unwrap().name,
+        group
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn database_catalog_initialization_preserves_storage_errors() {
+    let mut attempts = 0;
+    let result = initialize_database_catalog(|| {
+        attempts += 1;
+        async {
+            Err(sm_master::ExecError::StorageFailure(
+                "persist failed".into(),
+            ))
+        }
+    })
+    .await;
+    assert!(
+        matches!(result, Err(sm_master::ExecError::StorageFailure(reason)) if reason == "persist failed")
+    );
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn a_final_peer_discard_releases_segment_pins() {
+    let chunks = crate::ram::chunk::Chunks::new_dummy(1, 4 * crate::ram::segs::SEGMENT_SIZE);
+    chunks.stop_background();
+    let txn = crate::server::transactions::test_hlc(9845, 1);
+    let segment = chunks.list[0].segments().pop().unwrap();
+    segment.protection.retain_transaction(&txn);
+    assert_eq!(chunks.pinned_segments(), 1);
+    let bracket = crate::ram::recovery::InDoubtBracket {
+        txn,
+        chunks: vec![0],
+        cells: vec![],
+        participants: vec![],
+    };
+    super::discard_in_doubt(&chunks, &bracket, "all peers returned a final abort");
+    assert_eq!(chunks.pinned_segments(), 0);
+    assert_eq!(chunks.pinned_bytes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn independent_database_initializers_do_not_wait_for_another_database() {
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![crate::server::Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &crate::utils::test_port::unique_localhost_addr(),
+        "database_init_partitions",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let blocked = server.runtime_initializer("blocked");
+    let held = blocked.lock().await;
+    let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            server.ensure_database_runtime("independent"),
+            server.ensure_database_runtime("independent")
+        )
+    })
+    .await
+    .expect("an unrelated database initializer must progress");
+    assert!(
+        Arc::ptr_eq(&one.unwrap(), &two.unwrap()),
+        "the same database must publish one runtime"
+    );
+    drop(held);
+    server.shutdown().await;
 }

@@ -10,6 +10,7 @@ set -o pipefail
 # Handle Ctrl+C and other signals
 CURRENT_TEST_PID=""
 CURRENT_TEST_NAME=""
+RUN_TMP=$(mktemp -d "${TMPDIR:-/tmp}/neb-isolated.XXXXXX") || exit 1
 cleanup() {
     echo ""
     if [ -n "$CURRENT_TEST_NAME" ]; then
@@ -30,7 +31,8 @@ cleanup() {
     jobs -p | xargs -r kill -TERM 2>/dev/null || true
     
     # Clean up temp file
-    rm -f /tmp/test_output.log
+    rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test-binary"
+    rmdir "$RUN_TMP" 2>/dev/null || true
     
     echo "Cleanup complete"
     exit 130
@@ -58,16 +60,28 @@ echo "=========================================="
 echo ""
 
 # Build tests once and stop immediately on compilation failure.
-BUILD_LOG=$(mktemp /tmp/neb-isolated-build.XXXXXX.log)
-BUILD_STAMP=$(mktemp /tmp/neb-isolated-build.XXXXXX.stamp)
+BUILD_LOG=$(mktemp "$RUN_TMP/build.XXXXXX.log")
+BUILD_STAMP=$(mktemp "$RUN_TMP/build.XXXXXX.stamp")
 touch "$BUILD_STAMP"
 
+CARGO_BUILD_COMMAND=(cargo)
+if [ -n "${TEST_BUILD_LOCK:-}" ]; then
+    CARGO_BUILD_COMMAND=(flock "$TEST_BUILD_LOCK" cargo)
+fi
+
+if [ -n "${TEST_PREBUILT_BINARY:-}" ]; then
+    TEST_BINARY="$TEST_PREBUILT_BINARY"
+    if [ ! -x "$TEST_BINARY" ]; then
+        echo "Error: prebuilt test binary is not executable"
+        exit 1
+    fi
+else
 echo "Building tests..."
 if [ -z "$FILTER" ]; then
-    cargo test --lib --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    "${CARGO_BUILD_COMMAND[@]}" test --lib --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
     BUILD_EXIT_CODE=$?
 else
-    cargo test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    "${CARGO_BUILD_COMMAND[@]}" test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
     BUILD_EXIT_CODE=$?
 fi
 
@@ -84,7 +98,7 @@ grep -E "Compiling|Finished" "$BUILD_LOG" || true
 # Find the test binary
 # Try to use jq if available, otherwise fall back to binaries built after BUILD_STAMP
 if command -v jq >/dev/null 2>&1; then
-    TEST_BINARY=$(cargo test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
+    TEST_BINARY=$("${CARGO_BUILD_COMMAND[@]}" test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
         jq -r 'select(.profile.test == true) | select(.target.kind | contains(["lib"])) | .executable' | \
         grep -v "^null$" | head -1)
 fi
@@ -102,8 +116,12 @@ if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
     fi
 fi
 
+fi
+
 rm -f "$BUILD_LOG" "$BUILD_STAMP"
 
+cp "$TEST_BINARY" "$RUN_TMP/test-binary" || exit 1
+TEST_BINARY="$RUN_TMP/test-binary"
 echo "Using test binary: $TEST_BINARY"
 echo ""
 
@@ -113,6 +131,14 @@ if [ -z "$FILTER" ]; then
     TEST_LIST=$("$TEST_BINARY" --list 2>/dev/null | grep ': test$' | sed 's/: test$//')
 else
     TEST_LIST=$("$TEST_BINARY" --list 2>/dev/null | grep "$FILTER" | grep ': test$' | sed 's/: test$//')
+fi
+
+# An empty selection must not produce a successful test run.
+if [ -z "$TEST_LIST" ]; then
+    echo "Error: no tests matched filter: ${FILTER:-<none>}"
+    rm -f "$RUN_TMP/test-binary"
+    rmdir "$RUN_TMP" 2>/dev/null || true
+    exit 1
 fi
 
 # Count total tests
@@ -144,7 +170,7 @@ while IFS= read -r test_name; do
     # Run test with timeout (directly using test binary)
     # Run in background so we can track PID and handle signals
     # Use PIPESTATUS to capture the test exit code, not tee's exit code
-    (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --exact --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > /tmp/test_exit_code.txt) | tee /tmp/test_output.log &
+    (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --exact --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > "$RUN_TMP/test_exit_code.txt") | tee "$RUN_TMP/test_output.log" &
     CURRENT_TEST_NAME="$test_name"
     CURRENT_TEST_PID=$!
     
@@ -154,12 +180,12 @@ while IFS= read -r test_name; do
     CURRENT_TEST_NAME=""
     
     # Read the actual test exit code (captured by the subprocess)
-    TEST_EXIT_CODE=$(cat /tmp/test_exit_code.txt 2>/dev/null || echo "1")
+    TEST_EXIT_CODE=$(cat "$RUN_TMP/test_exit_code.txt" 2>/dev/null || echo "1")
     
     if [ "$TEST_EXIT_CODE" -eq 0 ]; then
         # Check if test was actually ignored (look for "test result: ok. 0 passed" with ignored > 0)
-        if grep -q "test result: ok. 0 passed; 0 failed; 1 ignored" /tmp/test_output.log || \
-           grep -q "... ignored$" /tmp/test_output.log; then
+        if grep -q "test result: ok. 0 passed; 0 failed; 1 ignored" "$RUN_TMP/test_output.log" || \
+           grep -q "... ignored$" "$RUN_TMP/test_output.log"; then
              echo -e "${YELLOW}IGNORED${NC}"
              IGNORED=$((IGNORED + 1))
          else
@@ -187,7 +213,7 @@ while IFS= read -r test_name; do
     sleep 0.5
     
     # Clean up temp files
-    rm -f /tmp/test_output.log /tmp/test_exit_code.txt
+    rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test_exit_code.txt"
 done < "$TEST_LIST_FILE"
 
 # Print summary
@@ -220,7 +246,8 @@ fi
 echo ""
 
 # Clean up temp files
-rm -f /tmp/test_output.log /tmp/test_exit_code.txt "$TEST_LIST_FILE"
+rm -f "$RUN_TMP/test_output.log" "$RUN_TMP/test_exit_code.txt" "$RUN_TMP/test-binary" "$TEST_LIST_FILE"
+rmdir "$RUN_TMP"
 
 # Exit with error if any tests failed
 if [ $FAILED -gt 0 ] || [ $TIMED_OUT -gt 0 ]; then

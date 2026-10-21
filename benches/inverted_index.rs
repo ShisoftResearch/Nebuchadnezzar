@@ -9,8 +9,6 @@ use bifrost::raft::disk::DiskOptions;
 use bifrost::rpc::Server;
 use bifrost_hasher::hash_str;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-#[cfg(not(debug_assertions))]
-use lightning::map::{Map, PtrHashMap as LFHashMap};
 use neb::client::AsyncClient;
 use neb::index::full_text::shard::InvertedIndexer;
 use neb::index::full_text::{build_index_meta, FullTextIndexMeta};
@@ -38,69 +36,11 @@ const SAMPLE_TEXTS: &[&str] = &[
     "Indexing performance directly impacts search latency and overall system throughput.",
 ];
 
-// Helper to register a schema (works in both debug and release mode)
-// In release mode, we bypass the debug-only check by using unsafe to access private fields
-fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema) {
-    #[cfg(debug_assertions)]
-    {
-        // In debug mode, use the public API
-        schemas.debug_only_new_schema(schema);
-        return;
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        // In release mode, we need to bypass the check
-        // We'll use the public API but catch the panic, or use a workaround
-        // Actually, let's just use the public method and handle it differently
-        // Since new_schema panics in release, we'll use a different approach
-
-        // For benchmarks, we can use a feature flag or just accept that schemas
-        // need to be registered differently. Let's use a workaround by accessing
-        // the internal structure via unsafe (safe in benchmark context)
-        use neb::ram::schema::SchemaUid;
-        use std::mem;
-        use std::sync::Arc;
-
-        // Define internal structures matching the private ones
-        type SchemaRef = Arc<neb::ram::schema::Schema>;
-
-        struct LocalSchemasMapInternal {
-            schema_map: LFHashMap<u32, SchemaRef>,
-            name_map: LFHashMap<String, u32>,
-        }
-
-        struct LocalSchemasCacheInternal {
-            map: Arc<LocalSchemasMapInternal>,
-        }
-
-        // Transmute to access private fields
-        let internal: &LocalSchemasCacheInternal = unsafe { mem::transmute(schemas) };
-
-        let name = schema.name.clone();
-        let id = schema.vid;
-
-        // Check if schema already exists
-        if let Some(existing_id) = internal.map.name_map.get(&name) {
-            if existing_id != id {
-                return; // Skip on collision
-            }
-        }
-
-        // Insert into maps
-        internal.map.name_map.insert(name.clone(), id);
-        internal.map.schema_map.insert(id, Arc::new(schema));
-    }
-}
-
 // Helper to create test chunks
 fn create_test_chunks() -> Arc<Chunks> {
     let schemas = LocalSchemasCache::new_local("");
-    register_schema(
-        &schemas,
-        neb::index::full_text::shard::inverted_segment_schema(),
-    );
-    register_schema(&schemas, neb::index::full_text::inverted_stats_schema());
+    schemas.register_internal_schema(neb::index::full_text::shard::inverted_segment_schema());
+    schemas.register_internal_schema(neb::index::full_text::inverted_stats_schema());
 
     Chunks::new(
         1,

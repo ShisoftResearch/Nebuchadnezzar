@@ -6,6 +6,17 @@
 //! bifrost decides WHICH slots move; this module answers what they weigh,
 //! whether the recipient will take them, and actually moves them.
 
+use lightning::map::{Map, PtrHashMap};
+type JoiningMembers = PtrHashMap<u64, bool>;
+
+fn claim_joiner(inflight: &JoiningMembers, member: u64) -> bool {
+    inflight.try_insert(member, true).is_none()
+}
+
+fn release_joiner(inflight: &JoiningMembers, member: u64) {
+    inflight.remove(&member);
+}
+
 use crate::client::AsyncClient;
 use crate::migration::{reshard_slots, MigrationPlan};
 use bifrost::conshash::fill::{FillFabric, FillReport, JoinFiller, PlacementView};
@@ -156,6 +167,12 @@ impl crate::server::NebServer {
         if !self.raft_service.is_leader_for_real().await {
             return Err("not the placement leader; the leader runs the fill".to_string());
         }
+        // The fill reads the placement and the migration freeze from any
+        // member. Another client may have written them a moment ago (the
+        // operator thaws the migrations, then calls the fill). Raise the read
+        // cursor of this client to the position of the raft leader first, so
+        // that no lagging follower serves the inputs (IC7).
+        self.neb_client.raft_client.refresh_leader(0).await;
 
         let members: Vec<u64> = self
             .membership
@@ -245,8 +262,7 @@ impl crate::server::NebServer {
         // "committed to None". A duplicate event during the stability window
         // coalesces into the pending fill, which reads the placement fresh
         // when it fires anyway.
-        let inflight: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> =
-            Default::default();
+        let inflight = Arc::new(JoiningMembers::with_capacity(16));
         let subscription = self
             .membership
             .on_group_member_joined(
@@ -255,7 +271,7 @@ impl crate::server::NebServer {
                     let inflight = inflight.clone();
                     async move {
                         let Some(server) = weak.upgrade() else { return };
-                        if !inflight.lock().unwrap().insert(member.id) {
+                        if !claim_joiner(&inflight, member.id) {
                             debug!(
                                 "join fill for {} already pending; coalescing the duplicate \
                                  join event",
@@ -268,13 +284,10 @@ impl crate::server::NebServer {
                             // Release on every exit, panic included: a leaked
                             // entry would silently disable fills for this
                             // joiner until restart.
-                            struct Release(
-                                Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
-                                u64,
-                            );
+                            struct Release(Arc<JoiningMembers>, u64);
                             impl Drop for Release {
                                 fn drop(&mut self) {
-                                    self.0.lock().unwrap().remove(&self.1);
+                                    release_joiner(&self.0, self.1);
                                 }
                             }
                             let _release = Release(inflight.clone(), member.id);
@@ -337,5 +350,48 @@ impl PlacementView for GroupScopedPlacement {
                 .map_err(|e| format!("migration_control: {e:?}"))
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod join_partition_tests {
+    use super::*;
+
+    #[test]
+    fn simultaneous_join_claims_have_one_owner() {
+        let members = JoiningMembers::with_capacity(16);
+        let start = std::sync::Barrier::new(8);
+        let winners = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                start.wait();
+                claim_joiner(&members, 42)
+            })).collect();
+            threads.into_iter().map(|thread| usize::from(thread.join().unwrap())).sum::<usize>()
+        });
+        assert_eq!(winners, 1);
+        release_joiner(&members, 42);
+        assert!(claim_joiner(&members, 42));
+    }
+
+    #[test]
+    fn join_fill_claims_coalesce_only_the_same_member() {
+        let members = Arc::new(JoiningMembers::with_capacity(16));
+        let first = 1u64;
+        let second = 2;
+        assert!(claim_joiner(&members, first));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = members.clone();
+        let thread = std::thread::spawn(move || {
+            assert!(claim_joiner(&worker, second));
+            assert!(!claim_joiner(&worker, second));
+            release_joiner(&worker, second);
+            assert!(claim_joiner(&worker, second));
+            release_joiner(&worker, second);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_joiner(&members, first);
+        thread.join().unwrap();
+        assert!(result.is_ok());
     }
 }

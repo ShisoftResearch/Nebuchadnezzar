@@ -41,7 +41,7 @@ pub(crate) static CELLS_READ: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Cells read so far; take two readings and subtract to measure one query.
-pub(crate) fn cells_read_count() -> usize {
+pub fn cells_read_count() -> usize {
     CELLS_READ.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -189,7 +189,13 @@ impl IndexedDataClient {
                 break;
             }
             let cells = self
-                .read_cells_from_ids(&pending, &vec![], &Expr::nothing(), &Expr::nothing())
+                .read_cells_from_ids_checked(
+                    &pending,
+                    &vec![],
+                    &Expr::nothing(),
+                    &Expr::nothing(),
+                    &vec![crate::index::verification::IndexCheck::Schema(schema)],
+                )
                 .await;
             for cell in cells {
                 if cell_matches_selection(&cell, selection) {
@@ -213,12 +219,19 @@ impl IndexedDataClient {
     pub(super) async fn filter_ids_by_selection_limit(
         &self,
         candidate_ids: &[Id],
+        schema: SchemaUid,
         selection: &Expr,
         limit: Option<usize>,
     ) -> Vec<Id> {
         let Some(limit) = limit else {
             let cells = self
-                .read_cells_from_ids(candidate_ids, &vec![], &Expr::nothing(), &Expr::nothing())
+                .read_cells_from_ids_checked(
+                    candidate_ids,
+                    &vec![],
+                    &Expr::nothing(),
+                    &Expr::nothing(),
+                    &vec![crate::index::verification::IndexCheck::Schema(schema)],
+                )
                 .await;
             return cells
                 .into_iter()
@@ -234,7 +247,13 @@ impl IndexedDataClient {
         let batch = usize::from(SCAN_BUFFER_SIZE.max(1));
         for chunk in candidate_ids.chunks(batch) {
             let cells = self
-                .read_cells_from_ids(chunk, &vec![], &Expr::nothing(), &Expr::nothing())
+                .read_cells_from_ids_checked(
+                    chunk,
+                    &vec![],
+                    &Expr::nothing(),
+                    &Expr::nothing(),
+                    &vec![crate::index::verification::IndexCheck::Schema(schema)],
+                )
                 .await;
             selected_ids.extend(
                 cells
@@ -259,6 +278,7 @@ impl IndexedDataClient {
     ) -> DataCursor {
         let mut cursor = DataCursor {
             index_cursor,
+            checks: vec![],
             projection,
             selection,
             proc,
@@ -270,6 +290,12 @@ impl IndexedDataClient {
         cursor
     }
 
+    pub(super) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {
+        CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
+            .existing_ids(ids)
+            .await
+    }
+
     pub(super) async fn read_cells_from_ids(
         &self,
         ids: &[Id],
@@ -277,167 +303,21 @@ impl IndexedDataClient {
         selection: &Expr,
         proc: &Expr,
     ) -> Vec<OwnedCell> {
-        CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
-        let normalized_selection = normalize_selection_for_eval(selection);
-        let expect_full_batch = normalized_selection.is_empty() && proc.is_empty();
-        let mut all_cells = vec![];
-        let mut ordered_cells = if expect_full_batch {
-            Some(vec![None; ids.len()])
-        } else {
-            None
-        };
-        let mut tasks = ids
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
-            .sorted_by_key(|(_i, sid, _id)| *sid)
-            .chunk_by(|(_i, sid, _id)| *sid)
-            .into_iter()
-            .map(|(sid, pairs)| {
-                let mut grouped_ids = vec![];
-                let mut idx = vec![];
-                for (i, _, id) in pairs {
-                    idx.push(i);
-                    grouped_ids.push(id);
-                }
-                let projection = projection.clone();
-                let selection = normalized_selection.clone();
-                let proc = proc.clone();
-                let group_name = self.group_name.clone();
-                let database_name = self.database_name.clone();
-                let server_name = self.conshash.try_server_name(sid);
-                async move {
-                    let Some(server_name) = server_name else {
-                        // See above: an unroutable member fails these ids rather
-                        // than taking the process down.
-                        return Err(RPCError::IOError(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("no address known for server id {sid}"),
-                        )));
-                    };
-                    match client_by_server_name_for_database(
-                        sid,
-                        server_name,
-                        &group_name,
-                        &database_name,
-                    )
-                    .await
-                    {
-                        Ok(client) => {
-                            let read_res = client
-                                .read_all_cells_proced(&grouped_ids, &projection, &selection, &proc)
-                                .await
-                                .map(|cells| {
-                                    if cells.len() != idx.len() {
-                                        warn!(
-                                            "Batch cell read count mismatch: requested {}, got {}",
-                                            idx.len(),
-                                            cells.len()
-                                        );
-                                    }
-                                    cells
-                                        .into_iter()
-                                        .zip(idx)
-                                        .filter_map(|(cell_res, original_idx)| match cell_res {
-                                            Ok(cell) => Some((cell, original_idx)),
-                                            Err(e) => {
-                                                warn!(
-                                                    "Cell read error at index {}: {:?}",
-                                                    original_idx, e
-                                                );
-                                                None
-                                            }
-                                        })
-                                        .collect_vec()
-                                });
-                            match read_res {
-                                Ok(cells) => Ok(cells),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            })
-            .collect::<FuturesUnordered<_>>();
+        self.read_cells_from_ids_checked(ids, projection, selection, proc, &vec![])
+            .await
+    }
 
-        while let Some(task_res) = tasks.next().await {
-            match task_res {
-                Ok(mut cells) => {
-                    if let Some(ordered_cells) = ordered_cells.as_mut() {
-                        for (cell, original_idx) in cells.drain(..) {
-                            ordered_cells[original_idx] = Some(cell);
-                        }
-                    } else {
-                        all_cells.append(&mut cells);
-                    }
-                }
-                Err(e) => {
-                    warn!("Task error in read_cells_from_ids: {:?}", e);
-                }
-            }
-        }
-
-        if let Some(mut ordered_cells) = ordered_cells {
-            for (idx, slot) in ordered_cells.iter_mut().enumerate() {
-                if slot.is_some() {
-                    continue;
-                }
-                let Some(sid) = self.conshash.get_server_id_by(&ids[idx]) else {
-                    warn!("Missing server mapping for id {:?}", ids[idx]);
-                    continue;
-                };
-                // Unknown member: it has left the ring, or a stale placement table
-                // still names it. Skipped exactly like a missing mapping above --
-                // an unroutable id is not grounds for panicking the process.
-                let Some(server_name) = self.conshash.try_server_name(sid) else {
-                    warn!("No address known for server {} holding {:?}", sid, ids[idx]);
-                    continue;
-                };
-                match client_by_server_name_for_database(
-                    sid,
-                    server_name,
-                    &self.group_name,
-                    &self.database_name,
-                )
-                .await
-                {
-                    Ok(client) => {
-                        let single_id = vec![ids[idx]];
-                        match client
-                            .read_all_cells_proced(&single_id, projection, selection, proc)
-                            .await
-                        {
-                            Ok(mut cells) => match cells.pop() {
-                                Some(Ok(cell)) => {
-                                    *slot = Some(cell);
-                                }
-                                Some(Err(e)) => {
-                                    warn!("Retry cell read error at index {}: {:?}", idx, e);
-                                }
-                                None => {
-                                    warn!("Retry cell read returned no cell at index {}", idx);
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Retry task error in read_cells_from_ids: {:?}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Retry client creation error in read_cells_from_ids: {:?}",
-                            e
-                        );
-                    }
-                }
-            }
-
-            return ordered_cells.into_iter().flatten().collect_vec();
-        }
-
-        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
-        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
+    pub(super) async fn read_cells_from_ids_checked(
+        &self,
+        ids: &[Id],
+        projection: &Vec<u64>,
+        selection: &Expr,
+        proc: &Expr,
+        checks: &Vec<crate::index::verification::IndexCheck>,
+    ) -> Vec<OwnedCell> {
+        CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
+            .read_cells_from_ids_checked(ids, projection, selection, proc, checks)
+            .await
     }
 
     pub(super) async fn read_projected_rows_from_ids(
@@ -469,7 +349,11 @@ impl IndexedDataClient {
         let mut tasks = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
+            .filter_map(|(i, id)| {
+                self.conshash
+                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                    .map(|sid| (i, sid, *id))
+            })
             .sorted_by_key(|(_i, sid, _id)| *sid)
             .chunk_by(|(_i, sid, _id)| *sid)
             .into_iter()
@@ -538,7 +422,293 @@ impl IndexedDataClient {
     }
 }
 
-fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
+#[derive(Clone)]
+pub(crate) struct CellReader {
+    conshash: std::sync::Arc<bifrost::conshash::ConsistentHashing>,
+    group_name: String,
+    database_name: String,
+}
+
+impl CellReader {
+    pub(crate) fn new(
+        conshash: std::sync::Arc<bifrost::conshash::ConsistentHashing>,
+        group_name: &str,
+        database_name: &str,
+    ) -> Self {
+        Self {
+            conshash,
+            group_name: group_name.into(),
+            database_name: database_name.into(),
+        }
+    }
+    pub(crate) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {
+        let mut groups = std::collections::BTreeMap::<u64, Vec<(usize, Id)>>::new();
+        for (index, id) in ids.iter().enumerate() {
+            let sid = self
+                .conshash
+                .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                .ok_or_else(|| {
+                    RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no owner for index candidate",
+                    ))
+                })?;
+            groups.entry(sid).or_default().push((index, *id));
+        }
+        let mut tasks = groups
+            .into_iter()
+            .map(|(sid, entries)| async move {
+                let name = self.conshash.try_server_name(sid).ok_or_else(|| {
+                    RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no owner address",
+                    ))
+                })?;
+                let client = client_by_server_name_for_database(
+                    sid,
+                    name,
+                    &self.group_name,
+                    &self.database_name,
+                )
+                .await?;
+                let keys = entries.iter().map(|(_, id)| *id).collect();
+                let present = client.existing_ids(&keys).await?;
+                if present.len() != entries.len() {
+                    return Err(RPCError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "existence response length mismatch",
+                    )));
+                }
+                let mut result = Vec::new();
+                for ((index, id), present) in entries.into_iter().zip(present) {
+                    match present {
+                        Ok(true) => result.push((index, id)),
+                        Ok(false) => {}
+                        Err(error) => {
+                            return Err(RPCError::IOError(std::io::Error::other(format!(
+                                "existence check: {error:?}"
+                            ))))
+                        }
+                    }
+                }
+                Ok::<_, RPCError>(result)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut result = Vec::new();
+        while let Some(batch) = tasks.next().await {
+            result.extend(batch?);
+        }
+        result.sort_unstable_by_key(|(index, _)| *index);
+        Ok(result.into_iter().map(|(_, id)| id).collect())
+    }
+
+    pub(crate) async fn read_cells_from_ids_checked(
+        &self,
+        ids: &[Id],
+        projection: &Vec<u64>,
+        selection: &Expr,
+        proc: &Expr,
+        checks: &Vec<crate::index::verification::IndexCheck>,
+    ) -> Vec<OwnedCell> {
+        CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
+        let normalized_selection = normalize_selection_for_eval(selection);
+        let preserve_order = normalized_selection.is_empty() && proc.is_empty();
+        let expect_full_batch = preserve_order && checks.is_empty();
+        let mut all_cells = vec![];
+        let mut ordered_cells = if preserve_order {
+            Some(vec![None; ids.len()])
+        } else {
+            None
+        };
+        let mut tasks = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                self.conshash
+                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+                    .map(|sid| (i, sid, *id))
+            })
+            .sorted_by_key(|(_i, sid, _id)| *sid)
+            .chunk_by(|(_i, sid, _id)| *sid)
+            .into_iter()
+            .map(|(sid, pairs)| {
+                let mut grouped_ids = vec![];
+                let mut idx = vec![];
+                for (i, _, id) in pairs {
+                    idx.push(i);
+                    grouped_ids.push(id);
+                }
+                let checks = checks.clone();
+                let projection = projection.clone();
+                let selection = normalized_selection.clone();
+                let proc = proc.clone();
+                let group_name = self.group_name.clone();
+                let database_name = self.database_name.clone();
+                let server_name = self.conshash.try_server_name(sid);
+                async move {
+                    let Some(server_name) = server_name else {
+                        // See above: an unroutable member fails these ids rather
+                        // than taking the process down.
+                        return Err(RPCError::IOError(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("no address known for server id {sid}"),
+                        )));
+                    };
+                    match client_by_server_name_for_database(
+                        sid,
+                        server_name,
+                        &group_name,
+                        &database_name,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            let read_res = if checks.is_empty() {
+                                client
+                                    .read_all_cells_proced(
+                                        &grouped_ids,
+                                        &projection,
+                                        &selection,
+                                        &proc,
+                                    )
+                                    .await
+                            } else {
+                                client
+                                    .read_all_cells_verified(
+                                        &grouped_ids,
+                                        &projection,
+                                        &selection,
+                                        &proc,
+                                        &checks,
+                                    )
+                                    .await
+                            }
+                            .map(|cells| {
+                                if cells.len() != idx.len() {
+                                    warn!(
+                                        "Batch cell read count mismatch: requested {}, got {}",
+                                        idx.len(),
+                                        cells.len()
+                                    );
+                                }
+                                cells
+                                    .into_iter()
+                                    .zip(idx)
+                                    .filter_map(|(cell_res, original_idx)| match cell_res {
+                                        Ok(cell) => Some((cell, original_idx)),
+                                        Err(e) => {
+                                            warn!(
+                                                "Cell read error at index {}: {:?}",
+                                                original_idx, e
+                                            );
+                                            None
+                                        }
+                                    })
+                                    .collect_vec()
+                            });
+                            match read_res {
+                                Ok(cells) => Ok(cells),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some(task_res) = tasks.next().await {
+            match task_res {
+                Ok(mut cells) => {
+                    if let Some(ordered_cells) = ordered_cells.as_mut() {
+                        for (cell, original_idx) in cells.drain(..) {
+                            ordered_cells[original_idx] = Some(cell);
+                        }
+                    } else {
+                        all_cells.append(&mut cells);
+                    }
+                }
+                Err(e) => {
+                    warn!("Task error in read_cells_from_ids: {:?}", e);
+                }
+            }
+        }
+
+        if let Some(mut ordered_cells) = ordered_cells {
+            for (idx, slot) in ordered_cells.iter_mut().enumerate() {
+                if slot.is_some() || !expect_full_batch {
+                    continue;
+                }
+                let Some(sid) = self.conshash.get_server_id_for_slot(crate::slots::slot_of(&ids[idx]) as u64) else {
+                    warn!("Missing server mapping for id {:?}", ids[idx]);
+                    continue;
+                };
+                // Unknown member: it has left the ring, or a stale placement table
+                // still names it. Skipped exactly like a missing mapping above --
+                // an unroutable id is not grounds for panicking the process.
+                let Some(server_name) = self.conshash.try_server_name(sid) else {
+                    warn!("No address known for server {} holding {:?}", sid, ids[idx]);
+                    continue;
+                };
+                match client_by_server_name_for_database(
+                    sid,
+                    server_name,
+                    &self.group_name,
+                    &self.database_name,
+                )
+                .await
+                {
+                    Ok(client) => {
+                        let single_id = vec![ids[idx]];
+                        match if checks.is_empty() {
+                            client
+                                .read_all_cells_proced(&single_id, projection, selection, proc)
+                                .await
+                        } else {
+                            client
+                                .read_all_cells_verified(
+                                    &single_id, projection, selection, proc, checks,
+                                )
+                                .await
+                        } {
+                            Ok(mut cells) => match cells.pop() {
+                                Some(Ok(cell)) => {
+                                    *slot = Some(cell);
+                                }
+                                Some(Err(e)) => {
+                                    warn!("Retry cell read error at index {}: {:?}", idx, e);
+                                }
+                                None => {
+                                    warn!("Retry cell read returned no cell at index {}", idx);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Retry task error in read_cells_from_ids: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Retry client creation error in read_cells_from_ids: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+
+            return ordered_cells.into_iter().flatten().collect_vec();
+        }
+
+        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
+        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
+    }
+}
+
+pub(super) fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
+    selection_matches_fields(selection, &|field| &cell[field])
+}
+
+fn selection_matches_fields<'a>(selection: &Expr, field: &impl Fn(u64) -> &'a OwnedValue) -> bool {
     let Expr::List(items) = selection else {
         return true;
     };
@@ -551,20 +721,20 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
         return items
             .iter()
             .skip(1)
-            .all(|child| cell_matches_selection(cell, child));
+            .all(|child| selection_matches_fields(child, field));
     }
 
     if is_symbol_named(&items[0], "or") {
         return items
             .iter()
             .skip(1)
-            .any(|child| cell_matches_selection(cell, child));
+            .any(|child| selection_matches_fields(child, field));
     }
 
     if is_symbol_named(&items[0], "not") {
         return items
             .get(1)
-            .map(|child| !cell_matches_selection(cell, child))
+            .map(|child| !selection_matches_fields(child, field))
             .unwrap_or(false);
     }
 
@@ -572,7 +742,7 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
         return items
             .get(1)
             .and_then(expr_field_id)
-            .map(|field_id| matches!(cell[field_id], OwnedValue::Null | OwnedValue::NA))
+            .map(|field_id| matches!(field(field_id), OwnedValue::Null | OwnedValue::NA))
             .unwrap_or(false);
     }
 
@@ -580,7 +750,7 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
         return items
             .get(1)
             .and_then(expr_field_id)
-            .map(|field_id| !matches!(cell[field_id], OwnedValue::Null | OwnedValue::NA))
+            .map(|field_id| !matches!(field(field_id), OwnedValue::Null | OwnedValue::NA))
             .unwrap_or(false);
     }
 
@@ -588,7 +758,7 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
         let Some(field_id) = items.get(1).and_then(expr_field_id) else {
             return false;
         };
-        let field_value = &cell[field_id];
+        let field_value = field(field_id);
         return items
             .iter()
             .skip(2)
@@ -604,13 +774,13 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
         ) else {
             return false;
         };
-        let field_value = &cell[field_id];
+        let field_value = field(field_id);
         return compare_values(field_value, lower, CompareOp::Ge)
             && compare_values(field_value, upper, CompareOp::Le);
     }
 
     if let Some((op, field_id, value)) = comparison_clause(selection) {
-        return compare_values(&cell[field_id], &value, op);
+        return compare_values(field(field_id), &value, op);
     }
 
     false
@@ -737,4 +907,191 @@ fn expr_owned_value(expr: &Expr) -> Option<&OwnedValue> {
 
 fn is_symbol_named(expr: &Expr, expected: &str) -> bool {
     matches!(expr, Expr::Symbol(_, name) if name == expected)
+}
+
+/// A scalar selection whose field accesses and operators are supported locally.
+/// Construction validates once. Evaluation uses the same comparisons as Neb reads.
+#[derive(Clone, Debug)]
+pub struct ScalarSelection {
+    selection: Expr,
+    fields: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedScalarSelection;
+
+impl std::fmt::Display for UnsupportedScalarSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("selection requires the query evaluator")
+    }
+}
+impl std::error::Error for UnsupportedScalarSelection {}
+
+impl ScalarSelection {
+    pub fn new(selection: &Expr) -> Result<Self, UnsupportedScalarSelection> {
+        let mut fields = Vec::new();
+        scalar_fields(selection, &mut fields)?;
+        fields.sort_unstable();
+        fields.dedup();
+        Ok(Self {
+            selection: selection.clone(),
+            fields,
+        })
+    }
+
+    pub fn fields(&self) -> &[u64] {
+        &self.fields
+    }
+
+    pub fn matches_cell(&self, cell: &OwnedCell) -> bool {
+        cell_matches_selection(cell, &self.selection)
+    }
+
+    /// The accessor maps field ids to selected positions or full map fields.
+    pub fn matches_fields<'a>(&self, field: impl Fn(u64) -> &'a OwnedValue) -> bool {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_IDCONTRACT_SKIP_SCALAR").is_some() {
+            return true;
+        }
+        selection_matches_fields(&self.selection, &field)
+    }
+}
+
+fn scalar_fields(
+    selection: &Expr,
+    fields: &mut Vec<u64>,
+) -> Result<(), UnsupportedScalarSelection> {
+    let Expr::List(items) = selection else {
+        return Err(UnsupportedScalarSelection);
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    if is_symbol_named(&items[0], "and") || is_symbol_named(&items[0], "or") {
+        for child in &items[1..] {
+            scalar_fields(child, fields)?;
+        }
+        return Ok(());
+    }
+    if is_symbol_named(&items[0], "not") && items.len() == 2 {
+        return scalar_fields(&items[1], fields);
+    }
+    let unary = is_symbol_named(&items[0], "is-null") || is_symbol_named(&items[0], "is-not-null");
+    let membership = is_symbol_named(&items[0], "in") && items.len() >= 2;
+    let between = is_symbol_named(&items[0], "between") && items.len() == 4;
+    if (unary && items.len() == 2) || membership || between {
+        let field = items
+            .get(1)
+            .and_then(expr_field_id)
+            .ok_or(UnsupportedScalarSelection)?;
+        if items[2..]
+            .iter()
+            .any(|value| expr_owned_value(value).is_none())
+        {
+            return Err(UnsupportedScalarSelection);
+        }
+        fields.push(field);
+        return Ok(());
+    }
+    if let Some((_, field, _)) = comparison_clause(selection) {
+        fields.push(field);
+        return Ok(());
+    }
+    Err(UnsupportedScalarSelection)
+}
+
+#[cfg(test)]
+mod scalar_tests {
+    use super::*;
+    use crate::ram::schema::SchemaVid;
+    use bifrost_hasher::hash_str;
+    use dovahkiin::types::{Map, OwnedMap};
+
+    fn selection(op: &str, values: Vec<OwnedValue>) -> Expr {
+        let mut items = vec![
+            Expr::Symbol(hash_str(op), op.into()),
+            Expr::Symbol(9, "field".into()),
+        ];
+        items.extend(values.into_iter().map(Expr::Value));
+        Expr::List(items)
+    }
+
+    #[test]
+    fn idcontract_scalar_adapter_matches_neb_and_projection() {
+        // U32 covers the stored dictionary-code representation. Strings cover decoded values.
+        let values = [
+            OwnedValue::U64(7),
+            OwnedValue::I64(7),
+            OwnedValue::F64(7.0),
+            OwnedValue::U32(7),
+            OwnedValue::Null,
+            OwnedValue::NA,
+            OwnedValue::String("seven".into()),
+        ];
+        let mut cases = Vec::new();
+        for value in &values {
+            for op in ["=", "!=", ">", ">=", "<", "<="] {
+                cases.push(selection(op, vec![value.clone()]));
+            }
+        }
+        cases.extend([
+            selection("is-null", vec![]),
+            selection("is-not-null", vec![]),
+            selection(
+                "in",
+                vec![OwnedValue::U64(7), OwnedValue::String("seven".into())],
+            ),
+            selection("between", vec![OwnedValue::U64(6), OwnedValue::U64(8)]),
+            Expr::nothing(),
+        ]);
+        for op in ["and", "or"] {
+            cases.push(Expr::List(vec![
+                Expr::Symbol(hash_str(op), op.into()),
+                selection("=", vec![OwnedValue::U64(7)]),
+                selection("is-null", vec![]),
+            ]));
+        }
+        cases.push(Expr::List(vec![
+            Expr::Symbol(hash_str("not"), "not".into()),
+            selection("is-null", vec![]),
+        ]));
+        for value in values {
+            let mut map = OwnedMap::new();
+            map.insert_key_id(9, value.clone());
+            let cell =
+                OwnedCell::new_with_id(SchemaVid(1), &Id::from_parts(1, 1), OwnedValue::Map(map));
+            for expr in &cases {
+                let adapter = ScalarSelection::new(expr).unwrap();
+                let expected = cell_matches_selection(&cell, expr);
+                assert_eq!(adapter.matches_cell(&cell), expected);
+                assert_eq!(
+                    adapter.matches_fields(|id| {
+                        assert_eq!(id, 9);
+                        &value
+                    }),
+                    expected
+                );
+            }
+        }
+        let adapter = ScalarSelection::new(&selection("=", vec![OwnedValue::U64(7)])).unwrap();
+        assert!(adapter.matches_fields(|_| &OwnedValue::U64(7)));
+        assert!(!adapter.matches_fields(|_| &OwnedValue::U64(8)));
+        assert_eq!(adapter.fields(), &[9]);
+    }
+
+    #[test]
+    fn idcontract_scalar_adapter_rejects_unsupported() {
+        for expr in [
+            Expr::Value(OwnedValue::Bool(true)),
+            selection("similar", vec![OwnedValue::String("text".into())]),
+            selection("=", vec![]),
+            selection("between", vec![OwnedValue::U64(7)]),
+            Expr::List(vec![Expr::Symbol(1, "not".into())]),
+        ] {
+            assert_eq!(
+                ScalarSelection::new(&expr).unwrap_err(),
+                UnsupportedScalarSelection
+            );
+        }
+    }
 }

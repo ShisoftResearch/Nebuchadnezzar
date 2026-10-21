@@ -1,4 +1,4 @@
-// Crash-churn fuzzer for the ranged index.
+// Crash-churn fuzzer for the ranged and hash indexes.
 //
 // The durability corpses this hunts (TB14/TB16/TB17) share three
 // ingredients none of which needs a terabyte: structural churn (page and
@@ -928,7 +928,11 @@ async fn child_async(
 
     if first {
         let fields = Field::new_schema(vec![
-            Field::new_indexed(KEY_FIELD, Type::U64, vec![IndexType::Ranged]),
+            Field::new_indexed(
+                KEY_FIELD,
+                Type::U64,
+                vec![IndexType::Ranged, IndexType::Hashed],
+            ),
             Field::new_unindexed(PAD_FIELD, Type::String),
         ]);
         let schema = Schema::new_with_id(CHURN_SCHEMA_ID, "churn", None, fields, false, true);
@@ -1004,11 +1008,15 @@ async fn child_async(
     // the startup path is a price, and a price nobody measures is one that
     // grows.
     println!(
-        "RECONCILE ms={} scanned={} noidx={} repaired={} abandoned_pages={}",
+        "RECONCILE ms={} scanned={} noidx={} repaired={} pruned={} hash_repaired={} \
+         hash_pruned={} abandoned_pages={}",
         neb::index::scrub::LAST_RECONCILE_MS.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_SCANNED.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_NOIDX.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_HASH_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_HASH_PRUNED.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
             .load(std::sync::atomic::Ordering::Relaxed),
     );
@@ -1030,15 +1038,26 @@ async fn child_async(
     // nothing reads is a number nobody has.
     if std::env::var("NEB_CHURN_SCRUB").as_deref() != Ok("0") {
         let began = std::time::Instant::now();
-        match client.scrub_ranged_index(false).await {
+        match client.scrub_index(false).await {
             Ok(report) => println!(
-                "SCRUB missing={} unreachable={} present={} derived={} cells={} took_ms={}",
+                "SCRUB missing={} unreachable={} present={} derived={} cells={} \
+                 hash_missing={} hash_stale={} hash_unreachable={} took_ms={} index_keys={} stale={} prune_incomplete={} \
+                 hash_derived={} hash_ids={} hash_prune_incomplete={}",
                 report.entries_missing,
                 report.entries_unreachable,
                 report.entries_present,
                 report.entries_derived,
                 report.cells_scanned,
-                began.elapsed().as_millis()
+                report.hash_entries_missing,
+                report.hash_entries_stale,
+                report.hash_buckets_unreachable,
+                began.elapsed().as_millis(),
+                report.index_keys_scanned,
+                report.entries_stale,
+                report.prune_incomplete,
+                report.hash_entries_derived,
+                report.hash_index_ids_scanned,
+                report.hash_prune_incomplete
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
@@ -1085,10 +1104,16 @@ async fn child_async(
     // returns them. Off by default because it mutates the store, and a
     // fuzzer that repaired every cycle would be grading its own work.
     if std::env::var("NEB_CHURN_SCRUB").as_deref() == Ok("repair") {
-        match client.scrub_ranged_index(true).await {
+        match client.scrub_index(true).await {
             Ok(report) => println!(
-                "SCRUB_REPAIRED filled={} unreachable={} derived={}",
-                report.entries_repaired, report.entries_unreachable, report.entries_derived
+                "SCRUB_REPAIRED filled={} pruned={} unreachable={} derived={} hash_filled={} \
+                 hash_pruned={}",
+                report.entries_repaired,
+                report.entries_pruned,
+                report.entries_unreachable,
+                report.entries_derived,
+                report.hash_entries_repaired,
+                report.hash_entries_pruned
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
@@ -1591,13 +1616,16 @@ async fn child_async(
             // on the way to disk. Reported either way -- the harness does not
             // decide which is acceptable.
             if std::env::var("NEB_CHURN_SCRUB").as_deref() != Ok("0") {
-                match client.scrub_ranged_index(false).await {
+                match client.scrub_index(false).await {
                     Ok(r) => println!(
-                        "PRESHUTDOWN_SCRUB missing={} unreachable={} present={} derived={}",
+                        "PRESHUTDOWN_SCRUB missing={} unreachable={} present={} derived={} \
+                         hash_missing={} hash_stale={}",
                         r.entries_missing,
                         r.entries_unreachable,
                         r.entries_present,
-                        r.entries_derived
+                        r.entries_derived,
+                        r.hash_entries_missing,
+                        r.hash_entries_stale
                     ),
                     Err(e) => println!("PRESHUTDOWN_SCRUB_ERROR {}", e),
                 }

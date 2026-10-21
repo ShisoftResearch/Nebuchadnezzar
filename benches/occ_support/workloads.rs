@@ -104,6 +104,10 @@ async fn confirm_prepare_cleanup(fixture: &OccFixture, tid: TxnId) -> Result<(),
         )),
         Ok(Ok(other)) => Err(format!("abort({tid:?}) returned {:?}", other)),
         Ok(Err(TMError::TransactionNotFound)) => Ok(()),
+        Ok(Err(TMError::OutcomeUnknown)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::OutcomeUnknown
+        )),
         Ok(Err(TMError::TransactionIdExisted)) => Err(format!(
             "abort({tid:?}) manager error: {:?}",
             TMError::TransactionIdExisted

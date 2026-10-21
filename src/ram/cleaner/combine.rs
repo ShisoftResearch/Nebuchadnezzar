@@ -191,8 +191,9 @@ impl CombinedCleaner {
                 if !seg.no_references() {
                     return None;
                 }
-
-                SegmentCandidate::new(&seg)
+                // The in-progress rule (D20, D28) is checked in one place,
+                // after the claim: `SegmentCandidate::for_cleaner`.
+                SegmentCandidate::for_cleaner(&seg)
             })
             .collect_vec();
 
@@ -238,6 +239,93 @@ impl CombinedCleaner {
         Vec::new()
     }
 
+    /// Scan physical headers once per combine, including entries marked dead.
+    /// Recovery can read those entries until their segment leaves the store.
+    fn needed_tombstones(
+        chunk: &Chunk,
+        entries: &[crate::ram::entry::Entry],
+        selected: &HashSet<u64>,
+    ) -> HashSet<u64> {
+        let mut versions = std::collections::HashMap::<u64, u64, ahash::RandomState>::default();
+        for entry in entries {
+            if let EntryContent::Tombstone(t) = &entry.content {
+                versions
+                    .entry(t.id.bits())
+                    .and_modify(|v| *v = (*v).max(t.version))
+                    .or_insert(t.version);
+            }
+        }
+        let mut needed = HashSet::new();
+        if versions.is_empty() {
+            return needed;
+        }
+        if chunk.retired_segment_files.load(Ordering::Acquire) != 0 {
+            return versions.keys().copied().collect();
+        }
+        for seg in chunk.segments() {
+            // Cold or busy images cannot prove absence. Keep the tombstones.
+            let _pin = if selected.contains(&seg.id) {
+                None // The selected source already holds a hot pin.
+            } else {
+                match SegmentCandidate::new(&seg) {
+                    Some(pin) => Some(pin),
+                    None => return versions.keys().copied().collect(),
+                }
+            };
+            if !seg.try_own() {
+                return versions.keys().copied().collect();
+            }
+            struct HeadScan<'a>(&'a Segment);
+            impl Drop for HeadScan<'_> {
+                fn drop(&mut self) {
+                    self.0.release_own();
+                }
+            }
+            let _head = HeadScan(&seg);
+            if seg.pending_journal_count() != 0 {
+                return versions.keys().copied().collect();
+            }
+            let frontier = seg.append_header.load(Ordering::Acquire);
+            let mut iter = crate::ram::segs::SegmentEntryIter {
+                cursor: seg.addr,
+                bound: frontier,
+            };
+            while let Some(entry) = iter.next() {
+                if entry.entry_header.entry_type == crate::ram::entry::EntryType::CELL {
+                    let header = cell::cell_header_from_entry_content_addr(entry.body_pos);
+                    if versions
+                        .get(&header.id.bits())
+                        .map_or(false, |v| header.version <= *v)
+                    {
+                        needed.insert(header.id.bits());
+                    }
+                }
+            }
+            if iter.cursor != frontier || seg.pending_journal_count() != 0 {
+                return versions.keys().copied().collect();
+            }
+        }
+        if chunk.retired_segment_files.load(Ordering::Acquire) != 0 {
+            return versions.keys().copied().collect();
+        }
+        needed
+    }
+
+    /// A tombstone whose id is live in the index at a version the tombstone
+    /// would kill never took effect: its delete was dropped (a bracket that
+    /// never got its COMMIT) or undone. Carrying it forward would write it
+    /// outside that bracket, and the next recovery would apply it as an
+    /// ordinary delete. A real delete clears the index entry, and a re-create
+    /// continues above the deleted version, so neither is held back by this.
+    fn tombstone_is_contradicted(chunk: &Chunk, tombstone: &crate::ram::tombstone::Tombstone) -> bool {
+        match chunk.lock_cell_for_read(tombstone.id.bits()) {
+            Ok(mut guard) => guard
+                .cell_version()
+                .map_or(false, |version| version <= tombstone.version),
+            Err(_) => false,
+        }
+    }
+
     fn collect_and_deduplicate_entries(
         chunk: &Chunk,
         segments: &[SegmentCandidate],
@@ -255,29 +343,17 @@ impl CombinedCleaner {
         let mut deduped_cells: HashMap<u64, DummyEntry> = HashMap::new();
         let mut tombstones: Vec<DummyEntry> = Vec::new();
 
-        for entry in segments
+        let entries: Vec<_> = segments
             .iter()
-            .flat_map(|seg| chunk.live_entries(seg).map(|entry| (entry, seg.id)))
-            .filter(|(entry, _seg_id)| {
-                // live entries have done a lot of filtering work already
-                // but we still need to remove those tombstones that pointed to segments we are about to combine
-                if let EntryContent::Tombstone(ref tombstone) = entry.content {
-                    // Exclude tombstones pointing to segments being combined
-                    // Look up the segment by seq_id to get its segment_id
-                    let tombstone_seg_id = chunk
-                        .segs
-                        .get_by_seq_id(tombstone.segment_seq_id)
-                        .map(|seg| seg.id);
-                    let is_pointing_to_combined_seg = tombstone_seg_id
-                        .map_or(false, |seg_id| segment_ids_to_combine.contains(&seg_id));
-                    return !is_pointing_to_combined_seg // Tombstone is not pointing to a segment we are about to combine
-                        && !chunk.cell_index.contains_key(&(tombstone.id.bits() as usize));
-                    // Tombstone is not pointing to a cell that is already in the chunk;
-                }
-                return true;
-            })
-            .map(|(entry, _seg_id)| entry)
-        {
+            .flat_map(|seg| chunk.live_entries(seg))
+            .collect();
+        let needed = Self::needed_tombstones(chunk, &entries, segment_ids_to_combine);
+        for entry in entries.into_iter().filter(|entry| match &entry.content {
+            EntryContent::Tombstone(t) => {
+                needed.contains(&t.id.bits()) && !Self::tombstone_is_contradicted(chunk, t)
+            }
+            _ => true,
+        }) {
             let entry_size = entry.meta.entry_size;
             let entry_addr = entry.meta.entry_pos;
             let cell_header = match entry.content {
@@ -603,7 +679,7 @@ impl CombinedCleaner {
     fn cleanup_segments(chunk: &Chunk, segments: Vec<SegmentCandidate>) {
         debug!("Unpublishing {} source segments", segments.len());
         for old_seg in &segments {
-            chunk.remove_segment(old_seg.id);
+            chunk.remove_segment_for_cleaner(old_seg.id);
         }
         // Releases our references; from here the segments can go quiescent.
         drop(segments);
@@ -620,6 +696,12 @@ impl CombinedCleaner {
         if segments.is_empty() {
             return (0, 0);
         }
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+        info!(
+            "TRACE combine chunk {} segments {:?}",
+            chunk.id,
+            segments.iter().map(|seg| seg.id).collect::<Vec<_>>()
+        );
 
         let space_to_collect;
         let segment_ids_to_combine: HashSet<_>;
@@ -811,6 +893,11 @@ impl CombinedCleaner {
             chunk.get_head_seg_id()
         );
 
+        // The destination adds physical copies before source files leave the store.
+        for entry in all_entries.iter().filter(|entry| entry.cell_hash.is_none()) {
+            let tombstone = crate::ram::tombstone::Tombstone::read(entry.addr);
+            chunk.note_deleted_version(tombstone.id.bits(), tombstone.version);
+        }
         Self::cleanup_segments(chunk, segments);
 
         debug!(

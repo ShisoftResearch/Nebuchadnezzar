@@ -5,6 +5,17 @@ use super::node::NodeReadHandler;
 use super::*;
 use std::fmt::Debug;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_INTERNAL_POSITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+enum SearchError {
+    Follow(NodeCellRef),
+    InvalidPosition { pos: usize, len: usize },
+}
+
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
     key: &EntryKey,
@@ -50,28 +61,33 @@ where
             if ordering == Ordering::Backward && node.is_empty() {
                 if let Some(left) = node.left_ref() {
                     let Some(follow) = left.try_clone_speculative() else {
-                        return Err(node_ref.clone());
+                        return Err(SearchError::Follow(node_ref.clone()));
                     };
-                    return Err(follow);
+                    return Err(SearchError::Follow(follow));
                 }
             }
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
                 // Pointer read from unlatched data: clone speculatively and
                 // retry on this node if its target is already condemned.
-                return Err(right_node
-                    .try_clone_speculative()
-                    .unwrap_or_else(|| node_ref.clone()));
+                return Err(SearchError::Follow(
+                    right_node
+                        .try_clone_speculative()
+                        .unwrap_or_else(|| node_ref.clone()),
+                ));
             }
             let pos = match node.search_unwindable(key) {
                 Ok(pos) => pos,
                 Err(_) => {
                     warn!("Search cursor failed, expecting retry");
-                    return Err(node_ref.clone());
+                    return Err(SearchError::Follow(node_ref.clone()));
                 }
             };
             match node {
                 &NodeData::External(ref n) => {
+                    let n = &**n;
+                    #[cfg(test)]
+                    super::revision_tests::after_external_borrow();
                     trace!(
                         "search in external for {:?}, len {}, ordering {:?}",
                         key,
@@ -135,29 +151,60 @@ where
                                 Ordering::Backward => &n.prev,
                             };
                             let Some(follow) = follow_src.try_clone_speculative() else {
-                                return Err(node_ref.clone());
+                                return Err(SearchError::Follow(node_ref.clone()));
                             };
-                            Err(follow)
+                            Err(SearchError::Follow(follow))
                         }
                     }
                 }
                 &NodeData::Internal(ref n) => {
+                    #[cfg(test)]
+                    super::revision_tests::after_internal_borrow(n);
+                    #[cfg(test)]
+                    AFTER_INTERNAL_POSITION.with(|hook| {
+                        let action = hook.borrow_mut().take();
+                        if let Some(action) = action {
+                            action();
+                        }
+                    });
                     trace!(
                         "search in internal node for {:?}, len {}, pos {}",
                         key,
                         n.len,
                         pos
                     );
+                    let observed_len = n.len;
+                    #[cfg(test)]
+                    if pos > observed_len {
+                        eprintln!(
+                            "BTREE_POSITION pos_slots={} len_keys={} version_start={} version_now={} node={:?}",
+                            pos,
+                            observed_len,
+                            node_handler.version,
+                            node_handler.current_version_for_test(),
+                            node_ref
+                        );
+                    }
+                    // A split can change the key count after the search. Check
+                    // the invariant only after read_node validates this version.
+                    if pos > observed_len {
+                        return Err(SearchError::InvalidPosition {
+                            pos,
+                            len: observed_len,
+                        });
+                    }
                     let next_node_ref = &n.ptrs.as_slice_immute()[pos];
-                    debug_assert!(pos <= n.len);
-                    Err(next_node_ref
-                        .try_clone_speculative()
-                        .unwrap_or_else(|| node_ref.clone()))
+                    Err(SearchError::Follow(
+                        next_node_ref
+                            .try_clone_speculative()
+                            .unwrap_or_else(|| node_ref.clone()),
+                    ))
                 }
-                &NodeData::Empty(ref n) => Err(n
-                    .right
-                    .try_clone_speculative()
-                    .unwrap_or_else(|| node_ref.clone())),
+                &NodeData::Empty(ref n) => Err(SearchError::Follow(
+                    n.right
+                        .try_clone_speculative()
+                        .unwrap_or_else(|| node_ref.clone()),
+                )),
                 &NodeData::None => Ok(RTCursor::empty(ordering, deletion.clone(), filter_deleted)),
             }
         });
@@ -166,7 +213,10 @@ where
                 cursor.initialize();
                 return cursor;
             }
-            Err(e) => {
+            Err(SearchError::InvalidPosition { pos, len }) => {
+                panic!("validated internal search position {pos} exceeds key count {len}");
+            }
+            Err(SearchError::Follow(e)) => {
                 node = e;
                 node_ref = &node;
                 spins += 1;
@@ -183,6 +233,58 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    type Keys = [EntryKey; 5];
+    type Ptrs = [NodeCellRef; 6];
+
+    fn key(n: u64) -> EntryKey {
+        EntryKey::from_id(&Id::from_parts(1, n))
+    }
+
+    #[test]
+    fn internal_split_during_search_retries_before_checking_position() {
+        let deletion = Arc::new(DeletionSet::with_capacity(16));
+        let leaf = BPlusTree::<Keys, Ptrs>::new(&deletion);
+        assert!(leaf.insert(&key(55)));
+        let mut internal = InNode::<Keys, Ptrs>::new(5, max_entry_key());
+        internal.keys = InternalKeys::from_keys(&[key(10), key(20), key(30), key(40), key(50)]);
+        Slice::as_slice(&mut internal.ptrs)[5] = leaf.get_root();
+        let root = NodeCellRef::new(Node::with_internal(internal));
+        let writer_root = root.clone();
+        AFTER_INTERNAL_POSITION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    let mut guard = write_node::<Keys, Ptrs>(&writer_root);
+                    let old_len = guard.innode().len;
+                    let (_right, pivot) =
+                        guard
+                            .innode_mut()
+                            .split_insert(key(25), NodeCellRef::default(), 2, true);
+                    assert_eq!(pivot, key(30));
+                    assert_eq!(guard.innode().len, 3);
+                    eprintln!(
+                        "BTREE_CONTROL split old_len_keys={} new_len_keys={} writer_version={}",
+                        old_len,
+                        guard.innode().len,
+                        guard.version
+                    );
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        let cursor = search_node::<Keys, Ptrs>(&root, &key(55), Ordering::Forward, &deletion, true);
+        assert_eq!(cursor.current(), Some(&key(55)));
+        assert_eq!(
+            read_node(&root, |n: &NodeReadHandler<Keys, Ptrs>| n.innode().len),
+            3
+        );
     }
 }
 
@@ -212,6 +314,8 @@ where
                         return Err(node_ref.clone());
                     }
                 };
+                #[cfg(test)]
+                super::revision_tests::after_internal_borrow(n);
                 match n.ptrs.as_slice_immute()[pos].try_clone_speculative() {
                     Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
                     None => Err(node_ref.clone()),

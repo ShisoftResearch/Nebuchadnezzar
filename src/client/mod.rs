@@ -20,7 +20,7 @@ use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{
     DelSchemaError, EvolutionOutcome, EvolveSchemaError, NewSchemaError, RenameSchemaError, Schema,
-    SchemaEdit, SchemaVid,
+    SchemaEdit, SchemaVid, SetAppMetaError,
 };
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
@@ -33,6 +33,8 @@ use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_H
 use crate::server::{database_meta_plane_id, shared_meta_plane_id};
 
 use self::transaction::*;
+
+pub static TRANSACTION_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static TRANSACTION_MAX_RETRY: u32 = 1000;
 
@@ -55,7 +57,91 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError),
 }
 
+/// A deferred covering barrier. Captured calls acknowledge application only;
+/// finish must succeed before a caller acknowledges durability.
+pub struct CapturedWriteBatch {
+    clients: parking_lot::Mutex<Vec<(Arc<plain_server::AsyncServiceClient>, Vec<Id>)>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl CapturedWriteBatch {
+    pub fn new() -> Self {
+        Self {
+            clients: parking_lot::Mutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn record_call<T>(
+        &self,
+        client: Arc<plain_server::AsyncServiceClient>,
+        response: Result<(Result<T, WriteError>, Vec<Id>), RPCError>,
+    ) -> Result<Result<T, WriteError>, RPCError> {
+        let (result, tokens) = response?;
+        if !tokens.is_empty() {
+            let mut clients = self.clients.lock();
+            if let Some((_, old)) = clients.iter_mut().find(|(old, _)| {
+                let same = old.service_id == client.service_id
+                    && old.client.server_id == client.client.server_id;
+                #[cfg(test)]
+                let same = if std::env::var_os("NEB_TEST_REVERT_CAPTURE_TARGET_GROUP").is_some() {
+                    Arc::ptr_eq(old, &client)
+                } else {
+                    same
+                };
+                same
+            }) {
+                old.extend(tokens);
+            } else {
+                clients.push((client, tokens));
+            }
+        }
+        Ok(result)
+    }
+    pub async fn finish(&self) -> Result<Result<(), WriteError>, RPCError> {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(Err(WriteError::Durability(
+                crate::ram::durability::DurabilityError::Rpc {
+                    message: "captured batch already completed".into(),
+                },
+            )));
+        }
+        let clients = std::mem::take(&mut *self.clients.lock());
+        let results =
+            futures::future::join_all(clients.into_iter().map(|(client, tokens)| async move {
+                client.finish_captured_receipts(tokens, true).await
+            }))
+            .await;
+        let mut error = None;
+        for result in results {
+            match result {
+                Err(error) => return Err(error),
+                Ok(Err(failure)) => {
+                    error.get_or_insert(failure);
+                }
+                Ok(Ok(())) => {}
+            }
+        }
+        Ok(error.map_or(Ok(()), Err))
+    }
+}
+impl Drop for CapturedWriteBatch {
+    fn drop(&mut self) {
+        let clients = std::mem::take(self.clients.get_mut());
+        if clients.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for (client, tokens) in clients {
+                    let _ = client.finish_captured_receipts(tokens, false).await;
+                }
+            });
+        }
+        // Lost replies and unavailable peers expire their server receipts.
+    }
+}
+
 pub struct AsyncClient {
+    pub(crate) write_back_hub: std::sync::OnceLock<Arc<crate::index::ranged::tree::btree::storage::WriteBackHub>>,
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
@@ -94,6 +180,7 @@ impl AsyncClient {
                 .await
                 {
                     Ok(chash) => Ok(Self {
+                        write_back_hub: std::sync::OnceLock::new(),
                         schema_client: {
                             let schema_plane_client =
                                 raft_client.plane(database_meta_plane_id(group, database_name));
@@ -400,6 +487,24 @@ impl AsyncClient {
             .collect())
     }
 
+    pub(crate) async fn read_indexed_cell(
+        &self,
+        id: Id,
+        check: crate::index::verification::IndexCheck,
+    ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        let mut cells = client
+            .read_all_cells_verified(
+                &vec![id],
+                &vec![],
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &dovahkiin::expr::serde::Expr::nothing(),
+                &vec![check],
+            )
+            .await?;
+        Ok(cells.pop().unwrap_or(Err(ReadError::CellDoesNotExisted)))
+    }
+
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,
@@ -466,6 +571,12 @@ impl AsyncClient {
         self.client_by_server_id(current_owner).await
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn write_cell(
         &self,
         cell: OwnedCell,
@@ -502,6 +613,12 @@ impl AsyncClient {
         tokio::task::consume_budget().await;
         res
     }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn update_cell(
         &self,
         cell: OwnedCell,
@@ -532,6 +649,12 @@ impl AsyncClient {
         tokio::task::consume_budget().await;
         res
     }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_cell(
         &self,
         cell: OwnedCell,
@@ -568,6 +691,13 @@ impl AsyncClient {
     /// server, amortizing per-cell location lookup and RPC round-trips.
     /// Results are returned in the same order as `cells`. Used by B-tree
     /// write-back to drain many dirty pages at once.
+    ///
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn upsert_all_cells(
         &self,
         cells: Vec<OwnedCell>,
@@ -598,6 +728,12 @@ impl AsyncClient {
         }
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell(id).await? {
@@ -618,6 +754,118 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
+    /// Headers (no bodies) for many cells, in the order of `ids`, each from the
+    /// server that owns it.
+    pub async fn head_all_cells(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Result<CellHeader, ReadError>>, RPCError> {
+        let mut by_server: HashMap<u64, Vec<(usize, Id)>> = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let server_id = self.locate_server_id(id)?;
+            by_server.entry(server_id).or_default().push((index, *id));
+        }
+        let mut out: Vec<Option<Result<CellHeader, ReadError>>> =
+            (0..ids.len()).map(|_| None).collect();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<Id>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let heads = client.head_all_cells(&batch).await?;
+                Ok::<_, RPCError>((indices, heads))
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(batch) = batches.next().await {
+            let (indices, heads) = batch?;
+            for (index, head) in indices.into_iter().zip(heads) {
+                out[index] = Some(head);
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|head| head.expect("every id was routed"))
+            .collect())
+    }
+
+    /// Fence writes to `families` on every member and wait for in-flight writes
+    /// to drain. The fence is leased: a holder that dies stops renewing and the
+    /// members lift it on their own. Hold the returned [`ClusterFence`] for as
+    /// long as the copy runs and call [`ClusterFence::release`] when done.
+    pub async fn engage_write_fence(
+        &self,
+        families: &[u32],
+        drain: std::time::Duration,
+        lease: std::time::Duration,
+    ) -> Result<ClusterFence, String> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .all_members(true)
+            .await
+            .map_err(|e| format!("cannot list members: {e:?}"))?;
+        let families = families.to_vec();
+        let lease_ms = lease.as_millis() as u64;
+        let mut holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)> = Vec::new();
+        for member in members {
+            let rpc = self
+                .client_by_server_id(member.id)
+                .await
+                .map_err(|e| format!("cannot reach member {}: {e:?}", member.id))?;
+            let engaged = rpc
+                .fence_engage(&families, drain.as_millis() as u64, lease_ms)
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|answer| answer);
+            match engaged {
+                Ok(token) => holds.push((rpc, token)),
+                Err(reason) => {
+                    for (rpc, token) in holds {
+                        let _ = rpc.fence_release(token).await;
+                    }
+                    return Err(format!("member {} refused the fence: {reason}", member.id));
+                }
+            }
+        }
+        Ok(ClusterFence::start(holds, lease_ms))
+    }
+
+    /// Cells the cell indexes of every member hold live, summed.
+    pub async fn live_cell_count(&self) -> Result<u64, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut total = 0;
+        for member in members {
+            total += self
+                .client_by_server_id(member.id)
+                .await?
+                .live_cell_count()
+                .await?;
+        }
+        Ok(total)
+    }
+
+    /// Begin a bounded-memory walk over every live cell id in the database,
+    /// server by server and chunk by chunk, straight off each chunk's primary
+    /// `cell_index`.
+    ///
+    /// The walk only yields ids the visited server OWNS. After a migration the
+    /// donor keeps a deferred copy of a cell until it is reclaimed, and
+    /// reporting both copies would visit one cell twice. Concurrent writes are
+    /// not frozen by this call: a caller that needs a stable set holds the
+    /// database's write fence for the walk.
+    pub async fn cell_id_scan(&self) -> Result<CellIdScan<'_>, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut servers: Vec<u64> = members.into_iter().map(|m| m.id).collect();
+        servers.sort_unstable();
+        Ok(CellIdScan {
+            client: self,
+            servers,
+            next_server: 0,
+            current: None,
+            not_owned: 0,
+        })
+    }
+
     pub async fn count(&self) -> Result<u64, RPCError> {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut member_futs: FuturesUnordered<_> = members
@@ -633,19 +881,20 @@ impl AsyncClient {
         }
         Ok(sum)
     }
-    /// Re-derive every node's ranged index entries and report (or fill) the
-    /// holes. The maintenance command for an index that has lost entries
-    /// their cells can still supply.
+    /// Re-derive every node's index entries and report (or fill) the holes, for
+    /// both secondary indexes. The maintenance command for an index that has lost
+    /// entries their cells can still supply.
     ///
     /// Fans out to EVERY member and sums, because a ranged tree covers a key
     /// range across the whole cluster while each node can only walk its own
-    /// chunks. A single node's pass is sound but partial: it can prove an
-    /// entry is missing, never that the index is complete. Only the union
-    /// rebuilds a tree in full.
+    /// chunks, and because a bucket cell sits on whichever member owns its slot
+    /// while the ids it lists can live anywhere. A single node's pass is sound but
+    /// partial: it can prove an entry is missing, never that the index is complete.
+    /// Only the union rebuilds an index in full.
     ///
-    /// `repair` inserts what is missing and never deletes, so it is safe to
-    /// run on a healthy store -- on which it is a no-op.
-    pub async fn scrub_ranged_index(
+    /// `repair` inserts what is missing and prunes what no cell implies, so it is
+    /// safe to run on a healthy store -- on which it is a no-op.
+    pub async fn scrub_index(
         &self,
         repair: bool,
     ) -> Result<crate::index::scrub::ScrubReport, String> {
@@ -654,7 +903,7 @@ impl AsyncClient {
             .into_iter()
             .map(|m| async move {
                 let client = self.client_by_server_id(m.id).await?;
-                Ok::<_, RPCError>(client.scrub_ranged_index(repair).await?)
+                Ok::<_, RPCError>(client.scrub_index(repair).await?)
             })
             .collect();
         let mut total = crate::index::scrub::ScrubReport::default();
@@ -667,6 +916,12 @@ impl AsyncClient {
         Ok(total)
     }
 
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_update_cell(
         &self,
         id: Id,
@@ -688,6 +943,12 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
     pub async fn compare_version_and_set_field(
         &self,
         id: Id,
@@ -705,6 +966,471 @@ impl AsyncClient {
                     .await?;
                 client
                     .compare_version_and_set_field(id, version, field, value)
+                    .await
+            }
+            other => Ok(other),
+        }
+    }
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn write_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // Local-shortcut RPC futures can complete without ever returning
+        // Pending, so a hot caller loop never yields to the runtime: it
+        // starves timers and peer tasks, and JoinHandle::abort can never
+        // land (the task must return from poll to be cancelled). Consuming
+        // coop budget bounds such loops to tokio's task budget. The yield
+        // sits AFTER the call so that on the all-local path a cancellation
+        // can only land once the write's side effects are complete -- never
+        // between the caller reserving work and the cell landing.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.write_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.write_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.write_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn update_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.update_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.update_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.update_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn upsert_cell_durable(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            // Clone only for the rare schema-miss retry path, not on every call.
+            match client.upsert_cell_durable(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.upsert_cell_durable(cell).await
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    owner_client.upsert_cell_durable(cell).await
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn remove_cell_durable(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client.remove_cell_durable(id).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.remove_cell_durable(id).await
+            }
+            Err(WriteError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
+                owner_client.remove_cell_durable(id).await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Certify current WAL prefixes on every member of this database.
+    pub async fn flush_wal_durable(&self) -> Result<Result<(), WriteError>, RPCError> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .group_members(&self.group_name, false)
+            .await
+            .map_err(|error| {
+                RPCError::IOError(std::io::Error::other(format!(
+                    "membership query failed: {error:?}"
+                )))
+            })?
+            .ok_or_else(|| RPCError::IOError(std::io::Error::other("database group is missing")))?;
+        let mut waits: FuturesUnordered<_> = members
+            .into_iter()
+            .map(|member| async move {
+                self.client_by_server_id(member.id)
+                    .await?
+                    .flush_wal_durable()
+                    .await
+            })
+            .collect();
+        let mut first = None;
+        while let Some(result) = waits.next().await {
+            if let Err(error) = result? {
+                first.get_or_insert(error);
+            }
+        }
+        Ok(first.map_or(Ok(()), Err))
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn write_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        // Local-shortcut RPC futures can complete without ever returning
+        // Pending, so a hot caller loop never yields to the runtime: it
+        // starves timers and peer tasks, and JoinHandle::abort can never
+        // land (the task must return from poll to be cancelled). Consuming
+        // coop budget bounds such loops to tokio's task budget. The yield
+        // sits AFTER the call so that on the all-local path a cancellation
+        // can only land once the write's side effects are complete -- never
+        // between the caller reserving work and the cell landing.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match capture.record_call(
+                client.clone(),
+                client.write_cell_captured(cell.clone()).await,
+            )? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    capture.record_call(client.clone(), client.write_cell_captured(cell).await)
+                }
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
+                    capture.record_call(
+                        owner_client.clone(),
+                        owner_client.write_cell_captured(cell).await,
+                    )
+                }
+                other => Ok(other),
+            }
+        }
+        .await;
+        tokio::task::consume_budget().await;
+        res
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn remove_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+    ) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(client.clone(), client.remove_cell_captured(id).await)? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(client.clone(), client.remove_cell_captured(id).await)
+            }
+            Err(WriteError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
+                capture.record_call(
+                    owner_client.clone(),
+                    owner_client.remove_cell_captured(id).await,
+                )
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Certify current WAL prefixes on every member of this database.
+    ///
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn compare_version_and_update_cell_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+        version: u64,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_REVERT_CAPTURE_CAS_ROUTING").is_some() { return self.compare_version_and_update_cell_durable(id, version, cell).await; }
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(
+            client.clone(),
+            client
+                .compare_version_and_update_cell_captured(id, version, cell.clone())
+                .await,
+        )? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(
+                    client.clone(),
+                    client
+                        .compare_version_and_update_cell_captured(id, version, cell)
+                        .await,
+                )
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn compare_version_and_set_field_captured(
+        &self,
+        capture: &CapturedWriteBatch,
+        id: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        #[cfg(test)]
+        if std::env::var_os("NEB_TEST_REVERT_CAPTURE_CAS_ROUTING").is_some() { return self.compare_version_and_set_field_durable(id, version, field, value).await; }
+        let client = self.locate_plain_server(id).await?;
+        match capture.record_call(
+            client.clone(),
+            client
+                .compare_version_and_set_field_captured(id, version, field, value.clone())
+                .await,
+        )? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                capture.record_call(
+                    client.clone(),
+                    client
+                        .compare_version_and_set_field_captured(id, version, field, value)
+                        .await,
+                )
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn write_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> Result<Vec<Result<CellHeader, WriteError>>, RPCError> {
+        // Preserve input order: tag each cell with its index, group by server.
+        let mut by_server: HashMap<u64, Vec<(usize, OwnedCell)>> = HashMap::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let server_id = self.locate_server_id(&cell.id())?;
+            by_server.entry(server_id).or_default().push((i, cell));
+        }
+        let total: usize = by_server.values().map(|v| v.len()).sum();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<OwnedCell>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let results = client.write_all_cells_durable(batch).await?;
+                Ok::<_, RPCError>((indices, results))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
+        while let Some(res) = batches.next().await {
+            let (indices, results) = res?;
+            for (idx, r) in indices.into_iter().zip(results) {
+                out[idx] = Some(r);
+            }
+        }
+        Ok(out.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn upsert_all_cells_durable(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> Result<Vec<Result<CellHeader, WriteError>>, RPCError> {
+        // Preserve input order: tag each cell with its index, group by server.
+        let mut by_server: HashMap<u64, Vec<(usize, OwnedCell)>> = HashMap::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let server_id = self.locate_server_id(&cell.id())?;
+            by_server.entry(server_id).or_default().push((i, cell));
+        }
+        let total: usize = by_server.values().map(|v| v.len()).sum();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<OwnedCell>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let results = client.upsert_all_cells_durable(batch).await?;
+                Ok::<_, RPCError>((indices, results))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
+        while let Some(res) = batches.next().await {
+            let (indices, results) = res?;
+            for (idx, r) in indices.into_iter().zip(results) {
+                out[idx] = Some(r);
+            }
+        }
+        Ok(out.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn compare_version_and_update_cell_durable(
+        &self,
+        id: Id,
+        version: u64,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client
+            .compare_version_and_update_cell_durable(id, version, cell.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_update_cell_durable(id, version, cell)
+                    .await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Contract: a cell takes plain (non-transactional) writes or transactions,
+    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
+    /// an acknowledged plain write or delete survives the resolution of an
+    /// in-doubt transaction: after a restart with a transaction T in doubt, the
+    /// plain write and T's write can get the same version, and only one is kept;
+    /// an acknowledged delete is undone when the resolution installs T's cell.
+    pub async fn compare_version_and_set_field_durable(
+        &self,
+        id: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client
+            .compare_version_and_set_field_durable(id, version, field, value.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_set_field_durable(id, version, field, value)
                     .await
             }
             other => Ok(other),
@@ -745,6 +1471,7 @@ impl AsyncClient {
         while retried < TRANSACTION_MAX_RETRY {
             // Exponential backoff before retry (skip on first attempt)
             if retried > 0 {
+                TRANSACTION_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let backoff_ms = 2u64.pow(retried.min(10)) * 5; // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms, cap at 5120ms
                 debug!(
                     "Client retrying transaction after {}ms backoff (attempt {}/{})",
@@ -809,6 +1536,11 @@ impl AsyncClient {
                         reason, abort_result
                     );
                 }
+                Err(TxnError::OutcomeUnknown) => {
+                    // `end` was sent (D33): the transaction can be committed.
+                    // No abort and no retry; the caller reads the data again.
+                    return Err(TxnError::OutcomeUnknown);
+                }
                 Err(e) => {
                     // abort will always be an error to achieve early break
                     let abort_result = txn.abort().await;
@@ -842,6 +1574,7 @@ impl AsyncClient {
     }
 
     pub async fn schema_by_id(&self, id: u32) -> Result<Option<Schema>, ExecError> {
+        crate::index::query_metrics::metadata();
         self.schema_client.get(&id).await
     }
 
@@ -856,6 +1589,8 @@ impl AsyncClient {
         let schema_id = schema.vid;
         match res {
             Ok(Ok(_)) => {
+                // The record is committed here; only derived state remains.
+                crate::ram::schema::schema_create_point("neb_after_raft_commit", &schema.name);
                 if schema.index_fields.is_empty() && schema.compound_index_fields.is_empty() {
                     // Nothing to process
                     return res;
@@ -1030,6 +1765,18 @@ impl AsyncClient {
         self.schema_client.rename_schema(&old_name, &new_name).await
     }
 
+    /// Replace the owner metadata stored in the family's schema record. One
+    /// raft command: it is applied in full or not at all.
+    pub async fn set_schema_app_meta(
+        &self,
+        name: &str,
+        app_meta: Vec<u8>,
+    ) -> Result<Result<(), SetAppMetaError>, ExecError> {
+        self.schema_client
+            .set_app_meta(&name.to_string(), &app_meta)
+            .await
+    }
+
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         let schema = self.schema_client.get_by_name(&name).await?;
         let has_index_fields;
@@ -1093,6 +1840,7 @@ impl AsyncClient {
     /// For callers that must see superseded layouts -- diagnostics, migration
     /// tooling, anything decoding cells written before an evolution.
     pub async fn get_all_schema_generations(&self) -> Result<Vec<Schema>, ExecError> {
+        crate::index::query_metrics::metadata();
         self.schema_client.get_all().await
     }
 
@@ -1122,7 +1870,7 @@ impl AsyncClient {
     /// let ranged = client.ranged();
     ///
     /// // Scan all documents in a schema
-    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100).await? {
+    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100, crate::index::verification::Verify::Predicate).await? {
     ///     while let Some(id) = cursor.next().await? {
     ///         let doc = client.read_cell(id).await?;
     ///     }
@@ -1216,4 +1964,182 @@ pub async fn client_by_server_name_for_database(
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
+}
+
+/// A walk over the live cell ids of a database. See [`AsyncClient::cell_id_scan`].
+pub struct CellIdScan<'a> {
+    client: &'a AsyncClient,
+    servers: Vec<u64>,
+    next_server: usize,
+    /// The server being walked and its open cursor.
+    current: Option<(u64, Arc<plain_server::AsyncServiceClient>, u64)>,
+    not_owned: u64,
+}
+
+impl CellIdScan<'_> {
+    /// Deferred donor copies skipped so far (ids a server holds but does not own).
+    pub fn not_owned_skipped(&self) -> u64 {
+        self.not_owned
+    }
+
+    /// The next page of at most `max` ids, or `None` when every server has been
+    /// walked. A page can be empty or short without the walk being over.
+    pub async fn next_page(&mut self, max: u32) -> Result<Option<Vec<Id>>, RPCError> {
+        loop {
+            if self.current.is_none() {
+                let Some(&server_id) = self.servers.get(self.next_server) else {
+                    return Ok(None);
+                };
+                self.next_server += 1;
+                let rpc = self.client.client_by_server_id(server_id).await?;
+                let cursor = rpc.cell_scan_open().await?;
+                self.current = Some((server_id, rpc, cursor));
+            }
+            let (server_id, rpc, cursor) = self.current.clone().expect("just set");
+            let page = rpc.cell_scan_next(cursor, max).await?.map_err(|reason| {
+                RPCError::IOError(io::Error::new(io::ErrorKind::Other, reason))
+            })?;
+            if page.done {
+                self.current = None;
+            }
+            let mut ids = Vec::with_capacity(page.ids.len());
+            for id in page.ids {
+                if self.client.locate_server_id(&id)? == server_id {
+                    ids.push(id);
+                } else {
+                    self.not_owned += 1;
+                }
+            }
+            if !ids.is_empty() || !page.done {
+                if ids.is_empty() {
+                    continue;
+                }
+                return Ok(Some(ids));
+            }
+        }
+    }
+}
+
+impl Drop for CellIdScan<'_> {
+    fn drop(&mut self) {
+        // A walk dropped part-way leaves its cursor to the server's idle expiry.
+        self.current = None;
+    }
+}
+
+/// Write fences engaged on every member. See [`AsyncClient::engage_write_fence`].
+pub struct ClusterFence {
+    holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)>,
+    lease_ms: u64,
+    stop: Arc<tokio::sync::Notify>,
+    renewal: Option<tokio::task::JoinHandle<()>>,
+    lost: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ClusterFence {
+    fn start(holds: Vec<(Arc<plain_server::AsyncServiceClient>, u64)>, lease_ms: u64) -> Self {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let renewal = {
+            let holds = holds.clone();
+            let stop = stop.clone();
+            let lost = lost.clone();
+            let every = std::time::Duration::from_millis((lease_ms / 3).max(1));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        _ = tokio::time::sleep(every) => {}
+                    }
+                    for (rpc, token) in &holds {
+                        match rpc.fence_renew(*token, lease_ms).await {
+                            Ok(true) => {}
+                            // A member that no longer holds the fence means the
+                            // copy is no longer protected on it.
+                            _ => lost.store(true, std::sync::atomic::Ordering::SeqCst),
+                        }
+                    }
+                }
+            })
+        };
+        ClusterFence {
+            holds,
+            lease_ms,
+            stop,
+            renewal: Some(renewal),
+            lost,
+        }
+    }
+
+    /// Prove, right now, that every member has held the fence continuously
+    /// since it was engaged.
+    ///
+    /// [`Self::is_lost`] only knows what the background renewals have seen so
+    /// far, and a lease can lapse between two of them (a stalled renewal task,
+    /// a slow network) with nobody told yet. A member drops a lease's token
+    /// when, and only when, it lifts that fence, so a renewal answered `true`
+    /// means the fence has been up there the whole time. A copy calls this
+    /// after its last read and before it declares itself complete.
+    pub async fn confirm(&self) -> Result<(), String> {
+        let lost = |reason: String| {
+            self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(reason)
+        };
+        if self.is_lost() {
+            return Err("a renewal already found the fence lifted on a member".to_string());
+        }
+        for (rpc, token) in &self.holds {
+            match rpc.fence_renew(*token, self.lease_ms).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return lost(format!(
+                        "the fence lease {token} lapsed on a member and the fence was lifted there"
+                    ))
+                }
+                Err(e) => {
+                    return lost(format!(
+                        "cannot confirm the fence lease {token} on a member: {e:?}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any member lost the fence (a missed renewal) since it was engaged.
+    /// A copy taken while this is true is not consistent.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stop renewing without releasing, as a holder whose renewal task stalls
+    /// (a starved runtime, a slow network) would.
+    #[cfg(test)]
+    pub(crate) fn stop_renewing_for_test(&mut self) {
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
+    }
+
+    pub async fn release(mut self) {
+        self.stop.notify_one();
+        if let Some(task) = self.renewal.take() {
+            let _ = task.await;
+        }
+        for (rpc, token) in &self.holds {
+            let _ = rpc.fence_release(*token).await;
+        }
+        self.holds.clear();
+    }
+}
+
+impl Drop for ClusterFence {
+    fn drop(&mut self) {
+        // Not released explicitly (a panic, a cancelled task): stop renewing and
+        // let the members' leases lapse.
+        self.stop.notify_one();
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
+    }
 }

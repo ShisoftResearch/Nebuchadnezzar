@@ -90,7 +90,7 @@ async fn lazy_hydration_recovers_missing_active_tree() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mark_migration_recreates_missing_metadata_cell() {
+async fn publish_head_recreates_missing_metadata_cell() {
     let _ = env_logger::try_init();
 
     let server_addr = String::from("127.0.0.1:6832");
@@ -144,9 +144,9 @@ async fn mark_migration_recreates_missing_metadata_cell() {
     let head_id = tree.head_id();
 
     client.remove_cell(tree_id).await.unwrap().unwrap();
-    tree.mark_migration(&tree_id, None, &client)
+    tree.publish_head(&tree_id, &client)
         .await
-        .expect("mark_migration should recreate a missing tree metadata cell");
+        .expect("publish_head should recreate a missing tree metadata cell");
 
     let restored = client.read_cell(tree_id).await.unwrap().unwrap();
     assert_eq!(restored.data[*RANGED_TREE_HEAD_HASH].id(), Some(&head_id));

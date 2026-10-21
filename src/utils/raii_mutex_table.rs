@@ -1,10 +1,9 @@
-use parking_lot::Mutex;
+use lightning::map::{Map, PtrHashMap};
 use std::cmp::Eq;
-use std::collections::HashSet;
 use std::hash::Hash;
 
-pub struct RAIIMutexTable<K> {
-    map: Mutex<HashSet<K>>,
+pub struct RAIIMutexTable<K: Eq + Clone + Hash> {
+    map: PtrHashMap<K, bool>,
 }
 
 pub struct RAIIMutexGuard<'a, K>
@@ -21,27 +20,22 @@ where
 {
     pub fn new() -> RAIIMutexTable<K> {
         RAIIMutexTable {
-            map: Mutex::new(HashSet::new()),
+            map: PtrHashMap::with_capacity(128),
         }
     }
 
     pub fn lock(&self, k: K) -> RAIIMutexGuard<'_, K> {
         loop {
-            let mut map_guard = self.map.lock();
-            if !map_guard.contains(&k) {
-                map_guard.insert(k.clone());
-                return RAIIMutexGuard {
-                    parent: self,
-                    key: k,
-                };
+            if !self.map.contains_key(&k) && self.map.try_insert(k.clone(), true).is_none() {
+                return RAIIMutexGuard { parent: self, key: k };
             }
+            std::hint::spin_loop();
         }
     }
 
     pub fn unlock(&self, key: &K) {
-        let mut map_guard = self.map.lock();
-        debug_assert!(map_guard.contains(key));
-        map_guard.remove(key);
+        debug_assert!(self.map.contains_key(key));
+        self.map.remove(key);
     }
 }
 
@@ -51,5 +45,30 @@ where
 {
     fn drop(&mut self) {
         self.parent.unlock(&self.key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unrelated_mutex_keys_progress_and_owned_keys_stay_exclusive() {
+        let table = std::sync::Arc::new(RAIIMutexTable::new());
+        let first = 1u64;
+        let second = 2u64;
+        let held = table.lock(first);
+        let worker = table.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let guard = worker.lock(second);
+            assert!(worker.map.contains_key(&second));
+            drop(guard);
+            assert!(!worker.map.contains_key(&second));
+            tx.send(()).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        result.unwrap();
     }
 }

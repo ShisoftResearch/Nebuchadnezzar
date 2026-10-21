@@ -12,6 +12,7 @@ libc = "*"
 log = "*"
 lazy_static = "*"
 ahash = "0.8"
+arc-swap = "1.9"
 bifrost = { path = "../bifrost" }
 bifrost_plugins = { path = "../bifrost/src/plugins" }
 bifrost_proc_macro = { path = "../bifrost/src/proc_macro" }
@@ -21,10 +22,10 @@ lightning-containers = { git = "ssh://git@192.168.10.134/shisoft-x/Lightning.git
 rayon = "*"
 serde = "*"
 serde_derive = "*"
-bincode = "2"
+bincode = { version = "2", features = ["serde"] }
 bincode_derive = "2"
 byteorder = "*"
-parking_lot = "*"
+parking_lot = { version = "*", features = ["arc_lock"] }
 async-trait = "0.1"
 rand = { version = "*", features = ["small_rng"] }
 itertools = "0.14"
@@ -39,6 +40,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
+crossbeam-skiplist = "0.1.3"
 num = "*"
 core_affinity = "0.8.1"
 ndarray = "0.16.1"
@@ -55,6 +57,7 @@ mimalloc = { version = "0.1.52", optional = true }
 tikv-jemallocator = { version = "0.7.0", features = ["profiling"], optional = true }
 
 [features]
+c3doubt_trace = ["bifrost/c3doubt_trace"]
 # Swap the global allocator. glibc's arenas degrade badly under the
 # fragmentation a large import produces: identical write-plan code measured
 # 1.01us/cell locally against 11.93us/cell on a loaded server.
@@ -74,6 +77,8 @@ default = [
 cleaner = []
 combine_cleaner = ["cleaner"]
 occ_phase_profile = []
+lock_profile = []
+abort_profile = []
 
 # Enable CRC32 checksum verification during eviction and promotion
 debug_verify_checksums = ["tiered_memory"]
@@ -103,3 +108,17 @@ harness = false
 [[bench]]
 name = "occ_transactions"
 harness = false
+
+[[bench]]
+name = "write_path"
+harness = false
+
+[[bench]]
+name = "index_write_path"
+harness = false
+
+[patch."https://github.com/shisoft/bifrost"]
+bifrost = { path = "../bifrost" }
+bifrost_plugins = { path = "../bifrost/src/plugins" }
+bifrost_hasher = { path = "../bifrost/src/hasher" }
+bifrost_proc_macro = { path = "../bifrost/src/proc_macro" }

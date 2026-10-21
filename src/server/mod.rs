@@ -34,8 +34,11 @@ pub mod cell_rpc;
 pub mod database;
 pub mod status;
 mod storage_lock;
+pub mod write_fence;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod restart_delete_tests;
 pub mod transactions;
 
 // Re-export status types for convenience
@@ -71,6 +74,21 @@ fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
 }
 
 /// Check if Raft state exists on disk at the given path
+fn raft_storage_for_layout(layout: &database::DatabaseStorageLayout) -> raft::Storage {
+    if let Some(ref raft_path) = layout.raft_storage {
+        raft::Storage::DISK(DiskOptions {
+            path: raft_path.clone(),
+            take_snapshots: true,
+            append_logs: true,
+            trim_logs: true,
+            snapshot_log_threshold: raft_threshold_from_env("NEB_RAFT_SNAPSHOT_LOG_THRESHOLD", 1000),
+            log_compaction_threshold: raft_threshold_from_env("NEB_RAFT_LOG_COMPACTION_THRESHOLD", 2000),
+        })
+    } else {
+        raft::Storage::MEMORY
+    }
+}
+
 fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
     if let Some(ref path) = raft_storage {
         has_recoverable_raft_state_at(Path::new(path))
@@ -94,12 +112,7 @@ fn routed_cluster_members(
 ) -> Vec<String> {
     configured_cluster_members(server_addr, meta_members)
         .into_iter()
-        .filter(|member| {
-            conshash
-                .to_server_name_option(Some(hash_str(member)))
-                .as_ref()
-                == Some(member)
-        })
+        .filter(|member| conshash.is_routing_member(hash_str(member)))
         .collect()
 }
 
@@ -159,6 +172,91 @@ async fn wait_for_scoped_cell_rpc_services(
         members,
         last_unavailable
     )))
+}
+
+#[cfg(test)]
+mod readiness_membership_tests {
+    use super::*;
+
+    async fn readiness_with_configured_outsider(outsider: bool) {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            "readiness_configured_seed",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let (host, group, ring) = if outsider {
+            let host = crate::utils::test_port::unique_localhost_addr();
+            let group = "readiness_other_group".to_string();
+            let id = hash_str(&host);
+            server.membership.sm_client.join(&host).await.unwrap();
+            assert!(server
+                .membership
+                .sm_client
+                .join_group(&group, &id)
+                .await
+                .unwrap());
+            let ring = ConsistentHashing::new_with_id(
+                CONS_HASH_ID,
+                &group,
+                &server.raft_client,
+                &server.membership,
+            )
+            .await
+            .unwrap();
+            ring.set_weight(&host, 1).await.unwrap();
+            ring.init_table().await.unwrap();
+            (host, group, ring)
+        } else {
+            (
+                address.clone(),
+                server.group_name.clone(),
+                server.consh.clone(),
+            )
+        };
+        // The configured seed has no scoped cell service for the other group.
+        // Its address stays discoverable, but it is not a readiness peer.
+        assert_eq!(
+            ring.try_server_name(server.server_id),
+            Some(address.clone())
+        );
+        let configured = vec![address.clone()];
+        let peers = routed_cluster_members(&host, &configured, &ring);
+        let ready =
+            wait_for_scoped_cell_rpc_services(&host, &configured, &ring, &group, &group).await;
+        server.shutdown().await;
+        assert!(
+            ready.is_ok(),
+            "a configured outsider must not block scoped readiness: {:?}",
+            ready
+        );
+        assert_eq!(peers, vec![host]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_outsider_does_not_block_scoped_readiness() {
+        readiness_with_configured_outsider(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_a_group_member_passes_scoped_readiness() {
+        readiness_with_configured_outsider(false).await;
+    }
 }
 
 fn discover_known_databases_from_raft_storage(
@@ -600,6 +698,33 @@ async fn ensure_type2_meta_plane(
     Err(last_transient_error.unwrap_or_else(|| "unknown transient bootstrap error".to_string()))
 }
 
+async fn initialize_database_catalog<F, Fut>(mut ensure: F) -> Result<(), sm_master::ExecError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), sm_master::ExecError>> + Send,
+{
+    // A recovered plane needs up to 30 s to elect a leader. A command's
+    // 2 s discovery budget does not cover that startup phase.
+    let budget = tokio::time::Duration::from_millis(
+        META_PLANE_BOOTSTRAP_MAX_RETRIES as u64 * META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+    );
+    tokio::time::timeout(budget, async {
+        loop {
+            match ensure().await {
+                Err(sm_master::ExecError::TooManyRetry) => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .unwrap_or(Err(sm_master::ExecError::TooManyRetry))
+}
+
 async fn ensure_shared_meta_plane(
     raft_service: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
@@ -885,6 +1010,9 @@ mod startup_discovery_tests {
 
 #[derive(Debug)]
 pub enum ServerError {
+    HashIndexFormatMismatch {
+        found: Vec<u8>,
+    },
     CannotJoinCluster,
     CannotJoinClusterRejected(String),
     CannotJoinClusterGroup(sm_master::ExecError),
@@ -892,6 +1020,8 @@ pub enum ServerError {
     CannotInitMemberTable,
     CannotSetServerWeight,
     CannotInitConsistentHashTable(String),
+    /// The explicit restore of a store under a new address failed.
+    CannotRestoreStore(String),
     CannotLoadMetaClient,
     CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
@@ -899,6 +1029,8 @@ pub enum ServerError {
     CannotInitializeDatabaseServices(String),
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
+    /// Persisted state is present but cannot be read or decoded.
+    CannotRecoverPersistedState(std::io::Error),
     StandaloneMustAlsoBeMetaServer,
     /// `tiered_config` is set but `backup_storage` is not. Eviction frees
     /// memory by archiving a segment to its backup file and dropping the
@@ -910,6 +1042,9 @@ pub enum ServerError {
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServerError::HashIndexFormatMismatch { found } => {
+                write!(f, "hash index format mismatch: {found:?}")
+            }
             ServerError::CannotJoinCluster => write!(f, "cannot join cluster"),
             ServerError::CannotJoinClusterRejected(error) => {
                 write!(f, "cannot join cluster: {error}")
@@ -924,6 +1059,9 @@ impl std::fmt::Display for ServerError {
             ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
             ServerError::CannotInitConsistentHashTable(error) => {
                 write!(f, "cannot initialize consistent hash table: {error}")
+            }
+            ServerError::CannotRestoreStore(error) => {
+                write!(f, "cannot restore the store under a new address: {error}")
             }
             ServerError::CannotLoadMetaClient => write!(f, "cannot load meta client"),
             ServerError::CannotAcquireStorageLock(error) => write!(f, "{error}"),
@@ -941,6 +1079,9 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::CannotInitializeSchemaPlane(error) => {
                 write!(f, "cannot initialize schema plane: {error}")
+            }
+            ServerError::CannotRecoverPersistedState(error) => {
+                write!(f, "cannot recover persisted state: {error}")
             }
             ServerError::StandaloneMustAlsoBeMetaServer => {
                 write!(f, "standalone server must also be a meta server")
@@ -987,7 +1128,6 @@ pub struct ServerOptions {
     pub services: Vec<Service>,
     pub index_enabled: bool,
     pub enable_recovery: bool,
-    #[serde(default)]
     pub disable_storage_locks: bool,
 }
 
@@ -1021,6 +1161,11 @@ pub struct DatabaseRuntime {
     /// Lazily-initialized compact-id allocator: first use claims an
     /// origin slot from the database's lease authority.
     id_allocator: tokio::sync::OnceCell<Arc<crate::ram::id_alloc::IdAllocator>>,
+    /// The database's id-allocation authority as seen from this server, kept so
+    /// floors can be reserved for origins other than our own.
+    id_alloc_sm: tokio::sync::OnceCell<Arc<crate::ram::id_alloc_sm::client::SMClient>>,
+    /// Holds writers off for a logical dump; see `write_fence`.
+    write_fence: Arc<write_fence::WriteFence>,
     /// This database's participant side, once its service is registered.
     ///
     /// WEAK on purpose: the data site holds the runtime, so a strong link
@@ -1065,6 +1210,8 @@ impl DatabaseRuntime {
             raft_client,
             neb_client,
             id_allocator: tokio::sync::OnceCell::new(),
+            id_alloc_sm: tokio::sync::OnceCell::new(),
+            write_fence: Arc::new(write_fence::WriteFence::new()),
             data_site: std::sync::OnceLock::new(),
         }
     }
@@ -1078,17 +1225,7 @@ impl DatabaseRuntime {
     ) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
         self.id_allocator
             .get_or_try_init(|| async {
-                let plane_client = self
-                    .raft_client
-                    .plane(database_meta_plane_id(&self.group_name, &self.database_name));
-                let sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(
-                    &self.group_name,
-                    &self.database_name,
-                );
-                let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
-                    sm_id,
-                    &plane_client,
-                ));
+                let sm = self.id_alloc_sm_client();
                 let holder = self.rpc.server_id;
                 let (origin, epoch) = sm
                     .claim_origin(&holder)
@@ -1105,7 +1242,7 @@ impl DatabaseRuntime {
                             format!("origin claim refused: {e}"),
                         )
                     })?;
-                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm));
+                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm.clone()));
                 // The recovery scan's max observed sequence for this origin is
                 // the belt-and-suspenders floor: even if the durable lease
                 // record was lost, no sequence that reached disk is reissued.
@@ -1120,6 +1257,110 @@ impl DatabaseRuntime {
                 Ok(Arc::new(allocator))
             })
             .await
+    }
+
+    fn id_alloc_sm_client(&self) -> Arc<crate::ram::id_alloc_sm::client::SMClient> {
+        if let Some(sm) = self.id_alloc_sm.get() {
+            return sm.clone();
+        }
+        let plane_client = self
+            .raft_client
+            .plane(database_meta_plane_id(&self.group_name, &self.database_name));
+        let sm_id =
+            crate::ram::id_alloc_sm::generate_scoped_sm_id(&self.group_name, &self.database_name);
+        let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
+            sm_id,
+            &plane_client,
+        ));
+        // Two racing first calls build equivalent clients; keep whichever won.
+        let _ = self.id_alloc_sm.set(sm.clone());
+        self.id_alloc_sm.get().cloned().unwrap_or(sm)
+    }
+
+    /// The highest sequence ever durably leased for `origin`, if any.
+    ///
+    /// A dump uses this to tell ids this authority issued (sequence at or below
+    /// the lease end) from ids that merely have the same bit layout, such as
+    /// the random-bit shim ids `Id::from_parts` makes.
+    pub async fn id_lease_end(&self, origin: u16) -> std::io::Result<Option<u64>> {
+        self.id_alloc_sm_client().last_lease_end(&origin).await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("last_lease_end query failed: {e:?}"),
+            )
+        })
+    }
+
+    /// Make sure no id of `origin` with a sequence at or below `floor` is
+    /// issued here or by any server that claims the slot later.
+    ///
+    /// For ids imported from another database. Our own origin also moves the
+    /// warm in-memory cursor; any other origin only the durable record, which a
+    /// later claimant's first lease starts above.
+    pub async fn reserve_id_floor(&self, origin: u16, floor: u64) -> std::io::Result<()> {
+        let allocator = self.id_allocator().await?;
+        if allocator.origin() == origin {
+            return allocator.raise_floor(floor).await;
+        }
+        self.id_alloc_sm_client()
+            .reserve_floor(&origin, &floor)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("reserve_floor consensus round failed: {e:?}"),
+                )
+            })?
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("reserve_floor refused: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub fn write_fence(&self) -> &Arc<write_fence::WriteFence> {
+        &self.write_fence
+    }
+
+    /// Fence the families in `protected` against writes, wait for the ones in
+    /// flight (including prepared-but-uncommitted transactions that write) to
+    /// finish, and return a hold that lifts the fence when dropped.
+    pub async fn engage_write_fence(
+        &self,
+        protected: std::collections::HashSet<crate::ram::schema::SchemaUid>,
+        drain_timeout: std::time::Duration,
+    ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
+        self.engage_write_fence_with(write_fence::Protection::Only(protected), drain_timeout)
+            .await
+    }
+
+    /// [`Self::engage_write_fence`] with any [`write_fence::Protection`].
+    pub async fn engage_write_fence_with(
+        &self,
+        protected: write_fence::Protection,
+        drain_timeout: std::time::Duration,
+    ) -> Result<write_fence::FenceHold, write_fence::FenceError> {
+        let started = std::time::Instant::now();
+        let hold = self.write_fence.engage_with(protected, drain_timeout).await?;
+        // A transaction that prepared before the flag was set may still commit
+        // afterwards, and a commit is a write. `prepare` is itself fenced, so
+        // the set of such transactions only shrinks from here.
+        if let Some(site) = self.data_site() {
+            loop {
+                let prepared_writers = site.prepared_writer_count();
+                if prepared_writers == 0 {
+                    break;
+                }
+                if started.elapsed() >= drain_timeout {
+                    drop(hold);
+                    return Err(write_fence::FenceError::DrainTimeout {
+                        in_flight_writes: prepared_writers as i64,
+                        waited: started.elapsed(),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        Ok(hold)
     }
 
     pub fn group_name(&self) -> &str {
@@ -1149,6 +1390,15 @@ impl DatabaseRuntime {
     pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
         self.indexer.as_ref()
     }
+
+    /// Wait for unscoped index tasks from this database's local client.
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        match self.indexer() {
+            Some(indexer) => indexer.await_all_indices().await,
+            None => Vec::new(),
+        }
+    }
+
 
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
@@ -1202,23 +1452,13 @@ pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     /// The databases this server hosts, besides its default one.
     ///
-    /// A plain `RwLock<HashMap>`, deliberately, where this used to be a
-    /// `PtrHashMap`. That map's `remove` returns a CLONE and leaves the original
-    /// in the retired node -- correct, since a concurrent reader may still be
-    /// dereferencing it, but it means removal is not a release and the value
-    /// dies only on node reuse or map drop. This map outlives its removals, so
-    /// every database ever unloaded stayed resident for the life of the process,
-    /// entire memory store included. See
-    /// `server::tests::ptr_hash_map_remove_does_not_release_the_value`.
-    ///
-    /// Nothing is lost by the change: the map is written only when a database is
-    /// loaded or unloaded, and read on the same path plus status and shutdown.
-    /// It is not on any request path -- a request reaches its runtime through the
-    /// scoped RPC service that already holds it -- so there is no lock-free
-    /// requirement here to trade away.
-    database_runtimes: parking_lot::RwLock<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
+    /// Immutable snapshots keep load/unload publication separate from readers.
+    /// Replacing a snapshot releases its runtime Arcs when its readers finish.
+    /// Lightning's deferred node reclamation would retain removed runtime values.
+    /// Requests already hold their scoped runtime through their RPC service.
+    database_runtimes: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
-    runtime_init_lock: tokio::sync::Mutex<()>,
+    runtime_initializers: lightning::map::PtrHashMap<String, Arc<tokio::sync::Mutex<()>>>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
     /// `None` when tiered memory is disabled.
@@ -1265,6 +1505,10 @@ pub async fn init_conshash(
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client, membership).await {
         Ok(ch) => {
             ch.set_weight(address, memory_size).await.unwrap();
+            // A start has no notice to wait for. Raise the client cursor to the
+            // leader's log position first, so that the read of the group cannot
+            // come from a member that lags behind it (RC8).
+            let _ = raft_client.refresh_leader(0).await;
             if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
@@ -1293,64 +1537,10 @@ pub async fn init_conshash(
             match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
                 Ok((owners, applied_index)) => {
                     let has_table = owners.is_some();
-                    // A table whose every placed slot is owned by an
-                    // identity this ring does not know describes a cluster
-                    // that no longer exists: the store was reopened under a
-                    // new identity and the data came with the files. Re-point
-                    // those slots at this member, durably, so every consumer
-                    // sees one answer -- see `slots::adopt_orphaned_slots` for
-                    // why this is a reassignment rather than a routing-time
-                    // fallback.
-                    let owners = match owners {
-                        Some(table) => {
-                            match crate::slots::adopt_orphaned_slots(
-                                group_name,
-                                &ch,
-                                raft_client,
-                                SLOTS_SM_ID,
-                                &table,
-                            )
-                            .await
-                            {
-                                Ok(0) => Some(table),
-                                Ok(moved) => {
-                                    warn!(
-                                        "re-pointed {} orphaned slot(s) at this member: the \
-                                         placement table named identities this ring does not \
-                                         know, which is what reopening a store under a new \
-                                         address leaves behind",
-                                        moved
-                                    );
-                                    match crate::slots::load_owner_vec(
-                                        group_name,
-                                        raft_client,
-                                        SLOTS_SM_ID,
-                                    )
-                                    .await
-                                    {
-                                        Ok((refreshed, _)) => refreshed,
-                                        Err(reason) => {
-                                            warn!(
-                                                "could not re-read the placement table after \
-                                                 adopting orphaned slots ({}); routing by the ring",
-                                                reason
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    warn!(
-                                        "could not adopt orphaned slots ({}); those slots stay \
-                                         unreachable until placement is reconciled",
-                                        reason
-                                    );
-                                    Some(table)
-                                }
-                            }
-                        }
-                        None => None,
-                    };
+                    // No automatic adoption of orphaned slots: no view of the
+                    // live ring can prove that an owner is gone. A store that
+                    // is reopened under a new address goes through the
+                    // explicit restore (`NebServer::restore_from_opts`).
                     ch.set_slot_overrides(owners, applied_index);
                     if !has_table {
                         debug!("no slot placement table for this group; routing by the ring");
@@ -1611,6 +1801,19 @@ impl NebServer {
                 last_schema_cache_error.unwrap_or_else(|| "unknown error".to_string())
             )));
         };
+        let expected_hash_schema = crate::index::hash::hash_index_schema();
+        if let Some(vid) = schemas.name_to_id(&expected_hash_schema.name) {
+            let schema = schemas
+                .get(&vid)
+                .ok_or_else(|| ServerError::HashIndexFormatMismatch { found: vec![] })?;
+            if schema.vid != expected_hash_schema.vid
+                || schema.fields != expected_hash_schema.fields
+            {
+                return Err(ServerError::HashIndexFormatMismatch {
+                    found: schema.vid.get().to_le_bytes().to_vec(),
+                });
+            }
+        }
         let meta_rc = Arc::new(ServerMeta { schemas });
         let neb_client = Arc::new(
             client::AsyncClient::new_for_database(
@@ -1623,8 +1826,7 @@ impl NebServer {
             .await
             .unwrap(),
         );
-        neb_client
-            .ensure_database()
+        initialize_database_catalog(|| neb_client.ensure_database())
             .await
             .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
 
@@ -1653,7 +1855,7 @@ impl NebServer {
             );
             // Owner for index tasks spawned outside any request scope; request
             // handlers deliberately await only their own work.
-            IndexBuilder::spawn_pending_index_reaper();
+            builder.spawn_pending_index_reaper();
             Some(builder)
         } else {
             None
@@ -1670,6 +1872,9 @@ impl NebServer {
             effective_opts.enable_recovery,
             effective_opts.raft_storage.clone(),
         );
+
+        crate::index::hash::validate_recovered_buckets(&chunks)
+            .map_err(ServerError::CannotRecoverPersistedState)?;
 
         if let Some(ref index_builder) = index_builder {
             index_builder.initialize_inverted_indexer(&chunks);
@@ -1776,7 +1981,7 @@ impl NebServer {
                         database_name,
                         tree_path,
                     )
-                    .await
+                    .await?;
                 }
                 Service::Query => {}
             }
@@ -1808,12 +2013,13 @@ impl NebServer {
 
             // The cells are authoritative and the index is a cache of them,
             // so bring the cache up to date BEFORE anything can read it. A
-            // crash leaves ranged entries missing for cells written since the
-            // tree's last flush, and the write path re-asserts an entry only
-            // when its cell is written again -- so hot data heals and nothing
-            // else does. Bounded by the durability mark, so this costs the
-            // crash window and not the store; see
-            // `reconcile_index_before_serving`.
+            // crash leaves the index holding whatever reached disk, which cuts
+            // both ways: entries missing for cells written since the tree's
+            // last flush, and stale entries for cells whose delete or value
+            // change never reached the tree. The write path re-asserts an entry
+            // only when its cell is written again, and never removes one it did
+            // not just write, so neither half heals on its own. The pass scans
+            // the whole store; see `reconcile_index_before_serving`.
             if let Some(indexer) = database_runtime.indexer.as_ref() {
                 crate::index::scrub::reconcile_index_before_serving(
                     &database_runtime.chunks,
@@ -1835,15 +2041,21 @@ impl NebServer {
     /// Every runtime this server hosts, snapshotted so callers do not hold the
     /// lock while touching a runtime.
     fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().values().cloned().collect()
+        self.database_runtimes.load().values().cloned().collect()
     }
 
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        self.database_runtimes.read().get(database_name).cloned()
+        self.database_runtimes.load().get(database_name).cloned()
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
         self.database_runtime.clone()
+    }
+
+    fn runtime_initializer(&self, database: &str) -> Arc<tokio::sync::Mutex<()>> {
+        crate::utils::keyed_state::get_or_insert(&self.runtime_initializers, database.to_owned(), || {
+            Arc::new(tokio::sync::Mutex::new(()))
+        })
     }
 
     pub async fn ensure_database_runtime(
@@ -1854,7 +2066,8 @@ impl NebServer {
             return Ok(runtime);
         }
 
-        let _guard = self.runtime_init_lock.lock().await;
+        let initializer = self.runtime_initializer(database_name);
+        let _guard = crate::profile_lock!(C01_init, initializer.lock().await);
         if let Some(runtime) = self.database(database_name) {
             return Ok(runtime);
         }
@@ -1887,9 +2100,11 @@ impl NebServer {
                 .insert(database_name.to_string());
         }
 
-        self.database_runtimes
-            .write()
-            .insert(database_name.to_string(), database_runtime.clone());
+        self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(database_name.to_string(), database_runtime.clone());
+            next
+        });
 
         Ok(database_runtime)
     }
@@ -1904,7 +2119,12 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime = self.database_runtimes.write().remove(database_name);
+        let previous = self.database_runtimes.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(database_name);
+            next
+        });
+        let runtime = previous.get(database_name).cloned();
 
         let Some(runtime) = runtime else {
             return false;
@@ -1915,7 +2135,7 @@ impl NebServer {
         }
 
         if runtime.indexer().is_some() {
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = runtime.await_index_tasks().await;
 
             if let Some(indexer) = runtime.indexer() {
                 if let Err(e) = indexer.graceful_shutdown().await {
@@ -1936,7 +2156,10 @@ impl NebServer {
         // same silent loss the shutdown path had for dynamically-loaded
         // databases. Writes are closed first so nothing lands after its
         // segment is archived.
-        runtime.chunks().sync_all();
+        if let Err(error) = runtime.chunks().sync_all() {
+            // The unsynced tail stays in the WAL files for the next start.
+            error!("unload continues after a failed WAL sync: {error}");
+        }
         runtime.chunks().close_writes();
         runtime.chunks().archive_all();
         // Stop the store's background work EXPLICITLY rather than letting the
@@ -1950,8 +2173,8 @@ impl NebServer {
         // original in the retired node, so unloading never released the runtime
         // at all -- 14 databases loaded and unloaded left 14 runtimes reachable
         // and 14 `stats-sweeper` threads running, and 10 further load/unload
-        // cycles reclaimed none of them. The map is a plain `RwLock<HashMap>`
-        // now and the runtime does drop, which is asserted by
+        // cycles reclaimed none of them. Published snapshots now release the
+        // runtime after their readers finish. This is asserted by
         // `unloading_a_database_gives_its_threads_back`.
         runtime.chunks().stop_background();
         // And forget its tree service. Nothing else retires it, and it holds every
@@ -2077,7 +2300,7 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        self.database_runtimes.read().keys().cloned().collect()
+        self.database_runtimes.load().keys().cloned().collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -2099,6 +2322,11 @@ impl NebServer {
     pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
         self.database_runtime.indexer()
     }
+
+    pub async fn await_index_tasks(&self) -> Vec<Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>> {
+        self.database_runtime.await_index_tasks().await
+    }
+
 
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
@@ -2186,7 +2414,7 @@ impl NebServer {
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
-            let _ = IndexBuilder::await_all_indices().await;
+            let _ = self.await_index_tasks().await;
             info!("All pending index tasks completed");
 
 
@@ -2201,7 +2429,7 @@ impl NebServer {
                     "Shutting down with {} index task(s) that never landed. The cells are \
                      durable; their index entries are not, and nothing rebuilds them on its own. \
                      Start with NEB_SCRUB_ON_RECOVERY=repair, or run \
-                     client.scrub_ranged_index(true) once this server is back.",
+                     client.scrub_index(true) once this server is back.",
                     owed
                 );
             }
@@ -2272,7 +2500,10 @@ impl NebServer {
         // Step 1.5: Ensure all WAL data is synced to disk
         // This is critical after LSM flush to ensure root cells and new pages are persisted
         info!("Syncing WAL for all chunks...");
-        self.chunks().sync_all();
+        if let Err(error) = self.chunks().sync_all() {
+            // The unsynced tail stays in the WAL files for the next start.
+            error!("shutdown continues after a failed WAL sync: {error}");
+        }
         info!("WAL sync completed");
 
         // Step 1.6: Archive all dirty segments to backup storage
@@ -2286,6 +2517,15 @@ impl NebServer {
         // segment is exactly the twin that costs the post-archive suffix at
         // the next crash. Refusing those writes makes them the client's
         // problem to retry rather than silent loss.
+        //
+        // Stop new cleaner passes before writes close. A pass that already
+        // runs finishes; `stop` only sets a flag that the cleaner reads
+        // between passes. With writes closed, `archive_all` takes the heads
+        // out of the pool, and a new pass would compact those segments while
+        // the store goes down. That work gains nothing and raised the peak
+        // RSS of shutdown: with 128 chunks the cleaner copied the former
+        // heads into fresh segments.
+        self.cleaner().stop();
         self.chunks().close_writes();
         info!("Archiving all dirty segments to backup storage...");
         self.chunks().archive_all();
@@ -2300,9 +2540,7 @@ impl NebServer {
         // FlyWire connectome databases: after a SIGTERM restart the recently
         // written sidecar cells were unreadable while older, already-evicted
         // cells read fine.
-        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self
-            .database_runtimes
-            .read()
+        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self.database_runtimes.load()
             .iter()
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();
@@ -2381,7 +2619,10 @@ impl NebServer {
             }
         }
         for (_, runtime) in &secondary_runtimes {
-            runtime.chunks().sync_all();
+            runtime.cleaner().stop();
+            if let Err(error) = runtime.chunks().sync_all() {
+                error!("shutdown continues after a failed WAL sync: {error}");
+            }
             runtime.chunks().close_writes();
             runtime.chunks().archive_all();
         }
@@ -2490,7 +2731,7 @@ impl NebServer {
             database_runtimes: {
                 let mut runtimes = std::collections::HashMap::with_capacity(16);
                 runtimes.insert(database_name.to_string(), database_runtime.clone());
-                let runtimes = parking_lot::RwLock::new(runtimes);
+                let runtimes = arc_swap::ArcSwap::from_pointee(runtimes);
                 runtimes
             },
             registered_schema_services: {
@@ -2508,7 +2749,7 @@ impl NebServer {
                 }
                 registered
             },
-            runtime_init_lock: tokio::sync::Mutex::new(()),
+            runtime_initializers: lightning::map::PtrHashMap::with_capacity(16),
             host_options: opts.clone(),
             shared_memory_pool,
             shared_tiered_manager,
@@ -2543,6 +2784,22 @@ impl NebServer {
         Ok(server)
     }
 
+    /// Start or reopen a server at its stored address.
+    ///
+    /// # Operator note: restore at another address
+    ///
+    /// If the address changes, stop the old server and use explicit restore.
+    /// Keep the existing storage paths and set `opts.enable_recovery = true`.
+    /// A normal start preserves the stored voters and slot owners.
+    ///
+    /// ```ignore
+    /// let server = NebServer::restore_from_opts(
+    ///     &opts, new_address, group_name, false, async |_| {},
+    /// ).await?;
+    /// ```
+    ///
+    /// Keep every removed member stopped. With `force_new_cluster = false`,
+    /// restore refuses a store that names more than one voter.
     pub async fn new_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
@@ -2558,6 +2815,107 @@ impl NebServer {
             prepare_raft_service,
         )
         .await
+    }
+
+    /// Explicit restore: start a server on a store that was written under
+    /// another address. The stored raft configuration names the old address,
+    /// so the new address is made the only voter first (`restore_sole_voter`,
+    /// an operator step that cuts the old voters off on purpose). After the
+    /// start, the old identities leave the roster and the slots they owned are
+    /// re-pointed at this server. Nothing of this runs on a normal start.
+    ///
+    /// The storage locks are taken before the raft store is written and held
+    /// through the start, so a live server cannot share the store (IC2). The
+    /// call refuses a store that names more than one voter unless
+    /// `force_new_cluster` is true (IC3). The call can run again after a stop
+    /// in the middle: the old owners come from the slot table, not only from
+    /// the voters that this call removed (IC4). Every removed member must stay
+    /// stopped for ever.
+    pub async fn restore_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        group_name: &'a str,
+        force_new_cluster: bool,
+        prepare_raft_service: F,
+    ) -> Result<Arc<NebServer>, ServerError> {
+        let group = String::from(group_name);
+        let layout = database::DatabaseStorageLayout::from_options(opts, &group, &group);
+        let locks = Arc::new(
+            StorageDirectoryLocks::acquire(&layout, opts.disable_storage_locks)
+                .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+        );
+        let storage = raft_storage_for_layout(&layout);
+        let restored = raft::restore_sole_voter(
+            storage,
+            server_addr,
+            raft::DEFAULT_SERVICE_ID,
+            force_new_cluster,
+        )
+        .await
+        .map_err(|e| ServerError::CannotRestoreStore(e.to_string()))?;
+        let mut old_owners: Vec<u64> = restored
+            .iter()
+            .filter(|plane| plane.plane_id == raft::PlaneId::type1())
+            .flat_map(|plane| plane.removed.iter().map(|address| hash_str(address)))
+            .collect();
+        let server = Self::new_cluster_from_opts_with_locks(
+            opts,
+            server_addr,
+            &vec![server_addr.to_owned()],
+            group_name,
+            group_name,
+            prepare_raft_service,
+            Some(locks),
+        )
+        .await?;
+        let heir = hash_str(server_addr);
+        let membership = bifrost::membership::raft::client::SMClient::new(
+            bifrost::membership::DEFAULT_SERVICE_ID,
+            &server.raft_client,
+        );
+        let table = match crate::slots::load_owner_vec(
+            &server.group_name,
+            &server.raft_client,
+            SLOTS_SM_ID,
+        )
+        .await
+        {
+            Ok((table, _)) => table,
+            Err(reason) => return Err(ServerError::CannotRestoreStore(reason)),
+        };
+        // A second run finds `removed` empty. The owners that a stop left in
+        // the slot table are old identities too: this server is the only voter
+        // and the only live member of the group after the raft step.
+        if let Some(table) = &table {
+            for owner in table {
+                if *owner != 0 && *owner != heir && !old_owners.contains(owner) {
+                    old_owners.push(*owner);
+                }
+            }
+        }
+        for old in &old_owners {
+            if let Err(error) = membership.leave(old).await {
+                warn!("restore: old member {} could not leave the roster: {:?}", old, error);
+            }
+        }
+        match &table {
+            Some(table) => {
+                let moved = crate::slots::restore_slot_owners(
+                    &server.group_name,
+                    &server.raft_client,
+                    SLOTS_SM_ID,
+                    table,
+                    &old_owners,
+                    heir,
+                )
+                .await
+                .map_err(ServerError::CannotRestoreStore)?;
+                info!("restore: re-pointed {} slot(s) at {}", moved, server_addr);
+            }
+            None => debug!("restore: no slot placement table"),
+        }
+        server.refresh_slot_placement().await;
+        Ok(server)
     }
 
     pub async fn new_from_opts_in_database<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
@@ -2604,15 +2962,42 @@ impl NebServer {
         database_name: &'a str,
         prepare_raft_service: F,
     ) -> Result<Arc<NebServer>, ServerError> {
+        Self::new_cluster_from_opts_with_locks(
+            opts,
+            server_addr,
+            meta_servers,
+            group_name,
+            database_name,
+            prepare_raft_service,
+            None,
+        )
+        .await
+    }
+
+    /// `new_cluster_from_opts_in_database` with storage locks that the caller
+    /// already holds (the explicit restore holds them while it writes the raft
+    /// store, and keeps them through the start).
+    async fn new_cluster_from_opts_with_locks<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        meta_servers: &Vec<String>,
+        group_name: &'a str,
+        database_name: &'a str,
+        prepare_raft_service: F,
+        held_storage_locks: Option<Arc<StorageDirectoryLocks>>,
+    ) -> Result<Arc<NebServer>, ServerError> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         let storage_layout =
             database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
-        let startup_storage_locks = Arc::new(
-            StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
-                .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
-        );
+        let startup_storage_locks = match held_storage_locks {
+            Some(locks) => locks,
+            None => Arc::new(
+                StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
+                    .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+            ),
+        };
         debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
         let meta_members: Vec<_> = meta_servers
@@ -2620,18 +3005,7 @@ impl NebServer {
             .filter(|n| *n != server_addr)
             .cloned()
             .collect();
-        let storage = if let Some(ref raft_path) = storage_layout.raft_storage {
-            raft::Storage::DISK(DiskOptions {
-                path: raft_path.clone(),
-                take_snapshots: true,
-                append_logs: true,
-                trim_logs: true,
-                snapshot_log_threshold: 1000,
-                log_compaction_threshold: 2000,
-            })
-        } else {
-            raft::Storage::MEMORY
-        };
+        let storage = raft_storage_for_layout(&storage_layout);
         let raft_service = raft::RaftService::new(raft::Options {
             storage,
             address: server_addr.to_owned(),
@@ -2771,17 +3145,25 @@ impl NebServer {
         self.consh.get_server_id_for_slot(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
-        self.member_pool
-            .get_by_id(server_id, |_| self.consh.try_server_name(server_id))
-            .await
+        self.get_member_by_server_id_async(server_id).await
     }
     pub async fn get_member_by_server_id_async(
         &self,
         server_id: u64,
     ) -> Result<Arc<RPCClient>, io::Error> {
-        let cons_hash = self.consh.clone();
+        // The ring answers at once for a known server. Only a miss searches
+        // the roster and the raft configuration.
+        let address = match self.consh.try_server_name(server_id) {
+            Some(address) => Some(address),
+            None => Some(
+                self.consh
+                    .resolve_address(server_id)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?,
+            ),
+        };
         self.member_pool
-            .get_by_id(server_id, move |_| cons_hash.try_server_name(server_id))
+            .get_by_id(server_id, move |_| address)
             .await
     }
     pub fn conshash(&self) -> &ConsistentHashing {
@@ -2966,7 +3348,8 @@ pub async fn init_ranged_indexer_service<C>(
     group_name: &str,
     database_name: &str,
     tree_persistence_path: Option<String>,
-) where
+) -> Result<(), ServerError>
+where
     C: bifrost::raft::client::AsRaftPlaneClient + 'static,
 {
     info!("Initializing range indexer service");
@@ -3009,7 +3392,8 @@ pub async fn init_ranged_indexer_service<C>(
         meta_plane.id(),
         cons_hash,
         persistence_path,
-    );
+    )
+    .map_err(ServerError::CannotRecoverPersistedState)?;
     tree_sm.try_initialize().await;
     meta_plane
         .register_state_machine(Box::new(tree_sm))
@@ -3190,6 +3574,7 @@ pub async fn init_ranged_indexer_service<C>(
         }
     }
     }
+    Ok(())
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
@@ -3205,178 +3590,237 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
     res
 }
 
-/// Cooperative termination, recovery side.
+/// Cooperative termination, recovery side: the participant fence (D29).
 ///
-/// A store that restarts mid-transaction finds brackets with no COMMIT. Until
-/// now it discarded them, which is presume-abort: correct only if no other
-/// participant was told to commit, and it cannot see that from here.
+/// A store that restarts mid-transaction finds brackets with no COMMIT. Only
+/// facts on disk count now. Each BEGIN names the participant set:
 ///
-/// So it asks. It has lost the participant set the coordinator sent at
-/// prepare -- that lived in memory -- so it asks EVERY member of the group.
-/// One `Committed` decides the transaction; the record is written before the
-/// cells are installed, so a crash in the middle of resolving replays it
-/// rather than losing it again.
+/// * A bracket of this site alone is aborted: no other site can hold a
+///   COMMIT of it, and this one holds none.
+/// * Any other bracket runs the participant fence with the other
+///   participants (`DataManager::decide_in_doubt`): one `Committed` means
+///   commit; abort only when every participant is fenced, aborted, or never
+///   held it; anything else means wait, with no time limit. This start
+///   waits for `resolve_startup_wait`, then a background task keeps asking,
+///   so a participant that is down does not stop the start.
 ///
-/// Runs BEFORE the cleaner resumes, and that ordering is load-bearing: an
-/// in-doubt bracket's cells are not in the index, so a compaction pass would
-/// read them as dead and reclaim the evidence out from under the question.
+/// A commit writes an ordinary synced bracket with copies of the cells and
+/// the status cell before the transaction stops resolving
+/// (`apply_resolved_commit`).
 ///
-/// WHAT IT CANNOT DO: resolve a transaction when no peer is reachable, which
-/// is exactly a whole-cluster restart. Every peer answers `Unknown` -- either
-/// down, or itself restarting with no live record -- and the transaction is
-/// presumed abort. That is the limit of cooperative termination without a
-/// durable coordinator decision, and it is the same answer this code gave
-/// unconditionally before.
+/// This runs before the cleaner resumes. Recovery holds every part of an
+/// in-doubt bracket in `Protection` (`BracketLedger::settle`): its cells are
+/// absent from the cell index, so a compaction would read them as dead. A
+/// discard releases them; a resolved commit releases them once its new
+/// bracket is synced (D20).
 async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
     let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
+    let chunks = &database_runtime.chunks;
+    let me = database_runtime.rpc.server_id;
+    let site = match (database_runtime.txn_manager(), database_runtime.data_site()) {
+        (Some(_), Some(site)) => site,
+        _ => {
+            // No peer can ask this database anything.
+            if in_doubt.is_empty() {
+                return;
+            }
+            warn!(
+                "{} transaction(s) are in doubt after recovery but this database runs no \
+                 transaction service, so there is nothing to ask with; all remain pinned",
+                in_doubt.len()
+            );
+            for bracket in in_doubt {
+                chunks.park_unresolved(bracket);
+            }
+            return;
+        }
+    };
     if in_doubt.is_empty() {
         return;
     }
-    let me = database_runtime.rpc.server_id;
-    let Some(txn_manager) = database_runtime.txn_manager().cloned() else {
-        warn!(
-            "{} transaction(s) are in doubt after recovery but this database runs no transaction \
-             service, so there is nothing to ask with; all are presumed abort",
-            in_doubt.len()
-        );
-        for bracket in &in_doubt {
-            discard_in_doubt(bracket, "no transaction service on this database");
+    let mut waiting = Vec::new();
+    for bracket in in_doubt {
+        if bracket.participants.iter().all(|participant| *participant == me) {
+            discard_in_doubt(
+                chunks,
+                &bracket,
+                "a transaction of this site alone, with no COMMIT here",
+            );
+        } else {
+            waiting.push(bracket);
         }
+    }
+    if waiting.is_empty() {
         return;
-    };
-
-    // WAIT for the membership to know its peers before believing it has none.
-    //
-    // Not defensive padding -- this is the bug the first version had. A node
-    // that restarts resolves before its membership view is populated, reads a
-    // roster of just itself, concludes "no peer reports it committed", and
-    // discards a committed transaction's half. It reproduced roughly one run
-    // in four, logging `asking 0 peer(s)`.
-    //
-    // A successful read is NOT enough on its own: membership answers happily
-    // while it is still learning, so the roster has to be given time to grow.
-    // The cost falls only on a store that crashed mid-transaction, which is
-    // the case that can afford it.
-    let settle = resolve_membership_settle();
-    let settle_deadline = std::time::Instant::now() + settle;
-    let mut roster: Vec<u64> = Vec::new();
+    }
+    info!(
+        "running the participant fence for {} transaction(s) left in doubt by recovery",
+        waiting.len()
+    );
+    let deadline = std::time::Instant::now() + resolve_startup_wait();
+    bifrost::doubt_trace!(
+        "startup_resolution site={} budget={:?} brackets={}",
+        me,
+        resolve_startup_wait(),
+        waiting.len()
+    );
     loop {
-        match database_runtime.consh.membership().all_members(false).await {
-            Ok((members, _)) => {
-                let seen: Vec<u64> = members
-                    .into_iter()
-                    .map(|member| member.id)
-                    .filter(|id| *id != me)
-                    .collect();
-                if seen.len() > roster.len() {
-                    roster = seen;
-                }
-            }
-            Err(error) => debug!("membership not readable yet while resolving: {:?}", error),
-        }
-        // One peer is enough to ask; a bigger roster only matters for
-        // deciding that abort is safe, and the answer loop below re-checks.
-        if !roster.is_empty() || std::time::Instant::now() >= settle_deadline {
+        bifrost::doubt_trace!(
+            "startup_retry site={} remaining={:?} brackets={}",
+            me,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            waiting.len()
+        );
+        waiting = resolve_round(database_runtime, &site, waiting).await;
+        if waiting.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    if roster.is_empty() {
-        warn!(
-            "{} transaction(s) are in doubt after recovery and this group reports no other \
-             member after {:?}; all are presumed abort",
-            in_doubt.len(),
-            settle
-        );
-        for bracket in &in_doubt {
-            discard_in_doubt(bracket, "no peer in the group to ask");
-        }
+    if waiting.is_empty() {
         return;
     }
-    info!(
-        "asking {} peer(s) about {} transaction(s) left in doubt by recovery",
-        roster.len(),
-        in_doubt.len()
-    );
-
-    // ABORT ONLY WHEN EVERY PEER HAS ACTUALLY ANSWERED.
-    //
-    // A peer that cannot be reached has not said "not committed" -- it has
-    // said nothing, and treating silence as a vote is what tears a
-    // transaction. So an unanswered roster member means retry, up to a
-    // deadline, and the give-up is loud and names the transaction.
-    let answer_deadline = std::time::Instant::now() + resolve_answer_timeout();
-    let mut unresolved: Vec<crate::ram::recovery::InDoubtBracket> = in_doubt;
-    loop {
-        let mut still_waiting = Vec::new();
-        for bracket in unresolved {
-            let mut committed = false;
-            let mut answered = 0usize;
-            for peer in &roster {
-                let Ok(site) = txn_manager.data_site_for(*peer).await else {
-                    continue;
+    for bracket in &waiting {
+        error!(
+            "transaction {:?} stays in doubt: its participants {:?} do not decide it within \
+             {:?}. It is NOT presumed abort: its parts stay pinned, and a background task keeps \
+             asking. If a participant is lost for good, resolve it with \
+             `force_resolve_in_doubt`.",
+            bracket.txn,
+            bracket.participants,
+            resolve_startup_wait()
+        );
+    }
+    for bracket in waiting {
+        chunks.park_unresolved(bracket);
+    }
+    let runtime = database_runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if runtime.chunks.is_background_stopped() {
+                return;
+            }
+            let parked = runtime.chunks.unresolved_transactions();
+            if parked.is_empty() {
+                // Resolved here or by the operator tool.
+                return;
+            }
+            bifrost::doubt_trace!(
+                "background_retry site={} period=1s brackets={} deadline=none",
+                runtime.rpc.server_id,
+                parked.len()
+            );
+            for (txn, participants) in parked {
+                let peers: Vec<u64> = participants
+                    .iter()
+                    .copied()
+                    .filter(|peer| *peer != runtime.rpc.server_id)
+                    .collect();
+                let commit = match site.decide_in_doubt(&txn, &peers).await {
+                    transactions::data_site::InDoubtDecision::Commit => true,
+                    transactions::data_site::InDoubtDecision::Abort => false,
+                    transactions::data_site::InDoubtDecision::Wait => continue,
                 };
-                match site.txn_status(bracket.txn.clone()).await {
-                    Ok(response) => {
-                        answered += 1;
-                        if response.payload == transactions::TxnOutcome::Committed {
-                            committed = true;
-                            break;
-                        }
-                    }
-                    Err(error) => debug!(
-                        "peer {} did not answer about {:?}: {:?}",
-                        peer, bracket.txn, error
-                    ),
+                // Taken only now, so the operator tool finds the bracket
+                // while the question is out.
+                if let Some(bracket) = runtime.chunks.take_unresolved(&txn) {
+                    finish_in_doubt_bracket(&runtime, bracket, commit);
                 }
             }
-            if committed {
-                apply_resolved_commit(database_runtime, &bracket);
-                continue;
-            }
-            if answered == roster.len() {
-                discard_in_doubt(&bracket, "every peer answered and none had committed it");
-                continue;
-            }
-            still_waiting.push(bracket);
         }
-        unresolved = still_waiting;
-        if unresolved.is_empty() || std::time::Instant::now() >= answer_deadline {
-            break;
+    });
+}
+
+/// Run the participant fence once for each bracket, and resolve the ones it
+/// decides. Returns the brackets that still wait.
+async fn resolve_round(
+    database_runtime: &Arc<DatabaseRuntime>,
+    site: &Arc<transactions::data_site::DataManager>,
+    brackets: Vec<crate::ram::recovery::InDoubtBracket>,
+) -> Vec<crate::ram::recovery::InDoubtBracket> {
+    let me = database_runtime.rpc.server_id;
+    let mut waiting = Vec::new();
+    for bracket in brackets {
+        let peers: Vec<u64> = bracket
+            .participants
+            .iter()
+            .copied()
+            .filter(|peer| *peer != me)
+            .collect();
+        match site.decide_in_doubt(&bracket.txn, &peers).await {
+            transactions::data_site::InDoubtDecision::Commit => {
+                if let Some(unresolved) =
+                    finish_in_doubt_bracket_or_keep(database_runtime, bracket, true)
+                {
+                    waiting.push(unresolved);
+                }
+            }
+            transactions::data_site::InDoubtDecision::Abort => {
+                finish_in_doubt_bracket_or_keep(database_runtime, bracket, false);
+            }
+            transactions::data_site::InDoubtDecision::Wait => waiting.push(bracket),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    for bracket in &unresolved {
-        error!(
-            "transaction {:?} stayed in doubt: not every peer answered within {:?}. Presuming \
-             abort, which is the only thing this node can do alone -- if a peer did commit it, \
-             this store has lost its half.",
-            bracket.txn,
-            resolve_answer_timeout()
+    waiting
+}
+
+/// Resolve one in-doubt bracket: commit it or discard it. Returns the
+/// bracket if it stays in doubt, because the commit could not be made
+/// durable.
+fn finish_in_doubt_bracket_or_keep(
+    database_runtime: &Arc<DatabaseRuntime>,
+    bracket: crate::ram::recovery::InDoubtBracket,
+    commit: bool,
+) -> Option<crate::ram::recovery::InDoubtBracket> {
+    if commit {
+        if !apply_resolved_commit(database_runtime, &bracket) {
+            return Some(bracket);
+        }
+    } else {
+        discard_in_doubt(
+            &database_runtime.chunks,
+            &bracket,
+            "every participant is fenced, aborted, or never held it",
         );
-        discard_in_doubt(bracket, "peers did not answer in time");
+    }
+    None
+}
+
+/// `finish_in_doubt_bracket_or_keep`, for the operator tool and the
+/// background task. A bracket that stays in doubt is parked again. Returns
+/// whether it was resolved.
+pub(crate) fn finish_in_doubt_bracket(
+    database_runtime: &Arc<DatabaseRuntime>,
+    bracket: crate::ram::recovery::InDoubtBracket,
+    commit: bool,
+) -> bool {
+    match finish_in_doubt_bracket_or_keep(database_runtime, bracket, commit) {
+        None => true,
+        Some(bracket) => {
+            database_runtime.chunks.park_unresolved(bracket);
+            false
+        }
     }
 }
 
-/// How long to let the membership roster grow before believing it is final.
-fn resolve_membership_settle() -> std::time::Duration {
-    std::env::var("NEB_TERMINATION_SETTLE_SECS")
+/// How long a start waits for the participants of its in-doubt
+/// transactions before it leaves them to the background task.
+fn resolve_startup_wait() -> std::time::Duration {
+    std::env::var("NEB_RESOLVE_STARTUP_WAIT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(10))
 }
 
-/// How long to keep asking peers that have not answered.
-fn resolve_answer_timeout() -> std::time::Duration {
-    std::env::var("NEB_TERMINATION_ANSWER_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(30))
-}
-
-fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
+/// Drop an in-doubt bracket: its cells were never installed, and its parts
+/// are no longer in progress.
+fn discard_in_doubt(
+    chunks: &crate::ram::chunk::Chunks,
+    bracket: &crate::ram::recovery::InDoubtBracket,
+    why: &str,
+) {
     info!(
         "transaction {:?} was in doubt after recovery and is discarded ({}); {} bracketed \
          cell(s) dropped",
@@ -3384,69 +3828,153 @@ fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
         why,
         bracket.cells.len()
     );
+    chunks.release_transaction_pins(&bracket.txn);
+    chunks.txn_status().end_resolving(&bracket.txn);
     crate::ram::recovery::BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Make a peer-resolved commit durable HERE, then install its cells.
+/// Make a commit that a participant reported HERE, then install its cells.
 ///
-/// The record first: installing the cells alone leaves a store that answers
-/// reads correctly right now and forgets the transaction again at the next
-/// restart -- the same loss, one crash later.
+/// The site writes ONE ORDINARY BRACKET for the transaction (D31): copies of
+/// its cells, and, for a multi-site transaction, its status cell, closed by a
+/// COMMIT and synced before it answers anything. Then:
 ///
-/// One record per CHUNK THAT HOLDS A PART, not one record store-wide.
-/// Recovery would honour a single record anywhere -- it collects COMMITs
-/// globally -- but the cleaner would not. Parts are decided together and
-/// compacted INDEPENDENTLY, so a COMMIT sitting in a chunk this transaction
-/// never touched is one compaction can carry away while the BEGINs it closes
-/// are still on disk. Same reasoning as the per-part rule in
-/// `close_transaction_bracket`, at chunk granularity: as precise as this path
-/// can be, since the transaction's own segments are full or sealed.
+/// * the data no longer depends on the old open parts: a later start finds
+///   the copies committed, and an old open part is decided by the status cell
+///   or, after the release, by the copies being the newest versions;
+/// * the status cell answers `Committed` for this site until every
+///   participant reported its COMMIT synced (TLA+ F4), like any commit.
+///
+/// The old open parts stay held in `Protection` (D20) until the new bracket
+/// is synced; then they are released.
+///
+/// Returns whether the transaction is decided here.
 fn apply_resolved_commit(
     database_runtime: &Arc<DatabaseRuntime>,
     bracket: &crate::ram::recovery::InDoubtBracket,
-) {
-    let mut placed = 0usize;
-    for chunk_id in &bracket.chunks {
-        let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
-            continue;
-        };
-        match chunk.write_resolved_commit(&bracket.txn) {
-            Ok(()) => placed += 1,
-            Err(error) => warn!(
-                "chunk {} holds part of resolved transaction {:?} but could not take its COMMIT: \
-                 {:?}",
-                chunk_id, bracket.txn, error
-            ),
-        }
-    }
-    if placed == 0 {
+) -> bool {
+    let chunks = &database_runtime.chunks;
+    #[cfg(test)]
+    if crate::ram::chunk::resolved_commits_refused_for_test() {
         error!(
-            "transaction {:?} was resolved COMMITTED by a peer but none of its {} chunk(s) could \
-             hold a COMMIT; leaving it in doubt rather than installing cells this store would \
-             lose again at the next start",
-            bracket.txn,
-            bracket.chunks.len()
+            "TEST: the resolution of {:?} cannot write its bracket",
+            bracket.txn
         );
-        return;
-    }
-    if placed < bracket.chunks.len() {
-        warn!(
-            "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely on \
-             those records surviving compaction",
-            bracket.txn,
-            placed,
-            bracket.chunks.len()
-        );
+        return false;
     }
     for cell in &bracket.cells {
-        crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);
+        if let Err(error) = crate::ram::recovery::apply_bracketed_cell(&chunks.list, cell) {
+            error!(
+                "cannot install resolved transaction {:?}: {}",
+                bracket.txn, error
+            );
+            return false;
+        }
     }
+    let me = database_runtime.rpc.server_id;
+    let multi_site = bracket.participants.iter().any(|peer| *peer != me);
+    let store = chunks.address_range();
+    let mut status = None;
+    let written = {
+        let _scope = crate::ram::chunk::TransactionScope::enter_with_participants(
+            bracket.txn.clone(),
+            bracket.participants.clone(),
+        );
+        let copied = crate::ram::recovery::copy_resolved_entries(&chunks.list, &bracket.cells);
+        copied.and_then(|()| {
+            if !multi_site {
+                return Ok(());
+            }
+            // The status cell goes into a chunk the copies already lease.
+            let chunk_id = crate::ram::chunk::transaction_leased_segments(&bracket.txn, &store)
+                .iter()
+                .map(|segment| segment.chunk_id)
+                .min()
+                .or_else(|| bracket.chunks.first().copied())
+                .unwrap_or(0);
+            let chunk = &chunks.list[chunk_id];
+            let id = chunk
+                .free_status_id(&bracket.txn)
+                .ok_or(crate::ram::cell::WriteError::CannotAllocateSpace)?;
+            let mut cell =
+                crate::ram::txn_status::status_cell(&bracket.txn, &id, &bracket.participants);
+            chunk.write_status_cell(&mut cell)?;
+            status = Some((chunk_id, id));
+            Ok(())
+        })
+    };
+    drop(crate::ram::chunk::take_transactional_segments());
+    let closed = written.map_err(|error| format!("{error:?}")).and_then(|()| {
+        chunks
+            .commit_transaction_brackets(&bracket.txn, true)
+            .map(|_| ())
+            .map_err(|refusal| format!("{refusal:?}"))
+    });
+    if let Err(error) = closed {
+        error!(
+            "cannot write the resolution of {:?}: {}; it stays in doubt and pinned, and \
+             resolution retries",
+            bracket.txn, error
+        );
+        // The open bracket of this attempt is retired; it has no COMMIT, so
+        // recovery discards it.
+        let _ = crate::ram::chunk::retire_transaction_leases(&bracket.txn, &store);
+        return false;
+    }
+    if let Err(error) = crate::ram::chunk::release_transaction_leases(&bracket.txn, &store) {
+        error!(
+            "resolved transaction {:?} committed but its heads could not be released: {}",
+            bracket.txn, error
+        );
+    }
+    if let Some((chunk, id)) = status {
+        chunks.txn_status().register(
+            bracket.txn.clone(),
+            crate::ram::txn_status::StatusEntry {
+                id,
+                chunk,
+                participants: bracket.participants.clone(),
+                self_synced: true,
+                synced_peers: std::collections::BTreeSet::new(),
+                segments: Vec::new(),
+                announced: false,
+                since: std::time::Instant::now(),
+            },
+        );
+    }
+    // The new bracket is synced: the old open parts may go.
+    chunks.release_transaction_pins(&bracket.txn);
+    chunks.txn_status().end_resolving(&bracket.txn);
     warn!(
-        "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \
-         cell(s) are installed and its COMMIT is durable here",
+        "transaction {:?} was in doubt after recovery and a participant reports it \
+         COMMITTED; its {} cell(s) are installed and durable here",
         bracket.txn,
         bracket.cells.len()
     );
-    crate::ram::recovery::BRACKETS_APPLIED
-        .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    crate::ram::recovery::BRACKETS_APPLIED.fetch_add(
+        bracket.cells.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
+/// Raft snapshot/compaction thresholds. The defaults (snapshot every 1000
+/// applied entries, compact once the in-memory log passes 2000) are rarely
+/// reached by a short test lifetime, so the compaction paths stay unexercised;
+/// these variables let a test or a campaign lower them without a rebuild.
+fn raft_threshold_from_env(name: &str, default: u64) -> u64 {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            // Set but unusable: say so, or a typo silently runs the defaults.
+            warn!(
+                "{}={:?} is not a positive integer; using the default {}",
+                name, raw, default
+            );
+            default
+        }
+    }
 }

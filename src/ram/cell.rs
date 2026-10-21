@@ -56,8 +56,15 @@ pub struct WriteToChunkResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum WriteError {
+    /// The write can be visible, but its durability could not be certified.
+    Durability(crate::ram::durability::DurabilityError),
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
+    /// The WAL append failed. The write was not published.
+    IOError {
+        os_error: Option<i32>,
+        message: String,
+    },
     CellIsTooLarge(usize),
     CellAlreadyExisted,
     CellDoesNotExisted,
@@ -109,6 +116,44 @@ pub enum WriteError {
     /// error instead would lie the other way, telling a caller nothing was
     /// stored when the cell is right there.
     IndexIncomplete(String),
+    /// The database is fenced for a logical dump and this cell's schema is
+    /// among the ones being copied. Nothing was written; the write is
+    /// retryable once the fence is released.
+    ///
+    /// Refused rather than queued on purpose: a dump can run for hours, and a
+    /// writer parked behind it would pin a request slot for the whole time.
+    DatabaseFenced,
+    /// The transaction this write belongs to was ended -- aborted, or its
+    /// lease expired and it was presumed aborted -- while its thread was
+    /// still writing. Nothing was written: the segments it owned have been
+    /// rewound and may already belong to another writer, and a stale owner's
+    /// write must not land in them.
+    TransactionRevoked,
+    /// A transaction's write needed a write head of its own (a bracket part)
+    /// and none came free within the bounded wait. Nothing was written. The
+    /// transaction must fail rather than write outside its bracket, which
+    /// would make that entry survive a crash the rest of the transaction does
+    /// not.
+    TransactionHeadUnavailable,
+}
+
+impl WriteError {
+    pub(crate) fn from_wal_io(error: std::io::Error) -> Self {
+        if let Some(error) = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::ram::durability::DurabilityError>())
+        {
+            return Self::Durability(error.clone());
+        }
+        if error.raw_os_error() == Some(libc::ENOSPC) {
+            Self::CannotAllocateSpace
+        } else {
+            Self::IOError {
+                os_error: error.raw_os_error(),
+                message: error.to_string(),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -975,8 +1020,7 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
 ///
 /// Zeroing the version makes the abandoned image lose to every live version
 /// and every tombstone. The patch happens while the entry's `PendingEntry`
-/// is still alive, so the WAL append (which runs at its drop) carries the
-/// patched bytes.
+/// is still alive. The caller's explicit append carries the patched bytes.
 /// Abandon an appended image whose write lost its race.
 ///
 /// The bytes stay where they are -- the span is claimed and has to remain

@@ -3,6 +3,7 @@
 //! This module provides `RangedClient` for performing distributed range queries
 //! across the Nebuchadnezzar cluster's B-tree based ranged index.
 
+use crate::index::verification::Verify;
 use std::sync::Arc;
 
 use bifrost::conshash::ConsistentHashing;
@@ -13,7 +14,7 @@ use crate::index::entry::EntryKey;
 use crate::index::ranged::client::cursor::ClientCursor;
 use crate::index::ranged::client::RangedIndexerClient;
 use crate::index::ranged::tree::btree::Ordering;
-use crate::index::ranged::tree::service::{Range, RangeTerm};
+use crate::index::ranged::tree::service::Range;
 use crate::index::Feature;
 use crate::ram::schema::SchemaUid;
 use crate::ram::types::Id;
@@ -28,7 +29,7 @@ use crate::ram::types::Id;
 /// let ranged = client.ranged();
 ///
 /// // Scan all documents of a schema
-/// let mut cursor = ranged.scan_schema(schema_id, 100).await?;
+/// let mut cursor = ranged.scan_schema(schema_id, 100, Verify::Exists).await?;
 /// while let Some(id) = cursor.next().await? {
 ///     let doc = client.read_cell(id).await?;
 /// }
@@ -41,10 +42,12 @@ use crate::ram::types::Id;
 ///     Some(&max_feature),  // end
 ///     ScanOrder::Forward,
 ///     100,
+///     Verify::Exists,
 /// ).await?;
 /// ```
 pub struct RangedClient {
     inner: Arc<RangedIndexerClient>,
+    reader: crate::query::data_client::read::CellReader,
 }
 
 /// Scan ordering direction
@@ -67,11 +70,16 @@ impl From<ScanOrder> for Ordering {
 
 impl RangedClient {
     /// Create a new ranged client
-    pub fn new<C>(conshash: Arc<ConsistentHashing>, raft_client: Arc<C>) -> Self
+    pub fn new<C>(conshash: Arc<ConsistentHashing>, raft_client: Arc<C>, group_name: &str) -> Self
     where
         C: AsRaftPlaneClient + 'static,
     {
         Self {
+            reader: crate::query::data_client::read::CellReader::new(
+                conshash.clone(),
+                group_name,
+                group_name,
+            ),
             inner: Arc::new(RangedIndexerClient::new(&conshash, &raft_client)),
         }
     }
@@ -86,6 +94,11 @@ impl RangedClient {
         C: AsRaftPlaneClient + 'static,
     {
         Self {
+            reader: crate::query::data_client::read::CellReader::new(
+                conshash.clone(),
+                group_name,
+                database_name,
+            ),
             inner: Arc::new(RangedIndexerClient::new_for_database(
                 &conshash,
                 &raft_client,
@@ -106,13 +119,22 @@ impl RangedClient {
         &self,
         schema_id: SchemaUid,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let key = EntryKey::for_schema(schema_id);
         let range = Range::new_inclusive_opened(key, Ordering::Forward);
         let pattern = Some(self.schema_pattern(schema_id));
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, pattern).await? {
-            Some(cursor) => Ok(Some(RangedCursor { inner: cursor })),
+            Some(cursor) => Ok(Some(
+                RangedCursor::new(
+                    cursor,
+                    self.reader.clone(),
+                    vec![crate::index::verification::IndexCheck::Schema(schema_id)],
+                    verify,
+                )
+                .await?,
+            )),
             None => Ok(None),
         }
     }
@@ -123,13 +145,22 @@ impl RangedClient {
         schema_id: SchemaUid,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let key = EntryKey::for_schema(schema_id);
         let range = Range::new_inclusive_opened(key, order.into());
         let pattern = Some(self.schema_pattern(schema_id));
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, pattern).await? {
-            Some(cursor) => Ok(Some(RangedCursor { inner: cursor })),
+            Some(cursor) => Ok(Some(
+                RangedCursor::new(
+                    cursor,
+                    self.reader.clone(),
+                    vec![crate::index::verification::IndexCheck::Schema(schema_id)],
+                    verify,
+                )
+                .await?,
+            )),
             None => Ok(None),
         }
     }
@@ -151,28 +182,26 @@ impl RangedClient {
         end_feature: Option<&Feature>,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
-        let start = match start_feature {
-            Some(f) => {
-                RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f))
-            }
-            None => RangeTerm::Open,
-        };
-        let end = match end_feature {
-            Some(f) => {
-                RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f))
-            }
-            None => RangeTerm::Open,
-        };
-
-        let range = Range {
-            start,
-            end,
-            ordering: order.into(),
-        };
+        let range = crate::query::data_client::ValueRange {
+            start: start_feature
+                .map(|feature| crate::query::data_client::ValueRangeTerm::Inclusive(*feature))
+                .unwrap_or(crate::query::data_client::ValueRangeTerm::Open),
+            end: end_feature
+                .map(|feature| crate::query::data_client::ValueRangeTerm::Inclusive(*feature))
+                .unwrap_or(crate::query::data_client::ValueRangeTerm::Open),
+        }
+        .to_key_range(schema_id, field_id, order.into());
+        let checks = vec![
+            crate::index::verification::IndexCheck::Schema(schema_id),
+            crate::index::verification::IndexCheck::Ranged(range.clone()),
+        ];
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, None).await? {
-            Some(cursor) => Ok(Some(RangedCursor { inner: cursor })),
+            Some(cursor) => Ok(Some(
+                RangedCursor::new(cursor, self.reader.clone(), checks, verify).await?,
+            )),
             None => Ok(None),
         }
     }
@@ -188,11 +217,17 @@ impl RangedClient {
         key: EntryKey,
         order: ScanOrder,
         buffer_size: u16,
+        verify: Verify,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let range = Range::new_inclusive_opened(key, order.into());
+        let checks = vec![crate::index::verification::IndexCheck::Ranged(
+            range.clone(),
+        )];
 
         match RangedIndexerClient::seek(&self.inner, range, buffer_size, None).await? {
-            Some(cursor) => Ok(Some(RangedCursor { inner: cursor })),
+            Some(cursor) => Ok(Some(
+                RangedCursor::new(cursor, self.reader.clone(), checks, verify).await?,
+            )),
             None => Ok(None),
         }
     }
@@ -232,33 +267,118 @@ impl RangedClient {
 /// Cursor for iterating over ranged query results
 pub struct RangedCursor {
     inner: ClientCursor,
+    reader: crate::query::data_client::read::CellReader,
+    checks: Vec<crate::index::verification::IndexCheck>,
+    verify: Verify,
+    ids: Vec<Id>,
+    cells: Vec<Option<crate::ram::cell::OwnedCell>>,
+    pos: usize,
 }
 
 impl RangedCursor {
-    /// Get the next document ID
+    pub(crate) async fn new(
+        inner: ClientCursor,
+        reader: crate::query::data_client::read::CellReader,
+        checks: Vec<crate::index::verification::IndexCheck>,
+        verify: Verify,
+    ) -> Result<Self, RPCError> {
+        let mut cursor = Self {
+            inner,
+            reader,
+            checks,
+            verify,
+            ids: Vec::new(),
+            cells: Vec::new(),
+            pos: 0,
+        };
+        cursor.refresh().await?;
+        Ok(cursor)
+    }
+
+    async fn refresh(&mut self) -> Result<bool, RPCError> {
+        loop {
+            if self.verify == Verify::Exists {
+                self.ids = self.reader.existing_ids(self.inner.current_block()).await?;
+                self.cells.clear();
+            } else {
+                let cells = self
+                    .reader
+                    .read_cells_from_ids_checked(
+                        self.inner.current_block(),
+                        &vec![],
+                        &dovahkiin::expr::serde::Expr::nothing(),
+                        &dovahkiin::expr::serde::Expr::nothing(),
+                        &self.checks,
+                    )
+                    .await;
+                self.ids = cells.iter().map(|cell| cell.id()).collect();
+                self.cells = cells.into_iter().map(Some).collect();
+            }
+            self.pos = 0;
+            if !self.ids.is_empty() {
+                return Ok(true);
+            }
+            if !self.inner.next_block().await? {
+                return Ok(false);
+            }
+        }
+    }
+
     pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
-        self.inner.next().await
+        if self.pos >= self.ids.len() && !self.next_block().await? {
+            return Ok(None);
+        }
+        let id = self.ids.get(self.pos).copied();
+        self.pos += usize::from(id.is_some());
+        Ok(id)
     }
 
-    /// Get the current document ID without advancing
+    /// Return a cell that passed predicate verification.
+    pub async fn next_cell(&mut self) -> Result<Option<crate::ram::cell::OwnedCell>, RPCError> {
+        loop {
+            if self.pos >= self.ids.len() && !self.next_block().await? {
+                return Ok(None);
+            }
+            let index = self.pos;
+            self.pos += 1;
+            if self.verify == Verify::Predicate {
+                return Ok(self.cells.get_mut(index).and_then(Option::take));
+            }
+            // Cell results always verify the predicate, even on an existence cursor.
+            let mut cells = self
+                .reader
+                .read_cells_from_ids_checked(
+                    &[self.ids[index]],
+                    &vec![],
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &dovahkiin::expr::serde::Expr::nothing(),
+                    &self.checks,
+                )
+                .await;
+            if let Some(cell) = cells.pop() {
+                return Ok(Some(cell));
+            }
+        }
+    }
+
     pub fn current(&self) -> Option<&Id> {
-        self.inner.current()
+        self.ids.get(self.pos)
     }
-
-    /// Get all IDs in the current buffer
     pub fn current_block(&self) -> &Vec<Id> {
-        self.inner.current_block()
+        &self.ids
     }
 
-    /// Advance to the next block of results
-    ///
-    /// Returns true if there are more results
     pub async fn next_block(&mut self) -> Result<bool, RPCError> {
-        self.inner.next_block().await
+        self.ids.clear();
+        self.cells.clear();
+        self.pos = 0;
+        if !self.inner.next_block().await? {
+            return Ok(false);
+        }
+        self.refresh().await
     }
 
-    /// Current position in the buffer
     pub fn position(&self) -> usize {
-        self.inner.pos
+        self.pos
     }
 }

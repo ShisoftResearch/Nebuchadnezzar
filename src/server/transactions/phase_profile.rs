@@ -20,9 +20,21 @@ pub enum Phase {
     ParticipantCommit,
     ParticipantAbort,
     ParticipantEnd,
+    GroupLayout,
+    GroupStaging,
+    GroupPrepareRpc,
+    GroupDecisionRpc,
+    GroupWave,
+    GroupBetweenWaves,
+    ParticipantAcquireLocks,
+    PrepareSync,
+    DecisionClose,
+    ReleaseLocks,
+    DecisionSyncWait,
+    CacheRelease,
 }
 
-pub const PHASE_COUNT: usize = 13;
+pub const PHASE_COUNT: usize = 25;
 
 pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::ReadSiteRpc,
@@ -38,6 +50,18 @@ pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::ParticipantCommit,
     Phase::ParticipantAbort,
     Phase::ParticipantEnd,
+    Phase::GroupLayout,
+    Phase::GroupStaging,
+    Phase::GroupPrepareRpc,
+    Phase::GroupDecisionRpc,
+    Phase::GroupWave,
+    Phase::GroupBetweenWaves,
+    Phase::ParticipantAcquireLocks,
+    Phase::PrepareSync,
+    Phase::DecisionClose,
+    Phase::ReleaseLocks,
+    Phase::DecisionSyncWait,
+    Phase::CacheRelease,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,6 +110,18 @@ impl Phase {
             Phase::ParticipantCommit => "participant_commit",
             Phase::ParticipantAbort => "participant_abort",
             Phase::ParticipantEnd => "participant_end",
+            Phase::GroupLayout => "group_layout",
+            Phase::GroupStaging => "group_staging",
+            Phase::GroupPrepareRpc => "group_prepare_rpc",
+            Phase::GroupDecisionRpc => "group_decision_rpc",
+            Phase::GroupWave => "group_wave",
+            Phase::GroupBetweenWaves => "group_between_waves",
+            Phase::ParticipantAcquireLocks => "participant_acquire_locks",
+            Phase::PrepareSync => "prepare_sync",
+            Phase::DecisionClose => "decision_close",
+            Phase::ReleaseLocks => "release_locks",
+            Phase::DecisionSyncWait => "decision_sync_wait",
+            Phase::CacheRelease => "cache_release",
         }
     }
 }
@@ -93,36 +129,8 @@ impl Phase {
 impl Registry {
     const fn new() -> Self {
         Self {
-            totals_ns: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
-            counts: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            totals_ns: [const { AtomicU64::new(0) }; PHASE_COUNT],
+            counts: [const { AtomicU64::new(0) }; PHASE_COUNT],
             active_guards: AtomicUsize::new(0),
         }
     }
@@ -235,6 +243,18 @@ mod tests {
             "participant_commit",
             "participant_abort",
             "participant_end",
+            "group_layout",
+            "group_staging",
+            "group_prepare_rpc",
+            "group_decision_rpc",
+            "group_wave",
+            "group_between_waves",
+            "participant_acquire_locks",
+            "prepare_sync",
+            "decision_close",
+            "release_locks",
+            "decision_sync_wait",
+            "cache_release",
         ];
 
         let actual = PHASES.map(Phase::as_str);

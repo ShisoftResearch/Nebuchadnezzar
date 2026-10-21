@@ -208,6 +208,9 @@ pub enum MigrationError {
     /// The table does not say what the caller believed it says. Nothing was
     /// destroyed.
     NotCommitted(String),
+    /// The donor holds a cell of this slot in a bracket that is in doubt
+    /// after a restart. Nothing moved; retry after the resolution.
+    SlotInDoubt(crate::ram::txn_status::SlotInDoubt),
 }
 
 impl fmt::Display for MigrationError {
@@ -218,6 +221,7 @@ impl fmt::Display for MigrationError {
             MigrationError::Rpc(error) => write!(f, "member unreachable: {error:?}"),
             MigrationError::Transfer(reason) => write!(f, "transfer failed: {reason}"),
             MigrationError::NotCommitted(reason) => write!(f, "not committed: {reason}"),
+            MigrationError::SlotInDoubt(in_doubt) => write!(f, "slot in doubt: {in_doubt}"),
         }
     }
 }
@@ -255,8 +259,14 @@ fn range_batches(ids: Vec<Id>, batch_cells: usize) -> Vec<Vec<Id>> {
 }
 
 /// Ids of every live cell a member holds in one slot.
-async fn enumerate_slot(member: &Arc<CellServiceClient>, slot: u32) -> Result<Vec<Id>, RPCError> {
-    member.cell_ids_in_slots(&vec![slot]).await
+async fn enumerate_slot(
+    member: &Arc<CellServiceClient>,
+    slot: u32,
+) -> Result<Vec<Id>, MigrationError> {
+    member
+        .cell_ids_in_slots(&vec![slot])
+        .await?
+        .map_err(MigrationError::SlotInDoubt)
 }
 
 /// Every live cell a member holds across many slots, bucketed by slot, in ONE
@@ -274,12 +284,16 @@ async fn enumerate_slot(member: &Arc<CellServiceClient>, slot: u32) -> Result<Ve
 async fn enumerate_slots(
     member: &Arc<CellServiceClient>,
     slots: &[u32],
-) -> Result<std::collections::HashMap<u32, Vec<Id>>, RPCError> {
+) -> Result<std::collections::HashMap<u32, Vec<Id>>, MigrationError> {
     let mut held: std::collections::HashMap<u32, Vec<Id>> = Default::default();
     if slots.is_empty() {
         return Ok(held);
     }
-    for id in member.cell_ids_in_slots(&slots.to_vec()).await? {
+    for id in member
+        .cell_ids_in_slots(&slots.to_vec())
+        .await?
+        .map_err(MigrationError::SlotInDoubt)?
+    {
         held.entry(crate::slots::slot_of(id_ref(&id)))
             .or_default()
             .push(id);
@@ -519,6 +533,8 @@ async fn migrate_slot_prepared(
         .map_err(|error| MigrationError::Placement(format!("{error:?}")))?
         .map_err(MigrationError::Placement)?;
 
+    #[cfg(multisite_test)]
+    crate::utils::multisite::point("during_slot_transfer", (slot, from, to));
     let mut handover = SlotHandover {
         slot,
         from,
@@ -618,7 +634,16 @@ async fn migrate_slot_prepared(
         // benign orphan as before, just rarer, and a retried migration
         // upserts over it.
         if let Ok(recipient) = client.client_by_server_id(to).await {
-            if let Ok(orphaned) = recipient.cell_ids_in_slots(&vec![slot]).await {
+            let scanned = recipient.cell_ids_in_slots(&vec![slot]).await;
+            if let Ok(Err(in_doubt)) = &scanned {
+                // The recipient holds an in-doubt bracket for a slot it does
+                // not own; its landed copies stay (review N2).
+                warn!(
+                    "slot {slot} transfer aborted; recipient {to} refused its orphan scan: \
+                     {in_doubt}; the cells that landed there stay"
+                );
+            }
+            if let Ok(Ok(orphaned)) = scanned {
                 if !orphaned.is_empty() {
                     match recipient.drop_migrated_cells(&orphaned).await {
                         Ok(results) => {
@@ -1014,10 +1039,25 @@ pub async fn reshard_slots(
     for round in 0..plan.delta_rounds.max(1) {
         let held = match enumerate_slots(&donor, &began).await {
             Ok(held) => held,
-            Err(error) if round == 0 => fail_all!(
-                began.clone(),
-                format!("could not enumerate donor: {error:?}")
-            ),
+            Err(error) if round == 0 => {
+                // Nothing moved yet. Give every begun slot back to its donor,
+                // as `migrate_slot` does, or the table keeps them `Migrating`
+                // (review N1). A `SlotInDoubt` refusal comes here.
+                for slot in &began {
+                    if let Err(abort_error) = placement.abort_slot_migration(&group, slot).await {
+                        warn!(
+                            "slot {slot}: the reshard could not enumerate donor {from} \
+                             ({error}) and the migration could not be aborted \
+                             ({abort_error:?}); the slot stays with its donor but its table \
+                             entry still reads as migrating"
+                        );
+                    }
+                }
+                fail_all!(
+                    began.clone(),
+                    format!("could not enumerate donor: {error:?}")
+                )
+            }
             // A later round failing is not fatal: the earlier rounds transferred,
             // and the reclaim's carry-over is the backstop for anything missed.
             Err(error) => {
@@ -1178,7 +1218,21 @@ pub async fn reshard_slots(
             .filter(|slot| !committed_map.contains_key(slot)),
     );
     if !orphaned_slots.is_empty() {
-        match recipient.cell_ids_in_slots(&orphaned_slots).await {
+        match recipient
+            .cell_ids_in_slots(&orphaned_slots)
+            .await
+            .map(|scanned| {
+                scanned.unwrap_or_else(|in_doubt| {
+                    // Review N2: the refusal covers the whole slot set.
+                    warn!(
+                        "{} slots did not commit to {to}; recipient {to} refused their orphan \
+                         scan: {in_doubt}; the cells that landed there stay",
+                        orphaned_slots.len()
+                    );
+                    Vec::new()
+                })
+            })
+        {
             Ok(orphaned) if !orphaned.is_empty() => {
                 match recipient.drop_migrated_cells(&orphaned).await {
                     Ok(results) => {
@@ -1304,9 +1358,8 @@ mod tests {
     /// answer decides whether the next optimisation belongs in the RPC layer or in
     /// the storage path.
     ///
-    /// **Must be run in release.** bifrost picks its codec by build profile --
-    /// `serde_cbor` in release, `serde_json` under `debug_assertions` -- so a debug
-    /// measurement is measuring JSON and is not a statement about production.
+    /// **Must be run in release.** The codec is CBOR in every profile, but a debug
+    /// build is unoptimised, so a debug timing is not a statement about production.
     #[test]
     #[ignore]
     fn codec_share_of_transfer_cost() {
@@ -1318,9 +1371,8 @@ mod tests {
 
         assert!(
             !cfg!(debug_assertions),
-            "run this with --release: bifrost serializes with JSON under \
-             debug_assertions and CBOR otherwise, so a debug number says nothing \
-             about production"
+            "run this with --release: a debug build is unoptimised, so a debug \
+             number says nothing about production"
         );
 
         let payload = "x".repeat(PAYLOAD);
@@ -1479,8 +1531,8 @@ mod cluster_tests {
             .map(|_| crate::utils::test_port::unique_localhost_addr())
             .collect();
         let opts = ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -1538,6 +1590,7 @@ mod cluster_tests {
         server
             .chunks()
             .cell_ids_in_slots(&HashSet::from([slot]))
+            .unwrap()
             .into_iter()
             .collect()
     }
@@ -2636,8 +2689,8 @@ mod cluster_tests {
             crate::utils::test_port::unique_localhost_addr(),
         ];
         let opts = ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -2686,11 +2739,19 @@ mod cluster_tests {
             client.write_cell(cell).await.unwrap().unwrap();
             written.insert(id);
         }
-        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+        for server in &servers { server.await_index_tasks().await; }
 
         async fn scan_ids(client: &Arc<AsyncClient>, schema: SchemaUid) -> HashSet<Id> {
             let mut found = HashSet::new();
-            if let Ok(Some(mut cursor)) = client.ranged().scan_schema(schema, 64).await {
+            if let Ok(Some(mut cursor)) = client
+                .ranged()
+                .scan_schema(
+                    schema,
+                    64,
+                    crate::index::verification::Verify::Predicate,
+                )
+                .await
+            {
                 loop {
                     match cursor.next().await {
                         Ok(Some(id)) => {
@@ -2724,7 +2785,7 @@ mod cluster_tests {
         for server in &servers {
             server.refresh_slot_placement().await;
         }
-        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+        for server in &servers { server.await_index_tasks().await; }
 
         let after = scan_ids(&client, SchemaUid(SCHEMA)).await;
         let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();
@@ -2793,7 +2854,11 @@ mod cluster_tests {
             .await
             .unwrap()
             .unwrap();
-        let ids = donor.cell_ids_in_slots(&vec![SLOT as u32]).await.unwrap();
+        let ids = donor
+            .cell_ids_in_slots(&vec![SLOT as u32])
+            .await
+            .unwrap()
+            .unwrap();
         donor
             .push_cells_to(&ids, recipient_id)
             .await
@@ -3376,9 +3441,8 @@ mod cluster_tests {
     /// cargo test --release --lib drain_throughput -- --ignored --nocapture
     /// ```
     ///
-    /// **Release only.** bifrost picks its codec by build profile -- `serde_cbor`
-    /// in release, `serde_json` under `debug_assertions` -- so a debug number is a
-    /// statement about JSON and nothing else.
+    /// **Release only.** The codec is CBOR in every profile, but a debug build is
+    /// unoptimised, so a debug number says nothing about production.
     ///
     /// A drain is the operator-facing operation of this whole campaign: it is what
     /// runs when a machine has to leave. `reshard_slots` has a measured number and

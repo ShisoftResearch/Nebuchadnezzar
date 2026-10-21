@@ -3,8 +3,8 @@ use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
-use dovahkiin::types::{OwnedValue, Type};
 use crate::ram::types::Id;
+use dovahkiin::types::{OwnedValue, Type};
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -26,6 +26,23 @@ use smallvec::SmallVec;
 use std::ops::Deref;
 
 pub mod sm;
+
+/// Crash-injection seam for tests of schema creation. Inert unless a test
+/// installs a hook; on the creation path it costs one atomic load.
+static SCHEMA_CREATE_HOOK: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+
+/// Install the hook called at named points of schema creation with the point
+/// and the schema's name (a server creates system schemas too, so a test has
+/// to be able to pick its own). First call wins.
+pub fn set_schema_create_hook(hook: fn(&str, &str)) {
+    let _ = SCHEMA_CREATE_HOOK.set(hook);
+}
+
+pub(crate) fn schema_create_point(point: &str, schema_name: &str) {
+    if let Some(hook) = SCHEMA_CREATE_HOOK.get() {
+        hook(point, schema_name);
+    }
+}
 
 pub type FieldPtr = u32;
 
@@ -173,6 +190,16 @@ pub struct Schema {
     pub is_scannable: bool,
     #[serde(default)]
     pub blobs: bool,
+    /// Opaque bytes the layer above Neb stores WITH the schema, in the same
+    /// record.
+    ///
+    /// A schema is one durable record: the raft command that creates it
+    /// carries these bytes too, so an owner's per-schema metadata (Morpheus's
+    /// graph kind and flags) is never in a different store from the schema it
+    /// describes and cannot disagree with it after a crash. Neb never
+    /// interprets them. They belong to the family: an evolution inherits them,
+    /// and only `set_app_meta` changes them.
+    pub app_meta: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -272,6 +299,7 @@ impl Schema {
             is_dynamic,
             is_scannable,
             blobs: false,
+            app_meta: Vec::new(),
             field_index,
             id_index,
             index_fields,
@@ -332,6 +360,12 @@ impl Schema {
         if !self.transform.renames.contains(&pair) {
             self.transform.renames.push(pair);
         }
+        self
+    }
+
+    /// Attach the owner's metadata to the record. See [`Schema::app_meta`].
+    pub fn with_app_meta(mut self, app_meta: Vec<u8>) -> Schema {
+        self.app_meta = app_meta;
         self
     }
 
@@ -1056,14 +1090,34 @@ impl SchemaCompressionPlan {
     }
 }
 
+#[derive(Clone, Default)]
+struct LocalSchemaSnapshot {
+    schema_map: HashMap<SchemaVid, SchemaRef>,
+    name_map: HashMap<String, SchemaUid>,
+    handles: HashMap<SchemaUid, SchemaVid>,
+}
+
 pub struct LocalSchemasMap {
-    /// Every generation this node knows about, by its own vid. Reads resolve
-    /// here, with the vid out of the cell header.
-    schema_map: LFHashMap<SchemaVid, SchemaRef>,
-    /// Name -> family. Only the current generation's name is bound.
-    name_map: LFHashMap<String, SchemaUid>,
-    /// Family -> the generation new writes belong in.
-    handles: LFHashMap<SchemaUid, SchemaVid>,
+    /// Publish generations, names, and family handles in one atomic step.
+    state: arc_swap::ArcSwap<LocalSchemaSnapshot>,
+    epoch: SchemaEpoch,
+}
+
+/// A handle on a local schema cache's change epoch (see
+/// [`LocalSchemasCache::epoch`]). Holding the handle makes reading the epoch a
+/// single load, for a reader that checks it on every call.
+#[derive(Clone, Default)]
+pub struct SchemaEpoch(Arc<std::sync::atomic::AtomicU64>);
+
+impl SchemaEpoch {
+    #[inline]
+    pub fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub struct LocalSchemasCache {
@@ -1163,12 +1217,35 @@ impl LocalSchemasCache {
     pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
         self.map.get(vid)
     }
+    /// A value that changes whenever any record in this cache changes
+    /// (install, evolution, rename, delete, app_meta patch). Anything derived
+    /// from the records can be cached under it and is current exactly while
+    /// the epoch is unchanged.
+    pub fn epoch(&self) -> u64 {
+        self.map.epoch.current()
+    }
+    /// The same epoch as a handle that can be kept and read with one load.
+    pub fn epoch_handle(&self) -> SchemaEpoch {
+        self.map.epoch.clone()
+    }
+    /// Replace the owner metadata of one installed generation, keeping
+    /// everything else about the record (status, name) as this node has it.
+    ///
+    /// For a writer that has just committed `set_app_meta` and wants its own
+    /// node to reflect it before the subscription event arrives. Unlike
+    /// re-installing a copy of the record, it cannot re-bind the family to a
+    /// generation that was superseded in the meantime. Returns whether the
+    /// generation was present.
+    pub fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
+        self.map.patch_app_meta(vid, app_meta)
+    }
     /// Resident bytes of the schema maps behind this cache.
     pub fn resident_bytes(&self) -> usize {
         self.map.resident_bytes()
     }
     pub fn debug_only_new_schema(&self, schema: Schema) {
-        if !cfg!(debug_assertions) {
+        // Unit-test fixtures also install local schemas in the release profile.
+        if !cfg!(debug_assertions) && !cfg!(test) {
             panic!("for debug only");
         }
         let m = &self.map;
@@ -1259,7 +1336,7 @@ impl LocalSchemasCache {
         self.map.current_vid_of_uid(uid)
     }
     pub fn count(&self) -> usize {
-        let len = self.map.schema_map.len();
+        let len = self.map.state.load().schema_map.len();
         debug!("Counted schema length {}", len);
         len
     }
@@ -1814,6 +1891,12 @@ pub enum EvolveSchemaError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SetAppMetaError {
+    SchemaDoesNotExist,
+    NotifyError(NotifyError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RenameSchemaError {
     SchemaDoesNotExist,
     NameExists(String),
@@ -1828,213 +1911,180 @@ pub enum DelSchemaError {
 }
 
 impl LocalSchemasMap {
-    /// Resident bytes of the two schema lookup maps.
+    /// Estimated table bytes in the current schema snapshot, excluding payloads.
     pub fn resident_bytes(&self) -> usize {
-        (self.schema_map.resident_pages()
-            + self.name_map.resident_pages()
-            + self.handles.resident_pages())
-            * 4096
+        let state = self.state.load();
+        state.schema_map.capacity() * std::mem::size_of::<(SchemaVid, SchemaRef)>()
+            + state.name_map.capacity() * std::mem::size_of::<(String, SchemaUid)>()
+            + state.handles.capacity() * std::mem::size_of::<(SchemaUid, SchemaVid)>()
     }
 
     pub fn new() -> Self {
-        debug!("Schema map created");
         Self {
-            schema_map: LFHashMap::with_capacity(32),
-            name_map: LFHashMap::with_capacity(32),
-            handles: LFHashMap::with_capacity(32),
+            state: arc_swap::ArcSwap::from_pointee(LocalSchemaSnapshot::default()),
+            epoch: SchemaEpoch::default(),
         }
     }
 
-    /// The generation a name currently writes into.
-    pub fn get_by_name(&self, name: &str) -> Option<SchemaRef> {
-        if let Some(id) = self.name_to_id(name) {
-            return self.get(&id);
+    // The operation changes only a private snapshot. A failed publication
+    // retries against the latest snapshot, preserving another writer's changes.
+    fn update<R>(&self, op: impl Fn(&mut LocalSchemaSnapshot) -> R) -> R {
+        loop {
+            let before = self.state.load_full();
+            let mut next = (*before).clone();
+            let result = op(&mut next);
+            let previous = self.state.compare_and_swap(&before, Arc::new(next));
+            if Arc::ptr_eq(&previous, &before) {
+                return result;
+            }
         }
-        return None;
+    }
+
+    fn advance_epoch(&self) {
+        self.epoch.advance();
+    }
+
+    fn patch_app_meta(&self, vid: SchemaVid, app_meta: Vec<u8>) -> bool {
+        let changed = self.update(|state| {
+            let Some(existing) = state.schema_map.get(&vid) else {
+                return false;
+            };
+            let mut patched = (**existing).clone();
+            patched.app_meta = app_meta.clone();
+            state.schema_map.insert(vid, Arc::new(patched));
+            true
+        });
+        if changed {
+            self.advance_epoch();
+        }
+        changed
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Option<SchemaRef> {
+        let state = self.state.load();
+        let uid = state.name_map.get(name)?;
+        let vid = state.handles.get(uid)?;
+        state.schema_map.get(vid).cloned()
     }
 
     pub fn uid_of_name(&self, name: &str) -> Option<SchemaUid> {
-        self.name_map.get(&name.to_string())
+        self.state.load().name_map.get(name).copied()
     }
 
-    /// The family a generation belongs to. Read straight off the record: a vid
-    /// names one layout, and that layout knows its own family. Never chase
-    /// `superseded_by` to get here -- resolution is one hop by construction.
     pub fn uid_of_vid(&self, vid: &SchemaVid) -> Option<SchemaUid> {
-        self.schema_map.get(vid).map(|s| s.uid)
+        self.state.load().schema_map.get(vid).map(|s| s.uid)
     }
 
-    /// The generation a family currently writes into, if this node has heard
-    /// of the family at all.
     pub fn current_vid_of_uid(&self, uid: &SchemaUid) -> Option<SchemaVid> {
-        self.handles.get(uid)
+        self.state.load().handles.get(uid).copied()
     }
 
     pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
-        let res = self.schema_map.get(vid);
-        debug!(
-            "Gettting from schema map for {}, return res {}",
-            vid,
-            res.is_some()
-        );
-        return res;
+        self.state.load().schema_map.get(vid).cloned()
     }
 
-    /// Resolve a name to the generation new writes belong in: name -> family
-    /// -> current generation. Two hops, because a name outlives any one
-    /// layout.
     pub fn name_to_id(&self, name: &str) -> Option<SchemaVid> {
-        self.uid_of_name(name)
-            .and_then(|uid| self.current_vid_of_uid(&uid))
+        let state = self.state.load();
+        state
+            .name_map
+            .get(name)
+            .and_then(|uid| state.handles.get(uid))
+            .copied()
     }
 
     fn new_schema(&self, mut schema: Schema) {
-        let name = schema.name.clone();
-        let vid = schema.vid;
-        let uid = schema.uid;
-        let is_current = schema.status.is_current();
         schema.refresh_compression_plan();
-
-        // The same schema legitimately arrives twice: `new_for_database`
-        // subscribes before it reads, so anything created around that point
-        // shows up in the `get_all` answer AND as an event. That overlap must
-        // be an idempotent upsert.
-        //
-        // The guard compares FAMILIES now, not generations. A name binds to a
-        // family for as long as the family lives, so a second generation of an
-        // already-known schema is a redelivery to accept, not a collision --
-        // whereas two different families claiming one name is still a real
-        // conflict and still refused.
-        if let Some(existing_uid) = self.name_map.get(&name) {
-            if existing_uid != uid {
-                error!(
-                    "Schema name collision: name '{}' already belongs to family {}                      but an incoming schema claims it for family {}; keeping the existing binding",
-                    name, existing_uid, uid
-                );
-                return;
-            }
-            debug!("Updating known schema family {} ({}) at {}", uid, name, vid);
-        }
-
-        // A superseded generation is still installed -- cells written under it
-        // must stay readable -- but it must not claim the name or become what
-        // new writes resolve to.
-        self.schema_map.insert(vid, Arc::new(schema));
-        if is_current {
-            self.name_map.insert(name.clone(), uid);
-            self.handles.insert(uid, vid);
-            info!("Added schema to local cache: {} ({}) at {}", uid, name, vid);
-        } else {
-            debug!(
-                "Cached superseded schema generation {} of family {} ({}), readable but not writable",
-                vid, uid, name
+        let accepted = self.update(|state| Self::insert_schema(state, schema.clone()));
+        if !accepted {
+            error!(
+                "Schema name collision for family {} and name {}",
+                schema.uid, schema.name
             );
         }
+        self.advance_epoch();
+    }
+
+    fn insert_schema(state: &mut LocalSchemaSnapshot, schema: Schema) -> bool {
+        if state
+            .name_map
+            .get(&schema.name)
+            .is_some_and(|uid| *uid != schema.uid)
+        {
+            return false;
+        }
+        if schema.status.is_current() {
+            state.name_map.insert(schema.name.clone(), schema.uid);
+            state.handles.insert(schema.uid, schema.vid);
+        }
+        state.schema_map.insert(schema.vid, Arc::new(schema));
+        true
     }
 
     fn get_all(&self) -> Vec<Schema> {
-        let entries = self.schema_map.entries();
-        entries
-            .into_iter()
-            .map(|(vid, s_ref)| {
-                debug!(
-                    "Get all local schema listed {}({}), tid {}",
-                    vid,
-                    s_ref.vid,
-                    thread_id()
-                );
-                debug_assert_eq!(vid, s_ref.vid);
-                (&*s_ref).clone()
-            })
-            .collect::<Vec<_>>()
+        self.state
+            .load()
+            .schema_map
+            .values()
+            .map(|schema| (**schema).clone())
+            .collect()
     }
 
-    /// Apply a rename that the state machine has already committed.
-    ///
-    /// Takes the family and the new name only: the old name is whatever this
-    /// node currently has bound, which is the binding that actually needs
-    /// removing. Trusting the event's idea of the old name instead would
-    /// leave a stale binding behind on any node that had missed an earlier
-    /// rename.
-    /// Apply an evolution the state machine has already committed.
-    ///
-    /// Installs the new generation and supersedes whatever this node currently
-    /// believes is current, in that order: a moment with no current generation
-    /// would make every write to the family fail to resolve.
-    fn evolve_schema(&self, evolved: Schema) {
-        let uid = evolved.uid;
-        let new_vid = evolved.vid;
-        let previous = self.handles.get(&uid);
-        self.new_schema(evolved);
-        if let Some(previous_vid) = previous {
-            if previous_vid != new_vid {
-                if let Some(old) = self.schema_map.get(&previous_vid) {
-                    let mut superseded = (*old).clone();
-                    superseded.status = SchemaVersionStatus::Stale {
-                        superseded_by: new_vid,
-                    };
-                    self.schema_map.insert(previous_vid, Arc::new(superseded));
+    fn evolve_schema(&self, mut evolved: Schema) {
+        evolved.refresh_compression_plan();
+        self.update(|state| {
+            let previous = state.handles.get(&evolved.uid).copied();
+            Self::insert_schema(state, evolved.clone());
+            if let Some(previous_vid) = previous {
+                if previous_vid != evolved.vid {
+                    if let Some(old) = state.schema_map.get(&previous_vid) {
+                        let mut superseded = (**old).clone();
+                        superseded.status = SchemaVersionStatus::Stale {
+                            superseded_by: evolved.vid,
+                        };
+                        state.schema_map.insert(previous_vid, Arc::new(superseded));
+                    }
                 }
             }
-        }
-        info!(
-            "Local schema family {} evolved to generation at {}",
-            uid, new_vid
-        );
+        });
+        self.advance_epoch();
     }
 
     fn rename_schema(&self, uid: SchemaUid, new_name: &str) {
-        let Some(current_vid) = self.handles.get(&uid) else {
-            debug!(
-                "Ignoring rename of unknown schema family {} to {}",
-                uid, new_name
-            );
-            return;
-        };
-        let Some(existing) = self.schema_map.get(&current_vid) else {
-            debug!(
-                "Ignoring rename of family {}: generation {} is not cached",
-                uid, current_vid
-            );
-            return;
-        };
-        let old_name = existing.name.clone();
-        if old_name == new_name {
-            return;
+        let changed = self.update(|state| {
+            let Some(current_vid) = state.handles.get(&uid).copied() else {
+                return false;
+            };
+            let Some(existing) = state.schema_map.get(&current_vid) else {
+                return false;
+            };
+            let old_name = existing.name.clone();
+            if old_name == new_name {
+                return false;
+            }
+            let mut renamed = (**existing).clone();
+            renamed.name = new_name.to_owned();
+            state.schema_map.insert(current_vid, Arc::new(renamed));
+            state.name_map.remove(&old_name);
+            state.name_map.insert(new_name.to_owned(), uid);
+            true
+        });
+        if changed {
+            self.advance_epoch();
         }
-        let mut renamed = (*existing).clone();
-        renamed.name = new_name.to_owned();
-        self.schema_map.insert(current_vid, Arc::new(renamed));
-        self.name_map.remove(&old_name);
-        self.name_map.insert(new_name.to_owned(), uid);
-        info!(
-            "Local schema family {} renamed {} -> {}",
-            uid, old_name, new_name
-        );
     }
 
     fn del_schema(&self, name: &str) {
-        let Some(uid) = self.name_map.remove(&(name.to_owned())) else {
-            return;
-        };
-        self.handles.remove(&uid);
-        // Every generation of the family, matching the state machine.
-        let doomed: Vec<SchemaVid> = self
-            .schema_map
-            .entries()
-            .into_iter()
-            .filter(|(_, schema)| schema.uid == uid)
-            .map(|(vid, _)| vid)
-            .collect();
-        for vid in &doomed {
-            self.schema_map.remove(vid);
+        let changed = self.update(|state| {
+            let Some(uid) = state.name_map.remove(name) else {
+                return false;
+            };
+            state.handles.remove(&uid);
+            state.schema_map.retain(|_, schema| schema.uid != uid);
+            true
+        });
+        if changed {
+            self.advance_epoch();
         }
-        debug!(
-            "Deleted local schema family {} ({}), {} generation(s)",
-            uid,
-            name,
-            doomed.len()
-        );
     }
 }
 
@@ -2341,6 +2391,75 @@ mod tests {
     use dovahkiin::types::Type;
     use futures::{future::BoxFuture, FutureExt};
     use std::sync::{Arc, Mutex};
+
+    fn local_family(uid: u32) -> (LocalSchemasMap, Schema, Schema) {
+        let map = LocalSchemasMap::new();
+        let mut first = schema_of(base_fields());
+        first.assign_identity(uid);
+        first.name = format!("family_{uid}");
+        let mut second = first.clone();
+        second.vid = SchemaVid(uid + 1);
+        second.generation = 1;
+        map.new_schema(first.clone());
+        (map, first, second)
+    }
+
+    #[test]
+    fn serialized_schema_records_require_app_meta() {
+        for app_meta in [vec![], vec![1, 2, 3]] {
+            let schema = schema_of(base_fields()).with_app_meta(app_meta.clone());
+            let mut record = serde_json::to_value(&schema).unwrap();
+            let decoded: Schema = serde_json::from_value(record.clone()).unwrap();
+            assert_eq!(decoded.app_meta, app_meta);
+            record.as_object_mut().unwrap().remove("app_meta");
+            let error = serde_json::from_value::<Schema>(record).unwrap_err();
+            assert!(error.to_string().contains("missing field `app_meta`"));
+        }
+    }
+
+    #[test]
+    fn every_local_record_change_advances_the_epoch() {
+        let (map, first, second) = local_family(40);
+        let mut seen = map.epoch.current();
+        let mut advanced = |map: &LocalSchemasMap, what: &str| {
+            let now = map.epoch.current();
+            assert!(now > seen, "{what} must advance the epoch");
+            seen = now;
+        };
+        map.new_schema(first.clone());
+        advanced(&map, "a re-install");
+        map.evolve_schema(second.clone());
+        advanced(&map, "an evolution");
+        map.rename_schema(first.uid, "family_40_renamed");
+        advanced(&map, "a rename");
+        assert!(map.patch_app_meta(second.vid, vec![1]));
+        advanced(&map, "an app_meta patch");
+        map.del_schema("family_40_renamed");
+        advanced(&map, "a delete");
+    }
+
+    #[test]
+    fn patching_app_meta_never_rebinds_a_superseded_generation() {
+        // A writer read generation 40, committed set_app_meta, and meanwhile
+        // the family evolved to 41. Re-installing its copy of 40 (status
+        // Current) would make 40 current again on this node; the patch must
+        // only change the bytes.
+        let (map, first, second) = local_family(40);
+        map.evolve_schema(second.clone());
+        assert!(map.patch_app_meta(first.vid, vec![9, 9]));
+        assert_eq!(map.current_vid_of_uid(&first.uid), Some(second.vid));
+        let patched = map.get(&first.vid).unwrap();
+        assert_eq!(patched.app_meta, vec![9, 9]);
+        assert!(
+            !patched.status.is_current(),
+            "the patch keeps the superseded status"
+        );
+        assert!(map.get(&second.vid).unwrap().status.is_current());
+        assert!(
+            !map.patch_app_meta(SchemaVid(999), vec![]),
+            "an unknown generation is not patched"
+        );
+    }
 
     fn schema_of(fields: Vec<Field>) -> Schema {
         Schema::new_with_id(1, "s", None, Field::new_schema(fields), false, false)
@@ -3254,6 +3373,61 @@ mod tests {
             cache.current_vid_of_uid(&SchemaUid(1)),
             Some(SchemaVid(900))
         );
+    }
+
+    #[test]
+    fn concurrent_schema_publication_preserves_names_generations_and_metadata() {
+        let cache = Arc::new(LocalSchemasCache::new_local(""));
+        for uid in 1..=8 {
+            cache.cache_schema_from_cluster(cache_test_schema(uid, &format!("family-{uid}")));
+        }
+        let before = cache.map.state.load();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for uid in 1..=8 {
+                let cache = &cache;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let mut evolved = cache_test_schema(uid, &format!("family-{uid}"));
+                    evolved.vid = SchemaVid(100 + uid);
+                    evolved.generation = 1;
+                    cache.map.evolve_schema(evolved);
+                    assert!(cache
+                        .map
+                        .patch_app_meta(SchemaVid(100 + uid), vec![uid as u8]));
+                    cache.apply_rename(SchemaUid(uid), &format!("renamed-{uid}"));
+                });
+            }
+        });
+        assert_eq!(
+            before.schema_map.len(),
+            8,
+            "readers retain their original generation snapshot"
+        );
+        let after = cache.map.state.load();
+        assert_eq!(after.schema_map.len(), 16);
+        for uid in 1..=8 {
+            assert_eq!(
+                after.name_map.get(&format!("renamed-{uid}")),
+                Some(&SchemaUid(uid))
+            );
+            assert!(!after.name_map.contains_key(&format!("family-{uid}")));
+            assert_eq!(
+                after.handles.get(&SchemaUid(uid)),
+                Some(&SchemaVid(100 + uid))
+            );
+            assert_eq!(
+                after.schema_map[&SchemaVid(100 + uid)].app_meta,
+                vec![uid as u8]
+            );
+            assert_eq!(
+                after.schema_map[&SchemaVid(uid)].status,
+                SchemaVersionStatus::Stale {
+                    superseded_by: SchemaVid(100 + uid)
+                }
+            );
+        }
     }
 
     #[test]

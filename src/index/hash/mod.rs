@@ -1,5 +1,6 @@
-use crate::ram::cell::{ReadError, WriteError, MAX_CELL_SIZE};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::utils::keyed_state::KeyedState;
+use crate::ram::cell::{Cell, ReadError, WriteError, MAX_CELL_SIZE};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Bucket-size accounting for the hashed index.
 pub static HASH_BUCKET_LEN_SUM: AtomicU64 = AtomicU64::new(0);
@@ -11,28 +12,44 @@ use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
 use bifrost_hasher::hash_str;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::Feature;
+use crate::index::full_text::ToOwnedValue;
 
 const MAX_CAS_RETRIES: u32 = 1000;
+
+const HASH_BUCKET_FORMAT_VERSION: u32 = 3;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 /// Link to the rest of a bucket that has outgrown one cell.
 const HASH_NEXT_FIELD: &'static str = "NEXT";
+/// The head of the chain this segment belongs to.
+///
+/// A bucket id is a one-way hash of (schema, field, value feature), and a
+/// spilled segment's id is a one-way hash of (head, version), so nothing in a
+/// segment's own id says which bucket it is part of. The recovery reconcile
+/// must ask "does the cell this entry names still imply THIS bucket", and it
+/// can only ask that of the bucket, not of a segment. `OWNER` is what makes an
+/// entry self-describing, the way a ranged key already is.
+const HASH_OWNER_FIELD: &'static str = "OWNER";
 
 /// Runaway guard when walking a bucket chain. A well-formed chain is
 /// `bucket_len / BUCKET_CAPACITY` cells; anything beyond this is a cycle or
 /// corruption, and walking it forever would hang a query.
-const MAX_CHAIN_HOPS: usize = 1_000_000;
+pub(crate) const MAX_CHAIN_HOPS: usize = 1_000_000;
 
 lazy_static! {
-    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    // The physical schema id is the format marker in each persisted cell header.
+    pub(crate) static ref HASH_INDEX_SCHEMA_V1_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
+    pub(crate) static ref HASH_INDEX_SCHEMA_V2_ID: SchemaVid = SchemaVid(key_hash("HASH_INDEX_SCHEMA:2") as u32);
+    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(&format!("{HASH_SCHEMA}:{HASH_BUCKET_FORMAT_VERSION}")) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
     pub static ref HASH_NEXT_FIELD_ID: u64 = hash_str(HASH_NEXT_FIELD);
+    pub static ref HASH_OWNER_FIELD_ID: u64 = hash_str(HASH_OWNER_FIELD);
     /// Ids one bucket cell holds before the bucket spills into a chain.
     ///
     /// A cell is capped at `MAX_CELL_SIZE`, so before chaining a bucket could
@@ -96,6 +113,9 @@ fn spilled_cell_id(index_id: &Id, version: u64) -> Id {
 struct Bucket {
     pending: Mutex<HashSet<Id>>,
     apply: TokioMutex<()>,
+    blocking_removals: AtomicUsize,
+    #[cfg(test)]
+    removal_handoffs: AtomicUsize,
 }
 
 pub struct HashIndexer {
@@ -104,7 +124,7 @@ pub struct HashIndexer {
     /// process-wide: bucket ids derive from (schema, field, value) and so can
     /// repeat across databases, and folding two databases' inserts into one
     /// apply would write them through the wrong client.
-    buckets: Mutex<HashMap<Id, Arc<Bucket>>>,
+    buckets: KeyedState<Id, Arc<Bucket>>,
 }
 
 impl HashIndexer {
@@ -130,17 +150,14 @@ impl HashIndexer {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         HashIndexer {
             neb_client: neb_client.clone(),
-            buckets: Mutex::new(HashMap::new()),
+            buckets: KeyedState::default(),
         }
     }
 
     /// Coalescing slot for one bucket, created on demand.
     fn bucket(&self, index_id: &Id) -> Arc<Bucket> {
-        self.buckets
-            .lock()
-            .entry(*index_id)
-            .or_insert_with(|| Arc::new(Bucket::default()))
-            .clone()
+        crate::profile_lock!(H19, self.buckets.entry(index_id))
+            .get_or_insert_with(|| Arc::new(Bucket::default())).clone()
     }
 
     /// Drop a bucket's slot once nothing is queued on it, so the map does not
@@ -150,12 +167,12 @@ impl HashIndexer {
     /// means the map is the last owner. Racing a newcomer is harmless -- it
     /// gets a fresh slot, coalesces with nobody, and its CAS still applies.
     fn release_bucket(&self, index_id: &Id) {
-        let mut buckets = self.buckets.lock();
+        let mut buckets = crate::profile_lock!(H19, self.buckets.entry(index_id));
         let drop_it = buckets
-            .get(index_id)
+            .as_ref()
             .is_some_and(|b| Arc::strong_count(b) == 1 && b.pending.lock().is_empty());
         if drop_it {
-            buckets.remove(index_id);
+            buckets.take();
         }
     }
 
@@ -243,8 +260,7 @@ impl HashIndexer {
     }
 
     /// Next cell in the bucket chain, if this one has spilled. Null, NA and a
-    /// missing field all mean "end of chain" -- the last covers cells written
-    /// before the link field existed.
+    /// missing field all mean "end of chain".
     fn cell_next(cell: &OwnedCell) -> Option<Id> {
         match &cell[*HASH_NEXT_FIELD_ID] {
             OwnedValue::Id(id) => Some(*id),
@@ -252,7 +268,9 @@ impl HashIndexer {
         }
     }
 
-    fn bucket_cell(index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
+    /// `owner` is the head of the chain this cell belongs to; a head is its own
+    /// owner.
+    fn bucket_cell(owner: &Id, index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
         let mut map = OwnedMap::new();
         map.insert_key_id(
             *HASH_INDEX_FIELD_ID,
@@ -265,6 +283,7 @@ impl HashIndexer {
                 None => OwnedValue::Null,
             },
         );
+        map.insert_key_id(*HASH_OWNER_FIELD_ID, OwnedValue::Id(*owner));
         OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map))
     }
 
@@ -331,7 +350,7 @@ impl HashIndexer {
             // rejected create and falls through to the merge below, which the
             // measurement says is the rare path.
             if retry == 0 {
-                let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                 match self.neb_client.write_cell(cell).await {
                     Ok(Ok(_)) => return Ok(()),
                     // Bucket already there: fall through and merge into it.
@@ -446,7 +465,7 @@ impl HashIndexer {
                     // frozen cells by the same version they both read, so the
                     // contents are identical by construction.
                     let frozen_id = spilled_cell_id(index_id, version);
-                    let frozen = Self::bucket_cell(&frozen_id, head, next);
+                    let frozen = Self::bucket_cell(index_id, &frozen_id, head, next);
                     match self.neb_client.write_cell(frozen).await {
                         Ok(Ok(_)) | Ok(Err(WriteError::CellAlreadyExisted)) => {}
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -460,7 +479,7 @@ impl HashIndexer {
                         }
                     }
 
-                    let new_head = Self::bucket_cell(index_id, fresh, Some(frozen_id));
+                    let new_head = Self::bucket_cell(index_id, index_id, fresh, Some(frozen_id));
                     match self
                         .neb_client
                         .compare_version_and_update_cell(*index_id, version, new_head)
@@ -489,7 +508,7 @@ impl HashIndexer {
                     }
                 }
                 Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    let cell = Self::bucket_cell(index_id, batch.to_vec(), None);
+                    let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                     match self.neb_client.write_cell(cell).await {
                         Ok(Ok(_)) => return Ok(()),
                         Ok(Err(WriteError::CellAlreadyExisted)) => continue,
@@ -531,6 +550,49 @@ impl HashIndexer {
     /// same predecessor. An empty segment costs one small cell and one read on
     /// the walk, which is cheaper than getting that race wrong.
     pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
+        let bucket = self.bucket(index_id);
+        let mut inline = bucket
+            .apply
+            .try_lock()
+            .ok()
+            .filter(|_| bucket.blocking_removals.load(Ordering::Acquire) == 0);
+        let result = if let Some(_guard) = inline.take() {
+            Self::remove_index_inner(&self.neb_client, cell_id, index_id).await
+        } else {
+            // Count queued jobs too. A cancelled future must not clear this count
+            // while its blocking worker still uses the bucket.
+            struct RemovalJob(Arc<Bucket>);
+            impl Drop for RemovalJob {
+                fn drop(&mut self) {
+                    self.0.blocking_removals.fetch_sub(1, Ordering::Release);
+                }
+            }
+            bucket.blocking_removals.fetch_add(1, Ordering::AcqRel);
+            #[cfg(test)]
+            bucket.removal_handoffs.fetch_add(1, Ordering::Relaxed);
+            let job = RemovalJob(bucket.clone());
+            let client = self.neb_client.clone();
+            let cell_id = *cell_id;
+            let index_id = *index_id;
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let _job = job;
+                runtime.block_on(Self::remove_index_inner(&client, &cell_id, &index_id))
+            })
+            .await
+            .map_err(|_| WriteError::NetworkingError)?
+        };
+        drop(inline);
+        drop(bucket);
+        self.release_bucket(index_id);
+        result
+    }
+
+    async fn remove_index_inner(
+        neb_client: &AsyncClient,
+        cell_id: &Id,
+        index_id: &Id,
+    ) -> Result<(), WriteError> {
         debug!(
             "Attempting to remove index for cell_id: {:?}, index_id: {:?}",
             cell_id, index_id
@@ -543,7 +605,7 @@ impl HashIndexer {
             let mut holder: Option<(Id, u64, Vec<Id>)> = None;
             loop {
                 let Some(cid) = cursor else { break };
-                match self.neb_client.read_cell(cid).await {
+                match neb_client.read_cell(cid).await {
                     Ok(Ok(cell)) => {
                         let version = cell.header.version;
                         if let Some(ids) = Self::cell_ids(&cell) {
@@ -571,19 +633,24 @@ impl HashIndexer {
                 }
                 hops += 1;
                 if hops > MAX_CHAIN_HOPS {
-                    error!("hash bucket {:?} chain exceeded {} hops during remove", index_id, MAX_CHAIN_HOPS);
+                    error!(
+                        "hash bucket {:?} chain exceeded {} hops during remove",
+                        index_id, MAX_CHAIN_HOPS
+                    );
                     break;
                 }
             }
 
             let Some((seg_id, version, mut ids)) = holder else {
-                debug!("Cell {:?} not in index {:?}, nothing to remove", cell_id, index_id);
+                debug!(
+                    "Cell {:?} not in index {:?}, nothing to remove",
+                    cell_id, index_id
+                );
                 return Ok(());
             };
             ids.retain(|id| id != cell_id);
 
-            match self
-                .neb_client
+            match neb_client
                 .compare_version_and_set_field(
                     seg_id,
                     version,
@@ -593,7 +660,10 @@ impl HashIndexer {
                 .await
             {
                 Ok(Ok(_)) => {
-                    debug!("Successfully removed cell {:?} from index {:?}", cell_id, index_id);
+                    debug!(
+                        "Successfully removed cell {:?} from index {:?}",
+                        cell_id, index_id
+                    );
                     return Ok(());
                 }
                 Ok(Err(e)) if Self::retryable_write_error(&e) => {
@@ -616,6 +686,58 @@ impl HashIndexer {
         Err(WriteError::CellVersionMismatch)
     }
 
+    /// Remove a member from the exact segment that the prune inspected.
+    /// Orphan spills are not reachable from the head after a lost head CAS.
+    pub(crate) async fn remove_segment_member(
+        &self,
+        member: &Id,
+        segment: &Id,
+        owner: &Id,
+    ) -> Result<(), WriteError> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let cell = match self.neb_client.read_cell(*segment).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(ReadError::CellDoesNotExisted)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(Err(e)) => return Err(WriteError::ReadError(e)),
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            let mut contents = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+            if contents.owner != *owner {
+                return Err(WriteError::ReadError(ReadError::ExecError(
+                    "hash segment owner changed".into(),
+                )));
+            }
+            let previous = contents.ids.len();
+            contents.ids.retain(|id| id != member);
+            if contents.ids.len() == previous {
+                return Ok(());
+            }
+            match self
+                .neb_client
+                .compare_version_and_set_field(
+                    *segment,
+                    cell.header.version,
+                    *HASH_INDEX_FIELD_ID,
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(contents.ids)),
+                )
+                .await
+            {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) if Self::retryable_write_error(&e) => tokio::task::yield_now().await,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        Err(WriteError::CellVersionMismatch)
+    }
+
     /// Cells whose `field_id` equals `value`, walking the bucket chain.
     ///
     /// Streams: one segment is held at a time, its members are verified and
@@ -631,11 +753,11 @@ impl HashIndexer {
     /// the bucket. Duplicates are possible at all because write-side dedup
     /// checks only the head segment: scanning the chain on every insert would
     /// put a chain-length read on the write path.
-    pub async fn query(
+    async fn query_ids(
         &self,
         index_id: Id,
-        field_id: u64,
-        value: &OwnedValue,
+        check: Option<&crate::index::verification::IndexCheck>,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let mut result = Vec::new();
         let mut emitted = HashSet::new();
@@ -667,24 +789,29 @@ impl HashIndexer {
                 if emitted.contains(&id) {
                     continue;
                 }
-                // Each candidate is re-read and checked: a bucket is keyed by
-                // a hash, so it holds collisions as well as matches.
-                let cell_res = self
-                    .neb_client
-                    .read_cell_select(id, &vec![field_id], false)
-                    .await;
-                if let Ok(Ok(cell)) = &cell_res {
-                    let field_val = &cell[0usize];
-                    if values_semantically_equal(field_val, value) {
-                        emitted.insert(id);
-                        result.push(id);
-                    } else {
-                        debug!(
-                            "Cell {:?} has field {:?} with value {:?}, but expected {:?}",
-                            id, field_id, field_val, value
-                        );
+                if let Some(check) = check {
+                    let present = match verify {
+                        crate::index::verification::Verify::Exists => {
+                            let client = self.neb_client.locate_plain_server(id).await?;
+                            match client.existing_ids(&vec![id]).await?.pop() {
+                                Some(Ok(exists)) => exists,
+                                Some(Err(error)) => return Ok(Err(error)),
+                                None => return Ok(Err(ReadError::CellDoesNotExisted)),
+                            }
+                        }
+                        crate::index::verification::Verify::Predicate => matches!(
+                            self.neb_client
+                                .read_indexed_cell(id, check.clone())
+                                .await,
+                            Ok(Ok(_))
+                        ),
+                    };
+                    if !present {
+                        continue;
                     }
                 }
+                emitted.insert(id);
+                result.push(id);
             }
 
             hops += 1;
@@ -699,6 +826,37 @@ impl HashIndexer {
 
         Ok(Ok(result))
     }
+    pub(crate) async fn candidates(
+        &self,
+        index_id: Id,
+    ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        self.query_ids(
+            index_id,
+            None,
+            crate::index::verification::Verify::Predicate,
+        )
+        .await
+    }
+
+    pub async fn query(
+        &self,
+        index_id: Id,
+        field_id: u64,
+        value: &OwnedValue,
+        verify: crate::index::verification::Verify,
+    ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        let check = crate::index::verification::IndexCheck::Hashed {
+            buckets: vec![index_id],
+            field: field_id,
+            value: value.clone(),
+        };
+        self.query_ids(
+            index_id,
+            Some(&check),
+            verify,
+        )
+        .await
+    }
 }
 
 pub fn hash_index_schema() -> Schema {
@@ -708,13 +866,96 @@ pub fn hash_index_schema() -> Schema {
         None,
         Field::new_schema(vec![
             Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-            // Nullable: a bucket that never outgrew one cell has no link, and
-            // so does a bucket written before chaining existed.
+            // Nullable: a bucket that never outgrew one cell has no link.
             Field::new_unindexed_nullable(HASH_NEXT_FIELD, Type::Id),
+            Field::new_unindexed(HASH_OWNER_FIELD, Type::Id),
         ]),
         false,
         false,
     )
+}
+
+/// What one bucket segment holds.
+///
+/// The recovery reconcile reads bucket cells in both cell forms -- `OwnedCell`
+/// when the segment sits on another member and `SharedCell` when it sits in
+/// this member's own chunks -- so the decode is written once, against the
+/// `Cell` trait, rather than twice.
+pub(crate) struct BucketSegment {
+    /// The head of the chain this segment belongs to.
+    pub(crate) owner: Id,
+    /// The member ids this segment holds.
+    pub(crate) ids: Vec<Id>,
+    /// The older segment of the chain, if this one spilled.
+    pub(crate) next: Option<Id>,
+}
+
+fn bucket_field<C>(cell: &C, field_id: u64) -> OwnedValue
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    cell.data().get_in_by_ids(&vec![field_id]).to_owned_value()
+}
+
+/// Read a bucket cell out of any cell form.
+pub(crate) fn bucket_segment<C>(cell: &C) -> Result<BucketSegment, ReadError>
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    let ids = match bucket_field(cell, *HASH_INDEX_FIELD_ID) {
+        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids,
+        _ => return Err(ReadError::ExecError("invalid hash member array".into())),
+    };
+    let owner = match bucket_field(cell, *HASH_OWNER_FIELD_ID) {
+        OwnedValue::Id(id) => id,
+        _ => return Err(ReadError::ExecError("invalid hash owner".into())),
+    };
+    let next = match bucket_field(cell, *HASH_NEXT_FIELD_ID) {
+        OwnedValue::Id(id) => Some(id),
+        OwnedValue::Null => None,
+        _ => return Err(ReadError::ExecError("invalid hash next link".into())),
+    };
+    Ok(BucketSegment { owner, ids, next })
+}
+
+/// Validate recovered bucket records before startup can repair or serve them.
+pub(crate) fn validate_recovered_buckets(
+    chunks: &Arc<crate::ram::chunk::Chunks>,
+) -> std::io::Result<()> {
+    use crate::ram::entry::EntryContent;
+    for chunk in &chunks.list {
+        for segment in chunk.segments() {
+            for entry in chunk.live_entries(&segment) {
+                let EntryContent::Cell(header) = entry.content else {
+                    continue;
+                };
+                if header.schema == *HASH_INDEX_SCHEMA_V1_ID
+                    || header.schema == *HASH_INDEX_SCHEMA_V2_ID
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "hash bucket format does not match format 3",
+                    ));
+                }
+                if header.schema != *HASH_INDEX_SCHEMA_ID {
+                    continue;
+                }
+                let invalid =
+                    |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+                if chunk.meta.schemas.get(&header.schema).is_none() {
+                    return Err(invalid("hash bucket schema is absent".into()));
+                }
+                let cell = chunk
+                    .read_cell(header.id().bits())
+                    .map_err(|e| invalid(format!("hash bucket read failed: {e:?}")))?;
+                bucket_segment(&cell)
+                    .map_err(|e| invalid(format!("hash bucket decode failed: {e:?}")))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct HashedIndexClient {
@@ -740,8 +981,9 @@ impl HashedIndexClient {
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        self.indexer.query(index_id, field_id, value).await
+        self.indexer.query(index_id, field_id, value, verify).await
     }
 }
 
@@ -917,6 +1159,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn independent_buckets_keep_their_own_coalescing_slots() {
+        let (server, client) = create_test_server("bucket_registry_shards").await;
+        let indexer = Arc::new(HashIndexer::new(&client));
+        let first = Id::from_parts(1, 1);
+        let second = Id::from_parts(1, 2);
+        let held = indexer.buckets.entry(&first);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = indexer.clone();
+        let thread = std::thread::spawn(move || {
+            let one = worker.bucket(&second);
+            worker.release_bucket(&second);
+            let two = worker.bucket(&second);
+            assert!(Arc::ptr_eq(&one, &two), "a borrowed slot must stay registered");
+            drop(one);
+            drop(two);
+            worker.release_bucket(&second);
+            assert!(worker.buckets.entry(&second).is_none());
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "an unrelated bucket shard must make progress");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn uncontended_removal_makes_no_blocking_handoffs() {
+        let (server, client) = create_test_server("remove_inline").await;
+        let indexer = HashIndexer::new(&client);
+        let index_id = Id::rand();
+        let member = Id::rand();
+        indexer.add_index(&member, &index_id).await.unwrap();
+        let bucket = indexer.bucket(&index_id);
+        indexer.remove_index(&member, &index_id).await.unwrap();
+        assert_eq!(bucket.removal_handoffs.load(Ordering::Relaxed), 0);
+        let stored = client.read_cell(index_id).await.unwrap().unwrap();
+        assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_does_not_serialize_on_the_bucket_applier() {
+        let (server, client) = create_test_server("remove_no_applier_queue").await;
+        let indexer = HashIndexer::new(&client);
+        let index_id = Id::rand();
+        let member = Id::rand();
+        indexer.add_index(&member, &index_id).await.unwrap();
+        let bucket = indexer.bucket(&index_id);
+        let apply = bucket.apply.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            indexer.remove_index(&member, &index_id),
+        )
+        .await;
+        drop(apply);
+        assert!(
+            result.is_ok(),
+            "removal unnecessarily waited for the bucket applier"
+        );
+        result.unwrap().unwrap();
+        let stored = client.read_cell(index_id).await.unwrap().unwrap();
+        assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn contended_removal_waits_for_the_cell_word_without_stalling_the_runtime() {
+        use std::time::Duration;
+
+        let (server, client) = create_test_server("remove_applier_progress").await;
+        let indexer = HashIndexer::new(&client);
+        let index_id = Id::rand();
+        let other_index = Id::rand();
+        let member = Id::rand();
+        indexer.add_index(&member, &index_id).await.unwrap();
+        indexer.add_index(&member, &other_index).await.unwrap();
+        let bucket = indexer.bucket(&index_id);
+        let apply = bucket.apply.lock().await;
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let chunks = server.chunks().clone();
+        let owner = std::thread::spawn(move || {
+            let word = chunks.lock_cell_for_write(&index_id, true).unwrap();
+            locked_tx.send(()).unwrap();
+            // Bound the negative control even if removal blocks the runtime.
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            drop(word);
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        indexer.remove_index(&member, &other_index).await.unwrap();
+        let removal = indexer.remove_index(&member, &index_id);
+        tokio::pin!(removal);
+        let waiting = tokio::time::timeout(Duration::from_millis(50), removal.as_mut()).await;
+        let _ = release_tx.send(());
+        owner.join().unwrap();
+        drop(apply);
+        assert!(
+            waiting.is_err(),
+            "removal must await the cell word and let the runtime timer run"
+        );
+        removal.await.unwrap();
+        let stored = client.read_cell(index_id).await.unwrap().unwrap();
+        let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = &stored[*HASH_INDEX_FIELD_ID] else {
+            panic!("expected bucket IDs");
+        };
+        assert!(ids.is_empty());
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_remove_index_multiple_entries() {
         let (_server, client) = create_test_server("remove_multiple").await;
@@ -974,7 +1327,14 @@ mod tests {
         let value = OwnedValue::I64(42);
 
         // Query non-existent index
-        let result = indexer.query(index_id, field_id, &value).await;
+        let result = indexer
+            .query(
+                index_id,
+                field_id,
+                &value,
+                crate::index::verification::Verify::Predicate,
+            )
+            .await;
         assert!(result.is_ok());
         let ids = result.unwrap().unwrap();
         assert_eq!(ids.len(), 0);
@@ -1045,7 +1405,9 @@ mod tests {
             *BUCKET_CAPACITY
         );
         let total = *BUCKET_CAPACITY + 500;
-        let cell_ids: Vec<Id> = (0..total as u64).map(|i| Id::from_parts(7, i + 1)).collect();
+        let cell_ids: Vec<Id> = (0..total as u64)
+            .map(|i| Id::from_parts(7, i + 1))
+            .collect();
 
         let mut tasks = JoinSet::new();
         for chunk in cell_ids.chunks(total.div_ceil(32)) {
@@ -1098,7 +1460,11 @@ mod tests {
         );
         assert_eq!(seen.len(), total, "every id must survive the spill");
         for cell_id in &cell_ids {
-            assert!(seen.contains(cell_id), "id {:?} lost across the chain", cell_id);
+            assert!(
+                seen.contains(cell_id),
+                "id {:?} lost across the chain",
+                cell_id
+            );
         }
     }
 

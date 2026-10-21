@@ -65,6 +65,7 @@ raft_state_machine! {
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd rename_schema(old_name: String, new_name: String) -> Result<(), RenameSchemaError>;
     def cmd evolve_schema(name: String, schema: Schema, expected_base: Option<SchemaVid>) -> Result<EvolutionOutcome, EvolveSchemaError>;
+    def cmd set_app_meta(name: String, app_meta: Vec<u8>) -> Result<(), SetAppMetaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
@@ -160,6 +161,27 @@ impl StateMachineCmds for SchemasSM {
         }
         .boxed()
     }
+    fn set_app_meta(
+        &mut self,
+        name: String,
+        app_meta: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), SetAppMetaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
+        async move {
+            let updated = self.map.set_app_meta(&name, app_meta)?;
+            // Re-announced as an addition on purpose: `new_schema` on a node's
+            // cache is an idempotent upsert of the record, which is exactly
+            // "this record changed in place".
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_added::new(), updated)
+                    .await
+                    .map_err(|e| SetAppMetaError::NotifyError(e))?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
     fn next_id(&mut self) -> BoxFuture<'_, u32> {
         future::ready(self.allocate_id()).boxed()
     }
@@ -220,53 +242,10 @@ impl StateMachineCmds for SchemasSM {
     }
 }
 
-/// Decode a schema snapshot, or refuse the load.
-///
-/// `StateMachineCtl::recover` returns `()`, so there is no way to tell the
-/// caller the snapshot was unreadable. What this used to do instead was log at
-/// `trace!` and return, which left the state machine with an EMPTY schema map
-/// -- and a database that comes up looking like it has no schemas rather than
-/// one this build cannot read. Every cell then fails `SchemaDoesNotExisted`,
-/// and `select_from_chunk_raw` panics on the way there in debug builds. It is
-/// the same shape as the recovery bug that silently wiped the ranged index: an
-/// unreadable input treated as an empty one.
-///
-/// That path was unreachable while the record format only ever grew defaulted
-/// fields. The uid/vid split deliberately broke the format, which makes it the
-/// EXPECTED path for every store written before it -- so refuse loudly instead.
-/// A crash at startup is recoverable by rebuilding; a database that quietly
-/// forgot its schemas is not.
-///
-/// Empty input is a different thing and stays benign: `recover` runs only when
-/// a snapshot exists, and `snapshot()` never yields zero bytes, so an empty
-/// buffer means there was nothing to restore rather than something unreadable.
+/// A recovery hook receives present snapshot bytes, including a damaged empty
+/// buffer. Fresh stores do not call this hook.
 fn decode_snapshot(data: &[u8]) -> Vec<Schema> {
-    if data.is_empty() {
-        warn!("Schema snapshot is empty; nothing to recover");
-        return Vec::new();
-    }
-    match utils::serde::deserialize::<Vec<Schema>>(data) {
-        Some(schemas) => {
-            trace!("Successfully deserialized {} schemas", schemas.len());
-            schemas
-        }
-        None => {
-            error!(
-                "Schema snapshot ({} bytes) cannot be decoded by this build. The \
-                 most likely cause is a store written before the schema uid/vid \
-                 split, whose records carry `id` and none of `vid`/`uid`/\
-                 `generation`/`status`. That format is not supported and the \
-                 store must be rebuilt. Refusing to continue, because loading \
-                 zero schemas would leave every cell in this database \
-                 undecodable while looking like an empty database.",
-                data.len()
-            );
-            panic!(
-                "unreadable schema snapshot ({} bytes): incompatible store, rebuild it",
-                data.len()
-            );
-        }
-    }
+    crate::utils::persisted::decode_persisted_or_halt("schema snapshot", data)
 }
 
 impl StateMachineCtl for SchemasSM {
@@ -338,11 +317,7 @@ impl SchemasSM {
         )
     }
 
-    /// Create a new state machine (legacy method, defaults to not recovering)
-    pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
-        Self::new_with_recovery_flag(group, group, raft_service, Arc::new(AtomicBool::new(false)))
-            .await
-    }
+
 }
 
 impl SchemasSM {
@@ -438,6 +413,20 @@ impl SchemasMap {
             doomed
         );
         Ok(())
+    }
+    /// Replace the owner metadata of the family's CURRENT generation.
+    fn set_app_meta(&mut self, name: &str, app_meta: Vec<u8>) -> Result<Schema, SetAppMetaError> {
+        let vid = self
+            .uid_of_name(name)
+            .and_then(|uid| self.handles.get(&uid))
+            .map(|handle| handle.current_vid)
+            .ok_or(SetAppMetaError::SchemaDoesNotExist)?;
+        let record = self
+            .schema_map
+            .get_mut(&vid)
+            .ok_or(SetAppMetaError::SchemaDoesNotExist)?;
+        record.app_meta = app_meta;
+        Ok(record.clone())
     }
     fn load_from_list(&mut self, data: Vec<Schema>) {
         info!("load_from_list: Loading {} schemas", data.len());
@@ -576,6 +565,13 @@ impl SchemasMap {
         proposed.generation = handle.generation + 1;
         proposed.status = SchemaVersionStatus::Current;
         proposed.name = handle.current_name.clone();
+        // The owner's metadata belongs to the family, not to a layout: an
+        // evolution proposes field content only and must not reset it.
+        proposed.app_meta = self
+            .schema_map
+            .get(&previous_vid)
+            .map(|previous| previous.app_meta.clone())
+            .unwrap_or_default();
 
         // Drops accumulate across the family. Migration takes ONE hop --
         // generation 0 straight to generation 3 -- so a generation that only
@@ -651,8 +647,7 @@ mod tests {
 
     /// A schema record as it was written BEFORE the uid/vid split: an `id`,
     /// and none of the identity fields this build requires. Serialized through
-    /// the same helper the state machine uses, so it is a real snapshot in
-    /// whichever format this build speaks (JSON in debug, CBOR in release).
+    /// the same helper the state machine uses, so it is a real CBOR snapshot.
     #[derive(Serialize)]
     struct PreSplitSchema {
         id: u32,
@@ -660,11 +655,14 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_snapshot_recovers_to_nothing() {
-        // `recover` runs only when a snapshot exists and `snapshot()` never
-        // yields zero bytes, so this is "there was nothing to restore" -- not
-        // "something was unreadable". It must stay benign.
-        assert!(decode_snapshot(&[]).is_empty());
+    fn an_empty_snapshot_refuses_the_load() {
+        let error = std::panic::catch_unwind(|| decode_snapshot(&[])).unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "schema snapshot");
+        assert_eq!(error.bytes, 0);
+        assert!(decode_snapshot(&utils::serde::serialize(&Vec::<Schema>::new())).is_empty());
     }
 
     #[test]
@@ -687,7 +685,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unreadable schema snapshot")]
     fn an_incompatible_snapshot_refuses_the_load_instead_of_emptying_it() {
         // The regression this guards: `recover` used to swallow a failed
         // decode at `trace!` and install an EMPTY map, so a store this build
@@ -698,7 +695,12 @@ mod tests {
             name: "person".to_owned(),
         }]);
         assert!(!data.is_empty(), "the fixture must be a non-empty snapshot");
-        let _ = decode_snapshot(&data);
+        let error = std::panic::catch_unwind(|| decode_snapshot(&data)).unwrap_err();
+        let error = error
+            .downcast::<crate::utils::persisted::PersistedDecodeError>()
+            .unwrap();
+        assert_eq!(error.what, "schema snapshot");
+        assert_eq!(error.bytes, data.len());
     }
 
     /// Build a second generation of `base`'s family by hand. `evolve_schema`
@@ -723,6 +725,38 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[test]
+    fn app_meta_is_created_with_the_record_and_survives_a_snapshot() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "typed").with_app_meta(vec![7, 8, 9]))
+            .unwrap();
+        let mut restored = SchemasMap::new();
+        restored.load_from_list(decode_snapshot(&utils::serde::serialize(&map.get_all())));
+        let uid = restored.uid_of_name("typed").unwrap();
+        let vid = restored.handles.get(&uid).unwrap().current_vid;
+        assert_eq!(restored.schema_map.get(&vid).unwrap().app_meta, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn set_app_meta_replaces_the_current_generation_and_evolution_inherits_it() {
+        let mut map = SchemasMap::new();
+        map.new_schema(schema_named(1, "typed").with_app_meta(vec![1]))
+            .unwrap();
+        let updated = map.set_app_meta("typed", vec![2, 2]).unwrap();
+        assert_eq!(updated.app_meta, vec![2, 2]);
+        assert!(map.set_app_meta("missing", vec![]).is_err());
+
+        // A proposal carries field content only; it must not reset the meta.
+        let proposed = schema_named(0, "typed");
+        assert!(proposed.app_meta.is_empty());
+        let (evolved, previous) = map
+            .install_evolution("typed", proposed, SchemaVid(50))
+            .unwrap();
+        assert_eq!(previous, SchemaVid(1));
+        assert_eq!(evolved.app_meta, vec![2, 2]);
+        assert_eq!(map.schema_map.get(&SchemaVid(50)).unwrap().app_meta, vec![2, 2]);
     }
 
     #[test]

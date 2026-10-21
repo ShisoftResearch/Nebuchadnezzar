@@ -1,5 +1,4 @@
 use crate::ram::chunk::Chunk;
-#[cfg(feature = "compress_backups")]
 use crate::ram::compression;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
@@ -27,6 +26,26 @@ use std::{io, slice};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveOutcome {
+    Archived,
+    AlreadyArchived,
+    Refused,
+    Unconfigured,
+}
+
+pub static ARCHIVE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that a pin, a claim or a lease refused, then queued again.
+pub static SEAL_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Seal jobs that left a synced, mostly dead segment to the cleaner, then
+/// queued again. A wait is not a refusal: it takes no fsync.
+pub static SEAL_RECLAIM_WAIT_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Segments that wait for the cleaner now, and the most that waited at once.
+pub static SEAL_WAITING_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+pub static SEAL_WAITING_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Rotations whose seal job ran on the rotating writer: the queue was full.
+pub static SEAL_INLINE: AtomicU64 = AtomicU64::new(0);
+
 /// Durability write accounting, for attributing disk write volume.
 ///
 /// Inferring these from segment counts and directory growth proved unreliable
@@ -39,56 +58,262 @@ pub static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// re-dirtied and re-archived after they should have been sealed.
 pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static WAL_SYNC_SERVICE_NS: AtomicU64 = AtomicU64::new(0);
+pub static WAL_HEADER_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 /// Explicit `force_wal_sync` calls that actually reached `fsync`: the
 /// durability a transaction commit promises, made countable.
+pub static BACKGROUND_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+pub static DRAIN_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Forced syncs that the durability watermark already covered: another
+/// sync (a group sync or another transaction's) took these bytes to disk, so
+/// no `fsync` ran. Group commit on the forced path.
+pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
-/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
-/// dedicated thread fsyncs the whole set every `wal_sync_interval_ms` —
+/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). A
+/// dispatcher schedules independent segment jobs every `wal_sync_interval_ms`,
 /// replacing per-segment inline timer syncs (6,302 blocking fsyncs/s across an
-/// import's ~63 active segments) with O(dirty) syncs per tick on one thread.
+/// import's ~63 active segments) with O(dirty) independent jobs per tick.
 /// Entries hold `AArc`s, so segment lifecycle is a non-issue: an archived
 /// segment syncs as a no-op (its WAL file handle is gone) and drops.
-static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
-    parking_lot::Mutex::new(Vec::new());
+static WAL_DIRTY: crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>> =
+    crossbeam::queue::SegQueue::new();
+
+#[cfg(test)]
+static PAUSED_REWIND_SYNCS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// A test model of a power loss.
+///
+/// When enabled, every successful sync of a WAL file records the bytes it
+/// made durable. [`power_loss_model::copy_store_as_after_power_loss`] then
+/// builds a copy of a store in which each WAL file holds only those bytes:
+/// writes and truncations that no sync covered are gone, as after a power
+/// loss. Backup files are copied as they are: they are installed by rename
+/// after their own sync. The model does not cover directory entries.
+///
+/// Process-global. The test runner gives each test its own process.
+#[cfg(test)]
+pub(crate) mod power_loss_model {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static GROUP_SYNC_PAUSED: AtomicBool = AtomicBool::new(false);
+    static DURABLE: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Vec<u8>>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Start to record durable WAL bytes. Enable it before the first store
+    /// starts, or the WAL files written before have no durable image.
+    pub(crate) fn enable() {
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    /// Stop the group syncer, as a power loss inside its interval does.
+    /// Explicit syncs still run.
+    pub(crate) fn pause_group_sync(paused: bool) {
+        GROUP_SYNC_PAUSED.store(paused, Ordering::Release);
+    }
+
+    pub(super) fn group_sync_paused() -> bool {
+        GROUP_SYNC_PAUSED.load(Ordering::Acquire)
+    }
+
+    static FAILED_SYNC_DIRS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Fail every explicit WAL sync of a file under `prefix` with EIO, as a
+    /// disk that refuses the sync.
+    pub(crate) fn fail_wal_syncs_under(prefix: &Path, failing: bool) {
+        let mut dirs = FAILED_SYNC_DIRS.lock();
+        dirs.retain(|existing| existing != prefix);
+        if failing {
+            dirs.push(prefix.to_path_buf());
+        }
+    }
+
+    pub(crate) fn wal_sync_fails(path: &Option<String>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        let dirs = FAILED_SYNC_DIRS.lock();
+        !dirs.is_empty() && dirs.iter().any(|dir| Path::new(path).starts_with(dir))
+    }
+
+    /// `len` is the file length that the sync covered.
+    pub(crate) fn record_synced_len(path: &Option<String>, len: u64) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(mut bytes) = std::fs::read(path) else {
+            return;
+        };
+        bytes.truncate(len as usize);
+        DURABLE.lock().insert(path.clone(), bytes);
+    }
+
+    pub(crate) fn record_synced(path: &Option<String>, file: &std::fs::File) {
+        if let Ok(metadata) = file.metadata() {
+            record_synced_len(path, metadata.len());
+        }
+    }
+
+    fn copy_tree(from: &Path, to: &Path, wal: bool) -> std::io::Result<()> {
+        if !from.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target, wal)?;
+                continue;
+            }
+            if !wal {
+                std::fs::copy(entry.path(), &target)?;
+                continue;
+            }
+            let key = entry.path().to_string_lossy().to_string();
+            let durable = DURABLE.lock().get(&key).cloned();
+            let bytes = match durable {
+                Some(bytes) => bytes,
+                // Never synced through a segment: only the header, which the
+                // file manager syncs when it creates the file, is durable.
+                None => {
+                    let mut bytes = std::fs::read(entry.path())?;
+                    bytes.truncate(crate::ram::wal_format::FILE_HEADER_SIZE);
+                    bytes
+                }
+            };
+            std::fs::write(&target, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Copy a store's WAL and backup directories as a power loss at this
+    /// instant would leave them.
+    pub(crate) fn copy_store_as_after_power_loss(
+        wal_from: &Path,
+        backup_from: &Path,
+        wal_to: &Path,
+        backup_to: &Path,
+    ) -> std::io::Result<()> {
+        copy_tree(backup_from, backup_to, false)?;
+        copy_tree(wal_from, wal_to, true)
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct PauseRewindSync(usize);
+
+#[cfg(test)]
+impl PauseRewindSync {
+    pub(crate) fn new(seg: &Segment) -> Self {
+        PAUSED_REWIND_SYNCS.lock().insert(seg.addr);
+        Self(seg.addr)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PauseRewindSync {
+    fn drop(&mut self) {
+        PAUSED_REWIND_SYNCS.lock().remove(&self.0);
+    }
+}
 
 /// Enqueue a segment for the syncer's next pass and lazily start the syncer.
 pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
-    if seg
+    #[cfg(feature = "abort_profile")]
+    let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::QueueSync);
+    let enqueue = seg
         .wal_sync_queued
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
+        .is_ok();
+    if !enqueue {
         return;
     }
-    WAL_DIRTY.lock().push(seg.clone());
+    WAL_DIRTY.push(seg.clone());
 
     static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SYNCER.get_or_init(|| {
         std::thread::Builder::new()
             .name("wal-syncer".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    wal_sync_interval_ms().max(1) as u64,
-                ));
-                let dirty = std::mem::take(&mut *WAL_DIRTY.lock());
-                for seg in dirty {
-                    // Clear the flag BEFORE syncing: bytes that land during
-                    // the sync re-enqueue for the next pass instead of being
-                    // silently absorbed into a sync that may miss them.
-                    seg.wal_sync_queued.store(false, Ordering::Release);
-                    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0 {
-                        if let Err(e) = seg.force_wal_sync() {
-                            error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
-                        }
-                    }
+            .spawn(|| {
+                // Fsyncs for independent segments can run together, as they
+                // do for committing writers. A single sync thread otherwise
+                // becomes the throughput limit.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(8)
+                    .thread_name(|n| format!("wal-sync-{n}"))
+                    .build()
+                    .expect("spawn WAL sync workers");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        wal_sync_interval_ms().max(1) as u64,
+                    ));
+                    dispatch_dirty_segments(&WAL_DIRTY, &pool);
                 }
             })
             .expect("spawn wal-syncer");
     });
 }
+fn dispatch_dirty_segments(
+    dirty: &crossbeam::queue::SegQueue<lightning::aarc::Arc<Segment>>,
+    pool: &rayon::ThreadPool,
+) {
+    // A retry goes to the next pass. Independent segments need not wait for
+    // every sync from the previous pass to finish.
+    for _ in 0..dirty.len() {
+        let Some(seg) = dirty.pop() else { break };
+        if seg
+            .wal_sync_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            dirty.push(seg);
+            continue;
+        }
+        pool.spawn(move || {
+            struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Running<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _running = Running(&seg.wal_sync_running);
+            sync_dirty_segment(seg.clone());
+        });
+    }
+}
+
+fn sync_dirty_segment(seg: lightning::aarc::Arc<Segment>) {
+    let Some(_job) = seg.protection.job() else {
+        WAL_DIRTY.push(seg.clone());
+        return;
+    };
+    #[cfg(test)]
+    if PAUSED_REWIND_SYNCS.lock().contains(&seg.addr) || power_loss_model::group_sync_paused() {
+        WAL_DIRTY.push(seg.clone());
+        return;
+    }
+    // Bytes journaled during this sync must enqueue another pass. The
+    // dispatcher keeps that pass queued until this segment's job finishes.
+    seg.wal_sync_queued.store(false, Ordering::Release);
+    if seg.wal_pending_bytes() > 0 {
+        if let Err(e) = seg.sync_wal(false) {
+            error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
+        }
+    }
+}
+
 /// Entries written to the WAL. Against the number of live cells this gives the
 /// rewrite factor: how many times the average cell's bytes are journalled,
 /// which is write amplification the tier has no part in.
@@ -384,32 +609,138 @@ const JOURNAL_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
 /// acquisition a single fetch_or.
 const HEAD_OWNED: usize = 1 << (usize::BITS - 2);
 
+/// Third-from-top bit of `pending_journals`: the owning transaction has a
+/// BEGIN standing in this segment with neither a COMMIT nor a disowning
+/// padding behind it. Recovery reads every entry after an unclosed BEGIN as
+/// part of that transaction, so a head in this state that can still take an
+/// append must never be handed to another writer -- see
+/// [`Segment::try_release_own`], which is the one place that hand-over
+/// happens. Kept in the word the release already touches, so the check costs
+/// one load on a line that is about to be written anyway.
+const BRACKET_OPEN: usize = 1 << (usize::BITS - 3);
+
+/// Fourth-from-top bit: the owning transaction's bracket here was closed by
+/// its COMMIT. Lets the lease code refuse to disown (pad over) a bracket that
+/// is already decided committed, whatever the caller believes the
+/// transaction's state to be.
+const BRACKET_COMMITTED: usize = 1 << (usize::BITS - 4);
+
+/// Bracket state bits; cleared together when the owner lets the head go.
+const BRACKET_STATE_MASK: usize = BRACKET_OPEN | BRACKET_COMMITTED;
+
 /// Bits of `pending_journals` that are flags, not count.
-const JOURNAL_META_MASK: usize = JOURNAL_GATE_CLOSED | HEAD_OWNED;
+const JOURNAL_META_MASK: usize = JOURNAL_GATE_CLOSED | HEAD_OWNED | BRACKET_STATE_MASK;
+
+/// Head releases refused because the head still held an open transaction
+/// bracket and could take more appends. Non-zero is a bug in whichever exit
+/// path tried it: the head is kept out of the pool rather than handed over.
+pub static OPEN_BRACKET_RELEASES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A head was about to be handed to another writer with a transaction's
+/// BEGIN still open in it and room left behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenBracketRefused {
+    pub chunk_id: usize,
+    pub segment_id: u64,
+    pub seq_id: u64,
+}
+
+impl std::fmt::Display for OpenBracketRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused to release segment {} (chunk {}, seq {}): a transaction bracket is still \
+             open in it and it can take more appends, so the next writer's entries would be \
+             recovered as part of that transaction",
+            self.segment_id, self.chunk_id, self.seq_id
+        )
+    }
+}
+
+impl std::error::Error for OpenBracketRefused {}
 
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
-/// Pooled 8 MiB staging buffers for `Segment::archive` (slab adopter #1).
-/// Bounded in practice by archiver concurrency; `cold_ranges` on so buffer
-/// memory returns to the OS when archiver threads retire.
-type ArchiveStagingBuf = [u8; SEGMENT_SIZE];
+/// At most 32 MiB of staging across all chunks and stores in this process.
+/// Idle buffers share the same bound. Per-chunk pools retain their identity;
+/// a lock-free reserve lets another owner reuse an idle buffer without a sweep.
+const ARCHIVE_STAGING_LIMIT: usize = 4;
 
-fn archive_staging_pool(
-) -> &'static std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>> {
-    static POOL: std::sync::OnceLock<
-        std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>>,
-    > = std::sync::OnceLock::new();
-    POOL.get_or_init(|| lightning::slab_pool::SlabPool::new("archive_staging", true))
+struct ArchiveStagingReserve {
+    budget: Arc<crate::utils::budget::Budget>,
+    idle: crossbeam::queue::ArrayQueue<Vec<u8>>,
 }
 
-/// Frees the staging buffer on every exit path (plain data, no destructor).
-struct ArchiveStagingGuard(lightning::slab_pool::SlabHandle<ArchiveStagingBuf>);
+fn archive_staging_reserve() -> Arc<ArchiveStagingReserve> {
+    static RESERVE: arc_swap::ArcSwapOption<ArchiveStagingReserve> =
+        arc_swap::ArcSwapOption::const_empty();
+    if let Some(reserve) = RESERVE.load_full() {
+        return reserve;
+    }
+    let candidate = Arc::new(ArchiveStagingReserve {
+        budget: crate::utils::budget::Budget::new(ARCHIVE_STAGING_LIMIT),
+        idle: crossbeam::queue::ArrayQueue::new(ARCHIVE_STAGING_LIMIT),
+    });
+    let previous = RESERVE.compare_and_swap(
+        &None::<Arc<ArchiveStagingReserve>>,
+        Some(Arc::clone(&candidate)),
+    );
+    previous.as_ref().cloned().unwrap_or(candidate)
+}
+
+pub(crate) struct ArchiveStagingPool {
+    reserve: Arc<ArchiveStagingReserve>,
+}
+
+impl Default for ArchiveStagingPool {
+    fn default() -> Self {
+        Self { reserve: archive_staging_reserve() }
+    }
+}
+
+impl ArchiveStagingPool {
+    fn acquire(self: &Arc<Self>) -> ArchiveStagingGuard {
+        #[cfg(feature = "lock_profile")]
+        let capacity_wait =
+            crate::utils::lock_profile::Wait::new(crate::utils::lock_profile::labels::H43_capacity);
+        // Claim before allocation. Return the buffer before releasing this claim.
+        // Thus both live and idle buffers stay within the same four-slot reserve.
+        let permit = self.reserve.budget.acquire_blocking();
+        let buffer = self.reserve.idle.pop().unwrap_or_else(|| vec![0; SEGMENT_SIZE]);
+        ArchiveStagingGuard {
+            pool: Arc::clone(self),
+            #[cfg(feature = "lock_profile")]
+            _profile: capacity_wait.acquired(()),
+            buffer: Some(buffer),
+            _permit: permit,
+        }
+    }
+}
+
+/// Return the buffer and its quota on success, an I/O error, or a panic.
+struct ArchiveStagingGuard {
+    #[cfg(feature = "lock_profile")]
+    _profile: crate::utils::lock_profile::Guard<()>,
+    pool: Arc<ArchiveStagingPool>,
+    buffer: Option<Vec<u8>>,
+    _permit: crate::utils::budget::Permit,
+}
+
+impl ArchiveStagingGuard {
+    fn snapshot(&mut self, data: &[u8]) -> &[u8] {
+        let buffer = self.buffer.as_mut().unwrap();
+        buffer.copy_from_slice(data);
+        buffer
+    }
+}
+
 impl Drop for ArchiveStagingGuard {
     fn drop(&mut self) {
-        archive_staging_pool().free_forget(self.0);
+        assert!(self.pool.reserve.idle.push(self.buffer.take().unwrap()).is_ok());
+        // Field drop releases the quota only after the buffer is reusable.
     }
 }
 
@@ -538,6 +869,7 @@ pub fn wal_sync_interval_ms() -> i64 {
 ///   consulted (the combine cleaner skips cold segments).
 #[repr(C, align(64))]
 pub struct Segment {
+    pub(crate) protection: Box<crate::ram::cleaner::protection::Protection>,
     // --- identity & geometry: written at construction, read everywhere ---
     pub id: u64,
     pub seq_id: u64,
@@ -546,11 +878,12 @@ pub struct Segment {
 
     // --- write-path atomics ---
     pub append_header: AtomicUsize,
-    pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
-    pub last_sync_time: AtomicI64,     // Timestamp of last fsync in milliseconds
+    wal_bytes_written: AtomicUsize, // Non-transactional bytes journaled
+    wal_bytes_synced: AtomicUsize,  // Journaled bytes covered by a successful sync
     /// Set while this segment sits in the WAL syncer's dirty registry, so a
     /// segment is enqueued at most once per syncer pass.
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
+    wal_sync_running: std::sync::atomic::AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
     /// Entries that have taken space in this segment but have not yet written
@@ -756,7 +1089,10 @@ impl BlockResidency {
 /// BufWriter buffers caused multi-GB memory leaks.
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
-    pub wal: Option<File>,
+    pub wal: Option<Arc<File>>,
+    pub durability: Option<Arc<crate::ram::durability::DurableFile>>,
+    /// Length through the last complete frame.
+    wal_len: u64,
 }
 
 /// Reopens a segment's journal gate unless the archive actually sealed it.
@@ -834,11 +1170,14 @@ impl Segment {
             dead_bits: parking_lot::RwLock::new(None),
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
+            protection: Box::default(),
             references: AtomicUsize::new(0),
             pending_journals: AtomicUsize::new(0),
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
+                wal_len: 0,
+                durability: None,
             }),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
@@ -850,9 +1189,10 @@ impl Segment {
             dirty_seq: AtomicU64::new(1),
             archived_seq: AtomicU64::new(0),
             sealed: AtomicBool::new(false),
-            last_sync_time: AtomicI64::new(0),
-            bytes_since_sync: AtomicUsize::new(0),
+            wal_bytes_synced: AtomicUsize::new(0),
+            wal_bytes_written: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_running: std::sync::atomic::AtomicBool::new(false),
             // A segment born cold has no image in its mapping either: the
             // backup is all there is until something promotes it.
             block_residency: parking_lot::RwLock::new(BlockResidency {
@@ -867,19 +1207,15 @@ impl Segment {
         self.segment_class
     }
 
-    /// Undo a transaction's writes physically: stamp padding over them and
-    /// put the cursor back.
+    /// Hand back the unused tail of the owner's own claim: stamp padding over
+    /// it and put the cursor back.
     ///
-    /// Safe only because of the lease. One writer owns a segment while a
-    /// transaction writes into it, so there is nothing after the
-    /// transaction's entries to disturb -- which is what lets an abort make
-    /// the writes VANISH instead of recording undo entries that a later
-    /// rollback has to replay.
-    ///
-    /// The padding matters as much as the cursor: the bytes are already in
-    /// the WAL, so recovery will rebuild an image containing them. Padding
-    /// makes that image walk straight over the span; rewinding the cursor
-    /// alone would leave entries a scan still reads.
+    /// ONLY for bytes that were claimed and never journaled -- the over-claim
+    /// a bracket part takes so the head it picks can hold its first entry.
+    /// Nothing about those bytes reached the WAL or the cell index, so moving
+    /// the cursor back over them is invisible. It is NOT how an abort undoes
+    /// journaled entries: see [`Segment::disown_span`] for why that must
+    /// leave the cursor where it is.
     pub fn rewind_to(&self, cursor: usize) -> bool {
         let current = self.append_header.load(Ordering::Acquire);
         if cursor < self.addr || cursor > current {
@@ -897,57 +1233,195 @@ impl Segment {
         true
     }
 
-    /// Where a chain link lives: the last `TXN_CONT_ENTRY_SIZE` bytes of the
-    /// segment's usable space.
-    ///
-    /// A FIXED position is the whole point. Recovery reads it without
-    /// scanning, so deciding whether a segment belongs to a chain -- and
-    /// discarding an aborted chain's parts without ever walking them -- costs
-    /// one read per segment instead of a full pass.
-    pub fn chain_link_offset(&self) -> usize {
-        let usable = self.bound() - self.addr;
-        let tail = usable.saturating_sub(crate::ram::bracket::TXN_CONT_ENTRY_SIZE);
-        // Entries are 8-byte aligned and so is the link.
-        tail - (tail % crate::ram::entry::ENTRY_HEAD_SIZE)
+    /// Write a bare PADDING header covering `span` bytes at `addr`, as ONE
+    /// 8-byte store, so a concurrent walker reads either the old header or
+    /// the new one -- never the type of one and the length of the other.
+    fn store_padding_header(addr: usize, span: usize) {
+        debug_assert!(span >= ENTRY_HEAD_SIZE && addr % ENTRY_HEAD_SIZE == 0);
+        let mut header = [0u8; ENTRY_HEAD_SIZE];
+        header[..4].copy_from_slice(&entry::EntryType::PADDING.bits().to_le_bytes());
+        header[4..].copy_from_slice(&((span - ENTRY_HEAD_SIZE) as u32).to_le_bytes());
+        unsafe { (*(addr as *const AtomicU64)).store(u64::from_le_bytes(header), Release) };
     }
 
-    /// Close this segment as a full chain part: zero the gap, stamp the link
-    /// at the fixed tail, and take the segment out of use.
+    /// Disown a transaction's span `[from, to)`: one PADDING entry over all of
+    /// it, BEGIN included, with that header JOURNALED.
     ///
-    /// Zeros are safe here in a way they are not in a shared segment: the
-    /// link bounds the live region from OUTSIDE, so recovery knows where the
-    /// entries stop before it reads a single one. That is what removes the
-    /// ambiguity that forces PADDING entries elsewhere.
+    /// This is the physical half of an abort. Recovery rebuilds the segment
+    /// from the log, so a padding that existed only in memory would leave the
+    /// BEGIN standing in the rebuilt image, and every entry appended after it
+    /// -- acknowledged ordinary writes included -- would be recovered as part
+    /// of a transaction that never commits. With the header in the log the
+    /// rebuilt image walks straight over the span, exactly like the memory
+    /// does. Ordering is what makes it durable enough: the record sits in this
+    /// segment's WAL ahead of anything a later owner appends, so any sync that
+    /// persists a later entry persists the padding with it; and if nothing is
+    /// ever appended, losing the record only loses the abort to a bracket
+    /// that has no COMMIT, which recovery discards anyway.
     ///
-    /// Only the transaction that owns this head may call this.
-    pub fn seal_as_chain_part(&self, link: &[u8]) -> bool {
-        let tail_offset = self.chain_link_offset();
-        let tail_addr = self.addr + tail_offset;
-        let cursor = self.append_header.load(Ordering::Acquire);
-        if cursor > tail_addr {
-            // No room for the link. The caller must not chain from here.
-            return false;
+    /// The padding is journaled with the group-commit timer, not a forced
+    /// sync: the caller may release the head at once.
+    ///
+    /// The cursor does NOT move back, although the original design had it do
+    /// so. Handing the span out again is unsafe three ways: a reader that
+    /// resolved a cell address in the span before the rollback could read
+    /// another writer's bytes; the per-segment dead bitmap is keyed by entry
+    /// address, so a rolled-back entry's dead bit would mark whatever live
+    /// cell is written at the same offset, and compaction would drop it; and
+    /// the WAL would hold new records over old ones, so a crash part-way
+    /// through refilling the span leaves the old transaction's bytes beyond
+    /// the new cursor, where a walk that happens to land on an old entry
+    /// boundary reads them as ordinary entries. The span costs space until
+    /// the cleaner collects the segment, and nothing else.
+    ///
+    /// Only the owner may call this, and only over journaled bytes. On
+    /// failure the original header is put back, so memory and log agree.
+    pub fn disown_span(&self, from: usize, to: usize) -> io::Result<()> {
+        let refuse = |what: &str| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot disown [{from:#x}, {to:#x}) in segment {} (chunk {}): {what}",
+                    self.id, self.chunk_id
+                ),
+            ))
+        };
+        let cursor = self.append_header.load(Acquire);
+        if from < self.addr || to > cursor || to > self.bound() || from >= to {
+            return refuse("the span is not inside the written part of the segment");
         }
-        unsafe {
-            std::ptr::write_bytes(cursor as *mut u8, 0, tail_addr - cursor);
+        if from % ENTRY_HEAD_SIZE != 0 || to % ENTRY_HEAD_SIZE != 0 {
+            return refuse("the span is not 8-byte aligned");
         }
-        crate::ram::entry::Entry::encode_to(
-            tail_addr,
-            crate::ram::entry::EntryType::TXN_CONT,
-            link.len() as u32,
-            |content_addr| unsafe {
-                std::ptr::copy_nonoverlapping(link.as_ptr(), content_addr as *mut u8, link.len());
-            },
-        );
-        // Nothing may follow the link, so the segment is full from here.
-        self.append_header.store(
-            self.addr + tail_offset + crate::ram::bracket::TXN_CONT_ENTRY_SIZE,
-            Ordering::Release,
-        );
-        true
+        if to - from < ENTRY_HEAD_SIZE {
+            return refuse("the span cannot hold an entry header");
+        }
+        if self.is_sealed() {
+            return refuse("the segment is sealed");
+        }
+        // Read the entries before the first header is overwritten.
+        let newly_dead = self.span_bytes_not_yet_dead(from, to);
+        let saved = unsafe { (*(from as *const AtomicU64)).load(Acquire) };
+        Self::store_padding_header(from, to - from);
+        if !self.begin_pending_journal() {
+            unsafe { (*(from as *const AtomicU64)).store(saved, Release) };
+            return refuse("the segment is sealing");
+        }
+        #[cfg(feature = "abort_profile")]
+        let padding_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Padding);
+        let journaled = self.write_wal(from, ENTRY_HEAD_SIZE as u32, false);
+        #[cfg(feature = "abort_profile")]
+        drop(padding_timer);
+        self.end_pending_journal();
+        match journaled {
+            Ok(()) => {
+                self.set_dirty();
+                self.dead_space.fetch_add(newly_dead, Ordering::Relaxed);
+                self.note_dead_bytes_change();
+                Ok(())
+            }
+            Err(error) => {
+                unsafe { (*(from as *const AtomicU64)).store(saved, Release) };
+                Err(error)
+            }
+        }
     }
 
+    /// Bytes of the span `[from, to)` that no counter holds as dead yet.
+    ///
+    /// The rollback has already marked each cell it removed: its dead bit is
+    /// set and `dead_space` holds its `content_length`. What the rollback did
+    /// not count is the 8-byte header of such a cell, and every byte of an
+    /// entry that was never marked (the BEGIN, a cell whose mark was lost).
+    /// A tombstone is counted by `tombstones`, and an older padding entry by
+    /// the abort that wrote it, so neither is added here. Each byte is
+    /// counted once, because the span is padded over once.
+    fn span_bytes_not_yet_dead(&self, from: usize, to: usize) -> u32 {
+        let mut bytes = 0usize;
+        for meta in (SegmentEntryIter {
+            bound: to,
+            cursor: from,
+        }) {
+            match meta.entry_header.entry_type {
+                entry::EntryType::TOMBSTONE | entry::EntryType::PADDING => {}
+                _ if self.is_dead_at(meta.entry_pos) => bytes += ENTRY_HEAD_SIZE,
+                _ => bytes += meta.entry_size,
+            }
+        }
+        bytes as u32
+    }
+
+    /// Retire this head: take every remaining byte at once, so nothing can
+    /// ever be appended again, and pad the tail in memory so walks step over
+    /// it. Returns how many bytes were retired.
+    ///
+    /// The exit for a head whose transaction bracket must be left exactly as
+    /// it is -- an abort whose rollback could not finish, a rewind that could
+    /// not be journaled, a lease reclaimed by a sweeper that cannot vouch for
+    /// the cell index. The bracket stays uncommitted, which recovery
+    /// discards; the only thing that matters is that no other writer's entry
+    /// can land behind its BEGIN, and a full head guarantees that. The next
+    /// writer to look at this slot finds it full and rotates it out, which
+    /// drains, archives and SEALS it through the ordinary path.
+    ///
+    /// Deliberately NOT journaled: it is the fallback for when the log is the
+    /// thing failing, and it does not need to be. The rebuilt image ends
+    /// where the last journaled entry ended -- which is where the cursor was
+    /// -- and a walk stops there cleanly.
+    pub fn retire_tail(&self) -> usize {
+        // A sealed segment already takes nothing, and its image is the
+        // archived one: it must not be touched, not even with padding.
+        if self.is_sealed() {
+            return 0;
+        }
+        loop {
+            let cursor = self.append_header.load(Acquire);
+            let remaining = self.bound().saturating_sub(cursor);
+            if remaining < ENTRY_HEAD_SIZE {
+                return 0;
+            }
+            if self
+                .append_header
+                .compare_exchange(cursor, self.bound(), AcqRel, Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            Self::store_padding_header(cursor, remaining);
+            // Space the cleaner should count as reclaimable: nothing will
+            // ever live there.
+            self.dead_space.fetch_add(remaining as u32, Relaxed);
+            self.note_dead_bytes_change();
+            self.set_dirty();
+            return remaining;
+        }
+    }
+
+    /// Whether another entry could still be appended here.
+    #[inline]
+    pub fn can_still_append(&self) -> bool {
+        !self.is_sealed()
+            && self
+                .bound()
+                .saturating_sub(self.append_header.load(Acquire))
+                >= ENTRY_HEAD_SIZE
+    }
+
+    #[inline]
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
+        self.try_acquire_reserving(size, 0)
+    }
+
+    /// `try_acquire`, granted only if `reserve` bytes would still be free
+    /// behind the claim.
+    ///
+    /// A transaction's bracket part claims its entries this way so that the
+    /// part can ALWAYS take its own COMMIT at the decision. A part filled to
+    /// the last byte cannot be closed, and an unclosed part is a committed
+    /// transaction that recovery discards -- or, once the cleaner has
+    /// compacted whichever part did hold a COMMIT, one it cannot even find.
+    pub fn try_acquire_reserving(&self, size: u32, reserve: usize) -> Option<usize> {
         // A sealed segment is out of append space by definition, whatever its
         // cursor says: it has a backup at its seq id, so an append here could
         // only become durable through a WAL that must never exist (see the
@@ -962,7 +1436,7 @@ impl Segment {
         loop {
             let curr_last = self.append_header.load(Ordering::Acquire);
             let exp_last = curr_last + size;
-            if exp_last > self.bound() {
+            if exp_last + reserve > self.bound() {
                 return None;
             } else {
                 if self
@@ -1703,6 +2177,27 @@ impl Segment {
     // archive this segment and write the data to backup storage
     // Backup files are opened on demand and closed immediately after use
     pub fn archive(&self) -> Result<bool, io::Error> {
+        self.archive_inner(false)
+            .map(|outcome| outcome == ArchiveOutcome::Archived)
+    }
+
+    pub(crate) fn archive_rotated(&self) -> Result<ArchiveOutcome, io::Error> {
+        self.archive_inner(true)
+    }
+
+    fn archive_inner(&self, seal_job: bool) -> Result<ArchiveOutcome, io::Error> {
+        let Some(_maintenance) = self.protection.maintenance() else {
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
+        };
+        if self.protection.head.load(Acquire)
+            || (!seal_job && self.protection.seal_pending.load(Acquire))
+            || self.is_head_owned()
+            || self.protection.transaction_pending()
+        {
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
+        }
         // Let in-flight journal writes land before this takes `file_state`.
         //
         // This is the seal-vs-pending-writer race, at its source. A writer
@@ -1748,8 +2243,11 @@ impl Segment {
                 self.seq_id,
                 self.pending_journal_count()
             );
-            return Ok(false);
+            ARCHIVE_REFUSALS.fetch_add(1, Relaxed);
+            return Ok(ArchiveOutcome::Refused);
         }
+        let manager = self.file_state.lock().manager.clone();
+        let staging = manager.archive_staging_pool().acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -1897,7 +2395,7 @@ impl Segment {
                      blocks. The existing backup is authoritative.",
                     self.id, self.chunk_id, self.seq_id, via
                 );
-                return Ok(false);
+                return Ok(ArchiveOutcome::Unconfigured);
             }
 
             // A segment holding appended bytes must yield at least one entry.
@@ -2000,6 +2498,8 @@ image, not an empty segment; archiving it would persist the damage.",
                         let data_block =
                             slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
+                        let mut staging = staging;
+
                         // Read the append cursor BEFORE snapshotting the
                         // image, so the recorded length can never exceed the
                         // bytes captured. See the call to
@@ -2007,28 +2507,7 @@ image, not an empty segment; archiving it would persist the damage.",
                         let used_len_at_snapshot =
                             self.append_header.load(Ordering::Acquire) - self.addr;
 
-                        // Snapshot the segment into a pooled staging buffer
-                        // (slab adopter #1; Lightning docs/slab-pools-
-                        // design.md). Previously a per-archive 8 MiB
-                        // Vec::from — one large-block heap alloc + free per
-                        // archived segment, continuously for the life of an
-                        // import. The pool is bounded by archiver
-                        // concurrency and recycles the same slots.
-                        let staging = archive_staging_pool();
-                        let staging_handle = staging.alloc_with(|slot| {
-                            ptr::copy_nonoverlapping(
-                                data_block.as_ptr(),
-                                slot.as_mut_ptr() as *mut u8,
-                                SEGMENT_SIZE,
-                            );
-                        });
-                        // Plain-data buffer: freed via free_forget on every
-                        // exit path by this guard.
-                        let _staging_guard = ArchiveStagingGuard(staging_handle);
-                        let padded_data: &[u8] = slice::from_raw_parts(
-                            staging_handle.as_ptr() as *const u8,
-                            SEGMENT_SIZE,
-                        );
+                        let padded_data = staging.snapshot(data_block);
 
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
@@ -2073,6 +2552,10 @@ image, not an empty segment; archiving it would persist the damage.",
                         }
                     }
 
+                    #[cfg(test)]
+                    if power_loss_model::wal_sync_fails(&Some(tmp_backup_file.clone())) {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
                     file.sync_all()?;
                     drop(file);
 
@@ -2191,7 +2674,7 @@ image, not an empty segment; archiving it would persist the damage.",
                         debug!("Deleted WAL file for archived segment {}", self.id);
                     }
 
-                    return Ok(true);
+                    return Ok(ArchiveOutcome::Archived);
                 }
             }
         } else {
@@ -2199,9 +2682,9 @@ image, not an empty segment; archiving it would persist the damage.",
                 "Segment {} has no backup storage configured, cannot archive",
                 self.id
             );
-            return Ok(false);
+            return Ok(ArchiveOutcome::AlreadyArchived);
         }
-        return Ok(false);
+        return Ok(ArchiveOutcome::AlreadyArchived);
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
@@ -2217,8 +2700,19 @@ image, not an empty segment; archiving it would persist the damage.",
                 g
             }
         };
+        #[cfg(feature = "abort_profile")]
+        crate::ram::abort_profile::record(
+            crate::ram::abort_profile::Phase::WalWait,
+            acquire_start.elapsed().as_nanos() as u64,
+        );
+        #[cfg(feature = "abort_profile")]
+        let _held_timer =
+            crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::WalHold);
         let held_start = std::time::Instant::now();
         let _hold_guard = WalHoldTimer(held_start);
+        if let Some(error) = state.durability.as_ref().and_then(|d| d.failure()) {
+            return Err(io::Error::other(error));
+        }
         // Lazily create WAL file on first write if not already present
         if state.wal.is_none() {
             // The twin-birth site. A sealed segment has a backup at this seq
@@ -2245,10 +2739,27 @@ image, not an empty segment; archiving it would persist the damage.",
             }
             state.wal = state
                 .manager
-                .create_wal_file(self.chunk_id, self.id, self.seq_id)?;
+                .create_wal_file(self.chunk_id, self.id, self.seq_id)?
+                .map(Arc::new);
         }
 
-        if let Some(ref mut file) = state.wal {
+        if let Some(file) = &state.wal {
+            if state.wal_len == 0 {
+                state.wal_len = file.metadata()?.len();
+            }
+        }
+        let capturing = crate::ram::durability::capturing();
+        #[cfg(test)]
+        let capturing = capturing
+            || std::env::var_os("NEB_TEST_EAGER_RECEIPTS").is_some()
+            || std::env::var_os("NEB_TEST_TRACK_DEFAULT_RECEIPTS").is_some();
+        if capturing && state.durability.is_none() {
+            self.init_durability(&mut state)?;
+        }
+        let durability = state.durability.as_ref();
+        let original_len = state.wal_len;
+        let mut new_len = original_len;
+        if let Some(file) = &state.wal {
             // Framed: the record carries the segment offset it belongs at and
             // a CRC over both. One write_all keeps the frame and its payload
             // in a single syscall, so a torn record can only ever be torn at
@@ -2257,48 +2768,168 @@ image, not an empty segment; archiving it would persist the damage.",
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 crate::ram::wal_format::frame_record((addr - self.addr) as u64, data_block)
             };
-            file.write_all(&framed)?;
+            let mut sink = &**file;
+            if let Err(error) = sink.write_all(&framed) {
+                // Remove the refused frame before another append can follow it.
+                // A failed truncation closes this head instead.
+                if let Err(truncate_error) = file.set_len(original_len) {
+                    self.retire_tail();
+                    error!("WAL tail truncation failed after {error}: {truncate_error}");
+                }
+                return Err(error);
+            }
+            new_len += framed.len() as u64;
+            if capturing {
+                if let Some(durability) = durability {
+                    durability.appended(new_len, Some(file));
+                }
+            }
             WAL_BYTES.fetch_add(framed.len() as u64, Relaxed);
             WAL_WRITES.fetch_add(1, Relaxed);
-            // Transactions control their own sync at commit time
-            // For non-transactional writes, use group commit batching
-            if skip_sync {
-                // Transaction context: no sync, will be synced at commit
-                trace!(
-                    "WAL sync skipped for segment {} (transactional write, will sync at commit)",
-                    self.id
-                );
-                return Ok(());
-            }
+            if !skip_sync {
+                // Group commit for non-transactional writes. The timer path
+                // belongs to the WAL syncer thread — with ~63 segments absorbing
+                // an import, per-segment 10ms timers produced 6,302 fsyncs/s
+                // with every writer thread blocking inline on its own sync. Only
+                // the byte threshold remains inline, as backpressure against one
+                // segment accumulating unbounded unsynced bytes.
+                let written =
+                    self.wal_bytes_written.fetch_add(size as usize, Relaxed) + size as usize;
+                let bytes_written = written - self.wal_bytes_synced.load(Acquire);
 
-            // Group commit for non-transactional writes. The timer path
-            // belongs to the WAL syncer thread — with ~63 segments absorbing
-            // an import, per-segment 10ms timers produced 6,302 fsyncs/s
-            // with every writer thread blocking inline on its own sync. Only
-            // the byte threshold remains inline, as backpressure against one
-            // segment accumulating unbounded unsynced bytes.
-            let bytes_written = self
-                .bytes_since_sync
-                .fetch_add(size as usize, Ordering::Relaxed)
-                + size as usize;
-
-            if bytes_written >= WAL_SYNC_BATCH_SIZE {
-                WAL_SYNCS.fetch_add(1, Relaxed);
-                file.sync_data()?;
-                self.bytes_since_sync.store(0, Ordering::Relaxed);
-                self.last_sync_time.store(get_time(), Ordering::Relaxed);
-                trace!(
-                    "WAL synced inline for segment {} ({} bytes)",
-                    self.id,
-                    bytes_written
-                );
-            } else {
-                trace!(
+                if bytes_written >= WAL_SYNC_BATCH_SIZE && !capturing {
+                    WAL_SYNCS.fetch_add(1, Relaxed);
+                    let sync_started = std::time::Instant::now();
+                    #[cfg(test)]
+                    let result = if durability.is_some_and(|d| d.test_fail_sync()) {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        file.sync_data()
+                    };
+                    #[cfg(not(test))]
+                    let result = file.sync_data();
+                    WAL_SYNC_SERVICE_NS
+                        .fetch_add(sync_started.elapsed().as_nanos() as u64, Relaxed);
+                    if let Some(durability) = durability {
+                        let (_, epoch) = durability.snapshot();
+                        durability.complete(new_len, epoch, &result);
+                    }
+                    if let Err(error) = result {
+                        if let Err(truncate_error) = file.set_len(original_len) {
+                            self.retire_tail();
+                            error!("WAL tail truncation failed after {error}: {truncate_error}");
+                        }
+                        self.wal_bytes_written.fetch_sub(size as usize, Relaxed);
+                        if state.durability.is_none() {
+                            self.init_durability(&mut state)?;
+                            let d = state.durability.as_ref().unwrap();
+                            let (_, epoch) = d.snapshot();
+                            d.complete(
+                                original_len,
+                                epoch,
+                                &Err(io::Error::other(error.to_string())),
+                            );
+                        }
+                        return Err(state
+                            .durability
+                            .as_ref()
+                            .and_then(|d| d.failure())
+                            .map(io::Error::other)
+                            .unwrap_or(error));
+                    }
+                    self.wal_bytes_synced.fetch_max(written, Release);
+                    #[cfg(test)]
+                    power_loss_model::record_synced_len(
+                        &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                        original_len + framed.len() as u64,
+                    );
+                    trace!(
+                        "WAL synced inline for segment {} ({} bytes)",
+                        self.id,
+                        bytes_written
+                    );
+                } else {
+                    trace!(
                     "WAL write buffered for segment {} ({} bytes accumulated; syncer owns the timer)",
                     self.id,
                     bytes_written
                 );
+                }
             }
+        }
+        if state.wal.is_none() {
+            if let Some(d) = &state.durability {
+                d.appended(0, None);
+            }
+        }
+        state.wal_len = new_len;
+        Ok(())
+    }
+
+    fn init_durability(&self, state: &mut SegmentFileState) -> io::Result<()> {
+        let d = crate::ram::durability::DurableFile::new(self.chunk_id, self.id, self.seq_id);
+        if let Some(file) = &state.wal {
+            d.open(file, state.wal_len, state.manager.wal_storage().unwrap())?;
+        }
+        state.durability = Some(d);
+        Ok(())
+    }
+
+    pub fn durable_file(&self) -> Option<Arc<crate::ram::durability::DurableFile>> {
+        self.file_state.lock().durability.clone()
+    }
+
+    pub fn durable_receipt(&self) -> io::Result<Option<crate::ram::durability::Receipt>> {
+        let mut state = self.file_state.lock();
+        if state.wal.is_none() {
+            return Ok(None);
+        }
+        if state.durability.is_none() {
+            self.init_durability(&mut state)?;
+        }
+        if state.durability.as_ref().unwrap().covers(state.wal_len) {
+            return Ok(None);
+        }
+        state.durability.as_ref().unwrap().observe(state.wal_len);
+        Ok(Some(crate::ram::durability::Receipt {
+            file: state.durability.as_ref().unwrap().clone(),
+            offset: state.wal_len,
+            epoch: state.durability.as_ref().unwrap().snapshot().1,
+            descriptor: state.wal.clone(),
+        }))
+    }
+
+    pub fn durability_failure(&self) -> Option<crate::ram::durability::DurabilityError> {
+        self.file_state
+            .lock()
+            .durability
+            .as_ref()
+            .and_then(|d| d.failure())
+    }
+
+    pub(crate) fn wal_append_position(&self) -> u64 {
+        self.file_state.lock().wal_len
+    }
+
+    /// Remove decision records from a refused transaction's private tail.
+    ///
+    /// Synced. An unsynced truncation can be undone by a power loss, and
+    /// the COMMIT it removed then decides the transaction at recovery,
+    /// while the site already rolled it back and reported it failed.
+    pub(crate) fn truncate_wal_to(&self, position: u64) -> io::Result<()> {
+        let mut state = self.file_state.lock();
+        if let Some(file) = &state.wal {
+            file.set_len(position)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            crate::ram::segs::power_loss_model::record_synced(
+                &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                file,
+            );
+        }
+        state.wal_len = position;
+        if let Some(d) = &state.durability {
+            d.truncate(position);
         }
         Ok(())
     }
@@ -2306,18 +2937,170 @@ image, not an empty segment; archiving it would persist the damage.",
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
-        let mut state = self.file_state.lock();
-        if let Some(ref mut file) = state.wal {
-            file.sync_all()?;
-            FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
+        self.sync_wal(true)
+    }
 
-            // Reset counters after forced sync
-            let current_time = get_time();
-            self.bytes_since_sync.store(0, Ordering::Relaxed);
-            self.last_sync_time.store(current_time, Ordering::Relaxed);
+    pub fn drain_wal_sync(&self) -> io::Result<()> {
+        self.sync_wal_with_kind(true, File::sync_all, true)
+    }
 
-            trace!("Forced WAL sync for segment {}", self.id);
+    fn wal_pending_bytes(&self) -> usize {
+        let synced = self.wal_bytes_synced.load(Acquire);
+        self.wal_bytes_written.load(Relaxed) - synced
+    }
+
+    fn sync_wal(&self, force: bool) -> io::Result<()> {
+        self.sync_wal_with(force, File::sync_all)
+    }
+
+    fn sync_wal_with<F>(&self, force: bool, sync: F) -> io::Result<()>
+    where
+        F: FnOnce(&File) -> io::Result<()>,
+    {
+        self.sync_wal_with_kind(force, sync, false)
+    }
+
+    fn sync_wal_with_kind<F>(&self, force: bool, sync: F, drain: bool) -> io::Result<()>
+    where
+        F: FnOnce(&File) -> io::Result<()>,
+    {
+        let _job = self
+            .protection
+            .sync_job(std::time::Duration::from_secs(10))?;
+        #[cfg(feature = "abort_profile")]
+        let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
+        let needs_transaction_proof = force && self.protection.transaction_pending();
+        let (file, written, end, durability, epoch) = {
+            let mut state = self.file_state.lock();
+            if needs_transaction_proof && state.wal.is_some() && state.durability.is_none() {
+                self.init_durability(&mut state)?;
+            }
+            if let Some(error) = state.durability.as_ref().and_then(|d| d.failure()) {
+                return Err(io::Error::other(error));
+            }
+            let reuse_watermark = true;
+            #[cfg(test)]
+            let reuse_watermark = std::env::var_os("NEB_TEST_DISABLE_WATERMARK_REUSE").is_none();
+            // The watermark is the durable length of this file, with its
+            // name published: a sync that covers every byte written so far
+            // has nothing to add. A forced sync reuses it too, so several
+            // transactions that commit on one segment share one `fsync`.
+            if reuse_watermark
+                && state
+                    .durability
+                    .as_ref()
+                    .is_some_and(|d| d.watermark() >= state.wal_len)
+            {
+                self.wal_bytes_synced
+                    .fetch_max(self.wal_bytes_written.load(Relaxed), Release);
+                if force {
+                    COVERED_FORCED_SYNCS.fetch_add(1, Relaxed);
+                }
+                return Ok(());
+            }
+            // A transaction can sync this segment while the timer waits for the lock.
+            if !force && self.wal_pending_bytes() == 0 {
+                return Ok(());
+            }
+            let Some(file) = &state.wal else {
+                if drain {
+                    return Self::sync_unopened_wal(&state, self.chunk_id, self.id, self.seq_id);
+                }
+                return Ok(());
+            };
+            let file = file.clone();
+            let written = self.wal_bytes_written.load(Relaxed);
+            let epoch = state
+                .durability
+                .as_ref()
+                .map(|d| d.snapshot().1)
+                .unwrap_or(0);
+            (
+                file,
+                written,
+                state.wal_len,
+                state.durability.clone(),
+                epoch,
+            )
+        };
+        #[cfg(test)]
+        let (model_path, model_len) = {
+            let state = self.file_state.lock();
+            (
+                state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
+                state.wal_len,
+            )
+        };
+        // The descriptor keeps this WAL inode alive if an archive unlinks its name.
+        // Appends remain ordered under file_state. This sync covers the records that
+        // preceded it; later appends keep their own dirty bytes or force their own sync.
+        let sync_started = std::time::Instant::now();
+        #[cfg(test)]
+        let result = if durability.as_ref().is_some_and(|d| d.test_fail_sync())
+            || power_loss_model::wal_sync_fails(&model_path)
+        {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            sync(&file)
+        };
+        #[cfg(not(test))]
+        let result = sync(&file);
+        let result = result.and_then(|()| {
+            durability
+                .as_ref()
+                .map_or(Ok(()), |d| d.publish_namespace())
+        });
+        WAL_SYNC_SERVICE_NS.fetch_add(sync_started.elapsed().as_nanos() as u64, Relaxed);
+        if let Some(d) = durability {
+            d.complete(end, epoch, &result);
+        } else if result.is_err() {
+            let mut state = self.file_state.lock();
+            if state.durability.is_none() {
+                self.init_durability(&mut state)?;
+            }
+            let d = state.durability.as_ref().unwrap();
+            d.complete(end, epoch, &result);
         }
+        result?;
+        self.wal_bytes_synced.fetch_max(written, Release);
+        #[cfg(test)]
+        power_loss_model::record_synced_len(&model_path, model_len);
+        FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
+        if drain {
+            DRAIN_WAL_SYNCS.fetch_add(1, Relaxed);
+        } else if !force {
+            BACKGROUND_WAL_SYNCS.fetch_add(1, Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Sync the WAL file of a segment that has not opened it: a segment that
+    /// recovery left with its WAL, as a head or after a failed archive. A
+    /// process crash can leave its bytes in the page cache only, and a start
+    /// answers `Committed` from them once `sync_all` returns (review finding
+    /// 6, TLA+ F1).
+    fn sync_unopened_wal(
+        state: &SegmentFileState,
+        chunk_id: usize,
+        id: u64,
+        seq_id: u64,
+    ) -> io::Result<()> {
+        let Some(path) = state.manager.wal_path(chunk_id, id, seq_id) else {
+            return Ok(());
+        };
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        if power_loss_model::wal_sync_fails(&Some(path.clone())) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        file.sync_all()?;
+        #[cfg(test)]
+        power_loss_model::record_synced(&Some(path), &file);
+        DRAIN_WAL_SYNCS.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -2353,9 +3136,12 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     /// Accept claims again: for an archive that decided not to seal after
-    /// all. A sealed segment's gate stays shut -- nothing may append to it.
+    /// all. The gate of a sealed or rotated segment stays shut -- nothing may
+    /// append to it.
     pub fn reopen_journal_gate(&self) {
-        if !self.is_sealed() {
+        // A rotated segment stays closed for the rest of its life, also after
+        // the seal job ends without a seal (the cleaner took it, or no backup).
+        if !self.is_sealed() && !self.protection.rotated.load(Ordering::Acquire) {
             self.pending_journals
                 .fetch_and(!JOURNAL_GATE_CLOSED, Ordering::AcqRel);
         }
@@ -2392,13 +3178,110 @@ image, not an empty segment; archiving it would persist the damage.",
         self.pending_journals.fetch_or(HEAD_OWNED, Ordering::AcqRel) & HEAD_OWNED == 0
     }
 
-    /// Release head ownership. The RELEASE ORDERING here is the journal-in-
-    /// window invariant's other half: everything the owner wrote and
-    /// journaled happens-before the next owner's acquire.
+    /// Release head ownership, for callers that cannot act on a refusal.
+    ///
+    /// Goes through [`Segment::try_release_own`] like every release does; a
+    /// refusal is logged and the head stays owned -- out of the pool, never
+    /// handed to a writer that would append behind an open BEGIN. Reaching
+    /// that refusal from here is a bug in whoever left the bracket open.
     #[inline]
     pub fn release_own(&self) {
+        if let Err(refused) = self.try_release_own() {
+            Self::report_refused_release(refused);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn report_refused_release(refused: OpenBracketRefused) {
+        error!("{refused}");
+    }
+
+    /// THE release point: every head goes back to the pool through here.
+    ///
+    /// The RELEASE ORDERING is the journal-in-window invariant's other half:
+    /// everything the owner wrote and journaled happens-before the next
+    /// owner's acquire.
+    ///
+    /// And the class-closing invariant for transaction brackets: a head with
+    /// an open bracket is never handed to another writer while it can still
+    /// take an append. Recovery reads everything behind an unclosed BEGIN as
+    /// part of that transaction, so whatever the next owner appended -- an
+    /// acknowledged ordinary write included -- would be dropped with it. The
+    /// bracket must be closed (COMMIT), disowned (padded over) or the head
+    /// retired (full) first; anything else is refused here, the head stays
+    /// owned, and the caller gets the typed error. A head that can take no
+    /// more appends is released whatever its bracket state, because nothing
+    /// can land behind the BEGIN any more.
+    ///
+    /// Releasing clears the bracket state with the ownership: it described
+    /// the owner's bracket, and the owner is leaving.
+    #[inline]
+    pub fn try_release_own(&self) -> Result<(), OpenBracketRefused> {
+        // One relaxed load and one branch on the word this release is about
+        // to write: only the owner -- the caller -- ever sets the bracket
+        // bits, so its own earlier store is visible to it without ordering.
+        if self.pending_journals.load(Ordering::Relaxed) & BRACKET_OPEN != 0 {
+            if let Some(refused) = self.refuse_open_bracket_release() {
+                return Err(refused);
+            }
+        }
         self.pending_journals
-            .fetch_and(!HEAD_OWNED, Ordering::Release);
+            .fetch_and(!(HEAD_OWNED | BRACKET_STATE_MASK), Ordering::Release);
+        Ok(())
+    }
+
+    /// The off-path half of `try_release_own`: a bracket is open, so decide
+    /// whether the head can still take an append, and build the refusal.
+    #[cold]
+    #[inline(never)]
+    fn refuse_open_bracket_release(&self) -> Option<OpenBracketRefused> {
+        if !self.can_still_append() {
+            return None;
+        }
+        OPEN_BRACKET_RELEASES_REFUSED.fetch_add(1, Ordering::Relaxed);
+        Some(OpenBracketRefused {
+            chunk_id: self.chunk_id,
+            segment_id: self.id,
+            seq_id: self.seq_id,
+        })
+    }
+
+    /// The owner wrote a BEGIN here: from now until COMMIT, disown or
+    /// retirement, the head may not be handed over.
+    #[inline]
+    pub fn mark_bracket_open(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_COMMITTED, Ordering::AcqRel);
+        self.pending_journals
+            .fetch_or(BRACKET_OPEN, Ordering::AcqRel);
+    }
+
+    /// The bracket's COMMIT is journaled here.
+    #[inline]
+    pub fn mark_bracket_committed(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_OPEN, Ordering::AcqRel);
+        self.pending_journals
+            .fetch_or(BRACKET_COMMITTED, Ordering::AcqRel);
+    }
+
+    /// The bracket was padded over, BEGIN included: there is nothing left
+    /// open to close.
+    #[inline]
+    pub fn mark_bracket_disowned(&self) {
+        self.pending_journals
+            .fetch_and(!BRACKET_OPEN, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn bracket_is_open(&self) -> bool {
+        self.pending_journals.load(Ordering::Acquire) & BRACKET_OPEN != 0
+    }
+
+    #[inline]
+    pub fn bracket_is_committed(&self) -> bool {
+        self.pending_journals.load(Ordering::Acquire) & BRACKET_COMMITTED != 0
     }
 
     /// Wait for in-flight journal writes to land, briefly.
@@ -2851,6 +3734,15 @@ impl SegmentReferenceGuard {
         Some(Self { segment })
     }
 
+    /// Keep the segment in progress for the cleaner until `tokens` are synced.
+    pub(crate) fn pin_until_covered(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        tokens: std::sync::Arc<Vec<crate::ram::durability::Receipt>>,
+    ) {
+        self.segment.protection.pin_until_covered(txn, tokens);
+    }
+
     /// Get the segment ID
     pub fn segment_id(&self) -> u64 {
         self.segment.id
@@ -2942,7 +3834,16 @@ impl Iterator for SegmentEntryIter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_WRITER_RESERVE_CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 pub struct SegmentAllocator {
+    // Reserve checks and address claims are one operation. The guard never
+    // covers segment initialization, file I/O, or cleaner work.
+    allocation_lock: parking_lot::Mutex<()>,
     base: usize,
     offset: AtomicUsize,
     limit: usize,
@@ -2997,6 +3898,7 @@ impl SegmentAllocator {
         };
 
         Self {
+            allocation_lock: parking_lot::Mutex::new(()),
             base,
             offset: AtomicUsize::new(addr),
             limit,
@@ -3010,8 +3912,8 @@ impl SegmentAllocator {
     }
 
     /// Segments still grantable: the free list plus untouched bump space.
-    /// Approximate under concurrency, which is fine -- it feeds a headroom
-    /// heuristic, not an invariant.
+    /// Approximate under concurrency unless `allocation_lock` is held. The
+    /// writer reserve check holds that lock through the address claim.
     pub fn available_segments(&self) -> usize {
         let bump_left = self.limit.saturating_sub(self.offset.load(Relaxed)) >> SEGMENT_BITS_SHIFT;
         self.free_count.load(Relaxed) + bump_left
@@ -3083,6 +3985,7 @@ impl SegmentAllocator {
     where
         F: Fn(usize) -> bool,
     {
+        let _allocation = self.allocation_lock.lock();
         let bumped_to = self.offset.load(Relaxed);
         let mut reclaimed = 0usize;
         let mut addr = self.base;
@@ -3151,7 +4054,13 @@ impl SegmentAllocator {
             );
             return None;
         }
-        self.alloc_seg_with_class(file_manager, segment_class)
+        #[cfg(test)]
+        TEST_WRITER_RESERVE_CHECKED.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        self.alloc_seg_with_reserve(file_manager, segment_class, reserve)
     }
 
     fn take_free(&self) -> Option<usize> {
@@ -3162,42 +4071,52 @@ impl SegmentAllocator {
         addr
     }
 
+    /// Claim an address while preserving the caller's reserve. A snapshot
+    /// check before this claim lets two writers both spend the last writer
+    /// slot, leaving the cleaner no destination despite reclaimable sources.
+    fn take_address(&self, reserve: usize) -> Option<usize> {
+        let _allocation = self.allocation_lock.lock();
+        if self.available_segments() <= reserve {
+            return None;
+        }
+        self.take_free().or_else(|| {
+            let addr = self.offset.load(Relaxed);
+            let next = addr + SEGMENT_SIZE;
+            if next > self.limit {
+                return None;
+            }
+            self.offset.store(next, Release);
+            Some(addr)
+        })
+    }
+
     pub fn alloc_seg_with_class(
         &self,
         file_manager: &Arc<SegmentFileManager>,
         segment_class: SegmentClass,
     ) -> Option<Segment> {
-        self.take_free()
-            .or_else(|| loop {
-                debug!("Allocate segment by bump pointer");
-                let addr = self.offset.load(Relaxed);
-                let new_addr = addr + SEGMENT_SIZE;
-                if new_addr > self.limit {
-                    // Check the right boundary
-                    return None;
-                } else {
-                    if self
-                        .offset
-                        .compare_exchange(addr, new_addr, AcqRel, Relaxed)
-                        .is_ok()
-                    {
-                        return Some(addr);
-                    }
-                }
-            })
-            .map(|addr| {
-                let id = self.id_by_addr(addr);
-                let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
-                Segment::new_with_class(
-                    id as u64,
-                    seq_id as u64,
-                    self.chunk_id,
-                    addr,
-                    true,
-                    file_manager.clone(),
-                    segment_class,
-                )
-            })
+        self.alloc_seg_with_reserve(file_manager, segment_class, 0)
+    }
+
+    fn alloc_seg_with_reserve(
+        &self,
+        file_manager: &Arc<SegmentFileManager>,
+        segment_class: SegmentClass,
+        reserve: usize,
+    ) -> Option<Segment> {
+        self.take_address(reserve).map(|addr| {
+            let id = self.id_by_addr(addr);
+            let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
+            Segment::new_with_class(
+                id as u64,
+                seq_id as u64,
+                self.chunk_id,
+                addr,
+                true,
+                file_manager.clone(),
+                segment_class,
+            )
+        })
     }
 
     /// Allocate a segment with a specific seq_id (for recovery purposes)
@@ -3217,37 +4136,19 @@ impl SegmentAllocator {
         hot: bool,
         segment_class: SegmentClass,
     ) -> Option<Segment> {
-        // First allocate the address
-        self.take_free()
-            .or_else(|| loop {
-                debug!("Allocate segment by bump pointer (recovery)");
-                let addr = self.offset.load(Relaxed);
-                let new_addr = addr + SEGMENT_SIZE;
-                if new_addr > self.limit {
-                    return None;
-                } else {
-                    if self
-                        .offset
-                        .compare_exchange(addr, new_addr, AcqRel, Relaxed)
-                        .is_ok()
-                    {
-                        return Some(addr);
-                    }
-                }
-            })
-            .map(|addr| {
-                let id = self.id_by_addr(addr);
-                // Use the provided seq_id instead of fetching a new one
-                Segment::new_with_class(
-                    id as u64,
-                    seq_id,
-                    self.chunk_id,
-                    addr,
-                    hot,
-                    file_manager.clone(),
-                    segment_class,
-                )
-            })
+        self.take_address(0).map(|addr| {
+            let id = self.id_by_addr(addr);
+            // Use the provided seq_id instead of fetching a new one
+            Segment::new_with_class(
+                id as u64,
+                seq_id,
+                self.chunk_id,
+                addr,
+                hot,
+                file_manager.clone(),
+                segment_class,
+            )
+        })
     }
 
     /// Allocate a segment at a specific ID for recovery purposes
@@ -3281,6 +4182,7 @@ impl SegmentAllocator {
         }
 
         // Update offset if needed (to track allocated space)
+        let allocation = self.allocation_lock.lock();
         let required_end = addr + SEGMENT_SIZE;
         loop {
             let current_offset = self.offset.load(Ordering::Relaxed);
@@ -3301,6 +4203,8 @@ impl SegmentAllocator {
                 break;
             }
         }
+
+        drop(allocation);
 
         Some(Segment::new_with_class(
             seg_id,
@@ -3328,6 +4232,7 @@ impl SegmentAllocator {
     }
 
     pub fn free(&self, seg_addr: usize) {
+        let _allocation = self.allocation_lock.lock();
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);
         debug!("Segment {} freed", seg_addr);
@@ -3403,6 +4308,557 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_staging_capacity_is_independent_between_chunks_and_stores() {
+        let first_store = Arc::new(SegmentFileManager::new(None, None));
+        let other_chunk = Arc::new(SegmentFileManager::new(None, None));
+        let second_store = Arc::new(SegmentFileManager::new(None, None));
+        let saturated = first_store.archive_staging_pool();
+        // D106 restores the shared cap. Leave headroom for two other owners;
+        // saturation of the process budget must block every owner.
+        let held: Vec<_> = (0..2).map(|_| saturated.acquire()).collect();
+        assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = other_chunk;
+        let thread = std::thread::spawn(move || {
+            let _other_chunk = worker.archive_staging_pool().acquire();
+            let _other_store = second_store.archive_staging_pool().acquire();
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok(), "unrelated chunks must have independent archive capacity");
+    }
+
+    #[test]
+    fn archive_staging_total_across_chunks_and_two_stores_is_32_mib() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let stores: [Vec<_>; 2] = std::array::from_fn(|_| {
+            (0..64)
+                .map(|_| Arc::new(SegmentFileManager::new(None, None)))
+                .collect()
+        });
+        let mut held = Vec::new();
+        let mut addresses = std::collections::HashSet::new();
+        for chunk in 0..4 {
+            let pool = stores[chunk % 2][chunk / 2].archive_staging_pool();
+            held.push(pool.acquire());
+            addresses.insert(held.last().unwrap().buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+        let extra_chunk = Arc::clone(&stores[1][49]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let buffer = extra_chunk.archive_staging_pool().acquire();
+            acquired_tx.send(buffer.buffer.as_ref().unwrap().as_ptr() as usize).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        drop(held.pop());
+        let address = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(error) => panic!("archive waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout), "process staging exceeded 32 MiB across stores");
+        addresses.insert(address);
+        drop(held);
+        // Retain every per-chunk pool while cycling owners. Idle memory must
+        // share the same four buffers, rather than growing by owner count.
+        for chunk in 4..128 {
+            let guard = stores[chunk % 2][chunk / 2].archive_staging_pool().acquire();
+            addresses.insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+        }
+        assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn concurrent_archive_owners_share_four_buffers_and_wake_after_release() {
+        use std::sync::atomic::AtomicUsize;
+        let stores: [Vec<_>; 2] = std::array::from_fn(|_| {
+            (0..16)
+                .map(|_| Arc::new(SegmentFileManager::new(None, None)))
+                .collect()
+        });
+        let active = AtomicUsize::new(0);
+        let addresses = parking_lot::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|scope| {
+            for chunk in 0..32 {
+                let stores = &stores;
+                let active = &active;
+                let addresses = &addresses;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let guard = stores[chunk % 2][chunk / 2].archive_staging_pool().acquire();
+                        assert!(active.fetch_add(1, SeqCst) < 4);
+                        addresses.lock().insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
+                        std::thread::yield_now();
+                        active.fetch_sub(1, SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(active.load(SeqCst), 0);
+        assert!(addresses.lock().len() <= 4);
+    }
+
+    #[test]
+    fn cancelling_a_parked_archive_claim_does_not_leak_staging() {
+        use futures::FutureExt;
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let held: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        let mut pending = Box::pin(pool.reserve.budget.acquire());
+        assert!(pending.as_mut().now_or_never().is_none());
+        drop(pending);
+        drop(held);
+        let recovered: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
+        assert!(pool.reserve.budget.try_acquire().is_none());
+        drop(recovered);
+    }
+
+    #[test]
+    fn archive_staging_buffers_are_bounded_across_threads() {
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let addresses = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        // Replace every worker twice. The buffers belong to the pool, not TLS.
+        for _ in 0..3 {
+            let barrier = Arc::new(std::sync::Barrier::new(ARCHIVE_STAGING_LIMIT));
+            let workers: Vec<_> = (0..ARCHIVE_STAGING_LIMIT)
+                .map(|worker| {
+                    let pool = pool.clone();
+                    let addresses = addresses.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let source = vec![worker as u8 + 1; SEGMENT_SIZE];
+                        for _ in 0..8 {
+                            let mut staging = pool.acquire();
+                            let data = staging.snapshot(&source);
+                            addresses.lock().insert(data.as_ptr() as usize);
+                            barrier.wait();
+                            assert_eq!(data, source.as_slice());
+                            drop(staging);
+                            barrier.wait();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+        assert_eq!(
+            addresses.lock().len(),
+            ARCHIVE_STAGING_LIMIT,
+            "archive staging exceeded the 32 MiB buffer budget"
+        );
+    }
+
+    #[test]
+    fn archive_staging_waits_at_capacity_and_reuses_a_returned_buffer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let mut held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_pool = pool.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let staging = waiter_pool.acquire();
+            acquired_tx
+                .send(staging.buffer.as_ref().unwrap().as_ptr() as usize)
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let at_capacity = acquired_rx.recv_timeout(Duration::from_millis(100));
+        let returned = held.pop().unwrap();
+        let address = returned.buffer.as_ref().unwrap().as_ptr() as usize;
+        drop(returned);
+        let acquired = match at_capacity {
+            Ok(address) => address,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("staging waiter disconnected: {error}"),
+        };
+        waiter.join().unwrap();
+        assert_eq!(at_capacity, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(acquired, address);
+    }
+
+    #[test]
+    fn archive_staging_returns_a_buffer_after_a_panic() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = Arc::new(ArchiveStagingPool::default());
+        let panic_pool = pool.clone();
+        let panic = std::thread::spawn(move || {
+            let _staging = panic_pool.acquire();
+            panic!("panic with an archive staging buffer");
+        })
+        .join()
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"panic with an archive staging buffer")
+        );
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let held: Vec<_> = (0..ARCHIVE_STAGING_LIMIT).map(|_| pool.acquire()).collect();
+            acquired_tx.send(held.len()).unwrap();
+        });
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ARCHIVE_STAGING_LIMIT
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn seal_waits_for_in_flight_sync_and_credits_all_covered_bytes() {
+        use std::io::Read;
+        let dir = tempfile::TempDir::new().unwrap();
+        let chunks = crate::ram::chunk::Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(crate::server::ServerMeta {
+                schemas: crate::ram::schema::LocalSchemasCache::new_local(""),
+            }),
+            None,
+            Some(dir.path().join("backup").to_string_lossy().into_owned()),
+            Some(dir.path().join("wal").to_string_lossy().into_owned()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let allocated = chunk.allocator.alloc_seg(&chunk.file_manager).unwrap();
+        let id = allocated.id;
+        chunk.put_segment(allocated);
+        let seg = chunk.segs.get(&(id as usize)).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.append_header.store(seg.addr + 16, Release);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let path = chunk
+            .file_manager
+            .wal_path(seg.chunk_id, seg.id, seg.seq_id)
+            .unwrap();
+        let mut reader = File::open(path).unwrap();
+        seg.sync_wal_with(true, |file| {
+            assert_eq!(seg.wal_pending_bytes(), 8);
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            assert_eq!(seg.wal_pending_bytes(), 16);
+            // The seal can sync both records, but the active sync job prevents its archive.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| chunk.finish_rotated_head(id, seg.seq_id))
+                    .join()
+                    .unwrap();
+            });
+            assert!(seg.file_state.lock().wal.is_some());
+            assert!(seg.protection.seal_pending.load(Acquire));
+            assert_eq!(seg.wal_pending_bytes(), 0, "close must cover both records");
+            file.sync_all()?;
+
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            let replay = crate::ram::wal_format::scan_framed(&data, SEGMENT_SIZE).unwrap();
+            assert_eq!(replay.records, 2);
+            assert_eq!(replay.used_len, 16);
+            assert_eq!(replay.stop, crate::ram::wal_format::TailStop::Clean);
+            Ok(())
+        })
+        .unwrap();
+        chunk.wait_for_segment_jobs_for_test();
+        assert!(seg.file_state.lock().wal.is_none());
+        assert_eq!(seg.wal_bytes_written.load(Relaxed), 16);
+        assert_eq!(
+            seg.wal_bytes_synced.load(Acquire),
+            16,
+            "late sync must not lower the close's credit"
+        );
+        assert_eq!(seg.wal_pending_bytes(), 0);
+    }
+
+    #[test]
+    fn wal_dispatch_does_not_wait_for_an_unrelated_segments_io() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let first = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        let second = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        for seg in [&first, &second] {
+            Segment::store_padding_header(seg.addr, 8);
+            seg.write_wal(seg.addr, 8, false).unwrap();
+            seg.wal_sync_queued.store(true, Ordering::Release);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let queue = crossbeam::queue::SegQueue::new();
+        let held = first.file_state.lock();
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert!(first.wal_sync_running.load(Ordering::Acquire));
+        // A newly dirty segment belongs to a later pass. It must complete
+        // while the preceding pass still waits for another segment's I/O.
+        queue.push(second.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while second.wal_sync_running.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let independent_finished = second.wal_pending_bytes() == 0;
+        assert_eq!(first.wal_pending_bytes(), 8);
+        // A new request for the blocked segment stays queued, without
+        // consuming a second worker or creating an unbounded job backlog.
+        queue.push(first.clone());
+        dispatch_dirty_segments(&queue, &pool);
+        assert_eq!(queue.len(), 1);
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while first.wal_sync_running.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            independent_finished,
+            "another segment must sync before the blocked segment is released"
+        );
+        assert_eq!(first.wal_pending_bytes(), 0);
+        assert!(!first.wal_sync_running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn wal_sync_leaves_later_appends_dirty_and_replays_them_after_the_next_sync() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.sync_wal_with(true, |file| {
+            assert!(
+                seg.file_state.try_lock().is_some(),
+                "fsync must not hold the append lock"
+            );
+            assert_eq!(seg.wal_pending_bytes(), 8);
+            file.sync_all()?;
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal(false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+        seg.sync_wal_with(false, |_| panic!("a clean timer pass must not fsync again"))
+            .unwrap();
+        let path = manager.wal_path(seg.chunk_id, seg.id, seg.seq_id).unwrap();
+        let data = std::fs::read(path).unwrap();
+        let replay = crate::ram::wal_format::scan_framed(&data, SEGMENT_SIZE).unwrap();
+        assert_eq!(replay.records, 2);
+        assert_eq!(replay.used_len, 16);
+        assert_eq!(replay.stop, crate::ram::wal_format::TailStop::Clean);
+    }
+
+    #[test]
+    fn a_late_sync_does_not_erase_bytes_appended_after_a_newer_sync() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        for offset in [0, 8, 16] {
+            Segment::store_padding_header(seg.addr + offset, 8);
+        }
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.sync_wal_with(true, |file| {
+            file.sync_all()?;
+            seg.write_wal(seg.addr + 8, 8, false)?;
+            seg.sync_wal(false)?;
+            seg.write_wal(seg.addr + 16, 8, false)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal(false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_wal_sync_keeps_dirty_bytes_and_refuses_later_appends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        Segment::store_padding_header(seg.addr, 8);
+        Segment::store_padding_header(seg.addr + 8, 8);
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let error = seg
+            .sync_wal_with(true, |_| {
+                seg.write_wal(seg.addr + 8, 8, false)?;
+                Err(io::Error::other("injected sync failure"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(seg.wal_pending_bytes(), 16);
+        assert!(seg.durability_failure().is_some());
+        assert!(seg.sync_wal(false).is_err());
+        assert!(seg.write_wal(seg.addr + 16, 8, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forced_sync_after_a_retraction_is_not_covered_by_the_old_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        let retract_to = seg.wal_append_position();
+        let (result, receipts) =
+            crate::ram::durability::capture(|| seg.write_wal(seg.addr + 8, 64, false));
+        result.unwrap();
+        crate::ram::durability::wait(receipts).await.unwrap();
+        let high = seg.durable_file().unwrap().watermark();
+        assert!(
+            high > retract_to,
+            "test setup: the watermark covers the long frame"
+        );
+        seg.truncate_wal_to(retract_to).unwrap();
+        seg.write_wal(seg.addr + 8, 8, false).unwrap();
+        assert!(
+            seg.wal_append_position() <= high,
+            "test setup: the new bytes end below the old watermark"
+        );
+        let mut synced = false;
+        seg.sync_wal_with(true, |file| {
+            synced = true;
+            file.sync_all()
+        })
+        .unwrap();
+        assert!(
+            synced,
+            "bytes appended after a retraction must get their own sync, not the old watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_ack_background_reuses_a_covering_foreground_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        let (result, receipts) =
+            crate::ram::durability::capture(|| seg.write_wal(seg.addr, 8, false));
+        result.unwrap();
+        crate::ram::durability::wait(receipts).await.unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal_with(false, |_| {
+            panic!("a covered prefix must not need another fsync")
+        })
+        .unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 0);
+        seg.write_wal(seg.addr + 8, 8, false).unwrap();
+        assert_eq!(seg.wal_pending_bytes(), 8);
+        seg.sync_wal(false).unwrap();
+        let file = seg.durable_file().unwrap();
+        assert_eq!(file.watermark(), file.end());
+    }
+
+    #[test]
+    fn durable_ack_background_sync_failure_is_sticky_and_reported() {
+        std::env::set_var("NEB_WAL_SYNC_INTERVAL_MS", "3600000");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap());
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.init_durability(&mut seg.file_state.lock()).unwrap();
+        seg.durable_file().unwrap().inject_failure();
+        let failures = crate::ram::durability::FAILED_SEGMENTS.load(Relaxed);
+        sync_dirty_segment(seg.clone());
+        assert!(seg.durability_failure().is_some());
+        assert_eq!(
+            crate::ram::durability::FAILED_SEGMENTS.load(Relaxed) - failures,
+            1
+        );
+        assert!(seg.write_wal(seg.addr + 8, 8, false).is_err());
+        assert_eq!(
+            seg.durable_file().unwrap().watermark(),
+            crate::ram::wal_format::FILE_HEADER_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn durable_ack_inline_sync_failure_is_typed_and_refuses_later_appends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let seg = allocator.alloc_seg(&manager).unwrap();
+        seg.write_wal(seg.addr, 8, false).unwrap();
+        seg.init_durability(&mut seg.file_state.lock()).unwrap();
+        seg.durable_file().unwrap().inject_failure();
+        let before = seg.wal_append_position();
+        let error = seg
+            .write_wal(seg.addr + 8, WAL_SYNC_BATCH_SIZE as u32, false)
+            .unwrap_err();
+        assert!(matches!(
+            crate::ram::cell::WriteError::from_wal_io(error),
+            crate::ram::cell::WriteError::Durability(_)
+        ));
+        assert!(seg.durability_failure().is_some());
+        assert_eq!(
+            seg.durable_file().unwrap().end(),
+            before,
+            "a refused frame must not remain in the receipt end"
+        );
+        assert!(seg.write_wal(seg.addr + 16, 8, false).is_err());
+        assert_eq!(
+            seg.file_state
+                .lock()
+                .wal
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            before
+        );
+    }
 
     /// ~250,000 Segment structs stay resident for a terabyte store, so both
     /// their inline size and what they eagerly drag onto the heap are
@@ -4045,6 +5501,14 @@ mod seal_race_tests {
             });
 
             for index in 0..4_000u64 {
+                if index == 1_000 {
+                    for slot in chunk.head_pool.iter() {
+                        let id = slot.swap(u64::MAX, Ordering::AcqRel);
+                        if let Some(segment) = chunk.segs.get(&(id as usize)) {
+                            segment.protection.head.store(false, Ordering::Release);
+                        }
+                    }
+                }
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value["DATA"] = OwnedValue::U64(index);
                 let mut cell = OwnedCell {
@@ -4084,6 +5548,61 @@ mod skipped_slot_tests {
             SegmentAllocator::new(0, SEGMENT_SIZE * segments),
             Arc::new(SegmentFileManager::new(None, None)),
         )
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_bump_compaction_reserve() {
+        concurrent_writers_preserve_compaction_reserve(false);
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_recycled_compaction_reserve() {
+        concurrent_writers_preserve_compaction_reserve(true);
+    }
+
+    fn concurrent_writers_preserve_compaction_reserve(recycled: bool) {
+        let (allocator, fm) = allocator_of(8);
+        let allocator = Arc::new(allocator);
+        for _ in 0..6 {
+            allocator.alloc_seg(&fm).unwrap();
+        }
+        if recycled {
+            let first = allocator.alloc_seg(&fm).unwrap();
+            let second = allocator.alloc_seg(&fm).unwrap();
+            allocator.free(first.addr);
+            allocator.free(second.addr);
+        }
+        assert_eq!(allocator.available_segments(), 2);
+        assert_eq!(allocator.compaction_reserve(), 1);
+        let checked = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let allocator = allocator.clone();
+                let fm = fm.clone();
+                let checked = checked.clone();
+                std::thread::spawn(move || {
+                    TEST_WRITER_RESERVE_CHECKED.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            checked.wait();
+                        }));
+                    });
+                    allocator.alloc_seg_for_writer(&fm, SegmentClass::Regular)
+                })
+            })
+            .collect();
+        let granted = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .count();
+        assert_eq!(
+            granted, 1,
+            "writers spent the cleaner's reserved destination"
+        );
+        assert_eq!(allocator.available_segments(), 1);
+        assert!(
+            allocator.alloc_seg(&fm).is_some(),
+            "the cleaner must still allocate"
+        );
     }
 
     /// Allocating AT an id drags the bump pointer over every lower slot,

@@ -1,5 +1,6 @@
 #[macro_use]
 mod macros;
+mod admission;
 #[macro_use]
 pub mod builder;
 pub mod embedding;
@@ -9,6 +10,8 @@ pub mod hash;
 pub mod ranged;
 pub mod scrub;
 pub mod vector;
+pub mod verification;
+pub mod query_metrics;
 
 pub const FEATURE_SIZE: usize = 8;
 pub const KEY_SIZE: usize = ID_SIZE + FEATURE_SIZE + 8; // 8 is the estimate length of: schema id u32 (4) + field id u32(4, reduced from u64)
@@ -51,6 +54,8 @@ pub struct IndexerClients {
     pub vector_client: Arc<VectorIndexClient>,
     pub embedding_client: Arc<EmbeddingIndexClient>,
     fulltext_indexer: OnceLock<Arc<InvertedIndexer>>,
+    scannable_admission: admission::ScannableAdmission,
+    pending_tasks: Arc<builder::PendingIndexTasks>,
     // Store initialization parameters for lazy initialization
     server_id: u64,
     pub(crate) neb_client: Arc<AsyncClient>,
@@ -78,6 +83,8 @@ impl IndexerClients {
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
+            pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
+            scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(),
             server_id,
             neb_client: neb_client.clone(),
@@ -134,6 +141,8 @@ impl IndexerClients {
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
+            pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
+            scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(), // Empty, won't be initialized
             server_id,
             neb_client: neb_client.clone(),
@@ -173,8 +182,9 @@ impl IndexerClients {
         index_id: Id,
         field_id: u64,
         value: &OwnedValue,
+        verify: crate::index::verification::Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        HashedIndexClient::query(&self.hashed_client, index_id, field_id, value).await
+        HashedIndexClient::query(&self.hashed_client, index_id, field_id, value, verify).await
     }
 
     pub async fn bm25_search(

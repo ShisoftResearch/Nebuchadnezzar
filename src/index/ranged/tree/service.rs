@@ -56,6 +56,27 @@ pub struct ServBlock {
     pub last_key: Option<EntryKey>,
 }
 
+/// One block of a tree's LOGICAL keys, in key order.
+///
+/// `ServBlock` carries ids because that is what a query returns: a ranged scan
+/// answers "which cells hold this value", and the value is the part the caller
+/// already knows. The reconcile's prune direction asks the opposite question --
+/// "which entries does this tree hold that no cell implies" -- and an id cannot
+/// name an entry. An entry IS its full `[schema][field][feature][id]`, and the
+/// feature is exactly what an id does not carry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyBlock {
+    /// The keys, ascending, from the requested key on. A key the tree holds is
+    /// listed once, and a tombstoned key is not listed at all: the walk sees
+    /// what a reader sees.
+    pub keys: Vec<EntryKey>,
+    /// Where to continue in THIS tree, or `None` when this tree holds nothing
+    /// later. An empty block with no resume point still means "ask for the next
+    /// tree": a seek that landed at or past this tree's upper bound collects
+    /// nothing here and says so the same way.
+    pub next: Option<EntryKey>,
+}
+
 pub struct DistTree {
     id: Id,
     tree: RangedTree,
@@ -142,6 +163,7 @@ service! {
     rpc contains(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
+    rpc scan_keys(id: Id, resume: EntryKey, limit: u32, epoch: u64) -> OpResult<KeyBlock>;
     rpc stat(id: Id) -> OpResult<TreeStat>;
     rpc audit(id: Id) -> OpResult<TreeAudit>;
     rpc flush_all();
@@ -163,20 +185,11 @@ service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 /// 43 trees and 117,677,730 keys. Under-reporting to zero is the worst
 /// direction for this particular number: an empty ranged index is exactly the
 /// failure being looked for.
-/// A plain `RwLock<HashMap>`, and it must stay removable. This was a
-/// `PtrHashMap` that was only ever inserted into -- so every database's tree
-/// service, and with it every page its trees held, stayed alive for the life of
-/// the process even after the database was unloaded or dropped. Two separate
-/// mistakes: nothing retired the entry, and `PtrHashMap::remove` would not have
-/// released it anyway (it returns a clone and leaves the original in the retired
-/// node, so removal is not a release; see
-/// `neb::server::tests::ptr_hash_map_remove_does_not_release_the_value`).
-///
-/// Per the comment above, nothing on an operation path reads this, so a lock
-/// costs nothing here.
+/// Keyed publication for status and shutdown. Retirement takes the payload
+/// out before Lightning defers reclamation of its small registry entry.
 static LOCAL_TREE_SERVICES: std::sync::LazyLock<
-    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<TreeService>>>,
-> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    crate::utils::keyed_state::KeyedState<String, std::sync::Arc<TreeService>>,
+> = std::sync::LazyLock::new(crate::utils::keyed_state::KeyedState::default);
 
 /// Key a database's tree service by the pair that scopes it everywhere else.
 pub fn local_tree_service_key(group_name: &str, database_name: &str) -> String {
@@ -189,9 +202,9 @@ pub fn publish_local_tree_service(
     database_name: &str,
     service: std::sync::Arc<TreeService>,
 ) {
-    LOCAL_TREE_SERVICES
-        .write()
-        .insert(local_tree_service_key(group_name, database_name), service);
+    let key = local_tree_service_key(group_name, database_name);
+    let replaced = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).replace(service);
+    drop(replaced);
 }
 
 /// Forget a database's tree service, because the database is going away.
@@ -200,10 +213,9 @@ pub fn publish_local_tree_service(
 /// -- and every page its trees hold -- outlives the database that owned it, for
 /// the life of the process.
 pub fn retire_local_tree_service(group_name: &str, database_name: &str) -> bool {
-    LOCAL_TREE_SERVICES
-        .write()
-        .remove(&local_tree_service_key(group_name, database_name))
-        .is_some()
+    let key = local_tree_service_key(group_name, database_name);
+    let retired = crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).take();
+    retired.is_some()
 }
 
 /// This database's tree service, if it has one.
@@ -211,10 +223,8 @@ pub fn local_tree_service(
     group_name: &str,
     database_name: &str,
 ) -> Option<std::sync::Arc<TreeService>> {
-    LOCAL_TREE_SERVICES
-        .read()
-        .get(&local_tree_service_key(group_name, database_name))
-        .cloned()
+    let key = local_tree_service_key(group_name, database_name);
+    crate::profile_lock!(C15, LOCAL_TREE_SERVICES.entry(&key)).as_ref().cloned()
 }
 
 pub struct TreeService {
@@ -942,6 +952,76 @@ impl Service for TreeService {
         })
     }
 
+    /// One block of this tree's keys, for the reconcile's prune walk.
+    ///
+    /// Read-only: it takes no write latch and marks no page dirty, so a pass
+    /// that only looks changes nothing. Like every other tree operation it
+    /// hydrates a tree that is not loaded yet -- the reconcile needs the trees
+    /// in memory anyway. The walk is the filtered one, so a key the tree has
+    /// logically deleted is not reported: reporting it would have the caller
+    /// delete an entry that is already gone and count that as a repair.
+    fn scan_keys(
+        &self,
+        id: Id,
+        resume: EntryKey,
+        limit: u32,
+        epoch: u64,
+    ) -> BoxFuture<'_, OpResult<KeyBlock>> {
+        self.apply_in_ranged_tree(id, resume, epoch, false, move |entry, tree, prop| {
+            // A client asks; it does not decide how much one round trip
+            // carries. Without the cap, `limit = usize::MAX` would make this
+            // handler allocate the whole tree's key list in one block.
+            const MAX_BLOCK: usize = 8192;
+            let limit = (limit as usize).clamp(1, MAX_BLOCK);
+            let boundary = &prop.boundary;
+            let start = if entry < &boundary.lower {
+                boundary.lower.clone()
+            } else {
+                entry.clone()
+            };
+            let mut cursor = tree.seek(&start, Ordering::Forward);
+            let mut pending = cursor.current().cloned();
+            let mut keys: Vec<EntryKey> = Vec::with_capacity(limit.min(1024));
+            // Rounds, not keys: the dedup and the boundary arms advance the
+            // walk without collecting, and every unbounded loop on this path
+            // has cost somebody a hung worker at least once.
+            let max_rounds = limit.saturating_mul(8).saturating_add(4096);
+            let mut rounds = 0usize;
+            while let Some(key) = pending.take() {
+                rounds += 1;
+                if rounds > max_rounds {
+                    warn!(
+                        "scan_keys on tree {:?} stopped after {} rounds without filling a {}-key \
+                         block (collected {}, at {:?}); the caller resumes at that key",
+                        id,
+                        rounds,
+                        limit,
+                        keys.len(),
+                        key.id()
+                    );
+                    pending = Some(key);
+                    break;
+                }
+                if &key >= &boundary.upper {
+                    // Physically present, logically this tree's neighbour's.
+                    break;
+                }
+                if keys.last() == Some(&key) {
+                    pending = cursor.next();
+                    continue;
+                }
+                if keys.len() >= limit {
+                    pending = Some(key);
+                    break;
+                }
+                keys.push(key);
+                pending = cursor.next();
+            }
+            let next = pending.filter(|key| key < &boundary.upper);
+            OpResult::Successful(KeyBlock { keys, next })
+        })
+    }
+
     fn flush_all(&self) -> BoxFuture<'_, ()> {
         async move {
             self.flush_all_trees().await;
@@ -1177,7 +1257,7 @@ impl TreeService {
         // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
         // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
         // B-tree pages that haven't been persisted yet, causing "CellDoesNotExisted" on recovery
-        let barrier = super::btree::storage::wait_until_updated().await;
+        let barrier = super::btree::storage::hub_for(&self.client).wait_until_updated().await;
         if barrier {
             info!("All B-tree nodes persisted, now marking migrations");
             // Now it's safe to update the LSM tree cells with the new head IDs
@@ -1206,7 +1286,7 @@ impl TreeService {
         // during to_cell), so re-drain before stopping the hub: the reset
         // DISCARDS whatever is still queued, and anything discarded here is
         // a page some durable head may already name.
-        if !super::btree::storage::wait_until_updated().await {
+        if !super::btree::storage::hub_for(&self.client).wait_until_updated().await {
             error!("flush_all_trees: post-publish drain barrier NOT established");
         }
 
@@ -1409,23 +1489,7 @@ impl TreeService {
                 checkpoint_counter = checkpoint_counter.wrapping_add(1);
                 let do_checkpoint = checkpoint_counter % CHECKPOINT_INTERVAL_LOOPS == 0;
 
-                // Head publishes below are gated on the drain barrier: a
-                // checkpoint over an unestablished barrier would point tree
-                // metadata at pages that never became durable.
-                let mut checkpoint_barrier = false;
-                if do_checkpoint {
-                    // Ensure all pending B-tree node writes are flushed, then update
-                    // tree root cells. This limits the recovery window to ~60 seconds
-                    // of writes even if the server is killed without a clean shutdown.
-                    checkpoint_barrier = storage::wait_until_updated().await;
-                    if !checkpoint_barrier {
-                        error!(
-                            "balancer checkpoint: write-back barrier NOT established; \
-                             skipping this round's head publishes"
-                        );
-                    }
-                }
-
+                // A checkpoint depends only on the page locality of that tree.
                 // No per-tree merge pass. `merge_levels` was an LSM-era
                 // no-op that always returned false -- so the whole
                 // post-merge publish below it was dead code -- but it still
@@ -1434,10 +1498,11 @@ impl TreeService {
                 // waits per pass, and under a real backlog each one blocks
                 // until the whole queue lands, which is why split cadence
                 // collapsed exactly when the store got busy. Checkpoints
-                // gate on their own barrier, taken once above.
+                // gate on the affected locality before each publication.
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    if do_checkpoint && checkpoint_barrier {
+                    if do_checkpoint && storage::hub_for(&client)
+                        .wait_for_locality(dist_tree.tree.head_id().locality()).await {
                         // Periodic checkpoint: update tree root cell to reflect current state
                         if let Err(e) = tree.publish_head(&dist_tree.id, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
@@ -1619,7 +1684,12 @@ impl TreeService {
                         // an oversized tree during rebalancing, where that
                         // cost is acceptable; a failed barrier rolls the split
                         // back rather than committing over undrained pages.
-                        if !storage::wait_until_updated().await {
+                        let hub = storage::hub_for(&client);
+                        let (source_ready, target_ready) = futures::join!(
+                            hub.wait_for_locality(dist_tree.tree.head_id().locality()),
+                            hub.wait_for_locality(migration_tree.tree.head_id().locality()),
+                        );
+                        if !source_ready || !target_ready {
                             error!(
                                 "Seam barrier for split of {:?} NOT established; rolling back",
                                 dist_tree.id
@@ -1976,5 +2046,27 @@ pub async fn locate_tree_server_from_conshash(
             .map(|c| client_by_rpc_client(&c, group_name, database_name))
     } else {
         Err(RPCError::RequestError(RPCRequestError::Other))
+    }
+}
+
+#[cfg(test)]
+mod registry_partition_tests {
+    use super::*;
+
+    #[test]
+    fn local_tree_registry_lookups_do_not_share_one_gate() {
+        let first = local_tree_service_key("registry_partition", "first");
+        let second = "second".to_owned();
+        let held = LOCAL_TREE_SERVICES.entry(&first);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            assert!(local_tree_service("registry_partition", &second).is_none());
+            assert!(!retire_local_tree_service("registry_partition", &second));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
     }
 }

@@ -504,7 +504,7 @@ async fn run_alignment_suite(
             schema_mode.is_scannable(),
         );
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        materialize_neb_dataset(&server, &client, schema_id, &dataset.rows).await;
         let sqlite = materialize_sqlite_dataset(&dataset.rows);
 
         let queries = if schema_mode.is_scannable() {
@@ -543,7 +543,7 @@ async fn run_projection_alignment_suite(
             schema_mode.is_scannable(),
         );
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        materialize_neb_dataset(&server, &client, schema_id, &dataset.rows).await;
         let sqlite = materialize_sqlite_dataset(&dataset.rows);
 
         let base_queries = if schema_mode.is_scannable() {
@@ -598,7 +598,7 @@ async fn run_aggregate_alignment_suite(
                 dataset.name, schema_id
             );
         }
-        materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        materialize_neb_dataset(&server, &client, schema_id, &dataset.rows).await;
         if trace_aggregate {
             debug!(
                 "ALIGN_AGGREGATE_NEB_READY dataset={} schema={}",
@@ -654,6 +654,7 @@ fn alignment_schema(schema_id: u32, name: &str, scannable: bool) -> Schema {
 }
 
 async fn materialize_neb_dataset(
+    server: &crate::server::NebServer,
     client: &crate::client::AsyncClient,
     schema_id: u32,
     rows: &[AlignRow],
@@ -671,7 +672,7 @@ async fn materialize_neb_dataset(
         let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &row.id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
-    crate::index::builder::IndexBuilder::await_all_indices().await;
+    server.await_index_tasks().await;
     crate::index::ranged::tree::btree::storage::wait_until_updated().await;
 }
 
@@ -739,6 +740,7 @@ async fn assert_query_alignment(
             None,
             query.limit,
             query.offset,
+            crate::index::verification::Verify::Predicate,
         )
         .await
         .unwrap();
@@ -1002,6 +1004,7 @@ async fn assert_aggregate_alignment(
                         }),
                 )
                 .collect(),
+            crate::index::verification::Verify::Predicate,
         ),
     )
     .await

@@ -186,28 +186,20 @@ stays correct without modification -- evolution rebinds
 ## The format break
 
 Making `uid`, `generation`, and `status` required changes the `Schema` record
-format. Bifrost serializes the SM snapshot with CBOR in release and JSON in
-debug; both will fail to deserialize a record missing required fields.
+format. Bifrost serializes the SM snapshot with CBOR in every build profile; it
+will fail to deserialize a record missing required fields.
 
-**This walks every pre-existing store into a live latent bug.**
-`SchemasSM::recover` (`src/ram/schema/sm.rs:141-150`) matches the deserialize
-result and, on `None`, logs at `trace!` and returns -- leaving the state
-machine with an **empty schema map**. The database then comes up looking like
-one that has no schemas rather than one this build cannot read: every cell
-fails `SchemaDoesNotExisted`, and in debug builds `select_from_chunk_raw`
-(`src/ram/cell.rs:1004`) panics on the way. That is the same shape as the
-recovery bug that silently wiped the ranged index -- an unreadable input
-treated as an empty one.
+`SchemasSM::recover` now refuses a snapshot that cannot decode. It logs an
+error and halts with a typed `PersistedDecodeError`. The raft recovery trait
+returns `()`, so this hook cannot return a `Result`.
 
-This path was unreachable while the record format only ever grew defaulted
-fields. Deliberately breaking the format makes it the *expected* path for every
-old store, so it must be fixed as part of the break, not after it:
+A present empty buffer is also an invalid snapshot. A fresh store has no
+snapshot and keeps the initial empty map. A valid snapshot of an empty schema
+list still decodes.
 
-- a failed snapshot deserialize is an `error!`, not a `trace!`
-- `recover` refuses to complete rather than installing an empty map, so the
-  database fails to load loudly instead of loading wrong
-- the message names the likely cause -- a store written by a build from before
-  the uid/vid split -- and says to rebuild
+Rebuild stores whose schema records lack the required identity fields. Rebuild
+databases made with the former debug JSON codec. The codec now writes CBOR
+in every build profile, and debug object hashes now match release hashes.
 
 What specifically stops working:
 

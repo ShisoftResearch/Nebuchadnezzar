@@ -40,6 +40,13 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         ));
     };
 
+    if segment.protection.in_progress() || segment.is_head_owned() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "segment is in progress",
+        ));
+    }
+
     // Step 1: Try to acquire segment lock (skip if already locked)
     if !segment.lock_hot_to_cold() {
         debug!("Segment {} is not hot, skipping eviction", segment.id);

@@ -293,31 +293,54 @@ where
     }
 }
 
+enum BoundaryStep {
+    Key(Option<EntryKey>),
+    Follow(NodeCellRef),
+    Retry,
+}
+
 pub fn select_merge_boundary<KS, PS>(node: &NodeCellRef) -> Option<EntryKey>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let res = read_node(node, |node: &NodeReadHandler<KS, PS>| {
-        let node_keys = node.keys();
-        let node_len = node_keys.len();
-        if node.len() < 1 {
-            if node.is_ext() {
-                return Ok(None);
-            } else {
-                return Err(node.ptrs()[0].clone());
+    let mut current = node.clone();
+    loop {
+        let step = read_node(&current, |node: &NodeReadHandler<KS, PS>| {
+            match &**node {
+                NodeData::External(n) => {
+                    let n = &**n;
+                    let keys = n.keys.to_vec(0..n.len);
+                    #[cfg(test)]
+                    super::revision_tests::after_median_copy();
+                    BoundaryStep::Key(keys.get(keys.len() / 2).cloned())
+                }
+                NodeData::Internal(n) => {
+                    let n = &**n;
+                    let keys = n.keys.to_vec(n.len);
+                    #[cfg(test)]
+                    super::revision_tests::after_median_copy();
+                    if let Some(key) = keys.get(keys.len() / 2) {
+                        BoundaryStep::Key(Some(key.clone()))
+                    } else {
+                        match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
+                            Some(child) => BoundaryStep::Follow(child),
+                            None => BoundaryStep::Retry,
+                        }
+                    }
+                }
+                NodeData::Empty(n) => match n.right.try_clone_speculative() {
+                    Some(right) => BoundaryStep::Follow(right),
+                    None => BoundaryStep::Retry,
+                },
+                NodeData::None => BoundaryStep::Key(None),
             }
+        });
+        match step {
+            BoundaryStep::Key(key) => return key,
+            BoundaryStep::Follow(next) => current = next,
+            BoundaryStep::Retry => {}
         }
-        // Pick half of the keys in the root
-        // Genreally, higher level sub tree in LSM tree will select more keys to merged
-        // into next level
-        let mid_idx = node_len / 2;
-        // Return the mid key as the boundary for selection (cut)
-        Ok(Some(node_keys[mid_idx].clone()))
-    });
-    match res {
-        Ok(key) => key,
-        Err(r) => select_merge_boundary::<KS, PS>(&r),
     }
 }
 

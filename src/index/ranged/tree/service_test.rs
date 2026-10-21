@@ -1132,7 +1132,7 @@ mod test {
         let expected_range_1: Vec<u64> = (20..=30).collect();
         let expected_all_prices: Vec<u64> = (10..=100).collect();
 
-        let _ = IndexBuilder::await_all_indices().await;
+        let _ = server.await_index_tasks().await;
         storage::wait_until_updated().await;
 
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3091,7 +3091,7 @@ mod test {
             result.unwrap();
         }
 
-        let _ = IndexBuilder::await_all_indices().await;
+        let _ = server.await_index_tasks().await;
 
         let ranged_client = server
             .database_runtime

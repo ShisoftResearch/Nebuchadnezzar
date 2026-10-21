@@ -18,7 +18,6 @@ pub use node::*;
 use parking_lot::RwLock;
 use search::*;
 use std::any::Any;
-use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -593,3 +592,6 @@ pub mod audit_test;
 pub mod bench_test;
 #[cfg(test)]
 pub mod test;
+
+#[cfg(test)]
+mod revision_tests;

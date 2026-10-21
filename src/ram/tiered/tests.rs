@@ -230,14 +230,6 @@ fn test_eviction_on_memory_overflow() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
 
-    // Configure tiered memory with a small physical memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7"); // 70% threshold
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 3 * SEGMENT_SIZE),
-    ); // 3 segments = 24MB
-
     let chunk_capacity = 10 * SEGMENT_SIZE; // 80MB virtual capacity
     let fields = default_fields();
     let schema = Schema::new("test_overflow", None, fields, false, false);
@@ -250,6 +242,13 @@ fn test_eviction_on_memory_overflow() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 3 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 2000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -257,11 +256,9 @@ fn test_eviction_on_memory_overflow() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     // Verify tiered manager is enabled in at least one chunk
@@ -325,6 +322,10 @@ fn test_eviction_on_memory_overflow() {
                 break;
             }
         }
+    }
+
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
     }
 
     // Final eviction check to ensure memory limit is respected
@@ -397,11 +398,6 @@ fn test_eviction_on_memory_overflow() {
         }
     }
 
-    // Clean up environment variables
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-
     // Clean up test directories
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
@@ -414,14 +410,6 @@ fn test_cold_segment_promotion() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
 
-    // Configure with tight memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.6");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 2 * SEGMENT_SIZE),
-    );
-
     let chunk_capacity = 8 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("test_promotion", None, fields, false, false);
@@ -433,6 +421,13 @@ fn test_cold_segment_promotion() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.6,
+        lower_watermark: 0.72,
+        physical_memory_limit: 2 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 2000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -440,11 +435,9 @@ fn test_cold_segment_promotion() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     // Write cells
@@ -487,12 +480,23 @@ fn test_cold_segment_promotion() {
 
     info!("Wrote {} cells", written_ids.len());
 
-    // Force eviction to make sure we have cold segments
+    // A queued seal protects its segment from eviction until the archive finishes.
     for chunk in &chunks.list {
-        if let Some(ref manager) = chunk.tiered_manager {
-            match manager.explicit_evict(chunk, 2) {
-                Ok(evicted) => info!("Explicitly evicted {} segments", evicted),
-                Err(e) => error!("Explicit eviction failed: {:?}", e),
+        chunk.wait_for_segment_jobs_for_test();
+    }
+
+    // This test checks promotion, so choose a sealed victim without CLOCK's extra chances.
+    for chunk in &chunks.list {
+        let candidates: Vec<_> = chunk
+            .segments()
+            .into_iter()
+            .filter(|segment| !chunk.is_active_head(segment.id))
+            .collect();
+        assert!(!candidates.is_empty(), "the fixture must rotate a segment");
+        for segment in candidates {
+            if segment.is_hot() {
+                crate::ram::tiered::eviction::evict_segment(&segment, chunk)
+                    .expect("a sealed fixture segment must be evictable");
             }
         }
     }
@@ -529,9 +533,6 @@ fn test_cold_segment_promotion() {
     info!("Successfully read all cells, promotion working correctly");
 
     // Clean up
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_dir_all(temp_path("neb_test_promotion_schema"));
@@ -542,15 +543,6 @@ fn test_cold_segment_promotion() {
 fn test_metrics_and_churn_counters() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
-
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.75");
-    std::env::set_var("NEB_TIERED_MEMORY_LOWER_WATERMARK", "0.50");
-    std::env::set_var("NEB_TIERED_PROMOTION_COOLDOWN_MS", "5000");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 2 * SEGMENT_SIZE),
-    );
 
     let chunk_capacity = 4 * SEGMENT_SIZE;
     let fields = default_fields();
@@ -563,6 +555,13 @@ fn test_metrics_and_churn_counters() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.75,
+        lower_watermark: 0.50,
+        physical_memory_limit: 2 * SEGMENT_SIZE,
+        promotion_cooldown_ms: 5000,
+    };
+
     let chunks = Chunks::new(
         1,
         chunk_capacity,
@@ -570,11 +569,9 @@ fn test_metrics_and_churn_counters() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env().map(|c| {
-            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
-                crate::ram::tiered::SharedMemoryPool::new(&c),
-            ))
-        }),
+        Some(Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&tiered_config),
+        ))),
     );
 
     let manager = chunks
@@ -641,11 +638,6 @@ fn test_metrics_and_churn_counters() {
     );
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_MEMORY_LOWER_WATERMARK");
-    std::env::remove_var("NEB_TIERED_PROMOTION_COOLDOWN_MS");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_dir_all(temp_path("neb_test_metrics_schema"));
@@ -755,6 +747,21 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
     );
 }
 
+// Eviction policy assertions need eligible victims. Rotation archives on a
+// background thread, which pins its source until the durable image is complete.
+// Wait for that setup work, rather than racing eviction against the archive.
+fn wait_for_rotated_archive(segment: &crate::ram::segs::Segment) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(segment.is_sealed() && segment.no_references()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rotated segment {} must finish its archive before eviction",
+            segment.id
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn test_blob_segments_evict_before_regular_segments() {
     let _guard = test_lock();
@@ -862,6 +869,11 @@ fn test_blob_segments_evict_before_regular_segments() {
         "setup should keep the blob non-head hot before eviction"
     );
 
+    for id in [regular_non_head, blob_non_head] {
+        wait_for_rotated_archive(&chunk.segs.get(&(id as usize)).unwrap());
+    }
+
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -964,6 +976,11 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         .find(|(_, segment_id)| *segment_id != blob_head)
         .expect("setup should create a non-head blob segment to evict");
 
+    wait_for_rotated_archive(
+        &chunk.segs.get(&(cold_target_segment_id as usize)).unwrap(),
+    );
+
+    chunk.wait_for_segment_jobs_for_test();
     let evicted = manager
         .explicit_evict(chunk, 1)
         .expect("explicit eviction should succeed");
@@ -1195,6 +1212,9 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
         "single database should reach the exact hot-segment threshold before eviction is triggered for the next allocation"
     );
 
+    for chunk in &chunks.list {
+        chunk.wait_for_segment_jobs_for_test();
+    }
     let cold_before_crossing = total_cold_segments(&chunks);
     let evicted_after_threshold = manager
         .evict_for_allocation()
@@ -1592,7 +1612,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
         .await;
 
-    analytics.chunks().sync_all();
+    analytics.chunks().sync_all().unwrap();
     analytics.chunks().archive_all();
     assert!(server.unload_database_runtime("analytics").await);
     wait_for_shared_counter_alignment(&manager, &[&server.chunks()], 750).await;
@@ -2006,6 +2026,17 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         databases.push((chunks, schema_dir, backup_dir, wal_dir));
     }
 
+    // All writes are complete. Make their rotated segments eligible before
+    // asking the policy to reach a watermark that includes those victims.
+    for (chunks, _, _, _) in &databases {
+        let chunk = &chunks.list[0];
+        for segment in chunk.segments() {
+            if !chunk.is_active_head(segment.id) {
+                wait_for_rotated_archive(&segment);
+            }
+        }
+    }
+
     let hot_before: usize = databases
         .iter()
         .map(|(chunks, _, _, _)| total_hot_segments(chunks))
@@ -2015,6 +2046,11 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         "equal-sized databases should exceed the shared lower watermark before eviction"
     );
 
+    for (chunks, _, _, _) in &databases {
+        for chunk in &chunks.list {
+            chunk.wait_for_segment_jobs_for_test();
+        }
+    }
     let mut evicted_total = 0;
     for _ in 0..4 {
         let hot_now: usize = databases
@@ -2200,21 +2236,22 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Configure: 64MB physical limit, 1GB virtual capacity
     let physical_limit = 64 * 1024 * 1024; // 64MB = 8 segments
     let virtual_capacity = 1024 * 1024 * 1024; // 1GB = 128 segments
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.75"); // 75% threshold
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", physical_limit),
-    );
 
     // Start server
     let server_addr = crate::utils::test_port::unique_localhost_addr();
+
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.75,
+        lower_watermark: 0.72,
+        physical_memory_limit: physical_limit,
+        promotion_cooldown_ms: 2000,
+    };
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: virtual_capacity,
             db_size: virtual_capacity,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             raft_storage: None,
@@ -2543,9 +2580,6 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     }
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
 
     // Drop server first to ensure all operations complete
     drop(server);
@@ -2569,12 +2603,6 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     info!("=== Starting Stress Test: Mixed Concurrent Workload ===");
 
     // Reduced configuration: 16MB physical, 64MB virtual (reduced for faster test)
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 16 * 1024 * 1024),
-    );
 
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let backup_dir = temp_path("neb_stress_test_bk");
@@ -2582,11 +2610,18 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 16 * 1024 * 1024,
+        promotion_cooldown_ms: 2000,
+    };
+
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024, // Reduced from 256MB
             db_size: 64 * 1024 * 1024,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             raft_storage: None,
@@ -2763,9 +2798,6 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     info!("Verified {} cells successfully", verified);
 
     // Cleanup
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
@@ -3059,12 +3091,6 @@ async fn test_direct_writes_with_tiered_memory() {
     info!("=== Starting Direct Write Test WITH Tiered Memory ===");
 
     // Configure tiered memory with a small physical memory limit
-    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7");
-    std::env::set_var(
-        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
-        &format!("{}", 32 * 1024 * 1024),
-    ); // 32MB physical
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "100"); // Faster cleaner for testing
 
     let chunk_capacity = 512 * 1024 * 1024; // 512MB virtual capacity (more space for updates)
@@ -3080,11 +3106,18 @@ async fn test_direct_writes_with_tiered_memory() {
     let _ = std::fs::create_dir_all(&backup_dir);
     let _ = std::fs::create_dir_all(&wal_dir);
 
+    let tiered_config = crate::ram::tiered::TieredConfig {
+        threshold: 0.7,
+        lower_watermark: 0.72,
+        physical_memory_limit: 32 * 1024 * 1024,
+        promotion_cooldown_ms: 2000,
+    };
+
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: chunk_capacity,
             db_size: chunk_capacity,
-            tiered_config: crate::ram::tiered::TieredConfig::from_env(),
+            tiered_config: Some(tiered_config),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
             index_enabled: false,
@@ -3394,9 +3427,6 @@ async fn test_direct_writes_with_tiered_memory() {
     // 2. Resetting here can cause SIGSEGV if signal handlers are still active
     // 3. The TEST_MUTEX ensures tests run serially, so new_with_recovery() will clean up properly
 
-    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
-    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
-    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 
@@ -3674,6 +3704,9 @@ fn blocks_faulted_into_cold_segments_are_accounted_and_released() {
     );
 
     let chunk = &chunks.list[0];
+    // This fixture needs a cold segment. Rotation archives asynchronously,
+    // and eviction must skip a segment until that seal job finishes.
+    chunk.wait_for_segment_jobs_for_test();
     assert!(manager.explicit_evict(chunk, 4).expect("evict") > 0);
 
     // Read a handful of cells to fault blocks into cold segments.
@@ -4987,9 +5020,8 @@ async fn every_cell_survives_being_written_past_the_tier_limit() {
         false,
     );
     // `register_internal_schema`, not `debug_only_new_schema`: this test has to
-    // run in RELEASE. bifrost picks its codec by build profile and the tier's
-    // pacing is entirely different under a debug build, so a debug-only run
-    // would be measuring a store that nobody ships. The id is fixed, which is
+    // run in RELEASE. The tier's pacing is entirely different under a debug
+    // build, so a debug-only run would measure a store that nobody ships. The id is fixed, which is
     // what that entry point requires.
     server
         .meta()

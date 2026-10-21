@@ -24,8 +24,8 @@ pub async fn workspace_wr() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: SEGMENT_SIZE,
-            db_size: SEGMENT_SIZE,
+            chunk_size: 4 * SEGMENT_SIZE,
+            db_size: 4 * SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -168,8 +168,8 @@ pub async fn data_site_wr() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -270,8 +270,8 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
     let server_group = "txn_hash_commit";
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -339,7 +339,12 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
 
     let query_result = server
         .indexed_data_client()
-        .hashed_query(schema.uid, hash_str("id"), &OwnedValue::U64(100))
+        .hashed_query(
+            schema.uid,
+            hash_str("id"),
+            &OwnedValue::U64(100),
+            crate::index::verification::Verify::Predicate,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -352,8 +357,8 @@ pub async fn multi_transaction() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -478,8 +483,8 @@ pub async fn smoke_rw() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -561,8 +566,8 @@ pub async fn head_then_remove_commits() {
     let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 16 * 1024 * 1024,
-            db_size: 16 * 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -651,4 +656,81 @@ pub async fn head_then_remove_commits() {
         txn.abort(verify_txn.to_owned()).await.unwrap().unwrap(),
         AbortResult::Success(_)
     ));
+}
+
+/// A commit the WAL refuses for lack of space must keep that reason.
+///
+/// Reproduction for ledger #26a (WAL variant): with the WAL filesystem full
+/// (here: an unwritable WAL directory, which fails `write_wal` the same way
+/// ENOSPC does), the COMMIT record cannot be journalled, the data site fails
+/// the decision, and the coordinator is told `CheckFailed(CannotEnd)`. The
+/// store-full cause was stringified in `close_committed_brackets`, so no
+/// caller downstream can tell "give the store room" from a server fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_refused_by_an_unwritable_wal_keeps_its_type() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::TempDir::new().unwrap();
+    let wal = dir.path().join("wal");
+    let backup = dir.path().join("backup");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 4 * SEGMENT_SIZE,
+            db_size: 4 * SEGMENT_SIZE,
+            tiered_config: None,
+            backup_storage: Some(backup.to_string_lossy().into_owned()),
+            wal_storage: Some(wal.to_string_lossy().into_owned()),
+            raft_storage: None,
+            services: vec![Service::Cell, Service::Transaction],
+            index_enabled: false,
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        "walfull",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(schema.clone());
+    let txn = scoped_txn_client(&server_addr, "walfull").await;
+    let txn_id = txn.begin().await.unwrap().unwrap();
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(1));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("wal-full")));
+    data_map.insert(&String::from("score"), OwnedValue::U64(7));
+    let cell = OwnedCell::new_with_id(schema.vid, &Id::rand(), OwnedValue::Map(data_map));
+    let cell_id = cell.id();
+    assert!(matches!(
+        txn.write(txn_id.to_owned(), cell).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    ));
+
+    // From here no WAL file can be created and no existing one appended to:
+    // every journal write fails, exactly as on a full filesystem.
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(&wal).unwrap().flatten() {
+        std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let prepared = txn.prepare(txn_id.to_owned()).await.unwrap();
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for entry in std::fs::read_dir(&wal).unwrap().flatten() {
+        std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert!(matches!(
+        prepared,
+        Ok(TMPrepareResult::DMCommitError(DMCommitResult::WriteError(
+            _, WriteError::IOError { os_error: Some(libc::EACCES), .. },
+        )))
+    ), "the WAL refusal must reach prepare with its type: {prepared:?}");
+    assert!(server.chunks().read_cell(&cell_id).is_err());
 }

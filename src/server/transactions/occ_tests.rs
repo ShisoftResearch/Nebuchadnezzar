@@ -25,8 +25,8 @@ async fn scoped_txn_client_for_database(
 async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: crate::ram::segs::SEGMENT_SIZE,
-            db_size: crate::ram::segs::SEGMENT_SIZE,
+            chunk_size: 4 * crate::ram::segs::SEGMENT_SIZE,
+            db_size: 4 * crate::ram::segs::SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -46,8 +46,8 @@ async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
 
 async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebServer>> {
     let opts = ServerOptions {
-        chunk_size: crate::ram::segs::SEGMENT_SIZE,
-        db_size: crate::ram::segs::SEGMENT_SIZE,
+        chunk_size: 4 * crate::ram::segs::SEGMENT_SIZE,
+        db_size: 4 * crate::ram::segs::SEGMENT_SIZE,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -556,6 +556,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let tid = txn.begin().await.unwrap().unwrap();
     let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&first), 1);
+    let first_address = runtime.chunks().address_of(&cell_id);
 
     let pending = counter_cell(
         schema.vid.get(),
@@ -588,7 +589,10 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
     let rolled_back = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&rolled_back), 1);
-    assert!(rolled_back.header.version > first.header.version);
+    assert_eq!(rolled_back.header.version, first.header.version);
+    assert_eq!(rolled_back.header.timestamp, first.header.timestamp);
+    assert_eq!(rolled_back.data, first.data);
+    assert_eq!(runtime.chunks().address_of(&cell_id), first_address);
 
     let retry_tid = txn.begin().await.unwrap().unwrap();
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), cell_id).await.unwrap().unwrap());
@@ -1669,5 +1673,57 @@ async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     assert_missing(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
 
     abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+/// Every segment reference the transactions below took must be given back
+/// when they end: a read pin that outlives its transaction keeps the
+/// segment it points into out of the cleaner's reach for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn ended_transactions_give_back_their_read_pins() {
+    let _ = env_logger::try_init();
+    let address = &crate::utils::test_port::unique_localhost_addr();
+    let group = "txn_occ_pins_given_back";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    const CELLS: u64 = 20;
+    for i in 0..CELLS {
+        let mut seed = counter_cell(schema.vid.get(), Id::from_parts(0, 91000 + i), 1, "pin_seed");
+        runtime.chunks().write_cell(&mut seed).unwrap();
+    }
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    for round in 0..200u64 {
+        let id = Id::from_parts(0, 91000 + round % CELLS);
+        let tid = txn.begin().await.unwrap().unwrap();
+        accepted_head(txn.head(tid.clone(), id).await.unwrap().unwrap());
+        let update = counter_cell(schema.vid.get(), id, round + 2, "pin_update");
+        assert_eq!(
+            txn.update(tid.clone(), update).await.unwrap().unwrap(),
+            TxnExecResult::Accepted(())
+        );
+        assert_eq!(
+            txn.prepare(tid.clone()).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(
+            txn.commit(tid.clone()).await.unwrap().unwrap(),
+            EndResult::Success
+        );
+    }
+    let held = || -> usize {
+        runtime
+            .chunks()
+            .list
+            .iter()
+            .flat_map(|chunk| chunk.segments())
+            .map(|segment| segment.references_count())
+            .sum()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while held() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(held(), 0, "ended transactions still hold segment references");
     server.shutdown().await;
 }

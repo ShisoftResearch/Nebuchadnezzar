@@ -41,7 +41,6 @@ use crate::ram::schema::{DictionaryEncoding, Field, Schema, SchemaUid, SchemaVid
 use crate::ram::types::*;
 use bifrost::rpc::RPCError;
 use bifrost_hasher::hash_str;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -252,7 +251,7 @@ pub fn dictionary_from_cell_field(cell: &OwnedCell, values_field: u64) -> Dictio
 pub struct DictionaryColumn {
     client: Arc<AsyncClient>,
     cell_id: Id,
-    cached: RwLock<Dictionary>,
+    cached: arc_swap::ArcSwap<Dictionary>,
 }
 
 impl DictionaryColumn {
@@ -260,7 +259,7 @@ impl DictionaryColumn {
         Self {
             client,
             cell_id: dictionary_cell_id(schema, field),
-            cached: RwLock::new(Dictionary::default()),
+            cached: arc_swap::ArcSwap::from_pointee(Dictionary::default()),
         }
     }
 
@@ -272,10 +271,10 @@ impl DictionaryColumn {
     pub async fn refresh(&self) -> Result<(), RPCError> {
         match self.client.read_cell(self.cell_id).await? {
             Ok(cell) => {
-                *self.cached.write() = Dictionary::from_cell(&cell);
+                self.cached.store(Arc::new(Dictionary::from_cell(&cell)));
             }
             Err(ReadError::CellDoesNotExisted) => {
-                *self.cached.write() = Dictionary::default();
+                self.cached.store(Arc::new(Dictionary::default()));
             }
             Err(_) => {}
         }
@@ -284,20 +283,20 @@ impl DictionaryColumn {
 
     /// Decode from the cache. `None` for unset or unknown codes.
     pub fn decode(&self, code: u32) -> Option<String> {
-        self.cached.read().decode(code).map(str::to_owned)
+        self.cached.load().decode(code).map(str::to_owned)
     }
 
     /// Encode from the cache without extending it.
     pub fn encode_known(&self, value: &str) -> u32 {
-        self.cached.read().encode(value)
+        self.cached.load().encode(value)
     }
 
     pub fn len(&self) -> usize {
-        self.cached.read().len()
+        self.cached.load().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cached.read().is_empty()
+        self.cached.load().is_empty()
     }
 
     /// Extend the vocabulary with `values` and persist it, then return their
@@ -307,31 +306,33 @@ impl DictionaryColumn {
     /// another writer is adopted rather than overwritten. Values are added in
     /// one batch because the cell is rewritten whole: doing it per value would
     /// rewrite the whole vocabulary per value.
-    pub async fn extend_and_encode(
-        &self,
-        values: &[String],
-    ) -> Result<Vec<u32>, DictionaryError> {
+    pub async fn extend_and_encode(&self, values: &[String]) -> Result<Vec<u32>, DictionaryError> {
         self.refresh().await.map_err(DictionaryError::Rpc)?;
         let needs_extend = {
-            let cached = self.cached.read();
+            let cached = self.cached.load();
             values
                 .iter()
                 .any(|v| !v.is_empty() && cached.encode(v) == DICTIONARY_UNSET)
         };
 
         if needs_extend {
-            let mut extended = self.cached.read().clone();
+            let mut extended = (**self.cached.load()).clone();
             extended.merge(values.iter().cloned());
             let cell = extended.to_cell(&self.cell_id);
-            match self.client.upsert_cell(cell).await.map_err(DictionaryError::Rpc)? {
+            match self
+                .client
+                .upsert_cell(cell)
+                .await
+                .map_err(DictionaryError::Rpc)?
+            {
                 Ok(_) => {
-                    *self.cached.write() = extended;
+                    self.cached.store(Arc::new(extended));
                 }
                 Err(e) => return Err(DictionaryError::Write(e)),
             }
         }
 
-        let cached = self.cached.read();
+        let cached = self.cached.load();
         Ok(values.iter().map(|v| cached.encode(v)).collect())
     }
 }
@@ -345,6 +346,53 @@ pub enum DictionaryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dictionary_reader_does_not_hold_back_cache_publication() {
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 32 * 1024 * 1024,
+                db_size: 32 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(),
+            "dictionary_snapshot",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let column = Arc::new(DictionaryColumn::new(
+            server.current_database().neb_client.clone(),
+            SchemaUid(100),
+            1,
+        ));
+        let before = column.cached.load();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = column.clone();
+        let thread = std::thread::spawn(move || {
+            worker
+                .cached
+                .store(Arc::new(Dictionary::from_values(vec!["known".to_owned()])));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        assert!(before.is_empty());
+        drop(before);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            column.decode(column.encode_known("known")),
+            Some("known".to_owned())
+        );
+        server.shutdown().await;
+    }
 
     #[test]
     fn codes_are_dense_one_based_and_zero_is_unset() {
@@ -377,7 +425,11 @@ mod tests {
         assert_eq!(added, 2, "only the two unseen values are assigned");
         assert_eq!(d.encode("glutamate"), g);
         assert_eq!(d.encode("gaba"), b);
-        assert_eq!(d.encode("acetylcholine"), 3, "new codes sort among themselves");
+        assert_eq!(
+            d.encode("acetylcholine"),
+            3,
+            "new codes sort among themselves"
+        );
         assert_eq!(d.encode("serotonin"), 4);
     }
 

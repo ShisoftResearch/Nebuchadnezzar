@@ -1,3 +1,4 @@
+use crate::utils::keyed_state::KeyedState;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -434,9 +435,8 @@ impl PostingSegment {
             segment.doc_lengths = lengths.clone();
         }
 
-        // Handle old schema without versions (backwards compatibility)
-        if segment.versions.is_empty() && !segment.doc_ids.is_empty() {
-            segment.versions = vec![0; segment.doc_ids.len()];
+        if segment.versions.len() != segment.doc_ids.len() {
+            return None;
         }
 
         Some(segment)
@@ -542,7 +542,8 @@ pub struct InvertedIndexer {
 
     // Dirty field-stats keys pending persistence.
     // PtrHashMap doesn't support iteration, so we keep the original tuple here.
-    dirty_field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>, // hash -> (schema_id, field_id)
+    dirty_field_stats_keys: Arc<KeyedState<u64, (u32, u64)>>, // hash -> (schema_id, field_id)
+    dirty_field_stats_queue: Arc<crossbeam::queue::SegQueue<u64>>,
 
     // Background sync for stats
     flush_interval: Duration,
@@ -574,7 +575,8 @@ impl InvertedIndexer {
             neb_client,
             field_stats: Arc::new(PtrHashMap::with_capacity(64)),
             doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
-            dirty_field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
+            dirty_field_stats_keys: Arc::new(KeyedState::default()),
+            dirty_field_stats_queue: Arc::new(crossbeam::queue::SegQueue::new()),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -613,10 +615,15 @@ impl InvertedIndexer {
 
     fn mark_field_stats_dirty(&self, schema_id: SchemaUid, field_id: u64) -> u64 {
         let stats_key = Self::stats_key(schema_id, field_id);
-        self.dirty_field_stats_keys
-            .lock()
-            .insert(stats_key, (schema_id.get(), field_id));
+        self.queue_field_stats(stats_key, (schema_id.get(), field_id));
         stats_key
+    }
+
+    fn queue_field_stats(&self, key: u64, value: (u32, u64)) {
+        let mut entry = crate::profile_lock!(H59, self.dirty_field_stats_keys.entry(&key));
+        if entry.replace(value).is_none() {
+            self.dirty_field_stats_queue.push(key);
+        }
     }
 
     fn requeue_dirty_field_stats_keys(&self, dirty_keys: HashMap<u64, (u32, u64)>) {
@@ -624,7 +631,9 @@ impl InvertedIndexer {
             return;
         }
 
-        self.dirty_field_stats_keys.lock().extend(dirty_keys);
+        for (key, value) in dirty_keys {
+            self.queue_field_stats(key, value);
+        }
     }
 
     /// Add a document to the index
@@ -988,10 +997,14 @@ impl InvertedIndexer {
     /// Note: Posting lists are written directly to Chunks during add_document,
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
-        let dirty_keys = {
-            let mut keys = self.dirty_field_stats_keys.lock();
-            std::mem::take(&mut *keys)
-        };
+        // Bound this flush to the queue length at entry. New marks remain
+        // queued if a producer races with retirement of the previous mark.
+        let pending = self.dirty_field_stats_queue.len();
+        let dirty_keys: HashMap<_, _> = (0..pending).filter_map(|_| {
+            let key = self.dirty_field_stats_queue.pop()?;
+            crate::profile_lock!(H59, self.dirty_field_stats_keys.get(&key)?)
+                .take().map(|value| (key, value))
+        }).collect();
 
         if dirty_keys.is_empty() {
             debug!("No dirty field stats to flush");
@@ -1217,6 +1230,7 @@ impl Clone for InvertedIndexer {
             field_stats: self.field_stats.clone(),
             doc_metadata: self.doc_metadata.clone(),
             dirty_field_stats_keys: self.dirty_field_stats_keys.clone(),
+            dirty_field_stats_queue: self.dirty_field_stats_queue.clone(),
             flush_interval: self.flush_interval,
             shutdown: self.shutdown.clone(),
         }
@@ -1240,6 +1254,21 @@ mod tests {
     use bifrost::rpc::Server;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn posting_segment_requires_one_version_per_document() {
+        let id = Id::from_parts(12, 34);
+        let mut segment = PostingSegment::new();
+        segment.add(id, 7, 2, 20);
+        let current = PostingSegment::from_cell(&segment.to_cell(&id)).unwrap();
+        assert_eq!(current.doc_ids, vec![id]);
+        assert_eq!(current.versions, vec![7]);
+        segment.versions.clear();
+        assert!(PostingSegment::from_cell(&segment.to_cell(&id)).is_none());
+        segment.versions = vec![7, 8];
+        assert!(PostingSegment::from_cell(&segment.to_cell(&id)).is_none());
+        assert!(PostingSegment::from_cell(&PostingSegment::new().to_cell(&id)).is_some());
+    }
 
     // Helper to create test chunks
     fn create_test_chunks() -> Arc<Chunks> {
@@ -2159,6 +2188,35 @@ mod tests {
         info!("Add and search test passed");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dirty_field_statistics_entries_accept_independent_updates() {
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 64 * 1024 * 1024, db_size: 64 * 1024 * 1024,
+                tiered_config: None, backup_storage: None, wal_storage: None, raft_storage: None,
+                index_enabled: true, services: vec![crate::server::Service::Cell],
+                enable_recovery: false, disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(), "field_stats_shards", async |_| {},
+        ).await.unwrap();
+        let indexer = server.indexer().unwrap().clients.fulltext_indexer().unwrap().clone();
+        let first = InvertedIndexer::stats_key(SchemaUid(100), 1);
+        let second_field = 2;
+        let held = indexer.dirty_field_stats_keys.entry(&first);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = indexer.clone();
+        let thread = std::thread::spawn(move || {
+            let key = worker.mark_field_stats_dirty(SchemaUid(100), second_field);
+            assert_eq!(worker.dirty_field_stats_keys.entry(&key).as_ref(), Some(&(100, second_field)));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        thread.join().unwrap();
+        assert!(result.is_ok());
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_remove_document() {
         let _ = env_logger::try_init();
@@ -2225,16 +2283,15 @@ mod tests {
         indexer.update_stats_for_add(&meta);
 
         assert!(
-            indexer
-                .dirty_field_stats_keys
-                .lock()
-                .contains_key(&stats_key),
+            crate::profile_lock!(H59, indexer
+                .dirty_field_stats_keys.entry(&stats_key))
+                .is_some(),
             "add should mark field stats dirty"
         );
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            indexer.dirty_field_stats_keys.lock().is_empty(),
+            indexer.dirty_field_stats_queue.is_empty(),
             "successful flush should clear dirty field stats"
         );
 
@@ -2246,16 +2303,15 @@ mod tests {
         indexer.remove_document(&meta).unwrap();
 
         assert!(
-            indexer
-                .dirty_field_stats_keys
-                .lock()
-                .contains_key(&stats_key),
+            crate::profile_lock!(H59, indexer
+                .dirty_field_stats_keys.entry(&stats_key))
+                .is_some(),
             "remove should mark field stats dirty again"
         );
 
         indexer.flush_to_disk().await.unwrap();
         assert!(
-            indexer.dirty_field_stats_keys.lock().is_empty(),
+            indexer.dirty_field_stats_queue.is_empty(),
             "successful flush should clear dirty field stats after remove"
         );
 
@@ -2578,7 +2634,7 @@ mod tests {
         }
 
         // Wait for async indexing tasks to complete
-        let _ = IndexBuilder::await_indices().await;
+        let _ = server.indexer().unwrap().await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
@@ -2778,7 +2834,7 @@ mod tests {
             index_builder.ensure_indices(&cell, &schema, None);
         }
         // Wait for async indexing tasks to complete
-        let _ = IndexBuilder::await_indices().await;
+        let _ = server.indexer().unwrap().await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;

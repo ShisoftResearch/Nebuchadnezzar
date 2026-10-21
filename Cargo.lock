@@ -117,6 +117,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-channel"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,39 +272,9 @@ name = "bifrost"
 version = "0.1.0"
 dependencies = [
  "async-std",
- "bifrost_hasher 0.1.0",
- "bifrost_plugins 0.1.0",
- "bifrost_proc_macro 0.1.0",
- "byteorder",
- "bytes",
- "crc32fast",
- "futures",
- "futures-timer",
- "lazy_static",
- "lightning-containers",
- "log",
- "num_cpus",
- "parking_lot",
- "rand 0.10.0",
- "serde",
- "serde_cbor",
- "serde_json",
- "thread-id",
- "threadpool",
- "tokio",
- "tokio-stream",
- "tokio-util",
-]
-
-[[package]]
-name = "bifrost"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "async-std",
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_proc_macro 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
+ "bifrost_hasher",
+ "bifrost_plugins",
+ "bifrost_proc_macro",
  "byteorder",
  "bytes",
  "crc32fast",
@@ -325,28 +304,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bifrost_hasher"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
 dependencies = [
- "bifrost_hasher 0.1.0",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "bifrost_plugins"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
-dependencies = [
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
+ "bifrost_hasher",
  "quote",
  "syn 2.0.117",
 ]
@@ -354,16 +315,6 @@ dependencies = [
 [[package]]
 name = "bifrost_proc_macro"
 version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "bifrost_proc_macro"
-version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#70f062f8dfcf494cc5eed8c4e29a86769ed6991b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -690,6 +641,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-skiplist"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,9 +724,9 @@ name = "dovahkiin"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
+ "bifrost",
+ "bifrost_hasher",
+ "bifrost_plugins",
  "byteorder",
  "lazy_static",
  "log",
@@ -1602,7 +1563,7 @@ dependencies = [
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#ecf8ba629585f2b2fc98c9af65ebf886996ce961"
+source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#58637ffe69ec15e372f568efb6fb85b4dfc36be1"
 dependencies = [
  "affinity",
  "ahash",
@@ -1972,12 +1933,13 @@ name = "neb"
 version = "0.2.0"
 dependencies = [
  "ahash",
+ "arc-swap",
  "async-std",
  "async-trait",
- "bifrost 0.1.0",
- "bifrost_hasher 0.1.0",
- "bifrost_plugins 0.1.0",
- "bifrost_proc_macro 0.1.0",
+ "bifrost",
+ "bifrost_hasher",
+ "bifrost_plugins",
+ "bifrost_proc_macro",
  "bincode 2.0.1",
  "bincode_derive",
  "byteorder",
@@ -1987,6 +1949,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "crossbeam-epoch",
+ "crossbeam-skiplist",
  "dovahkiin",
  "env_logger",
  "futures",

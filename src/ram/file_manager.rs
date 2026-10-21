@@ -1,13 +1,17 @@
 use crate::ram::compression;
+use crate::ram::segs::ArchiveStagingPool;
 use std::fs::{self, create_dir_all, remove_file, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Unified file manager for segment file operations
 /// Centralizes all file path generation, directory management, and file I/O
 pub struct SegmentFileManager {
     backup_storage: Option<String>,
     wal_storage: Option<String>,
+    // Each chunk owns its file manager and one archive pool.
+    archive_staging: Arc<ArchiveStagingPool>,
 }
 
 impl SegmentFileManager {
@@ -15,7 +19,12 @@ impl SegmentFileManager {
         Self {
             backup_storage: backup_storage.map(|p| Self::normalize_path(&p)),
             wal_storage: wal_storage.map(|p| Self::normalize_path(&p)),
+            archive_staging: Arc::new(ArchiveStagingPool::default()),
         }
+    }
+
+    pub(crate) fn archive_staging_pool(&self) -> Arc<ArchiveStagingPool> {
+        Arc::clone(&self.archive_staging)
     }
 
     fn normalize_path(path: &str) -> String {
@@ -95,8 +104,19 @@ impl SegmentFileManager {
             let existing_len = file.metadata()?.len();
             if existing_len == 0 {
                 use std::io::Write;
-                file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))?;
-                file.sync_data()?;
+                if let Err(error) = file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))
+                {
+                    // This new file has no accepted records.
+                    std::fs::remove_file(&wal_path)?;
+                    return Err(error);
+                }
+                let started = std::time::Instant::now();
+                let result = file.sync_data();
+                crate::ram::segs::WAL_HEADER_SYNC_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                result?;
             } else {
                 // Appending framed records to an unframed log would leave one
                 // file holding two formats, and recovery would have to guess
@@ -289,7 +309,8 @@ impl SegmentFileManager {
         let mut wal_file = File::open(&wal_path)?;
         let mut wal_data = Vec::new();
         wal_file.read_to_end(&mut wal_data)?;
-        let outcome = crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
+        let outcome =
+            crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
         let image = outcome.image;
         let wal_size = image.len();
 
@@ -306,6 +327,10 @@ impl SegmentFileManager {
             }
         }
 
+        #[cfg(test)]
+        if crate::ram::segs::power_loss_model::wal_sync_fails(&Some(wal_path.clone())) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         backup_file.sync_all()?;
         Ok(true)
     }
@@ -341,7 +366,8 @@ impl SegmentFileManager {
         // a raw segment image -- which is what the unframed path did -- means
         // replaying bytes nothing can verify.
         {
-            let outcome = crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
+            let outcome =
+                crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
             if let crate::ram::wal_format::TailStop::Torn {
                 at_file_offset,
                 reason,
@@ -621,6 +647,60 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::TempDir;
+
+    #[test]
+    fn archive_staging_pools_are_chunk_local_and_release_with_the_store() {
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use std::time::{Duration, Instant};
+
+        let first = Chunks::new_dummy(2, 4 * SEGMENT_SIZE);
+        let second = Chunks::new_dummy(2, 4 * SEGMENT_SIZE);
+        let pools: Vec<_> = [&first, &second]
+            .into_iter()
+            .flat_map(|store| {
+                store
+                    .list
+                    .iter()
+                    .map(|chunk| chunk.file_manager.archive_staging_pool())
+            })
+            .collect();
+        for (index, pool) in pools.iter().enumerate() {
+            for other in &pools[index + 1..] {
+                assert!(
+                    !Arc::ptr_eq(pool, other),
+                    "each chunk must own a separate pool"
+                );
+            }
+        }
+        assert!(Arc::ptr_eq(
+            &pools[0],
+            &first.list[0].file_manager.archive_staging_pool()
+        ));
+        let weak: Vec<_> = pools.iter().map(Arc::downgrade).collect();
+        drop(pools);
+        first.stop_background();
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak[..2].iter().any(|pool| pool.strong_count() != 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            weak[..2].iter().all(|pool| pool.upgrade().is_none()),
+            "dropped store retained an archive pool"
+        );
+        assert!(
+            weak[2..].iter().all(|pool| pool.upgrade().is_some()),
+            "the other store lost its pools"
+        );
+        second.stop_background();
+        drop(second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak[2..].iter().any(|pool| pool.strong_count() != 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(weak.iter().all(|pool| pool.upgrade().is_none()));
+    }
 
     #[test]
     fn test_path_generation() {

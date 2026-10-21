@@ -135,3 +135,70 @@ deletion set was correct for the shared-leaf design and became a defect
 the moment ownership was made disjoint — an invariant that changed
 meaning under a refactor, which is exactly the class of thing a model
 catches and a test suite does not.
+
+## `HeadWordLock.tla` — cell words, write heads, the GC lock
+
+Covers the lock order of one chunk in `ram/chunk.rs`: the word lock of each
+cell (the mutex bit of its cell-index word), the head pool (one owner per
+head), the GC lock and transaction leases. The processes are head-first
+writers (writes, upserts, CAS), word-first updaters (`update_cell_by`),
+deletes, the cleaner and a transaction. `HeadWordLock.py` writes one MC
+module per scenario, runs TLC and compares each result with the expected
+one:
+
+```sh
+TLC=tlc python3 HeadWordLock.py --out /some/scratch/dir
+```
+
+| scenario | result |
+|---|---|
+| `old_k1`, `old_k2` | Deadlock. The delete order before e6a64539: the delete holds the word and waits for a head, the head owner waits for the word. |
+| `cur_*` | No error. The e6a64539 order: the delete releases the word before it waits for a head. |
+| `new_*` | No error. The current order: the delete reserves its tombstone under the word that checked the cell if a head is free; the try has a bound, then the e6a64539 path runs. |
+| `ctl_new_unbounded_try` | Deadlock, on purpose: the try without a bound is the old order again. |
+| `ctl_new_no_recheck` | `AppendUnderBoth` violated, on purpose: a word taken again after a wait must check the cell again. |
+| `full_old`, `full_cur`, `full_new` | No error. At a full store an absent cell or a false predicate gives "absent", never "no space". |
+| `new_u_bounded_c1`, `new_u_bounded_c1_k3` | No error. A word-first updater holds the word and waits for a head while every head owner waits for that word (cycle C1). The updater refuses at the head-queue deadline and releases the word. |
+| `cur_u_unbounded`, `new_u_unbounded` | Deadlock, on purpose: C1 without that deadline, which was the code before the C1 fix. |
+| `ctl_cas_unbounded_try` | Deadlock, on purpose: the CAS free-head try without its bound. |
+| `full_cas` | No error. At a full store a CAS on an absent cell (a lost CAS in the model) reports a mismatch, never "no space". |
+| `cas_wordfast_*` | No error. The current CAS order: check the version, write and publish under one word hold if a head is free; else the bounded try ends, the word is released, and the CAS checks again under a new hold after it gets a head. |
+
+## `SealReclaim.tla` — the seal job and the cleaner
+
+Covers one rotated segment in `ram/chunk.rs` (`finish_rotated_head`) and
+`ram/cleaner` (`Protection::blocks_cleaner`, `SegmentCandidate::for_cleaner`).
+The seal job drains the segment, syncs its WAL and archives it. A mostly
+dead segment first waits for the cleaner for a bounded number of attempts.
+The archive and the cleaner claim exclude each other.
+
+Two writers touch the segment. The first write is in flight at the rotation,
+and the drain waits for it. The second write is a late writer. It loaded the
+head before the rotation and owns it later, so it can start after the drain
+while the journal gate is open. The D46 review found this case (F1): with
+`e07b3561` the cleaner removed a synced segment under such a write, and the
+acknowledged cell was lost. The fix is `CloseGate`: the seal job closes the
+journal gate before the drain, and the gate never reopens
+(`Protection::rotated`). The model also has the WAL syncer, which needs
+`Protection::job`, and the other cleaner checks (owned head, pending journals,
+`wal_sync_queued`). The constant `OtherChecks` switches these checks off, to
+show what the seal rule alone guarantees.
+`SealReclaim.py` writes one cfg per scenario, runs TLC and compares each
+result with the expected one:
+
+```sh
+TLC=tlc python3 SealReclaim.py --out /some/scratch/dir
+```
+
+The model does not cover the gate reopen; the Rust control `gate_reopen` covers it.
+
+| scenario | result |
+|---|---|
+| `synced_wait` | No error. The current rule: the cleaner may take a seal-pending segment after the drain and the WAL sync; the gate is closed before the drain; the seal job waits for the cleaner at most `Waits` times, then archives. 67 distinct states. |
+| `synced_live` | No error. A segment that is not mostly dead is archived without a wait. |
+| `synced_rule_only` | No error. The same as `synced_wait`, with no other cleaner check: the seal rule and the gate close are enough. |
+| `d20` | No error. The rule of 15370976: the cleaner never takes a seal-pending segment. |
+| `ctl_synced_no_close` | `NoLostLateWrite` violated, on purpose: the `synced` rule without `CloseGate` (`e07b3561`). A late writer appends after the drain, and the cleaner removes the segment without the write. |
+| `ctl_none` | `NoLostLateWrite` violated, on purpose: no rule and no gate close (`441c1ff7`). |
+| `ctl_no_gate`, `ctl_no_gate_wait` | `NoLostWrite` violated, on purpose: without a rule and without other cleaner checks, the cleaner copies the segment before its in-flight write lands. |
+| `ctl_unbounded_wait` | `SealEnds` violated, on purpose: without the bound, a seal job waits forever for a cleaner that never reclaims. |

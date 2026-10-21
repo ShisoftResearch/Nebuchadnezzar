@@ -167,44 +167,69 @@ Worth a test if someone touches that path.
 
 ---
 
-## 7. `tests/storage_lock_process` has been dead since 2026-04-08
+## 7. RESOLVED: the storage-lock integration test passed an obsolete argument
 
-**Status: broken, cause known, not fixed.** `tests/storage_lock_process.rs`
-and `src/bin/neb_storage_lock_probe.rs`.
+**Status: resolved by the test correction on 2026-10-13.**
 
-Both tests in this binary fail, and have since 2026-04-08. Confirmed still
-failing on `.239` on 2026-08-26.
-
-**The defect.** The test spawns the probe with EIGHT arguments
-(`tests/storage_lock_process.rs:48-56`):
-
-```
-server_addr, group, database, backup, wal, undo, raft, HOLD_SECS
-```
-
-The probe parses SEVEN (`src/bin/neb_storage_lock_probe.rs:21-39`):
+**Read:** `src/bin/neb_storage_lock_probe.rs` accepts these arguments:
 
 ```
 server_addr, group_name, database_name, backup_storage, wal_storage,
 raft_storage, hold_secs
 ```
 
-There is no `undo` parameter on the probe side. So the probe reads
-`paths.undo` as its `raft_storage`, then reads `paths.raft` -- a path -- where
-`hold_secs` expects an integer, and exits before signalling ready. Both tests
-then fail at `wait_ready()`, at
-`storage_lock_process.rs:134:44` and `:171:44`.
+**Read:** The probe configures backup, WAL, and raft storage.
+`StorageDirectoryLocks::acquire_impl` locks those 3 storage directories.
+The test passed an unused undo path before the raft path.
+The probe then parsed the raft path as `hold_secs` and exited before `READY`.
+The correction removes the obsolete argument from both spawn sites and the unused fixture field.
+All existing assertions remain unchanged. No production code changes.
 
-**Why it stayed invisible for four months.** It is an integration binary.
-`cargo test --lib` -- the gate this project actually runs -- never builds or
-runs `tests/`, so a green lib suite says nothing about it. It is only visible
-to `cargo test` with no target filter, or `--test storage_lock_process`.
+**Observed:** The local baseline at Neb `ff29a266` failed both tests:
+0 passed, 2 failed, with exit status 64 and `invalid hold_secs`.
+The corrected target passed both tests: 2 passed, 0 failed in 8.38 s.
+Both runs used fresh temporary stores, a 24 GiB memory scope, and a 180 s timeout.
+Builds used the shared compile lock and an isolated target directory.
+Logs and source/binary identities are under
+`/mnt/ext/morpheus-fixes/storage-test-closure/`.
 
-**What would close it.** Decide which side is right. Either add an `undo`
-parameter to the probe in the correct position, or drop `.arg(&paths.undo)`
-from the spawn. The probe's own storage setup will say which one the storage
-lock actually needs; do not guess from the argument names.
+**Recommended final gate:** Include Neb's `--test storage_lock_process` target explicitly.
+Compile it with `cargo test --locked --test storage_lock_process --no-run` under the shared compile lock.
+Run its emitted test executable without the lock, with a bounded timeout in a 24 GiB memory scope.
+`cargo test --lib` does not run this integration target and cannot verify it.
 
-**Worth knowing generally:** whatever gate this project runs should include
-the integration binaries, or the next one to rot will also take months to
-notice.
+---
+
+## Startup trap in Lightning's RPC-client map (2026-10-09)
+
+**Status: open.** The H1 durability campaign records this finding only.
+The user excluded further investigation from this task.
+
+**Observed:** Two churn children exited during startup, before `SCANNED`.
+The kernel recorded a `trap stack segment` for each child:
+
+| Time (EDT) | PID | Binary | Offset | Churn cycle |
+|---|---:|---|---|---:|
+| 06:02:10 | 3890484 | `neb_crash_churn-fix` | `0x381bf2f` | 13 |
+| 06:08:09 | 3917855 | `neb_crash_churn-continue-head` | `0x381bb2f` | 5 |
+
+**Observed:** `addr2line -f -C` resolved both offsets to
+`lightning::map::base::Table::copy_slab_range`.
+The table stores `Arc<bifrost::rpc::RPCClient>` values through
+`lightning::map::ptr_map::PtrValAttachment`.
+The symbol lookup did not supply a source line.
+This identifies the instruction location. It does not establish the cause.
+
+**Observed:** The preceding 12 and 4 cycles reported `torn=0`.
+Neither campaign completed 100 cycles.
+The failed stores remain available for a separate investigation.
+
+Evidence is under `/mnt/ext/morpheus-fixes/txn-fix/`:
+
+- `runs/continue-startup-trap-kernel.txt`: kernel messages.
+- `runs/continue-startup-trap-symbol-{old,head}.txt`: symbol lookup results.
+- `churn-capacity/run.out`: cycle 13 stopped before `SCANNED`.
+- `churn-final/run.out`: cycle 5 stopped before `SCANNED`.
+- `churn-capacity/data` and `churn-final/data`: failed stores.
+
+No Lightning or bifrost code changed for this finding.

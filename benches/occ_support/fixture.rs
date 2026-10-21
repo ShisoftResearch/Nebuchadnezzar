@@ -81,16 +81,20 @@ pub struct OccFixture {
 
 impl OccFixture {
     pub async fn single(address: impl Into<String>, group: impl Into<String>) -> Self {
+        Self::single_with_options(address, group, benchmark_server_options()).await
+    }
+
+    pub async fn single_with_options(
+        address: impl Into<String>,
+        group: impl Into<String>,
+        options: ServerOptions,
+    ) -> Self {
         let address = address.into();
         let group = group.into();
-        let server = NebServer::new_from_opts(
-            &benchmark_server_options(),
-            address.as_str(),
-            group.as_str(),
-            async |_| {},
-        )
-        .await
-        .expect("start OCC benchmark server");
+        let server =
+            NebServer::new_from_opts(&options, address.as_str(), group.as_str(), async |_| {})
+                .await
+                .expect("start OCC benchmark server");
         Self::finish(vec![server], vec![address], group).await
     }
 
