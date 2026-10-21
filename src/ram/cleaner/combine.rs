@@ -696,6 +696,12 @@ impl CombinedCleaner {
         if segments.is_empty() {
             return (0, 0);
         }
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+        info!(
+            "TRACE combine chunk {} segments {:?}",
+            chunk.id,
+            segments.iter().map(|seg| seg.id).collect::<Vec<_>>()
+        );
 
         let space_to_collect;
         let segment_ids_to_combine: HashSet<_>;

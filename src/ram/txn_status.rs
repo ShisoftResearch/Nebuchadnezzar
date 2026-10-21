@@ -259,6 +259,14 @@ impl TxnStatusRegistry {
         let mut state = crate::profile_lock!(H09, self.live.get(txn)?);
         let entry = state.take()?;
         Self::release_id(&self.ids, entry.id.bits());
+        // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+        log::info!(
+            "TRACE status entry removed {:?} participants {:?} synced peers {:?} self synced {}",
+            txn,
+            entry.participants,
+            entry.synced_peers,
+            entry.self_synced
+        );
         Some(entry)
     }
 

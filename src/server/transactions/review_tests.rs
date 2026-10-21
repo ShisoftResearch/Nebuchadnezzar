@@ -20,10 +20,27 @@ fn review_options(dir: &std::path::Path, tiered: bool) -> ServerOptions {
     }
 }
 
+/// One address per store: a restart of the same raft storage reuses it (a store
+/// reopened under another address is the explicit restore, not a restart). The
+/// address is kept in a file of the store, because a killed child process and
+/// the test that restarts its store do not share memory.
+fn review_address(opts: &ServerOptions) -> String {
+    let raft = std::path::PathBuf::from(opts.raft_storage.clone().unwrap_or_default());
+    let root = raft.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let file = root.join("review-address.txt");
+    if let Ok(address) = std::fs::read_to_string(&file) {
+        return address;
+    }
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let _ = std::fs::create_dir_all(&root);
+    std::fs::write(&file, &address).unwrap();
+    address
+}
+
 async fn review_server(opts: &ServerOptions, group: &str) -> Arc<NebServer> {
     let server = NebServer::new_from_opts(
         opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &review_address(opts),
         group,
         async |_| {},
     )

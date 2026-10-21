@@ -131,8 +131,6 @@ class Process:
         self.stderr = (gate.root / f'{role}-{index}-{generation}.stderr').open('w')
         env = os.environ.copy()
         env['NEB_TXN_LEASE_TIMEOUT_SECS'] = str(gate.args.lease_secs)
-        if gate.args.no_orphan_adoption:
-            env['MULTISITE_NO_ORPHAN_ADOPTION'] = '1'
         env.update(MULTISITE_ROUTES=gate.routes(index), NEB_DISABLE_JOIN_FILL='1',
                    RUST_BACKTRACE='1', RUST_LOG=os.environ.get('RUST_LOG','warn'), MULTISITE_EVENTS=str(gate.root / f'protocol-{index}.jsonl'),
                    MULTISITE_CONTROL=str(gate.root / f'control-{index}'))
@@ -576,10 +574,25 @@ class Gate:
         if self.args.link_delay:
             for proxy in self.proxies.values():
                 proxy.delay = self.args.link_delay
-        for index in range(self.args.members):
-            self.start(index)
+        if self.args.probe == 'ring-stale':
+            # Test arm (kind kill): the first reads of the group after a notice
+            # answer an older version, as a member that lags behind. Control arm
+            # (kind graceful): no injection. The last member joins afterwards.
+            for index in range(self.args.members - 1):
+                self.start(index)
+            if self.args.kind == 'kill':
+                for index in range(self.args.members - 1):
+                    (self.root/f'control-{index}'/'stale-ring-reads').write_text('3')
+                time.sleep(1)
+            self.start(self.args.members - 1)
+        else:
+            for index in range(self.args.members):
+                self.start(index)
         for proxy in self.proxies.values():
             proxy.delay = 0
+        if self.args.probe.startswith('raft-'):
+            from raft_probe import run
+            return run(self)
         client = self.client()
         assert client.command({'op':'setup'})['ok']
         if not self.args.no_refresh:
@@ -616,7 +629,7 @@ class Gate:
             assert second['outcome'] == 'ack', ('cell stays locked', report)
             (self.root/'PASS').write_text('cut-prepare probe passed\n')
             return
-        if self.args.probe == 'ring':
+        if self.args.probe in ('ring', 'ring-stale'):
             time.sleep(self.args.settle)
             report = {}
             for index in range(self.args.members):
@@ -634,6 +647,26 @@ class Gate:
             holes = {i:h for i,h in holes.items() if h}
             assert not holes, ('member view incomplete after start', holes)
             (self.root/'PASS').write_text('ring probe passed\n')
+            return
+        if self.args.probe == 'torn':
+            # Member 1 prepares, then the coordinator (member 2) is cut off. Member 1 must ask member 2.
+            request = {'op':'txn','id':'torn','keys':[[92,8000],[93,8000]],'value':8,'coordinator':2,'durable':self.args.durable}
+            self.arm(1, 'after_p0')
+            client.send(request)
+            self.wait_pause(1, 'after_p0')
+            self.set_links(2, cut=True)
+            (self.root/'control-1'/'resume').touch()
+            time.sleep(self.args.cut_hold)
+            self.set_links(2, cut=False)
+            result = self.collect(client, request, {'event':'torn'})
+            time.sleep(self.args.lease_secs+40)
+            observed = client.command({'op':'read','keys':request['keys']})['values']
+            status = {i: client.command({'op':'status','site':i,'tid':self.tids['torn']},60)['status'] for i in range(self.args.members)}
+            report = {'result':result,'observed':observed,'status':status}
+            (self.root/'probe-torn.json').write_text(json.dumps(report,indent=2))
+            check_transaction(request, result, observed)
+            assert 'InDoubt' not in status.values() and 'Committing' not in status.values(), ('stuck', report)
+            (self.root/'PASS').write_text('torn probe passed\n')
             return
         if self.args.probe == 'point-stop':
             victim, point = self.args.victim, self.args.cut_point
@@ -835,10 +868,9 @@ def main():
     parser.add_argument('--events', type=int, default=200)
     parser.add_argument('--durable', action='store_true')
     parser.add_argument('--no-faults', action='store_true')
-    parser.add_argument('--probe', choices=['none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring'], default='none')
+    parser.add_argument('--probe', choices=['raft-seed','raft-heartbeat','raft-roster','raft-rejoin','ring-stale','none','readonly','readonly-control','readonly-e2e','restart','cut-prepare','abandon','partial-abort','point-stop','ring','torn'], default='none')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--safe-stops', action='store_true')
-    parser.add_argument('--no-orphan-adoption', action='store_true')
     parser.add_argument('--cut-after', type=float, default=.05)
     parser.add_argument('--cut-point', default='')
     parser.add_argument('--cut-hold', type=float, default=5)

@@ -4476,7 +4476,7 @@ mod tests {
         let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
             .await
             .unwrap();
-        let client = server.data_client(&vec![addr]).await.unwrap();
+        let client = server.data_client(&vec![addr.clone()]).await.unwrap();
         let mut old = crate::index::hash::hash_index_schema();
         old.app_meta.clear();
         old.fields = Field::new_schema(vec![
@@ -4501,7 +4501,7 @@ mod tests {
             opts.index_enabled = index_enabled;
             let result = NebServer::new_from_opts(
                 &opts,
-                &crate::utils::test_port::unique_localhost_addr(),
+                &addr,
                 &group,
                 async |_| {},
             )
@@ -4775,7 +4775,7 @@ mod tests {
             let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
                 .await
                 .unwrap();
-            let client = server.data_client(&vec![addr]).await.unwrap();
+            let client = server.data_client(&vec![addr.clone()]).await.unwrap();
             let mut old = crate::index::hash::hash_index_schema();
             // Keep the current fields but persist the wrong physical version.
             let old = Schema::new_with_id(
@@ -4795,7 +4795,7 @@ mod tests {
                 opts.index_enabled = index_enabled;
                 let result = NebServer::new_from_opts(
                     &opts,
-                    &crate::utils::test_port::unique_localhost_addr(),
+                    &addr,
                     &group,
                     async |_| {},
                 )
@@ -4831,7 +4831,7 @@ mod tests {
         let server = NebServer::new_from_opts(&opts, &addr, &group, async |_| {})
             .await
             .unwrap();
-        let client = server.data_client(&vec![addr]).await.unwrap();
+        let client = server.data_client(&vec![addr.clone()]).await.unwrap();
         let old = Schema::new_with_id(
             crate::index::hash::HASH_INDEX_SCHEMA_V1_ID.get(),
             "HASH_INDEX_SCHEMA",
@@ -4882,7 +4882,7 @@ mod tests {
         opts.services = vec![Service::Cell, Service::RangedIndexer];
         let result = NebServer::new_from_opts(
             &opts,
-            &crate::utils::test_port::unique_localhost_addr(),
+            &addr,
             &group,
             async |_| {},
         )

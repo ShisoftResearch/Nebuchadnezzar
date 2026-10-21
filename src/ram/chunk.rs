@@ -5792,6 +5792,11 @@ impl Chunks {
     ) {
         brackets.committed.clear();
         for found in std::mem::take(&mut brackets.status_cells) {
+            // Trace for the open torn-batch item (FIX_graceful_prepare.md).
+            info!(
+                "TRACE recovered status cell registered {:?} participants {:?}",
+                found.txn, found.participants
+            );
             self.txn_status.register(
                 found.txn,
                 crate::ram::txn_status::StatusEntry {

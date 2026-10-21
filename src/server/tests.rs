@@ -1278,11 +1278,12 @@ pub async fn schema_persistence_multiple_restarts() {
 
     let server_group = String::from("multi_restart_test");
 
+    // The store belongs to one address; reopening it under another address
+    // is the explicit restore (`NebServer::restore_from_opts`).
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     for restart_num in 1..=3 {
         info!("=== RESTART CYCLE {} ===", restart_num);
 
-        // Use a unique port for each cycle to avoid "Address already in use" errors
-        let server_addr = crate::utils::test_port::unique_localhost_addr();
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1353,7 +1354,6 @@ pub async fn schema_persistence_multiple_restarts() {
     // Final verification: restart one more time and check all schemas exist
     info!("=== FINAL VERIFICATION ===");
     {
-        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -2184,10 +2184,15 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
     drop(dynamic);
     drop(server);
 
-    let server = NebServer::new_from_opts(
+    // The second start uses another address. That is the explicit restore: it
+    // makes the new address the only voter of the stored configuration and
+    // re-points the slots of the old identity (nothing of this runs
+    // automatically).
+    let server = NebServer::restore_from_opts(
         &opts,
         &crate::utils::test_port::unique_localhost_addr(),
         group,
+        false,
         async |_| {},
     )
     .await
@@ -2214,6 +2219,234 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
         missing.len()
     );
     server.shutdown().await;
+}
+
+/// B part 1: a store reopened under another address does not start by itself
+/// (no automatic adoption of its slots), and it does not start empty. The start
+/// ends with a typed error. The explicit restore starts it, and the cell that
+/// was written under the old address reads back.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_reopened_under_a_new_address_needs_the_explicit_restore() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "restore_new_address_group";
+    const SCHEMA: u32 = 9181;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA,
+            "restore_new_address_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        )
+    };
+    let id = Id::allocated(1, 7, 1);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    server.meta().schemas.register_internal_schema(schema());
+    let mut cell = {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(77);
+        OwnedCell::new_with_id(SchemaVid(SCHEMA), &id, value)
+    };
+    server.chunks().write_cell(&mut cell).expect("write");
+    server.shutdown().await;
+    drop(server);
+
+    let other = crate::utils::test_port::unique_localhost_addr();
+    // Control: without the restore the start fails with an error. It is not an
+    // empty start and not a silent re-pointing of the slots.
+    let refused = NebServer::new_from_opts(&opts, &other, group, async |_| {}).await;
+    assert!(
+        refused.is_err(),
+        "a store of another address started without the explicit restore"
+    );
+    drop(refused);
+
+    let restored = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {})
+        .await
+        .expect("the explicit restore starts the store under the new address");
+    restored.meta().schemas.register_internal_schema(schema());
+    let value = restored.chunks().read_cell(&id).expect("the cell reads back").to_owned();
+    assert_eq!(value.data["DATA"].u64().copied(), Some(77));
+    restored.shutdown().await;
+}
+
+/// Opens a store, writes one cell, closes it. Returns the options and the id.
+#[cfg(target_os = "linux")]
+async fn a_closed_store_with_one_cell(
+    dir: &tempfile::TempDir,
+    group: &str,
+    schema_id: u32,
+    disable_storage_locks: bool,
+) -> (ServerOptions, Id, String) {
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks,
+    };
+    let schema = Schema::new_with_id(
+        schema_id,
+        "restore_store_schema",
+        None,
+        Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+        false,
+        false,
+    );
+    let id = Id::allocated(1, 7, 1);
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+        .await
+        .unwrap();
+    server.meta().schemas.register_internal_schema(schema);
+    let mut value = OwnedValue::Map(OwnedMap::new());
+    value["DATA"] = OwnedValue::U64(77);
+    let mut cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
+    server.chunks().write_cell(&mut cell).expect("write");
+    server.shutdown().await;
+    drop(server);
+    (opts, id, address)
+}
+
+/// IC2: the restore takes the storage locks before it writes the raft store.
+/// A live server that holds the store makes the restore fail, and the raft
+/// store stays as it was.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_restore_refuses_a_store_that_a_live_server_holds() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::TempDir::new().unwrap();
+    let group = "restore_locked_group";
+    let (opts, _id, live_addr) = a_closed_store_with_one_cell(&dir, group, 9182, false).await;
+    let live = NebServer::new_from_opts(&opts, &live_addr, group, async |_| {})
+        .await
+        .unwrap();
+    let before = dir_digest(&dir.path().join("raft"));
+    let other = crate::utils::test_port::unique_localhost_addr();
+    let refused = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {}).await;
+    assert!(
+        matches!(refused, Err(ServerError::CannotAcquireStorageLock(_))),
+        "the restore ran on a store that a live server holds"
+    );
+    drop(refused);
+    assert_eq!(
+        before,
+        dir_digest(&dir.path().join("raft")),
+        "the refused restore changed the raft store"
+    );
+    live.shutdown().await;
+}
+
+/// IC4: a restore that stopped after the raft step and before the slot step
+/// completes on the second run. The first step is run alone here, as a stop
+/// between the two steps leaves it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_that_stopped_halfway_completes_on_the_second_run() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::TempDir::new().unwrap();
+    let group = "restore_halfway_group";
+    const SCHEMA: u32 = 9183;
+    let (opts, id, old_address) = a_closed_store_with_one_cell(&dir, group, SCHEMA, true).await;
+    let other = crate::utils::test_port::unique_localhost_addr();
+    let layout = database::DatabaseStorageLayout::from_options(&opts, group, group);
+    let removed = raft::restore_sole_voter(
+        raft_storage_for_layout(&layout),
+        &other,
+        raft::DEFAULT_SERVICE_ID,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.iter().any(|plane| !plane.removed.is_empty()),
+        "test setup: the first step must remove the old voter"
+    );
+    let restored = NebServer::restore_from_opts(&opts, &other, group, false, async |_| {})
+        .await
+        .expect("the second run completes the restore");
+    // The slot step: every slot names the new server, none names the old one.
+    // (The cell read below goes through the local chunk and does not use the
+    // table, so it cannot show this step.)
+    let (table, _) = crate::slots::load_owner_vec(
+        &restored.group_name,
+        &restored.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .unwrap();
+    let table = table.expect("the store has a slot placement table");
+    let heir = bifrost_hasher::hash_str(&other);
+    let old = bifrost_hasher::hash_str(&old_address);
+    assert!(
+        table.iter().all(|owner| *owner != old),
+        "a slot still names the old server"
+    );
+    assert!(
+        table.iter().filter(|owner| **owner == heir).count() > 0
+            && table.iter().all(|owner| *owner == 0 || *owner == heir),
+        "not every slot names the new server"
+    );
+    restored.meta().schemas.register_internal_schema(Schema::new_with_id(
+        SCHEMA,
+        "restore_store_schema",
+        None,
+        Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+        false,
+        false,
+    ));
+    let value = restored.chunks().read_cell(&id).expect("the cell reads back").to_owned();
+    assert_eq!(value.data["DATA"].u64().copied(), Some(77));
+    restored.shutdown().await;
+}
+
+/// A cheap digest of a directory tree: names and sizes.
+#[cfg(target_os = "linux")]
+fn dir_digest(path: &std::path::Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    fn walk(path: &std::path::Path, out: &mut Vec<(String, u64)>) {
+        if let Ok(read) = std::fs::read_dir(path) {
+            for entry in read.flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((entry.path().to_string_lossy().to_string(), meta.len()));
+                }
+            }
+        }
+    }
+    walk(path, &mut out);
+    out.sort();
+    out
 }
 
 /// The indexed sibling of the restart test above: the RANGED INDEX of a
@@ -2294,9 +2527,10 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2384,7 +2618,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2515,9 +2749,10 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         count
     }
 
+    let address = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )
@@ -2577,7 +2812,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
 
     let server = NebServer::new_from_opts(
         &opts,
-        &crate::utils::test_port::unique_localhost_addr(),
+        &address,
         group,
         async |_| {},
     )

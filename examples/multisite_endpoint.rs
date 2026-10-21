@@ -62,6 +62,23 @@ async fn main() {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = interval.tick() => {
+                    #[cfg(multisite_test)]
+                    {
+                        if control.join("raft-state").exists() {
+                            let mut state = server.raft_service.msraft_diagnostic().await;
+                            state["cached_leader"] = json!(server.raft_client.msraft_cached_leader());
+                            std::fs::write(control.join("raft-state.out.tmp"), state.to_string()).unwrap();
+                            std::fs::rename(control.join("raft-state.out.tmp"), control.join("raft-state.out")).unwrap();
+                            std::fs::remove_file(control.join("raft-state")).unwrap();
+                        }
+                        if let Ok(count) = std::fs::read_to_string(control.join("stale-ring-reads")) {
+                            server.conshash().inject_stale_reads(count.trim().parse().unwrap());
+                            std::fs::remove_file(control.join("stale-ring-reads")).unwrap();
+                        }
+                        if let Ok(target) = std::fs::read_to_string(control.join("direct-ping")) {
+                            bifrost::membership::msraft_ping(&target, server.server_id).await;
+                        }
+                    }
                     if let Ok(data) = std::fs::read(control.join("ring")) {
                         let addresses: Vec<String> = serde_json::from_slice(&data).unwrap();
                         let known: Vec<Value> = addresses.iter().map(|address| json!({

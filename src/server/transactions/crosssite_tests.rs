@@ -1392,6 +1392,76 @@ async fn a_refused_close_survives_a_power_cut_of_the_refusing_site() {
     cluster.shutdown().await;
 }
 
+/// Observed in the campaign (K-G3n, K-G3d, K-X3n, D19): a graceful stop of a
+/// participant closes the client writes first (`NebServer::shutdown`). A close
+/// that arrives after it cannot write the status cell (`ServerShuttingDown`),
+/// the site keeps the transaction decided in memory only, and the other site
+/// commits. After the restart the stopped site must resolve COMMIT from its
+/// open bracket and its peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_refused_by_a_graceful_stop_commits_after_the_restart() {
+    let (mut cluster, client) = Cluster::start("crosssite_stop_refused_close").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 19_000, 1).await;
+    drop(client);
+    cluster.site(B).chunks().close_client_writes();
+    let result = txn.commit(tid.clone()).await;
+    assert!(
+        matches!(result, Ok(Ok(EndResult::Success))),
+        "A committed, so the client must hear `Success`, not {:?}",
+        result
+    );
+    assert_ne!(
+        cluster.site(B).chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "test setup: site B must have refused its close"
+    );
+    cluster.restart(B).await;
+    assert_all_or_nothing(&cluster, &ids, &scores, "close refused by the stop of B");
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "the transaction must be committed on both sites");
+    cluster.shutdown().await;
+}
+
+/// A graceful stop of a participant that holds a prepared transaction must
+/// not apply it. The coordinator has not decided, so the prepared cells stay
+/// invisible on B until the decision arrives (D19).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_stop_does_not_apply_a_prepared_transaction() {
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "1");
+    let (mut cluster, client) = Cluster::start("crosssite_stop_prepared").await;
+    let (_txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 20_000, 1).await;
+    drop(client);
+    cluster.restart(B).await;
+    // Site A still holds its prepared half in memory, so only B is checked.
+    let (_a, b) = halves(&cluster, &ids, &scores);
+    assert!(
+        !b,
+        "nobody decided {:?}, yet B shows the new value after its restart",
+        tid
+    );
+    cluster.shutdown().await;
+}
+
+/// Control: the same transaction and the same restart of B, without the early
+/// close of the client writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_a_close_before_a_graceful_stop_commits_after_the_restart() {
+    let (mut cluster, client) = Cluster::start("crosssite_stop_open_close").await;
+    let (txn, tid, ids, scores) = prepared_transaction(&cluster, &client, 19_500, 1).await;
+    drop(client);
+    let result = txn.commit(tid.clone()).await;
+    assert!(
+        matches!(result, Ok(Ok(EndResult::Success))),
+        "{:?}",
+        result
+    );
+    cluster.restart(B).await;
+    assert_all_or_nothing(&cluster, &ids, &scores, "control: close before the stop of B");
+    let (a, b) = halves(&cluster, &ids, &scores);
+    assert!(a && b, "the transaction must be committed on both sites");
+    cluster.shutdown().await;
+}
+
 /// A status cell inside an open bracket decides it at the start: B's close
 /// is refused after B wrote its status cell, the group sync takes the cell
 /// to disk, and B loses power while A is silent. B commits from its own

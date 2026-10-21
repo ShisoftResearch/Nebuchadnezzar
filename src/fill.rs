@@ -167,6 +167,12 @@ impl crate::server::NebServer {
         if !self.raft_service.is_leader_for_real().await {
             return Err("not the placement leader; the leader runs the fill".to_string());
         }
+        // The fill reads the placement and the migration freeze from any
+        // member. Another client may have written them a moment ago (the
+        // operator thaws the migrations, then calls the fill). Raise the read
+        // cursor of this client to the position of the raft leader first, so
+        // that no lagging follower serves the inputs (IC7).
+        self.neb_client.raft_client.refresh_leader(0).await;
 
         let members: Vec<u64> = self
             .membership

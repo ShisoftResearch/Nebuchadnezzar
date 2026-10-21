@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-names = ['multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring']
+names = ['multisite_stale_ring_probe', 'multisite_raft_seed', 'multisite_raft_heartbeat', 'multisite_raft_roster', 'multisite_raft_rejoin', 'multisite_readonly', 'multisite_readonly_control', 'multisite_controller', 'multisite_smoke_3', 'multisite_smoke_5', 'multisite_seed_restart_2', 'multisite_restart_probe', 'multisite_readonly_e2e', 'multisite_mixed_3', 'multisite_mixed_5', 'multisite_cut_prepare', 'multisite_abandon', 'multisite_partial_abort', 'multisite_point_stop', 'multisite_ring', 'multisite_torn']
 if '--list' in sys.argv:
     for name in names:
         print(name + ': test')
@@ -20,6 +20,11 @@ else:
             '--head',os.environ['MULTISITE_HEAD'],'--output',str(Path(os.environ['MULTISITE_OUTPUT'])/name),
             '--members',str(members),'--events',os.environ.get('MULTISITE_EVENTS_COUNT','2'),
             '--port',os.environ.get('MULTISITE_PORT','46100')]
+    if name.startswith('multisite_raft_'):
+        args += ['--probe', name.replace('multisite_', '').replace('_', '-'),
+                 '--kind', os.environ.get('MSRAFT_ARM', 'kill')]
+        if name == 'multisite_raft_seed':
+            args[args.index('--members')+1] = '2'
     if name == 'multisite_restart_probe':
         members = int(os.environ.get('MULTISITE_MEMBERS', '2'))
         args[args.index('--members')+1] = str(members)
@@ -28,6 +33,10 @@ else:
     if name == 'multisite_cut_prepare':
         args += ['--probe','cut-prepare','--cut-after',os.environ.get('MULTISITE_CUT_AFTER','0.05'),
                  '--cut-point',os.environ.get('MULTISITE_CUT_POINT',''),'--cut-hold',os.environ.get('MULTISITE_CUT_HOLD','5'),'--cut-member',os.environ.get('MULTISITE_CUT_MEMBER','-1'),'--wait',os.environ.get('MULTISITE_WAIT','0')]
+    if name == 'multisite_torn':
+        args += ['--probe','torn','--link-delay',os.environ.get('MULTISITE_LINK_DELAY','0')]
+    if name == 'multisite_stale_ring_probe':
+        args += ['--probe','ring-stale','--kind',os.environ.get('MSRAFT_ARM','kill'),'--settle',os.environ.get('MULTISITE_SETTLE','20')]
     if name == 'multisite_ring':
         args += ['--probe','ring','--members',os.environ.get('MULTISITE_MEMBERS','3'),'--settle',os.environ.get('MULTISITE_SETTLE','20'),'--link-delay',os.environ.get('MULTISITE_LINK_DELAY','0')]
     if name == 'multisite_point_stop':
@@ -61,8 +70,6 @@ else:
         args.append('--seed-stop-only')
     if os.environ.get('MULTISITE_SAFE_STOPS') == '1':
         args.append('--safe-stops')
-    if os.environ.get('MULTISITE_NO_ORPHAN_ADOPTION') == '1':
-        args.append('--no-orphan-adoption')
     if os.environ.get('MULTISITE_NO_REFRESH') == '1':
         args.append('--no-refresh')
     if os.environ.get('MULTISITE_NO_SEED_STOP') == '1':
