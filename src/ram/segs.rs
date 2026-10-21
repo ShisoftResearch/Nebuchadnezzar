@@ -2247,7 +2247,7 @@ impl Segment {
             return Ok(ArchiveOutcome::Refused);
         }
         let manager = self.file_state.lock().manager.clone();
-        let staging = manager.archive_staging_pool(self.chunk_id).acquire();
+        let staging = manager.archive_staging_pool().acquire();
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -4312,17 +4312,18 @@ mod tests {
     #[test]
     fn archive_staging_capacity_is_independent_between_chunks_and_stores() {
         let first_store = Arc::new(SegmentFileManager::new(None, None));
+        let other_chunk = Arc::new(SegmentFileManager::new(None, None));
         let second_store = Arc::new(SegmentFileManager::new(None, None));
-        let saturated = first_store.archive_staging_pool(0);
+        let saturated = first_store.archive_staging_pool();
         // D106 restores the shared cap. Leave headroom for two other owners;
         // saturation of the process budget must block every owner.
         let held: Vec<_> = (0..2).map(|_| saturated.acquire()).collect();
-        assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool(0)));
+        assert!(Arc::ptr_eq(&saturated, &first_store.archive_staging_pool()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = first_store.clone();
+        let worker = other_chunk;
         let thread = std::thread::spawn(move || {
-            let _other_chunk = worker.archive_staging_pool(1).acquire();
-            let _other_store = second_store.archive_staging_pool(0).acquire();
+            let _other_chunk = worker.archive_staging_pool().acquire();
+            let _other_store = second_store.archive_staging_pool().acquire();
             done_tx.send(()).unwrap();
         });
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -4335,21 +4336,25 @@ mod tests {
     fn archive_staging_total_across_chunks_and_two_stores_is_32_mib() {
         use std::sync::mpsc;
         use std::time::Duration;
-        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let stores: [Vec<_>; 2] = std::array::from_fn(|_| {
+            (0..64)
+                .map(|_| Arc::new(SegmentFileManager::new(None, None)))
+                .collect()
+        });
         let mut held = Vec::new();
         let mut addresses = std::collections::HashSet::new();
         for chunk in 0..4 {
-            let pool = stores[chunk % 2].archive_staging_pool(chunk);
+            let pool = stores[chunk % 2][chunk / 2].archive_staging_pool();
             held.push(pool.acquire());
             addresses.insert(held.last().unwrap().buffer.as_ref().unwrap().as_ptr() as usize);
         }
         assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
-        let extra_store = Arc::clone(&stores[1]);
+        let extra_chunk = Arc::clone(&stores[1][49]);
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let buffer = extra_store.archive_staging_pool(99).acquire();
+            let buffer = extra_chunk.archive_staging_pool().acquire();
             acquired_tx.send(buffer.buffer.as_ref().unwrap().as_ptr() as usize).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4367,7 +4372,7 @@ mod tests {
         // Retain every per-chunk pool while cycling owners. Idle memory must
         // share the same four buffers, rather than growing by owner count.
         for chunk in 4..128 {
-            let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+            let guard = stores[chunk % 2][chunk / 2].archive_staging_pool().acquire();
             addresses.insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
         }
         assert_eq!(addresses.len() * SEGMENT_SIZE, 32 * 1024 * 1024);
@@ -4376,7 +4381,11 @@ mod tests {
     #[test]
     fn concurrent_archive_owners_share_four_buffers_and_wake_after_release() {
         use std::sync::atomic::AtomicUsize;
-        let stores = [Arc::new(SegmentFileManager::new(None, None)), Arc::new(SegmentFileManager::new(None, None))];
+        let stores: [Vec<_>; 2] = std::array::from_fn(|_| {
+            (0..16)
+                .map(|_| Arc::new(SegmentFileManager::new(None, None)))
+                .collect()
+        });
         let active = AtomicUsize::new(0);
         let addresses = parking_lot::Mutex::new(std::collections::HashSet::new());
         std::thread::scope(|scope| {
@@ -4386,7 +4395,7 @@ mod tests {
                 let addresses = &addresses;
                 scope.spawn(move || {
                     for _ in 0..8 {
-                        let guard = stores[chunk % 2].archive_staging_pool(chunk).acquire();
+                        let guard = stores[chunk % 2][chunk / 2].archive_staging_pool().acquire();
                         assert!(active.fetch_add(1, SeqCst) < 4);
                         addresses.lock().insert(guard.buffer.as_ref().unwrap().as_ptr() as usize);
                         std::thread::yield_now();

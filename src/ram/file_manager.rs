@@ -1,6 +1,5 @@
 use crate::ram::compression;
 use crate::ram::segs::ArchiveStagingPool;
-use lightning::map::PtrHashMap;
 use std::fs::{self, create_dir_all, remove_file, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +10,8 @@ use std::sync::Arc;
 pub struct SegmentFileManager {
     backup_storage: Option<String>,
     wal_storage: Option<String>,
-    archive_staging: PtrHashMap<usize, Arc<ArchiveStagingPool>>,
+    // Each chunk owns its file manager and one archive pool.
+    archive_staging: Arc<ArchiveStagingPool>,
 }
 
 impl SegmentFileManager {
@@ -19,12 +19,12 @@ impl SegmentFileManager {
         Self {
             backup_storage: backup_storage.map(|p| Self::normalize_path(&p)),
             wal_storage: wal_storage.map(|p| Self::normalize_path(&p)),
-            archive_staging: PtrHashMap::with_capacity(16),
+            archive_staging: Arc::new(ArchiveStagingPool::default()),
         }
     }
 
-    pub(crate) fn archive_staging_pool(&self, chunk: usize) -> Arc<ArchiveStagingPool> {
-        crate::utils::keyed_state::get_or_insert(&self.archive_staging, chunk, || Arc::new(ArchiveStagingPool::default()))
+    pub(crate) fn archive_staging_pool(&self) -> Arc<ArchiveStagingPool> {
+        Arc::clone(&self.archive_staging)
     }
 
     fn normalize_path(path: &str) -> String {
@@ -647,6 +647,60 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::TempDir;
+
+    #[test]
+    fn archive_staging_pools_are_chunk_local_and_release_with_the_store() {
+        use crate::ram::chunk::Chunks;
+        use crate::ram::segs::SEGMENT_SIZE;
+        use std::time::{Duration, Instant};
+
+        let first = Chunks::new_dummy(2, 4 * SEGMENT_SIZE);
+        let second = Chunks::new_dummy(2, 4 * SEGMENT_SIZE);
+        let pools: Vec<_> = [&first, &second]
+            .into_iter()
+            .flat_map(|store| {
+                store
+                    .list
+                    .iter()
+                    .map(|chunk| chunk.file_manager.archive_staging_pool())
+            })
+            .collect();
+        for (index, pool) in pools.iter().enumerate() {
+            for other in &pools[index + 1..] {
+                assert!(
+                    !Arc::ptr_eq(pool, other),
+                    "each chunk must own a separate pool"
+                );
+            }
+        }
+        assert!(Arc::ptr_eq(
+            &pools[0],
+            &first.list[0].file_manager.archive_staging_pool()
+        ));
+        let weak: Vec<_> = pools.iter().map(Arc::downgrade).collect();
+        drop(pools);
+        first.stop_background();
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak[..2].iter().any(|pool| pool.strong_count() != 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            weak[..2].iter().all(|pool| pool.upgrade().is_none()),
+            "dropped store retained an archive pool"
+        );
+        assert!(
+            weak[2..].iter().all(|pool| pool.upgrade().is_some()),
+            "the other store lost its pools"
+        );
+        second.stop_background();
+        drop(second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak[2..].iter().any(|pool| pool.strong_count() != 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(weak.iter().all(|pool| pool.upgrade().is_none()));
+    }
 
     #[test]
     fn test_path_generation() {
