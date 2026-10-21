@@ -116,3 +116,9 @@ harness = false
 [[bench]]
 name = "index_write_path"
 harness = false
+
+[patch."https://github.com/shisoft/bifrost"]
+bifrost = { path = "../bifrost" }
+bifrost_plugins = { path = "../bifrost/src/plugins" }
+bifrost_hasher = { path = "../bifrost/src/hasher" }
+bifrost_proc_macro = { path = "../bifrost/src/proc_macro" }
