@@ -51,11 +51,16 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
 
 #[test]
 fn node_size() {
-    // On-heap pointer plus node type tag (aligned), one word for concurrency
-    // control, and one for the write-back dirty flag (aligned).
+    // The node holds an atomic descriptor pointer, concurrency control,
+    // and aligned write-back flags. The immutable tag and payload pointer
+    // occupy a separate descriptor allocation; account for that too.
     assert_eq!(
         size_of::<Node<KeySlice, PtrSlice>>(),
-        size_of::<usize>() * 4
+        size_of::<usize>() * 3
+    );
+    assert_eq!(
+        size_of::<NodeData<KeySlice, PtrSlice>>(),
+        size_of::<usize>() * 2
     );
 }
 

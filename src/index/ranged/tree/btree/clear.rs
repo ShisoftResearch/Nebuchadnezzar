@@ -33,11 +33,11 @@ where
     node_ref.deref::<KS, PS>().detach();
     let mut node = write_node::<KS, PS>(&node_ref);
     let mut next_ref = mem::take(node.right_ref_mut().unwrap());
-    *node = NodeData::Empty(Box::new(Default::default()));
+    node.replace_data(NodeData::Empty(Box::new(Default::default())));
     while !next_ref.is_default() {
         next_ref.deref::<KS, PS>().detach();
         let mut node = write_node::<KS, PS>(&next_ref);
         next_ref = mem::take(node.right_ref_mut().unwrap());
-        *node = NodeData::Empty(Box::new(Default::default()));
+        node.replace_data(NodeData::Empty(Box::new(Default::default())));
     }
 }

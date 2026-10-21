@@ -393,7 +393,22 @@ where
     // owner-generation scheme in docs/ranged-index-robustness-plan.md
     // proposal 2: detachment is one-way, so a plain bool carries it.
     pub(super) detached: std::sync::atomic::AtomicBool,
-    data: UnsafeCell<NodeData<KS, PS>>,
+    // The descriptor's tag and box pointer never change after publication.
+    // Writers change payload fields under the existing node latch.
+    data: std::sync::atomic::AtomicPtr<NodeData<KS, PS>>,
+}
+
+impl<KS, PS> Drop for Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn drop(&mut self) {
+        // Node destruction already waits for pinned readers.
+        unsafe {
+            drop(Box::from_raw(*self.data.get_mut()));
+        }
+    }
 }
 
 impl<KS, PS> Node<KS, PS>
@@ -408,7 +423,7 @@ where
         };
         Node {
             writeback_locality,
-            data: UnsafeCell::new(data),
+            data: std::sync::atomic::AtomicPtr::new(Box::into_raw(Box::new(data))),
             cc: AtomicUsize::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
             persisted: std::sync::atomic::AtomicBool::new(false),
@@ -478,7 +493,7 @@ where
                 node.capture_backtrace();
             }
             return NodeWriteGuard {
-                data: node_deref.data.get(),
+                data: node_deref.data.load(Acquire),
                 cc: &node_deref.cc as *const AtomicUsize,
                 version: node_version(cc_num),
                 node_ref: node.clone(),
@@ -519,16 +534,65 @@ where
     cc_num != expected
 }
 
-// Borrow a node's data through a ref that may itself have been read out of
-// unlatched node data. Requires an active epoch pin (read_node provides
-// one); the data may be torn mid-write, like read_unchecked, but the memory
-// cannot be freed while pinned.
-pub fn peek_data<'a, KS, PS>(node: &'a NodeCellRef) -> &'a NodeData<KS, PS>
+// This guard protects a descriptor borrowed through a speculative node
+// reference. The caller must keep that node reference valid during entry.
+// The returned descriptor reference cannot outlive this guard's epoch pin.
+pub struct NodeDataGuard<'a, KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    unsafe { &*node.deref::<KS, PS>().data.get() }
+    data: *const NodeData<KS, PS>,
+    _epoch: crossbeam_epoch::Guard,
+    _node: PhantomData<&'a NodeCellRef>,
+}
+
+impl<KS, PS> Deref for NodeDataGuard<'_, KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    type Target = NodeData<KS, PS>;
+
+    fn deref(&self) -> &Self::Target {
+        // The pin precedes the pointer load and remains alive for this borrow.
+        unsafe { &*self.data }
+    }
+}
+
+pub fn peek_data<'a, KS, PS>(node: &'a NodeCellRef) -> NodeDataGuard<'a, KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let epoch = crossbeam_epoch::pin();
+    NodeDataGuard {
+        data: node.deref::<KS, PS>().data.load(Acquire),
+        _epoch: epoch,
+        _node: PhantomData,
+    }
+}
+
+const OPTIMISTIC_READ_RETRIES: usize = 8;
+
+// This guard reuses the node's existing exclusive latch for a read-only
+// attempt. Releasing it preserves the version because no data changed.
+struct NodeReadLatch<KS, PS>(NodeWriteGuard<KS, PS>)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static;
+
+impl<KS, PS> Drop for NodeReadLatch<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn drop(&mut self) {
+        if !self.0.cc.is_null() {
+            unsafe { (*self.0.cc).store(self.0.version, Release); }
+            self.0.cc = ptr::null();
+        }
+    }
 }
 
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
@@ -539,13 +603,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Pin the epoch for the whole optimistic read: closures peek at sibling
-    // and child pointers whose targets may have deferred destructions
-    // pending; the pin keeps that memory valid until the closure returns
-    // (docs/tla/SeqlockReclaim.tla).
-    let _epoch = crossbeam_epoch::pin();
+    // The handler owns the epoch pin for every attempt and callback borrow.
+    // It also protects speculative sibling and child references until return.
     let mut handler = read_unchecked(node);
-    if node.is_default() || handler.is_none() {
+    if node.is_default() {
+        handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
         return func(&handler);
     }
     let cc = &node.deref::<KS, PS>().cc;
@@ -555,9 +617,18 @@ where
     // 2026-08-30 sidecar-import hang). Count, warn, then yield -- while
     // pinned, an eternal spin also stalls epoch reclamation for everyone.
     let mut spins: u64 = 0;
+    let mut failed_validations = 0;
     loop {
+        if failed_validations == OPTIMISTIC_READ_RETRIES {
+            let latch = NodeReadLatch(write_node::<KS, PS>(node));
+            handler.version = latch.0.version;
+            handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
+            return func(&handler);
+        }
         let cc_num = cc.load(Acquire);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
+            #[cfg(test)]
+            super::revision_tests::latch_wait();
             spins += 1;
             if spins.is_power_of_two() && spins >= STUCK_LATCH_WARN_SPINS {
                 warn!(
@@ -573,15 +644,19 @@ where
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
+        handler.snapshot = node.deref::<KS, PS>().data.load(Acquire);
         let res = func(&handler);
         let new_cc_num = cc.load(Acquire);
         // Check the version. If not found need to retry
         if new_cc_num == cc_num {
             return res;
         }
+        failed_validations += 1;
     }
 }
 
+// Descriptor borrows retain this reader's epoch protection. This does not
+// validate concurrent changes to payload fields.
 pub fn read_unchecked<KS, PS>(node: &NodeCellRef) -> NodeReadHandler<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -589,8 +664,10 @@ where
 {
     NodeReadHandler {
         version: 0,
+        snapshot: ptr::null(),
         node_ref: node.clone(),
         mark: PhantomData,
+        _epoch: crossbeam_epoch::pin(),
     }
 }
 
@@ -623,6 +700,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // Replace a descriptor with replace_data; do not assign a new variant
+    // through this reference. Published descriptor slots stay immutable.
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
         assert!(!self.data.is_null());
         unsafe { &mut *self.data }
@@ -674,6 +753,24 @@ where
         self.node_ref.is_default()
     }
 
+    // Readers can retain references to the old payload until validation.
+    // Retire that payload through the same epoch that protects node reads.
+    pub(super) fn replace_data(&mut self, replacement: NodeData<KS, PS>) {
+        let published = Box::into_raw(Box::new(replacement));
+        let old = self.node_ref.deref::<KS, PS>().data.swap(published, AcqRel);
+        self.data = published;
+        let epoch = crossbeam_epoch::pin();
+        #[cfg(test)]
+        let retirement = super::revision_tests::track_retirement();
+        unsafe {
+            epoch.defer_unchecked(move || {
+                #[cfg(test)]
+                let _retirement = retirement;
+                drop(Box::from_raw(old));
+            });
+        }
+    }
+
     // make an empty node as empty node, right node pointer covered
     pub fn make_empty_node(&mut self, update_right: bool) {
         if self.is_empty_node() {
@@ -691,7 +788,7 @@ where
             left: left_node,
             right: right_node,
         };
-        *data = NodeData::Empty(Box::new(empty))
+        self.replace_data(NodeData::Empty(Box::new(empty)));
     }
 
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
@@ -802,7 +899,7 @@ where
     }
 
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef> {
-        let node = self.data.get().as_mut().unwrap();
+        let node = self.data.load(Acquire).as_mut().unwrap();
         let mut res = vec![];
         if !node.is_none() && !node.is_empty() && node.is_internal() {
             for ptr in node.ptrs_mut() {
@@ -854,8 +951,12 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub version: usize,
+    // The owned pin protects both snapshots and unchecked descriptor loads.
+    // Deref ties each descriptor reference to a borrow of this handler.
+    snapshot: *const NodeData<KS, PS>,
     node_ref: NodeCellRef,
     mark: PhantomData<(KS, PS)>,
+    _epoch: crossbeam_epoch::Guard,
 }
 
 impl<KS, PS> Deref for NodeReadHandler<KS, PS>
@@ -866,7 +967,12 @@ where
     type Target = NodeData<KS, PS>;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        unsafe { &*self.node_ref.deref().data.get() }
+        let data = if self.snapshot.is_null() {
+            self.node_ref.deref::<KS, PS>().data.load(Acquire)
+        } else {
+            self.snapshot
+        };
+        unsafe { &*data }
     }
 }
 
@@ -894,8 +1000,10 @@ where
     fn default() -> Self {
         Self {
             version: 0,
+            snapshot: ptr::null(),
             node_ref: Default::default(),
             mark: PhantomData,
+            _epoch: crossbeam_epoch::pin(),
         }
     }
 }

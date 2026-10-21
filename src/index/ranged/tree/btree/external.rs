@@ -62,6 +62,8 @@ where
     pub len: usize,
     pub right_bound: EntryKey,
     pub mark: PhantomData<(KS, PS)>,
+    #[cfg(test)]
+    pub(super) drop_probe: Option<super::revision_tests::DropProbe>,
 }
 
 impl<KS, PS> ExtNode<KS, PS>
@@ -78,6 +80,8 @@ where
             len: 0,
             right_bound,
             mark: PhantomData,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -138,6 +142,8 @@ where
             len: key_count,
             right_bound: max_entry_key(), // UNDETERMINED
             mark: PhantomData,
+            #[cfg(test)]
+            drop_probe: None,
         };
         Ok(Box::new(IncubatingExtNode {
             node: ext_node,
@@ -276,6 +282,8 @@ where
             len: keys_2_len,
             right_bound: self.right_bound.clone(),
             mark: PhantomData,
+            #[cfg(test)]
+            drop_probe: None,
         });
         debug_assert!(
             pivot_key < self.right_bound,
