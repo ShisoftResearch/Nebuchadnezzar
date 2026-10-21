@@ -14,7 +14,9 @@
 //! under DIR), times single and transaction-batched insert / update / delete,
 //! then shuts down gracefully. `recover` is a separate process (so its peak
 //! RSS is recovery's own): it times server start on the populated directories
-//! and samples the result. `txn` drives a participant's whole transaction
+//! and samples the result. Each process selects a PID-derived address, so `recover`
+//! explicitly restores the sole voter and slot owners at its new address.
+//! `txn` drives a participant's whole transaction
 //! lifecycle (prepare, apply, commit or abort, end) through a `DataManager`:
 //! sequential latency and concurrent throughput. `heads` claims and releases
 //! write heads from many threads with no WAL: the head pool's own cost.
@@ -352,9 +354,15 @@ async fn churn(base: &str, cells: u64, rounds: u64) {
 async fn recover(base: &str, cells: u64) {
     let addr = format!("127.0.0.1:{}", 47900 + std::process::id() % 100);
     let started = Instant::now();
-    let server = NebServer::new_from_opts(&options(base, true), &addr, "perf_probe", async |_| {})
-        .await
-        .expect("server start");
+    let server = NebServer::restore_from_opts(
+        &options(base, true),
+        &addr,
+        "perf_probe",
+        false,
+        async |_| {},
+    )
+    .await
+    .expect("server restore");
     println!(
         "METRIC recovery_secs {:.3}",
         started.elapsed().as_secs_f64()
