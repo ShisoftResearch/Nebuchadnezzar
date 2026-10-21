@@ -79,6 +79,8 @@ struct WriteBackLane {
     // Completions that finished ahead of earlier queue ids.
     completions: Mutex<BTreeSet<usize>>,
     wake: tokio::sync::Notify,
+    #[cfg(test)]
+    before_upsert: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct QueuedChange {
@@ -124,6 +126,8 @@ impl WriteBackLane {
             retry_lane: Mutex::new(Vec::new()),
             completions: Mutex::new(BTreeSet::new()),
             wake: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            before_upsert: Mutex::new(None),
         }
     }
 }
@@ -454,6 +458,14 @@ impl WriteBackLane {
 
                     let flushed_mods = !guards.is_empty();
                     if !cells.is_empty() {
+                        #[cfg(test)]
+                        {
+                            let gate = hub.before_upsert.lock().unwrap().take();
+                            if let Some((built, release)) = gate {
+                                built.notify_one();
+                                release.notified().await;
+                            }
+                        }
                         let client = batch_client.expect("cells present implies a client");
                         // Retry transient failures INLINE, before this batch's
                         // completion guards drop. A rejected upsert used to be
@@ -985,6 +997,71 @@ mod tests {
             lanes: std::array::from_fn(|_| lane.clone()),
         };
         assert!(!completion_progresses_beside_held_lane(control));
+    }
+
+    /// A page image can consume the live tombstone before its RPC commits.
+    /// The metadata checkpoint must not publish an empty journal over that image.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_waits_for_compaction_before_publishing_journal() {
+        use crate::index::ranged::tree::btree::LevelTree;
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "checkpoint_compaction_order";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                disable_storage_locks: true,
+                enable_recovery: false,
+            },
+            &server_addr, server_group, async |_| {},
+        ).await.unwrap();
+        let client = Arc::new(crate::client::AsyncClient::new(
+            &server.rpc, &server.membership, &vec![server_addr], server_group,
+        ).await.unwrap());
+        client.new_schema_with_id(super::super::external::page_schema())
+            .await.unwrap().unwrap();
+        client.new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await.unwrap().unwrap();
+        start_external_nodes_write_back(&client);
+        let tree_id = crate::ram::types::Id::from_parts(909, 909);
+        let key = super::super::EntryKey::from_id(&crate::ram::types::Id::from_parts(9, 1));
+        let tree = Arc::new(RangedTree::create(&client, &tree_id).await);
+        assert!(tree.insert(&key));
+        let hub = hub_for(&client);
+        assert!(hub.wait_for_locality(tree.tree.head_id().locality()).await);
+        let built = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *hub.lane(tree.tree.head_id().locality()).before_upsert.lock().unwrap() =
+            Some((built.clone(), release.clone()));
+        assert!(tree.delete(&key));
+        tokio::time::timeout(Duration::from_secs(10), built.notified())
+            .await.expect("the compacted image must reach the pre-RPC gate");
+        assert!(tree.tree.deletion.is_empty(), "the outgoing image consumed the tombstone");
+        let mut checkpoint = tokio::spawn({
+            let tree = tree.clone(); let client = client.clone();
+            async move { tree.publish_head(&tree_id, &client).await }
+        });
+        let premature = tokio::time::timeout(Duration::from_millis(200), &mut checkpoint).await;
+        // Release the worker even when the pre-fix control fails.
+        release.notify_one();
+        let published_early = premature.is_ok();
+        if premature.is_err() { checkpoint.await.unwrap().unwrap(); }
+        assert!(!published_early, "checkpoint published after tombstone compaction but before page persistence");
+        let reloaded = RangedTree::recover(&client, &tree_id).await.unwrap();
+        assert!(!reloaded.contains(&key), "a compacted delete must stay absent after reload");
+        let lane = hub.lane(tree.tree.head_id().locality());
+        lane.barrier_failed.store(true, Ordering::SeqCst);
+        let refused = tree.publish_head(&tree_id, &client).await;
+        lane.barrier_failed.store(false, Ordering::SeqCst);
+        assert!(refused.is_err(), "an unestablished page barrier must refuse the checkpoint");
+        server.shutdown().await;
     }
 
     /// An abandoned batch must not disable the barrier forever.

@@ -438,6 +438,18 @@ impl RangedTree {
         use crate::ram::cell::WriteError;
 
         let tombstones: Vec<EntryKey> = self.tree.deletion.snapshot().into_iter().collect();
+        // Compaction consumes tombstones while building a page image, before
+        // that image's RPC commits. Snapshot FIRST, then drain this tree's
+        // lane: a tombstone absent from the snapshot must already have its
+        // compacted image queued. Compactions after the snapshot are covered
+        // by the copied journal. Draining before the snapshot leaves a new
+        // compaction window and is not sufficient.
+        if !storage::hub_for(client)
+            .wait_for_locality(self.tree.head_id().locality())
+            .await
+        {
+            return Err("Cannot checkpoint ranged tree: page writeback barrier not established".into());
+        }
         if tombstones.len() > TOMBSTONE_JOURNAL_WARN {
             warn!(
                 "Ranged tree {:?} journals {} tombstones; write-back compaction is falling \
