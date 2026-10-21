@@ -2461,6 +2461,21 @@ mod tests {
             .expect("scratch dir")
     }
 
+    /// One address per store directory: a restart reuses it. Reopening a store
+    /// under another address is the explicit restore, not a restart.
+    fn crash_address(dir: &std::path::Path) -> String {
+        static ADDRESSES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+        > = std::sync::OnceLock::new();
+        ADDRESSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_insert_with(crate::utils::test_port::unique_localhost_addr)
+            .clone()
+    }
+
     fn crash_schema() -> Schema {
         Schema::new_with_id(
             CRASH_SCHEMA_ID,
@@ -2499,12 +2514,12 @@ mod tests {
     async fn start_crash_server(
         dir: &std::path::Path,
         group: &str,
-        addr: &str,
         enable_recovery: bool,
     ) -> (Arc<NebServer>, Arc<AsyncClient>) {
         for d in ["backup", "wal", "raft"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
+        let addr = crash_address(dir);
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -2554,7 +2569,6 @@ mod tests {
         let (server, client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
         )
         .await;
@@ -2622,7 +2636,6 @@ mod tests {
         let (server, client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
         )
         .await;
@@ -2696,7 +2709,6 @@ mod tests {
         let (server, _client) = start_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
         )
         .await;
@@ -3884,7 +3896,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             true,
         )
@@ -3912,7 +3923,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             false,
         )
@@ -3986,7 +3996,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             true,
         )
@@ -4086,7 +4095,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             true,
         )
@@ -4121,13 +4129,13 @@ mod tests {
     async fn start_hash_crash_server(
         dir: &std::path::Path,
         group: &str,
-        addr: &str,
         enable_recovery: bool,
         index_enabled: bool,
     ) -> (Arc<NebServer>, Arc<AsyncClient>) {
         for d in ["backup", "wal", "raft"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
+        let addr = crash_address(dir);
         let services = if index_enabled {
             vec![Service::Cell, Service::Query, Service::RangedIndexer]
         } else {
@@ -4172,7 +4180,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             true,
         )
@@ -4204,7 +4211,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             false,
         )
@@ -4225,7 +4231,6 @@ mod tests {
         let (server, client) = start_hash_crash_server(
             dir.path(),
             group,
-            &crate::utils::test_port::unique_localhost_addr(),
             true,
             true,
         )
