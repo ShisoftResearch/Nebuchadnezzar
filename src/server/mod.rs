@@ -2784,6 +2784,22 @@ impl NebServer {
         Ok(server)
     }
 
+    /// Start or reopen a server at its stored address.
+    ///
+    /// # Operator note: restore at another address
+    ///
+    /// If the address changes, stop the old server and use explicit restore.
+    /// Keep the existing storage paths and set `opts.enable_recovery = true`.
+    /// A normal start preserves the stored voters and slot owners.
+    ///
+    /// ```ignore
+    /// let server = NebServer::restore_from_opts(
+    ///     &opts, new_address, group_name, false, async |_| {},
+    /// ).await?;
+    /// ```
+    ///
+    /// Keep every removed member stopped. With `force_new_cluster = false`,
+    /// restore refuses a store that names more than one voter.
     pub async fn new_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
