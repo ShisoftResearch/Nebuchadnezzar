@@ -2851,6 +2851,69 @@ async fn g11_a_local_fence_waits_for_a_silent_committed_peer() {
     cluster.shutdown().await;
 }
 
+/// A power loss inside the append of an abort settlement leaves a cut final
+/// record. The start reads the fence log up to it, and the bracket is in doubt
+/// again: a silent peer keeps it pinned, and a reachable peer settles it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_abort_settlement_waits_for_a_silent_peer_then_settles() {
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let (mut cluster, client) = Cluster::start("cut_abort_settlement").await;
+    let (manager, tid, ids, _) = prepared_transaction(&cluster, &client, 49_007, 49_007).await;
+    drop(manager);
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid), "test setup: A waits for B");
+    assert_eq!(data_site(&cluster, A).fence_here(&tid), FenceAnswer::Fenced);
+    assert_eq!(data_site(&cluster, B).fence_here(&tid), FenceAnswer::Fenced);
+    cluster
+        .site(A)
+        .chunks()
+        .fences()
+        .append_cut_settlement_for_test(&tid);
+    cluster.power_loss_restart(A).await;
+    cluster.site(A).cleaner().pause();
+    let recovered = cluster.site(A).chunks().fences().load(true).unwrap();
+    assert!(recovered.fenced.contains(&tid), "the fence before the cut record stays");
+    assert!(recovered.aborted.is_empty(), "a cut settlement settles nothing");
+    assert!(in_doubt_on(&cluster, A, &tid), "a silent peer keeps the bracket in doubt");
+    assert!(held_for(&cluster, A, &tid) > 0);
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    wait_until("the settled abort with a reachable peer", 60, || {
+        !in_doubt_on(&cluster, A, &tid)
+    })
+    .await;
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    assert_eq!(score_on(cluster.site(A), &ids[0]), None);
+    assert!(cluster
+        .site(A)
+        .chunks()
+        .fences()
+        .load(true)
+        .unwrap()
+        .aborted
+        .contains(&tid));
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    let reenrolled = in_doubt_on(&cluster, A, &tid);
+    let pins = held_for(&cluster, A, &tid);
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    cluster.shutdown().await;
+    assert!(
+        !reenrolled && pins == 0,
+        "a settled abort regained doubt: reenrolled={reenrolled}, pins={pins}"
+    );
+}
+
 /// A refused abort settlement keeps its bracket pinned until a durable retry.
 #[tokio::test(flavor = "multi_thread")]
 async fn g11_a_refused_abort_settlement_keeps_its_bracket() {

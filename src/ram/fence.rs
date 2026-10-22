@@ -34,7 +34,9 @@
 //!
 //! A failed append removes its bytes again and closes its file for the rest
 //! of the process: after a failed sync, the state of the page cache is not
-//! known. Later records of that file fail until the next start.
+//! known. Later records of that file fail until the next start. A failed
+//! creation (header write, header sync or directory sync) does the same, so
+//! no record follows a partial or unpublished header.
 //!
 //! A fence must outlive the transaction at this site (TLA+ F3, F6): a site
 //! with no bracket of the transaction answers `Unknown` and must still refuse
@@ -73,8 +75,6 @@ pub enum FenceLogError {
     InvalidDecision(u32),
     /// The file is shorter than a header and is not a prefix of one.
     TruncatedHeader,
-    /// A record before the final record is incomplete.
-    TruncatedRecord,
     /// A record before the final record fails its checksum.
     ChecksumMismatch,
 }
@@ -92,9 +92,6 @@ impl std::fmt::Display for FenceLogError {
                 write!(f, "the fence record has decision tag {tag}")
             }
             FenceLogError::TruncatedHeader => write!(f, "the fence log header is incomplete"),
-            FenceLogError::TruncatedRecord => {
-                write!(f, "a fence record before the final record is incomplete")
-            }
             FenceLogError::ChecksumMismatch => {
                 write!(f, "the fence record checksum does not match")
             }
@@ -347,20 +344,16 @@ impl FenceLog {
         }
         if state.file.is_none() {
             if let Some(path) = &shard.path {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                let fresh = !path.exists();
-                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                if fresh {
-                    file.write_all(&header())?;
-                    file.sync_all()?;
-                    if let Some(dir) = path.parent() {
-                        File::open(dir)?.sync_all()?;
+                match Self::open_log(path) {
+                    Ok((file, len)) => {
+                        state.len = len;
+                        state.file = Some(file);
+                    }
+                    Err(error) => {
+                        state.failed = Some(format!("the creation of the file failed: {error}"));
+                        return Err(error);
                     }
                 }
-                state.len = file.metadata()?.len();
-                state.file = Some(file);
             }
         }
         let len = state.len;
@@ -396,6 +389,67 @@ impl FenceLog {
             self.count.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
+    }
+
+    /// Open the file of a shard for appends. A new file gets its header and
+    /// its directory entry synced before the first record.
+    fn open_log(path: &Path) -> io::Result<(File, u64)> {
+        let dir = path.parent();
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(dir)?;
+        }
+        let fresh = !path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if fresh {
+            if let Err(error) = Self::publish_header(&mut file, dir) {
+                // The caller fails the shard, so no record follows these bytes.
+                // A start reads a header prefix as an empty log.
+                let _ = file.set_len(0);
+                return Err(error);
+            }
+        }
+        let len = file.metadata()?.len();
+        Ok((file, len))
+    }
+
+    fn publish_header(file: &mut File, dir: Option<&Path>) -> io::Result<()> {
+        #[cfg(test)]
+        let fault = FENCE_CREATE_FAULT_FOR_TEST.load(Ordering::Acquire);
+        #[cfg(test)]
+        if fault == CreateFault::PartialHeader as u8 {
+            file.write_all(&header()[..HEADER_SIZE / 2])?;
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        file.write_all(&header())?;
+        #[cfg(test)]
+        if fault == CreateFault::HeaderSync as u8 {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        file.sync_all()?;
+        if let Some(dir) = dir {
+            #[cfg(test)]
+            if fault == CreateFault::DirectorySync as u8 {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Test hook: write half of a settlement record of `txn` to its file and
+    /// count those bytes as durable, as a power loss inside the append does.
+    #[cfg(test)]
+    pub(crate) fn append_cut_settlement_for_test(&self, txn: &TxnId) {
+        let shard = &self.shards[fence_shard(txn)];
+        let _state = shard.state.lock();
+        let path = shard.path.as_ref().expect("a fence log with a directory");
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&record(txn, true)[..RECORD_SIZE / 2]).unwrap();
+        file.sync_data().unwrap();
+        crate::ram::segs::power_loss_model::record_synced(
+            &Some(path.to_string_lossy().to_string()),
+            &file,
+        );
     }
 
     fn append_synced(file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -466,6 +520,22 @@ pub(crate) static FENCE_SYNC_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static FENCE_APPEND_FAILS_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: the step at which the creation of the next new file fails.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+enum CreateFault {
+    None = 0,
+    /// Half of the header reaches the file.
+    PartialHeader = 1,
+    HeaderSync = 2,
+    DirectorySync = 3,
+}
+
+#[cfg(test)]
+static FENCE_CREATE_FAULT_FOR_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(CreateFault::None as u8);
 
 #[cfg(test)]
 mod tests {
@@ -628,6 +698,43 @@ mod tests {
         interior.truncate(bytes.len() - 1);
         interior.extend_from_slice(&record(&test_hlc(2, 1), true));
         assert_eq!(load_error(&interior), FenceLogError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn a_failed_creation_closes_the_file_and_takes_no_record() {
+        for fault in [
+            CreateFault::PartialHeader,
+            CreateFault::HeaderSync,
+            CreateFault::DirectorySync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = FenceLog::new(dir.path().to_str());
+            log.reset(FenceRecords::default()).unwrap();
+            // A shard whose file the reset did not create.
+            let same_file: Vec<_> = (1..10_000)
+                .map(|n| test_hlc(n, 1))
+                .filter(|tid| fence_shard(tid) == 7)
+                .take(2)
+                .collect();
+            let path = log.shards[7].path.clone().unwrap();
+            assert!(!path.exists(), "test setup: {fault:?}");
+            FENCE_CREATE_FAULT_FOR_TEST.store(fault as u8, Ordering::Release);
+            let refused = log.record_abort(&same_file[0]);
+            FENCE_CREATE_FAULT_FOR_TEST.store(CreateFault::None as u8, Ordering::Release);
+            assert!(refused.is_err(), "{fault:?}");
+            assert!(
+                log.record(&same_file[1]).is_err(),
+                "{fault:?}: a file whose creation failed takes no record"
+            );
+            assert!(!log.is_fenced(&same_file[0]) && !log.is_fenced(&same_file[1]));
+            let len = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            assert!(
+                len <= HEADER_SIZE as u64,
+                "{fault:?}: the file holds no record, length {len} bytes"
+            );
+            let recovered = FenceLog::new(dir.path().to_str()).load(true).unwrap();
+            assert!(recovered.fenced.is_empty(), "{fault:?}");
+        }
     }
 
     #[test]
