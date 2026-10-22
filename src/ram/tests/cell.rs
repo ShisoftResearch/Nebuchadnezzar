@@ -192,3 +192,36 @@ pub fn a_keyed_cell_keeps_its_id_when_its_schema_is_evolved() {
         "the same key in the same family must name the same cell across an evolution"
     );
 }
+
+#[test]
+pub fn f16_cell_rw() {
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed("id", Type::I64),
+        Field::new_unindexed("half", Type::F16),
+    ]);
+    let id = Id::allocated(1, 0, 1);
+    let schema = Schema::new_with_id(1, &String::from("f16"), None, fields, false, false);
+    let bits = 0x4100u16; // 2.5
+    let data = data_map_value! {
+        id: 100 as i64,
+        half: OwnedValue::F16(half::f16::from_bits(bits))
+    };
+    let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
+    chunk.meta.schemas.debug_only_new_schema(schema.clone());
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.vid, &id),
+        data,
+    };
+    let write_plan = cell.plan_write(chunk).unwrap();
+    let pending_entry = write_plan.allocate(chunk, true).unwrap();
+    let write_result = chunk
+        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
+        .unwrap();
+    pending_entry.append().unwrap();
+    drop(pending_entry);
+    let (stored_cell, _) =
+        SharedCellData::from_chunk_raw(id.bits(), write_result.addr, &chunk).unwrap();
+    assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
+    let stored = stored_cell.data["half"].f16().unwrap();
+    assert_eq!(stored.to_bits(), bits, "f16 bits must round trip");
+}

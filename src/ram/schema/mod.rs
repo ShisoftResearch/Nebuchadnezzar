@@ -5,6 +5,7 @@ use bifrost_hasher::hash_str;
 
 use crate::ram::types::Id;
 use dovahkiin::types::{OwnedValue, Type};
+use half::f16;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1819,6 +1820,10 @@ pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
         (U16(v), Type::F64) => F64(*v as f64),
         (U32(v), Type::F64) => F64(*v as f64),
         (F32(v), Type::F64) => F64(*v as f64),
+        (F16(v), Type::F32) => F32(v.to_f32()),
+        (F16(v), Type::F64) => F64(v.to_f64()),
+        (I8(v), Type::F16) => F16(f16::from_f32(*v as f32)),
+        (U8(v), Type::F16) => F16(f16::from_f32(*v as f32)),
 
         _ => return None,
     })
@@ -1842,6 +1847,7 @@ pub fn widening_exists(from: Type, to: Type) -> bool {
         Type::U64 => OwnedValue::U64(0),
         Type::F32 => OwnedValue::F32(0.0),
         Type::F64 => OwnedValue::F64(0.0),
+        Type::F16 => OwnedValue::F16(f16::from_bits(0)),
         _ => return false,
     };
     coerce_value(&probe, to).is_some()
