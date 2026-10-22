@@ -259,8 +259,8 @@ fn take_apply_panic_hook(tid: &TxnId, id: &Id) -> bool {
         .is_some_and(|hooks| hooks.lock().remove(&(tid.clone(), *id)))
 }
 
-/// Test hook: the apply burst fails right after this cell is written, as a
-/// later write that finds no space.
+/// Test hook: the apply burst fails right after this cell is written or
+/// updated, as a later write that finds no space.
 #[cfg(test)]
 static APPLY_ERROR_HOOKS: Mutex<BTreeSet<(TxnId, Id)>> = parking_lot::const_mutex(BTreeSet::new());
 
@@ -440,10 +440,18 @@ struct Transaction {
     /// first try no status cell of the transaction can exist here, so the
     /// close does not search the probes for one (D44).
     status_cell_attempted: bool,
-    /// An abort of this object restored every applied cell and rewound its
-    /// spans. Only then may a presumed abort that finds it already aborted
-    /// release its cell locks.
-    abort_clean: bool,
+    /// Cells whose rollback failed: they still hold a write of this
+    /// transaction. They keep their locks, the object keeps its undo state
+    /// and segment references, and the sweep retries their restoration.
+    unrestored: BTreeSet<Id>,
+    /// The abort restored every applied cell and its secondary-index work is
+    /// complete. Until then no lock of this transaction is released or
+    /// reclaimed as stale.
+    restored: bool,
+    /// Orders the secondary-index work of this transaction. The apply holds
+    /// it until its index tasks are done, and every abort path holds it
+    /// until its undo tasks are done and its locks are released.
+    index_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Test hook: a site does not send `synced` notices, as one whose notices
@@ -544,6 +552,11 @@ pub struct DataManager {
     /// no participant holds it open; this map is the fast path.
     decided: LFMap<TxnId, TxnOutcome>,
     decision_order: SkipSet<TxnId>,
+    /// Aborted transactions that still hold cell locks. The lease sweep
+    /// finishes them (`finish_aborted_transactions`): it retries a failed
+    /// restoration, and it releases the locks of one whose `end` never came.
+    /// It does not depend on leases, which an abort gives back at once.
+    aborted: SkipSet<TxnId>,
 }
 
 /// How often a site asks the participants that did not report their COMMIT
@@ -555,12 +568,6 @@ fn settle_sweep_interval() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
-}
-
-/// The cell locks that a presumed abort releases, for `presume_abort`.
-struct PresumedAbortRelease {
-    owner: Option<TxnPriority>,
-    cells: Vec<Id>,
 }
 
 /// What `close_committed_brackets` did.
@@ -662,6 +669,7 @@ impl DataManager {
             cleanup_signal: cleanup_signal.clone(),
             decided: LFMap::with_capacity(128),
             decision_order: SkipSet::new(),
+            aborted: SkipSet::new(),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -737,7 +745,9 @@ impl DataManager {
                 fenced: false,
                 durable_commit: false,
                 status_cell_attempted: false,
-                abort_clean: false,
+                unrestored: BTreeSet::new(),
+                restored: false,
+                index_gate: Arc::new(tokio::sync::Mutex::new(())),
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -796,20 +806,40 @@ impl DataManager {
             })
     }
 
-    /// Whether the owner of a cell lock has applied writes here that can
-    /// still be aborted (`Committed`, or `Prepared` with a partial apply). Its lock is never reclaimed as stale: the abort of
-    /// the owner rolls its writes back only while it owns the cells, and a
-    /// reader without the lock would see writes that can still be aborted.
-    /// The lease sweeper ends such a transaction. A busy owner counts as one:
-    /// the caller holds a cell lock, so it must not wait for the owner's lock.
+    /// Whether the owner of a cell lock has applied writes here that are
+    /// not decided commit and not yet restored: applied and undecided, or
+    /// aborted with its restoration still pending.
+    ///
+    /// Its lock is never reclaimed as stale. The abort of the owner rolls its
+    /// writes back only while it owns the cells, and a reader without the
+    /// lock would see writes that can still be aborted. The lease sweeper
+    /// ends such a transaction. A busy owner counts as one: the caller holds
+    /// a cell lock, so it must not wait for the owner's lock.
     fn owner_waits_with_writes(&self, owner: &TxnPriority) -> bool {
         self.find_transaction(&owner.tid).is_some_and(|txn_lock| {
             txn_lock.try_lock().map_or(true, |txn| {
-                txn.state != TxnState::Aborted
-                    && !txn.history.is_empty()
-                    && !txn.decided_commit
+                !txn.decided_commit && !txn.history.is_empty() && !txn.restored
             })
         })
+    }
+
+    /// The index gate of `tid`, if this site holds the transaction.
+    fn index_gate(&self, tid: &TxnId) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let txn_lock = self.find_transaction(tid)?;
+        let gate = txn_lock.lock().index_gate.clone();
+        Some(gate)
+    }
+
+    /// Record that the abort of `tid` is complete: every cell restored, and
+    /// the index work awaited. The caller holds the index gate and has
+    /// awaited the undo index tasks.
+    fn mark_restored(&self, tid: &TxnId) {
+        if let Some(txn_lock) = self.find_transaction(tid) {
+            let mut txn = txn_lock.lock();
+            if txn.state == TxnState::Aborted && txn.unrestored.is_empty() {
+                txn.restored = true;
+            }
+        }
     }
 
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
@@ -1018,6 +1048,7 @@ impl DataManager {
         }
         let _ = self.txns.remove(tid);
         self.txns_sorted.remove(tid);
+        self.aborted.remove(tid);
     }
 
     /// Restore the cell index, pad the spans, then release the leased heads.
@@ -1049,9 +1080,11 @@ impl DataManager {
         }
         #[cfg(feature = "abort_profile")]
         drop(rollback_timer);
+        txn.unrestored = failures.iter().map(|failure| failure.id).collect();
         let failures = (!failures.is_empty()).then_some(failures);
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
+        self.aborted.insert(tid.clone());
         let store = self.chunks().address_range();
         #[cfg(feature = "abort_profile")]
         let _rewind_timer =
@@ -1067,7 +1100,6 @@ impl DataManager {
             );
             return Err(error.into_write_error());
         }
-        txn.abort_clean = failures.is_none();
         Ok(failures)
     }
 
@@ -1090,6 +1122,7 @@ impl DataManager {
             let guards_to_drop = std::mem::take(&mut txn.segment_guards);
             txn.last_activity = get_time();
             txn.state = TxnState::Aborted;
+            self.aborted.insert(tid.clone());
             // Nothing was applied, but a bracket may still have been OPENED:
             // a write that failed after its BEGIN landed leaves a BEGIN-only
             // span, and its head must not go back to the pool with it open.
@@ -1105,7 +1138,6 @@ impl DataManager {
                 );
                 return AbortResult::WriteError(error.into_write_error());
             }
-            txn.abort_clean = true;
             drop(guards_to_drop);
             return AbortResult::Success(None);
         }
@@ -1136,7 +1168,12 @@ impl DataManager {
         let rollback_failures =
             self.rollback_and_rewind(tid, txn, &guarded_cell_ids, &mut cell_guards);
         drop(cell_guards);
-        drop(guards_to_drop);
+        if txn.unrestored.is_empty() {
+            drop(guards_to_drop);
+        } else {
+            // The sources of the failed cells stay pinned for the retry.
+            txn.segment_guards = guards_to_drop;
+        }
         match rollback_failures {
             Ok(failures) => AbortResult::Success(failures),
             Err(error) => AbortResult::WriteError(error),
@@ -1165,6 +1202,8 @@ impl DataManager {
     ///    `end` finds the transaction gone and is refused, rather than told
     ///    it committed something whose spans were just disowned.
     /// 3. Retire whatever is left: leases no participant object knows about.
+    /// 4. Finish the aborted transactions that still hold locks
+    ///    (`finish_aborted_transactions`).
     pub(crate) async fn sweep_idle_transactions(&self, idle: std::time::Duration) {
         let store = self.chunks().address_range();
         let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
@@ -1190,88 +1229,367 @@ impl DataManager {
         for tid in crate::ram::chunk::retire_expired_transaction_leases(orphans, idle, &store) {
             self.wipe_out_transaction(&tid);
         }
+        self.finish_aborted_transactions(idle).await;
+    }
+
+    /// The work of `end`, under the index gate of `tid`: close or finish
+    /// the transaction and release its locks.
+    async fn end_transaction(&self, tid: &TxnId, durable: bool) -> EndResult {
+        let Some(gate) = self.index_gate(tid) else {
+            return EndResult::CheckFailed(CheckError::NotExisted);
+        };
+        let _gate = gate.lock().await;
+        // Option 6: Two-Phase Lock Release with Verification and Retry
+        let (affected_cell_ids, txn_state, expected_owner, unrestored) = {
+            let Some(txn_lock) = self.find_transaction(tid) else {
+                return EndResult::CheckFailed(CheckError::NotExisted);
+            };
+            let txn = txn_lock.lock();
+            if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
+                return EndResult::CheckFailed(CheckError::CannotEnd);
+            }
+            debug!(
+                "AFFECTED: {}, {:?}, {:?}",
+                txn.affected_cells.len(),
+                txn.state,
+                tid
+            );
+            (
+                txn.affected_cells.clone(),
+                txn.state,
+                txn.coordinator_id
+                    .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id)),
+                txn.unrestored.clone(),
+            )
+        };
+        // A cell whose restoration is pending keeps its lock: it still holds
+        // a write of this aborted transaction.
+        let affected_cell_ids: Vec<Id> = affected_cell_ids
+            .into_iter()
+            .filter(|id| !unrestored.contains(id))
+            .collect();
+
+        if txn_state == TxnState::Committed {
+            // A refused close can roll back (`CloseOutcome::RolledBack`): its
+            // undo index work is awaited before any lock goes.
+            let (closed, index_results) = IndexBuilder::with_request_index_scope(|| {
+                self.close_committed_brackets(tid, durable)
+            })
+            .await;
+            self.warn_on_index_wait_results(tid, index_results);
+            match closed {
+                CloseOutcome::Closed => {}
+                // Still decided and still holding its locks and heads.
+                CloseOutcome::Pending(report) => return report,
+                CloseOutcome::Fenced => return EndResult::CheckFailed(CheckError::CannotEnd),
+                CloseOutcome::RolledBack(reason) => {
+                    self.mark_restored(tid);
+                    if self.find_transaction(tid).is_some() {
+                        self.finish_aborted(tid);
+                    } else {
+                        self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
+                    }
+                    self.cleanup_signal.store(true, Relaxed);
+                    return reason;
+                }
+            }
+        }
+
+        // Attempt lock release with retries
+        let mut retry_attempt = 0;
+        let mut lock_release_result = None;
+
+        while retry_attempt <= MAX_LOCK_RELEASE_RETRIES {
+            if retry_attempt > 0 {
+                debug!(
+                    "Retrying lock release for {:?} (attempt {}/{})",
+                    tid, retry_attempt, MAX_LOCK_RELEASE_RETRIES
+                );
+                tokio::time::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS)).await;
+            }
+
+            let (released_count, failed_releases) =
+                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
+            let total_cells = affected_cell_ids.len();
+
+            if failed_releases.is_empty() {
+                // All locks released successfully
+                debug!(
+                    "Successfully released all {} locks for {:?}, total locks: {}",
+                    released_count,
+                    tid,
+                    self.txns.len()
+                );
+                lock_release_result = Some(Ok(()));
+                break;
+            } else if retry_attempt == MAX_LOCK_RELEASE_RETRIES {
+                // Retries exhausted - CRITICAL ERROR
+                error!(
+                    "CRITICAL: Lock release retries exhausted for {:?}: {}/{} locks released, {} failures",
+                    tid,
+                    released_count,
+                    total_cells,
+                    failed_releases.len()
+                );
+                for failure in &failed_releases {
+                    error!(
+                        "  - Cell {:?} lock release failed: {}",
+                        failure.cell_id, failure.reason
+                    );
+                }
+                lock_release_result = Some(Err((released_count, total_cells, failed_releases)));
+                break;
+            } else {
+                // Partial failure on this attempt, will retry
+                error!(
+                    "Lock release failed for {:?} on attempt {}/{}: {}/{} locks released, {} failures - retrying",
+                    tid,
+                    retry_attempt + 1,
+                    MAX_LOCK_RELEASE_RETRIES + 1,
+                    released_count,
+                    total_cells,
+                    failed_releases.len()
+                );
+                for failure in &failed_releases {
+                    error!(
+                        "  - Cell {:?} lock release failed: {}",
+                        failure.cell_id, failure.reason
+                    );
+                }
+            }
+
+            retry_attempt += 1;
+        }
+        // The decision completed before lock release. Old versions stayed
+        // referenced through the append result and any required rollback.
+        // Recorded only once the outcome is real: for a commit that means
+        // after the bracket closed, because a failed close is refused
+        // above and this site is then NOT committed.
+        self.record_decision(
+            tid,
+            if txn_state == TxnState::Committed {
+                TxnOutcome::Committed
+            } else {
+                TxnOutcome::Aborted
+            },
+        );
+        if unrestored.is_empty() {
+            self.wipe_out_transaction(tid);
+        } else {
+            // The sweep retries the restoration and then releases the
+            // retained locks (`finish_aborted_transactions`).
+            error!(
+                "transaction {:?} ended with {} cell(s) whose restoration is pending; they \
+                 keep their locks",
+                tid,
+                unrestored.len()
+            );
+        }
+        self.cleanup_signal.store(true, Relaxed);
+
+        // Return appropriate result based on lock release outcome
+        match lock_release_result {
+            Some(Ok(())) => {
+                debug!("ENDED: {:?} with all locks released", tid);
+                EndResult::Success
+            }
+            Some(Err((released, total, failures))) => {
+                // Option 1: Hard error on lock release failure
+                error!(
+                    "ENDED: {:?} with lock release failures ({}/{} released)",
+                    tid, released, total
+                );
+                if failures.len() == total {
+                    // Complete failure - retries exhausted
+                    EndResult::LockReleaseRetriesExhausted { failures }
+                } else {
+                    // Partial failure
+                    EndResult::SomeLocksNotReleased {
+                        released,
+                        total,
+                        failures,
+                    }
+                }
+            }
+            None => {
+                // This shouldn't happen, but handle it gracefully
+                error!("ENDED: {:?} with unknown lock release status", tid);
+                EndResult::LockReleaseRetriesExhausted { failures: vec![] }
+            }
+        }
     }
 
     /// Presumed abort for a transaction whose coordinator went silent.
-    /// Returns whether the transaction was ended here.
+    /// Returns whether the transaction was aborted here.
     ///
     /// No `end` follows a presumed abort, so the cell locks go with the
-    /// decision. They go only after the secondary-index rollback of the
-    /// abort is complete: index restoration runs as tasks, and a retry that
-    /// took the lock earlier could have its new index entry removed by an
-    /// old restoration task.
+    /// decision, through `finish_aborted`. The index gate is held from the
+    /// abort to the release: the undo index tasks complete first, and the
+    /// object stays, so no stale reclaim takes a cell in between.
     async fn presume_abort(&self, tid: &TxnId) -> bool {
-        let (release, index_results) =
-            IndexBuilder::with_request_index_scope(|| self.presume_abort_locked(tid)).await;
-        self.warn_on_index_wait_results(tid, index_results);
-        let Some(release) = release else {
+        let Some(gate) = self.index_gate(tid) else {
+            // Nothing to roll back here; the retire pass reclaims the heads.
             return false;
         };
-        // A cell that another transaction owns stays with it:
-        // `attempt_lock_release` clears only an owner equal to `owner`.
-        self.attempt_lock_release(release.owner.as_ref(), &release.cells);
+        let _gate = gate.lock().await;
+        let (outcome, index_results) =
+            IndexBuilder::with_request_index_scope(|| self.presume_abort_locked(tid)).await;
+        self.warn_on_index_wait_results(tid, index_results);
+        let Some(outcome) = outcome else {
+            return false;
+        };
+        match outcome {
+            AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
+                warn!(
+                    "transaction {:?} held its write heads past the lease timeout without a \
+                     decision; presumed ABORT",
+                    tid
+                );
+            }
+            AbortResult::Success(Some(failures)) => {
+                error!(
+                    "transaction {:?} was presumed ABORT, and {} cell(s) could not be \
+                     restored; they keep their locks and the sweep retries them",
+                    tid,
+                    failures.len()
+                );
+            }
+            other => {
+                // Could not roll back (ownership moved or no coordinator). The
+                // wipe retires whatever is still open, so no head leaves with
+                // its bracket open.
+                error!(
+                    "transaction {:?} held its write heads past the lease timeout; its presumed \
+                     abort ended with {:?}",
+                    tid, other
+                );
+                self.record_decision(tid, TxnOutcome::Aborted);
+                self.wipe_out_transaction(tid);
+                return true;
+            }
+        }
+        self.mark_restored(tid);
+        self.finish_aborted(tid);
         true
     }
 
-    /// The decision half of `presume_abort`: abort, record and remove the
-    /// transaction. Returns the cell locks the abort covers, or `None` if the
-    /// transaction was not ended here.
-    fn presume_abort_locked(&self, tid: &TxnId) -> Option<PresumedAbortRelease> {
-        let Some(txn_lock) = self.find_transaction(tid) else {
-            // Nothing to roll back here; the retire pass reclaims the heads.
-            return None;
-        };
+    /// The decision half of `presume_abort`, under the transaction lock.
+    /// `None` if the transaction is decided COMMIT.
+    fn presume_abort_locked(&self, tid: &TxnId) -> Option<AbortResult> {
+        let txn_lock = self.find_transaction(tid)?;
         let mut txn = txn_lock.lock();
         if txn.decided_commit {
             // Finishing it is the only option; termination retries the
             // close, and the heads stay held until it succeeds.
             return None;
         }
-        // Captured before the decision: the removal below drops the record.
-        let owner = txn
-            .coordinator_id
-            .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
-        let locked_cell_ids = Self::guarded_txn_cell_ids(&txn);
-        let outcome = self.abort_locked(tid, &mut txn);
-        let abort_clean = txn.abort_clean;
-        drop(txn);
-        // A lock goes only with a cell that holds no write of this
-        // transaction any more. A cell whose restore failed keeps its owner,
-        // so readers wait rather than read an aborted write; an abort that is
-        // not proven clean releases nothing.
-        let cells = match &outcome {
-            AbortResult::Success(None) => locked_cell_ids,
-            AbortResult::Success(Some(failures)) => locked_cell_ids
-                .into_iter()
-                .filter(|id| failures.iter().all(|failure| failure.id != *id))
-                .collect(),
-            AbortResult::CheckFailed(CheckError::AlreadyAborted) if abort_clean => {
-                locked_cell_ids
-            }
-            _ => Vec::new(),
+        Some(self.abort_locked(tid, &mut txn))
+    }
+
+    /// End an aborted transaction here: release the locks of its restored
+    /// cells and, if no cell waits for restoration, record the decision and
+    /// remove the object. A cell whose restoration is pending keeps its lock,
+    /// and the object keeps the undo state for `retry_restoration`. The
+    /// caller holds the index gate, and the undo index work is done.
+    /// Returns whether the object was removed.
+    fn finish_aborted(&self, tid: &TxnId) -> bool {
+        let Some(txn_lock) = self.find_transaction(tid) else {
+            return true;
         };
-        match outcome {
-            AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
-                warn!(
-                    "transaction {:?} held its write heads past the lease timeout without a \
-                     decision; presumed ABORT, rolled back and rewound",
-                    tid
-                );
+        let (owner, cells, restored) = {
+            let txn = txn_lock.lock();
+            if txn.state != TxnState::Aborted {
+                return false;
             }
-            other => {
-                // Could not roll back (ownership moved, no coordinator, or a
-                // rollback failure). The wipe below retires whatever is still
-                // open, so no head leaves with its bracket open either way.
-                error!(
-                    "transaction {:?} held its write heads past the lease timeout; its presumed \
-                     abort ended with {:?}",
-                    tid, other
-                );
-            }
+            let owner = txn
+                .coordinator_id
+                .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
+            let cells: Vec<Id> = Self::guarded_txn_cell_ids(&txn)
+                .into_iter()
+                .filter(|id| !txn.unrestored.contains(id))
+                .collect();
+            (owner, cells, txn.restored)
+        };
+        // `attempt_lock_release` clears only an owner equal to `owner`.
+        self.attempt_lock_release(owner.as_ref(), &cells);
+        if !restored {
+            return false;
         }
         self.record_decision(tid, TxnOutcome::Aborted);
         self.wipe_out_transaction(tid);
-        Some(PresumedAbortRelease { owner, cells })
+        true
+    }
+
+    /// One pass over the aborted transactions that still hold locks. Each
+    /// one retries the restoration of its failed cells; one that is restored
+    /// and has had no activity for `idle` is finished, as an `end` that never
+    /// came. Independent of leases: an abort gives its leases back at once.
+    async fn finish_aborted_transactions(&self, idle: std::time::Duration) {
+        let pending: Vec<TxnId> = self
+            .aborted
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for tid in pending {
+            let Some(gate) = self.index_gate(&tid) else {
+                self.aborted.remove(&tid);
+                continue;
+            };
+            let _gate = gate.lock().await;
+            let (idle_for, index_results) =
+                IndexBuilder::with_request_index_scope(|| self.retry_restoration(&tid)).await;
+            self.warn_on_index_wait_results(&tid, index_results);
+            self.mark_restored(&tid);
+            if idle_for.is_some_and(|silent| silent >= idle) {
+                self.finish_aborted(&tid);
+            }
+        }
+    }
+
+    /// Restore again each cell of `tid` whose rollback failed. Returns how
+    /// long the transaction has had no activity, or `None` if it is not an
+    /// aborted transaction any more.
+    fn retry_restoration(&self, tid: &TxnId) -> Option<std::time::Duration> {
+        let txn_lock = self.find_transaction(tid)?;
+        let mut txn = txn_lock.lock();
+        if txn.state != TxnState::Aborted {
+            return None;
+        }
+        let pending: Vec<Id> = txn.unrestored.iter().copied().collect();
+        for id in pending {
+            let Some((location, version, previous_write)) = txn.history.get(&id).map(|history| {
+                (
+                    history.previous_location,
+                    history.current_version,
+                    history.previous_write.clone(),
+                )
+            }) else {
+                txn.unrestored.remove(&id);
+                continue;
+            };
+            let meta_lock = self.cell_meta_mutex(&id);
+            let mut meta = meta_lock.lock();
+            match self.chunks().restore_transaction_cell(&id, location, version) {
+                Ok(()) => {
+                    meta.write = previous_write;
+                    drop(meta);
+                    txn.unrestored.remove(&id);
+                    warn!("transaction {:?}: cell {:?} is restored on retry", tid, id);
+                }
+                Err(error) => {
+                    debug!(
+                        "transaction {:?}: cell {:?} still cannot be restored: {:?}",
+                        tid, id, error
+                    );
+                }
+            }
+        }
+        if txn.unrestored.is_empty() {
+            // No source is needed any more.
+            drop(std::mem::take(&mut txn.segment_guards));
+        }
+        let silent_ms = get_time().saturating_sub(txn.last_activity).max(0) as u64;
+        Some(std::time::Duration::from_millis(silent_ms))
     }
 
     /// The commit decision's physical half: every bracket gets its COMMIT,
@@ -2642,6 +2960,12 @@ impl DataManager {
                                     );
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
+                                    #[cfg(test)]
+                                    if take_apply_error_hook(tid, &cell_id) {
+                                        write_error =
+                                            Some((cell_id, WriteError::CannotAllocateSpace));
+                                        break;
+                                    }
                                 }
                                 Err(error) => {
                                     write_error = Some((cell_id, error));
@@ -2675,13 +2999,10 @@ impl DataManager {
             // Drop what this attempt recorded: the next transaction on this
             // thread must not inherit segments (nor pin them alive).
             drop(crate::ram::chunk::take_transactional_segments());
-            // The earlier writes of this attempt are applied. Undo them now,
-            // as the panic and the sync-failure paths do: until the
-            // coordinator's abort arrives they would be visible, and nothing
-            // decides them.
-            if !txn.history.is_empty() {
-                let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
-            }
+            // The earlier writes of this attempt stay applied here: their
+            // forward index tasks are in this request's scope, so the
+            // `commit` RPC undoes them after those tasks
+            // (`undo_partial_apply`).
             return Self::map_commit_write_error(&txn, id, error);
         }
 
@@ -2783,6 +3104,28 @@ impl DataManager {
         // recovery will never roll back. That is durability for something
         // that was never agreed.
         DMCommitResult::Success
+    }
+
+    /// Undo the writes of an apply that failed after it applied some of
+    /// them, as the panic and the sync-failure paths do: until the
+    /// coordinator's abort arrives they would be visible, and nothing decides
+    /// them. The caller holds the index gate and has awaited the forward
+    /// index tasks of the apply.
+    fn undo_partial_apply(&self, tid: &TxnId) {
+        let Some(txn_lock) = self.find_transaction(tid) else {
+            return;
+        };
+        let mut txn = txn_lock.lock();
+        if txn.state != TxnState::Prepared || txn.history.is_empty() {
+            return;
+        }
+        let guarded_cell_ids = Self::guarded_txn_cell_ids(&txn);
+        let cell_mutexes: Vec<_> = guarded_cell_ids
+            .iter()
+            .map(|id| self.cell_meta_mutex(id))
+            .collect();
+        let mut cell_guards: Vec<_> = cell_mutexes.iter().map(|mutex| mutex.lock()).collect();
+        let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
     }
 
     fn validate_commit_subset(txn: &Transaction, cells: &[CommitOp]) -> Result<(), DMCommitResult> {
@@ -3888,39 +4231,438 @@ mod tests {
             .unwrap()
             .current_version += 1;
         assert!(manager.presume_abort(&tid).await);
-        assert_eq!(owner_of(&manager, &ids[0]), Some(owner));
+        assert_eq!(owner_of(&manager, &ids[0]), Some(owner.clone()));
         assert_eq!(owner_of(&manager, &ids[1]), None);
         assert_eq!(score_of(&runtime, &ids[1]), Some(5));
+        assert_retained_until_the_retry(&manager, &runtime, &tid, &owner, ids[0], versions[0])
+            .await;
         server.shutdown().await;
     }
 
-    /// A presumed abort that finds the transaction already aborted releases
-    /// the locks only if that abort is proven clean.
+    /// The cell `failed` kept its lock after a failed restoration. Check that
+    /// no stale reclaim takes it, then repair the injected failure and check
+    /// that the sweep restores the cell, releases the lock and removes the
+    /// transaction.
+    async fn assert_retained_until_the_retry(
+        manager: &Arc<DataManager>,
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        tid: &TxnId,
+        owner: &TxnPriority,
+        failed: Id,
+        version: u64,
+    ) {
+        assert!(
+            manager.has_transaction_for_test(tid),
+            "the undo state must stay for the retry"
+        );
+        let reader = test_hlc(tid.ts + 10, 9399);
+        let read = <DataManager as Service>::read(manager, 0, reader.clone(), reader, failed)
+            .await
+            .payload;
+        assert!(matches!(read, TxnExecResult::Wait), "{read:?}");
+        manager.cell_meta_for_test(&failed).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let later = test_hlc(tid.ts + 11, 9398);
+        assert_eq!(
+            prepare_ops_local(
+                manager,
+                9398,
+                &later,
+                vec![PrepareOp {
+                    id: failed,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::NotRealizable
+        );
+        assert_eq!(
+            owner_of(manager, &failed),
+            Some(owner.clone()),
+            "no stale reclaim while the restoration is pending"
+        );
+        // Repair the injected failure; the next sweep retries the restore.
+        manager
+            .txns
+            .get(tid)
+            .unwrap()
+            .lock()
+            .history
+            .get_mut(&failed)
+            .unwrap()
+            .current_version -= 1;
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        assert_eq!(score_of(runtime, &failed), Some(5), "the retry must restore");
+        assert_eq!(owner_of(manager, &failed), None);
+        assert!(!manager.has_transaction_for_test(tid));
+    }
+
+    /// An explicit abort whose restore failed on one cell: `end` releases
+    /// the restored cell only, and the sweep finishes the failed cell.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_presumed_abort_of_an_aborted_transaction_releases_only_a_clean_abort() {
+    async fn an_explicit_abort_keeps_the_lock_of_a_cell_it_could_not_restore() {
         let _ = env_logger::try_init();
         let address = &crate::utils::test_port::unique_localhost_addr();
-        let group = "txn_data_site_presume_already_aborted";
+        let group = "txn_data_site_explicit_failed_restore";
         let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        for (seq, clean) in [(9341u64, false), (9342, true)] {
-            let tid = test_hlc(1, seq);
-            let cell = Id::allocated(0, 0, seq);
-            prepare_local_txn(&manager, &tid, vec![cell]);
-            {
-                let txn_lock = manager.txns.get(&tid).unwrap();
-                let mut txn = txn_lock.lock();
-                txn.state = TxnState::Aborted;
-                txn.abort_clean = clean;
-            }
-            assert!(manager.presume_abort(&tid).await);
-            assert!(!manager.has_transaction_for_test(&tid));
-            assert_eq!(
-                owner_of(&manager, &cell).is_none(),
-                clean,
-                "clean abort: {clean}"
-            );
+        let ids = [Id::allocated(0, 0, 9361), Id::allocated(0, 0, 9362)];
+        let versions = ids.map(|id| seed_cell_version(&runtime, schema.vid.get(), id, 5, 0));
+        let tid = test_hlc(1, 9361);
+        let owner = TxnPriority::new(tid.clone(), 9361);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9361,
+                &tid,
+                ids.iter()
+                    .zip(versions)
+                    .map(|(id, version)| PrepareOp {
+                        id: *id,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    })
+                    .collect()
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                ids.iter()
+                    .map(|id| CommitOp::Update(counter_cell(schema.vid.get(), *id, 50, "new")))
+                    .collect()
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        manager
+            .txns
+            .get(&tid)
+            .unwrap()
+            .lock()
+            .history
+            .get_mut(&ids[0])
+            .unwrap()
+            .current_version += 1;
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert!(
+            matches!(&abort, AbortResult::Success(Some(failures)) if failures.len() == 1),
+            "{abort:?}"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(owner_of(&manager, &ids[0]), Some(owner.clone()));
+        assert_eq!(owner_of(&manager, &ids[1]), None);
+        assert_retained_until_the_retry(&manager, &runtime, &tid, &owner, ids[0], versions[0])
+            .await;
+        server.shutdown().await;
+    }
+
+    /// A partial apply whose coordinator never sends `abort` or `end`: the
+    /// sweep finishes it without leases and releases its locks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_apply_without_an_end_is_finished_by_the_sweep() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_partial_apply_no_end";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let ids = [Id::allocated(0, 0, 9371), Id::allocated(0, 0, 9372)];
+        let tid = test_hlc(1, 9371);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9371,
+                &tid,
+                ids.iter()
+                    .map(|id| PrepareOp {
+                        id: *id,
+                        expectation: CellExpectation::Absent,
+                        intent: PrepareIntent::Write,
+                    })
+                    .collect()
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        install_apply_error_after_cell(tid.clone(), ids[0]);
+        assert!(matches!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                ids.iter()
+                    .map(|id| CommitOp::Write(counter_cell(schema.vid.get(), *id, 1, "partial")))
+                    .collect()
+            )
+            .await,
+            DMCommitResult::WriteError(_, _)
+        ));
+        assert!(manager.has_transaction_for_test(&tid));
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        assert!(
+            !manager.has_transaction_for_test(&tid),
+            "the sweep must finish the aborted transaction"
+        );
+        for id in &ids {
+            assert_eq!(owner_of(&manager, id), None);
+            assert_eq!(score_of(&runtime, id), None);
         }
+        server.shutdown().await;
+    }
+
+    /// A server with a ranged index on `score`, for the index ordering tests.
+    async fn start_indexed_txn_server(
+        group: &str,
+        schema_id: u32,
+    ) -> (
+        Arc<NebServer>,
+        Arc<crate::server::DatabaseRuntime>,
+        Schema,
+        Arc<DataManager>,
+    ) {
+        use crate::ram::schema::{Field, IndexType};
+        use dovahkiin::types::Type;
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 16 * SEGMENT_SIZE,
+                db_size: 16 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![
+                    NebService::Cell,
+                    NebService::Transaction,
+                    NebService::RangedIndexer,
+                ],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I64),
+            Field::new_unindexed("name", Type::String),
+            Field::new_indexed_nullable("score", Type::U64, vec![IndexType::Ranged]),
+        ]);
+        let schema = Schema::new_with_id(schema_id, group, None, fields, false, false);
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema.clone());
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        (server, runtime, schema, manager)
+    }
+
+    fn score_key(schema: &Schema, id: &Id, score: u64) -> crate::index::EntryKey {
+        crate::index::EntryKey::from_props(
+            id,
+            &OwnedValue::U64(score).feature(),
+            hash_str("score"),
+            schema.uid,
+        )
+    }
+
+    /// Seed `ids` with score 5 and wait for their index entries.
+    async fn seed_indexed(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        schema: &Schema,
+        ids: &[Id],
+    ) -> Vec<u64> {
+        let versions = ids
+            .iter()
+            .map(|id| seed_cell_version(runtime, schema.vid.get(), *id, 5, 0))
+            .collect();
+        runtime.indexer().unwrap().await_indices().await;
+        versions
+    }
+
+    fn present_writes(ids: &[Id], versions: &[u64]) -> Vec<PrepareOp> {
+        ids.iter()
+            .zip(versions)
+            .map(|(id, version)| PrepareOp {
+                id: *id,
+                expectation: CellExpectation::Present(*version),
+                intent: PrepareIntent::Write,
+            })
+            .collect()
+    }
+
+    fn updates_to(schema: &Schema, ids: &[Id], score: u64) -> Vec<CommitOp> {
+        ids.iter()
+            .map(|id| CommitOp::Update(counter_cell(schema.vid.get(), *id, score, "applied")))
+            .collect()
+    }
+
+    /// Prepare and apply an update of `id` from score 5 to score 50.
+    async fn update_applied(
+        manager: &Arc<DataManager>,
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        schema: &Schema,
+        tid: &TxnId,
+        id: Id,
+    ) {
+        let versions = seed_indexed(runtime, schema, &[id]).await;
+        assert_eq!(
+            prepare_ops_local(manager, tid.node, tid, present_writes(&[id], &versions)).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(manager, tid, updates_to(schema, &[id], 50)).await,
+            DMCommitResult::Success
+        );
+    }
+
+    /// While the undo index task of a presumed abort is held, the cell stays
+    /// locked by the aborted transaction: a stale reclaim cannot take it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presumed_abort_keeps_its_locks_while_its_index_undo_runs() {
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("presumed_abort_index_hold", 995).await;
+        let id = Id::allocated(0, 0, 9381);
+        let tid = test_hlc(1, 9381);
+        let owner = TxnPriority::new(tid.clone(), tid.node);
+        update_applied(&manager, &runtime, &schema, &tid, id).await;
+        manager.cell_meta_for_test(&id).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let hold = crate::index::builder::hold_index_task("restore", id);
+        let later = test_hlc(2, 9382);
+        let competing = async {
+            hold.wait_until_entered().await;
+            let prepared = prepare_ops_local(
+                &manager,
+                later.node,
+                &later,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(1),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await;
+            let owner_during_undo = owner_of(&manager, &id);
+            hold.release();
+            (prepared, owner_during_undo)
+        };
+        let ((), (prepared, owner_during_undo)) =
+            tokio::join!(manager.sweep_idle_transactions(Duration::ZERO), competing);
+        assert_eq!(prepared, DMPrepareResult::NotRealizable);
+        assert_eq!(owner_during_undo, Some(owner));
+        assert_eq!(owner_of(&manager, &id), None);
+        assert!(!manager.has_transaction_for_test(&tid));
+        server.shutdown().await;
+    }
+
+    /// The undo of a partial apply runs after the forward index tasks of the
+    /// apply. With the forward insert held, the undo does not run; after it,
+    /// the aborted cell has no index entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_apply_undoes_its_index_after_the_forward_tasks() {
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("partial_apply_index_order", 996).await;
+        let ids = [Id::allocated(0, 0, 9391), Id::allocated(0, 0, 9392)];
+        let tid = test_hlc(1, 9391);
+        let versions = seed_indexed(&runtime, &schema, &ids).await;
+        assert_eq!(
+            prepare_ops_local(&manager, 9391, &tid, present_writes(&ids, &versions)).await,
+            DMPrepareResult::Success
+        );
+        install_apply_error_after_cell(tid.clone(), ids[0]);
+        let forward = crate::index::builder::hold_index_task("forward", ids[0]);
+        let undone = crate::index::builder::hold_index_task("restore_done", ids[0]);
+        undone.release();
+        let ops = updates_to(&schema, &ids, 50);
+        let checker = async {
+            forward.wait_until_entered().await;
+            // Give a concurrent undo every chance to finish first.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !undone.has_entered() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let undo_ran_first = undone.has_entered();
+            forward.release();
+            undo_ran_first
+        };
+        let (committed, undo_ran_first) =
+            tokio::join!(commit_ops_local(&manager, &tid, ops), checker);
+        assert!(matches!(committed, DMCommitResult::WriteError(_, _)), "{committed:?}");
+        assert!(undone.has_entered(), "test setup: the undo must run");
+        assert!(!undo_ran_first, "the undo must wait for the forward index task");
+        assert_eq!(score_of(&runtime, &ids[0]), Some(5));
+        let indexer = runtime.indexer().unwrap();
+        indexer.await_indices().await;
+        let ranged = &indexer.clients.ranged_client;
+        assert!(
+            !ranged.contains(&score_key(&schema, &ids[0], 50)).await.unwrap(),
+            "the aborted value must have no index entry"
+        );
+        assert!(ranged.contains(&score_key(&schema, &ids[0], 5)).await.unwrap());
+        server.shutdown().await;
+    }
+
+    /// An explicit abort answers only after its undo index work: `end`, and
+    /// with it the lock release, cannot come before it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_abort_answers_after_its_index_undo() {
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("explicit_abort_index_hold", 997).await;
+        let id = Id::allocated(0, 0, 9401);
+        let tid = test_hlc(1, 9401);
+        update_applied(&manager, &runtime, &schema, &tid, id).await;
+        let hold = crate::index::builder::hold_index_task("restore", id);
+        let answered = std::sync::atomic::AtomicBool::new(false);
+        let abort = async {
+            let result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+                .await
+                .payload;
+            answered.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        };
+        let checker = async {
+            hold.wait_until_entered().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let early = answered.load(std::sync::atomic::Ordering::SeqCst);
+            hold.release();
+            early
+        };
+        let (abort, answered_early) = tokio::join!(abort, checker);
+        assert_eq!(abort, AbortResult::Success(None));
+        assert!(!answered_early, "the abort answered before its index undo");
+        let ranged = &runtime.indexer().unwrap().clients.ranged_client;
+        assert!(!ranged.contains(&score_key(&schema, &id, 50)).await.unwrap());
+        assert!(ranged.contains(&score_key(&schema, &id, 5)).await.unwrap());
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid, false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(owner_of(&manager, &id), None);
         server.shutdown().await;
     }
 
@@ -8176,38 +8918,39 @@ impl Service for DataManager {
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
         };
-
-        if self.database_runtime.indexer().is_some() {
-            let tid_for_logs = tid.clone();
-            let scoped_commit = IndexBuilder::with_request_index_scope({
-                let txn_lock = txn_lock.clone();
-                let tid = tid.clone();
-                let effective_ts = effective_ts.clone();
-                move || self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
-            });
-            return async move {
-                let _fence_guard = fence_guard;
-                #[cfg(feature = "occ_phase_profile")]
-                let _phase_guard = phase_guard;
-                let (payload, request_results) = scoped_commit.await;
-                let pending_results = match self.database_runtime.indexer() {
-                    Some(indexer) => indexer.await_indices().await,
-                    None => Vec::new(),
-                };
-                self.warn_on_index_wait_results(
-                    &tid_for_logs,
-                    request_results
-                        .into_iter()
-                        .chain(pending_results.into_iter()),
-                );
-                DataSiteResponse::new(self.hlc.now(), payload)
+        let gate = txn_lock.lock().index_gate.clone();
+        async move {
+            let _fence_guard = fence_guard;
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase_guard = phase_guard;
+            // Held until the forward index tasks of this apply, and the undo
+            // of a partial apply, are done.
+            let _gate = gate.lock().await;
+            let (payload, request_results) = IndexBuilder::with_request_index_scope(|| {
+                self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
+            })
+            .await;
+            let pending_results = match self.database_runtime.indexer() {
+                Some(indexer) => indexer.await_indices().await,
+                None => Vec::new(),
+            };
+            self.warn_on_index_wait_results(
+                &tid,
+                request_results
+                    .into_iter()
+                    .chain(pending_results.into_iter()),
+            );
+            if !matches!(payload, DMCommitResult::Success) {
+                // After the forward index tasks: an undo task that ran beside
+                // a delayed forward insert could be overtaken by it.
+                let ((), undo_results) =
+                    IndexBuilder::with_request_index_scope(|| self.undo_partial_apply(&tid)).await;
+                self.warn_on_index_wait_results(&tid, undo_results);
+                self.mark_restored(&tid);
             }
-            .boxed();
+            DataSiteResponse::new(self.hlc.now(), payload)
         }
-
-        #[cfg(feature = "occ_phase_profile")]
-        let _phase_guard = phase_guard;
-        self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
+        .boxed()
     }
     fn abort(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
@@ -8215,18 +8958,31 @@ impl Service for DataManager {
         let _phase_guard =
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantAbort);
         self.update_clock(clock);
-        let Some(txn_lock) = self.find_transaction(&tid) else {
+        let Some(gate) = self.index_gate(&tid) else {
             return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
         };
-        // The leases are held through the rollback and released only after
-        // the spans are rewound; see `rollback_and_rewind`. They used to be
-        // released FIRST, which handed every head back with the
-        // transaction's BEGIN still open, so the next ordinary writer's
-        // acknowledged entries landed inside a bracket recovery discards.
-        let mut txn = txn_lock.lock();
-        let result = self.abort_locked(&tid, &mut txn);
-        drop(txn);
-        self.response_with(result)
+        async move {
+            // After the apply's index work; the undo index work is awaited
+            // before the answer, so `end` releases no lock before it.
+            let _gate = gate.lock().await;
+            // The leases are held through the rollback and released only
+            // after the spans are rewound; see `rollback_and_rewind`. They
+            // used to be released FIRST, which handed every head back with
+            // the transaction's BEGIN still open, so the next ordinary
+            // writer's acknowledged entries landed inside a bracket recovery
+            // discards.
+            let (result, index_results) = IndexBuilder::with_request_index_scope(|| {
+                match self.find_transaction(&tid) {
+                    Some(txn_lock) => self.abort_locked(&tid, &mut txn_lock.lock()),
+                    None => AbortResult::CheckFailed(CheckError::NotExisted),
+                }
+            })
+            .await;
+            self.warn_on_index_wait_results(&tid, index_results);
+            self.mark_restored(&tid);
+            self.response_with(result).await
+        }
+        .boxed()
     }
     fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
         let outcome = self.txn_outcome(&tid);
@@ -8290,165 +9046,11 @@ impl Service for DataManager {
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
         self.update_clock(clock);
-
-        // Option 6: Two-Phase Lock Release with Verification and Retry
-        let (affected_cell_ids, txn_state, expected_owner) = {
-            let Some(txn_lock) = self.find_transaction(&tid) else {
-                return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
-            };
-            let txn = txn_lock.lock();
-            if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
-                return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
-            }
-            debug!(
-                "AFFECTED: {}, {:?}, {:?}",
-                txn.affected_cells.len(),
-                txn.state,
-                tid
-            );
-            (
-                txn.affected_cells.clone(),
-                txn.state,
-                txn.coordinator_id
-                    .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id)),
-            )
-        };
-
-        if txn_state == TxnState::Committed {
-            match self.close_committed_brackets(&tid, durable) {
-                CloseOutcome::Closed => {}
-                // Still decided and still holding its locks and heads.
-                CloseOutcome::Pending(report) => return self.response_with(report),
-                CloseOutcome::Fenced => {
-                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
-                }
-                CloseOutcome::RolledBack(reason) => {
-                    self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
-                    self.record_decision(&tid, TxnOutcome::Aborted);
-                    self.wipe_out_transaction(&tid);
-                    self.cleanup_signal.store(true, Relaxed);
-                    return self.response_with(reason);
-                }
-            }
-        }
-
-        // Attempt lock release with retries
-        let mut retry_attempt = 0;
-        let mut lock_release_result = None;
-
-        while retry_attempt <= MAX_LOCK_RELEASE_RETRIES {
-            if retry_attempt > 0 {
-                debug!(
-                    "Retrying lock release for {:?} (attempt {}/{})",
-                    tid, retry_attempt, MAX_LOCK_RELEASE_RETRIES
-                );
-                std::thread::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS));
-            }
-
-            let (released_count, failed_releases) =
-                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
-            let total_cells = affected_cell_ids.len();
-
-            if failed_releases.is_empty() {
-                // All locks released successfully
-                debug!(
-                    "Successfully released all {} locks for {:?}, total locks: {}",
-                    released_count,
-                    tid,
-                    self.txns.len()
-                );
-                lock_release_result = Some(Ok(()));
-                break;
-            } else if retry_attempt == MAX_LOCK_RELEASE_RETRIES {
-                // Retries exhausted - CRITICAL ERROR
-                error!(
-                    "CRITICAL: Lock release retries exhausted for {:?}: {}/{} locks released, {} failures",
-                    tid,
-                    released_count,
-                    total_cells,
-                    failed_releases.len()
-                );
-                for failure in &failed_releases {
-                    error!(
-                        "  - Cell {:?} lock release failed: {}",
-                        failure.cell_id, failure.reason
-                    );
-                }
-                lock_release_result = Some(Err((released_count, total_cells, failed_releases)));
-                break;
-            } else {
-                // Partial failure on this attempt, will retry
-                error!(
-                    "Lock release failed for {:?} on attempt {}/{}: {}/{} locks released, {} failures - retrying",
-                    tid,
-                    retry_attempt + 1,
-                    MAX_LOCK_RELEASE_RETRIES + 1,
-                    released_count,
-                    total_cells,
-                    failed_releases.len()
-                );
-                for failure in &failed_releases {
-                    error!(
-                        "  - Cell {:?} lock release failed: {}",
-                        failure.cell_id, failure.reason
-                    );
-                }
-            }
-
-            retry_attempt += 1;
-        }
         async move {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard = phase_guard;
-            // The decision completed before lock release. Old versions stayed
-            // referenced through the append result and any required rollback.
-            // Recorded only once the outcome is real: for a commit that means
-            // after the bracket closed, because a failed close is refused
-            // above and this site is then NOT committed.
-            self.record_decision(
-                &tid,
-                if txn_state == TxnState::Committed {
-                    TxnOutcome::Committed
-                } else {
-                    TxnOutcome::Aborted
-                },
-            );
-            self.wipe_out_transaction(&tid);
-            self.cleanup_signal.store(true, Relaxed);
-
-            // Return appropriate result based on lock release outcome
-            match lock_release_result {
-                Some(Ok(())) => {
-                    debug!("ENDED: {:?} with all locks released", tid);
-                    self.response_with(EndResult::Success).await
-                }
-                Some(Err((released, total, failures))) => {
-                    // Option 1: Hard error on lock release failure
-                    error!(
-                        "ENDED: {:?} with lock release failures ({}/{} released)",
-                        tid, released, total
-                    );
-                    if failures.len() == total {
-                        // Complete failure - retries exhausted
-                        self.response_with(EndResult::LockReleaseRetriesExhausted { failures })
-                            .await
-                    } else {
-                        // Partial failure
-                        self.response_with(EndResult::SomeLocksNotReleased {
-                            released,
-                            total,
-                            failures,
-                        })
-                        .await
-                    }
-                }
-                None => {
-                    // This shouldn't happen, but handle it gracefully
-                    error!("ENDED: {:?} with unknown lock release status", tid);
-                    self.response_with(EndResult::LockReleaseRetriesExhausted { failures: vec![] })
-                        .await
-                }
-            }
+            let result = self.end_transaction(&tid, durable).await;
+            self.response_with(result).await
         }
         .boxed()
     }

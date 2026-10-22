@@ -596,6 +596,75 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Test hook: the next index task of a cell stops at a named point
+/// (`forward`, `restore`, `restore_done`) until the test releases it.
+#[cfg(test)]
+pub(crate) struct IndexTaskHold {
+    entered: std::sync::atomic::AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    released: std::sync::atomic::AtomicBool,
+    released_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl IndexTaskHold {
+    pub(crate) fn has_entered(&self) -> bool {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.entered_notify.notified();
+        if self.has_entered() {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.released_notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+static INDEX_TASK_HOLDS: parking_lot::Mutex<Vec<(&'static str, Id, Arc<IndexTaskHold>)>> =
+    parking_lot::const_mutex(Vec::new());
+
+/// Hold the next index task of `cell` at `point`. A hold that is released
+/// before the task arrives lets the task pass and only records its arrival.
+#[cfg(test)]
+pub(crate) fn hold_index_task(point: &'static str, cell: Id) -> Arc<IndexTaskHold> {
+    let hold = Arc::new(IndexTaskHold {
+        entered: Default::default(),
+        entered_notify: tokio::sync::Notify::new(),
+        released: Default::default(),
+        released_notify: tokio::sync::Notify::new(),
+    });
+    INDEX_TASK_HOLDS.lock().push((point, cell, hold.clone()));
+    hold
+}
+
+#[cfg(test)]
+async fn index_task_point(point: &'static str, cell: Id) {
+    let hold = {
+        let mut holds = INDEX_TASK_HOLDS.lock();
+        let Some(position) = holds
+            .iter()
+            .position(|(held, id, _)| *held == point && *id == cell)
+        else {
+            return;
+        };
+        holds.remove(position).2
+    };
+    let released = hold.released_notify.notified();
+    hold.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+    hold.entered_notify.notify_waiters();
+    if hold.released.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    released.await;
+}
+
 fn new_index_task(
     owner: &Arc<PendingIndexTasks>,
     task: impl Future<Output = Result<(), IndexError>> + Send + 'static,
@@ -728,6 +797,8 @@ impl IndexBuilder {
             let schema_uid = schema.uid;
             let t_spawn = std::time::Instant::now();
             new_index_task(&self.clients.pending_tasks, async move {
+                #[cfg(test)]
+                index_task_point("forward", cell_id).await;
                 if let Some(key) = scannable_key {
                     Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid)
                         .await?;
@@ -771,6 +842,8 @@ impl IndexBuilder {
         let cell_id = cell.id();
         let schema_uid = schema.uid;
         new_index_task(&self.clients.pending_tasks, async move {
+            #[cfg(test)]
+            index_task_point("restore", cell_id).await;
             if let Some(key) = restored_scannable_key {
                 Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid).await?;
             }
@@ -783,6 +856,8 @@ impl IndexBuilder {
                     .await
                     .map_err(IndexError::RPCError)?;
             }
+            #[cfg(test)]
+            index_task_point("restore_done", cell_id).await;
             Ok(())
         });
     }

@@ -974,6 +974,7 @@ pub fn transactions_with_idle_leases(
 /// participant aborts the transactions it knows about properly (rollback,
 /// then rewind) before calling this; what reaches here has no participant
 /// object to roll back. Returns the transactions whose leases were reclaimed.
+#[cfg(test)]
 pub fn expire_transaction_leases(
     idle: std::time::Duration,
     store: &StoreRange,
