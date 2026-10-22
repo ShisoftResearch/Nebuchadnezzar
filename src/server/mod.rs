@@ -24,11 +24,11 @@ use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use crate::server::storage_lock::StorageDirectoryLocks;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub mod cell_rpc;
 pub mod database;
@@ -2038,8 +2038,7 @@ impl NebServer {
         Ok(database_runtime)
     }
 
-    /// Every runtime this server hosts, snapshotted so callers do not hold the
-    /// lock while touching a runtime.
+    /// Every runtime this server hosts, copied out of the current snapshot.
     fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
         self.database_runtimes.load().values().cloned().collect()
     }
