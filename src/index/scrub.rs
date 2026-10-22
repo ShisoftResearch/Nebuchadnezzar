@@ -56,8 +56,6 @@
 //! one-way hash and a spilled segment's id names nothing. That is the `OWNER`
 //! field of `HASH_INDEX_SCHEMA`.
 
-#[cfg(test)]
-use crate::index::full_text::ToOwnedValue;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -305,14 +303,6 @@ impl std::fmt::Display for ScrubReport {
     }
 }
 
-/// Start a scrub after recovery, if this deployment asked for one.
-///
-/// `NEB_SCRUB_ON_RECOVERY`: `off`, `verify`, or `repair`.
-/// Startup uses `repair` when the variable is absent.
-///
-/// The pass scans every live cell. Its cost depends on the store size and
-/// the distribution of bucket members. Measure it on the deployment's data.
-///
 /// What the last reconciliation cost, for anything that wants to report it.
 ///
 /// A blocking pass on the startup path has to be answerable about its price,
@@ -342,6 +332,14 @@ pub static LAST_RECONCILE_HASH_REPAIRED: std::sync::atomic::AtomicU64 =
 pub static LAST_RECONCILE_HASH_PRUNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Start a scrub after recovery, if this deployment asked for one.
+///
+/// `NEB_SCRUB_ON_RECOVERY`: `off`, `verify`, or `repair`.
+/// Startup uses `repair` when the variable is absent.
+///
+/// The pass scans every live cell. Its cost depends on the store size and
+/// the distribution of bucket members. Measure it on the deployment's data.
+///
 /// **Why it BLOCKS rather than running in the background.** The index is a
 /// cache of the cells, and a cache that has not caught up answers queries
 /// with fewer rows and no error. Serving during the pass therefore does not
@@ -1431,59 +1429,6 @@ async fn scrub_hash_index_inner(
                     .collect::<Vec<_>>()
             });
         #[cfg(test)]
-        let mut moved_snapshot = if !prune
-            && mode == ScrubMode::Verify
-            && std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some()
-        {
-            let snapshot = pending.by_ref().collect::<Vec<_>>();
-            let mut moved_bytes = 0;
-            for chunk in &chunks.list {
-                let selected = chunk.segments();
-                let before = chunk
-                    .live_cell_ids()
-                    .into_iter()
-                    .map(|bits| {
-                        let cell = chunk.read_cell(bits).unwrap();
-                        (bits, cell.header.version, cell.data.to_owned_value())
-                    })
-                    .collect::<Vec<_>>();
-                chunk.rotate_heads_for_scrub_test();
-                for segment in &selected {
-                    eprintln!(
-                        "scrub source id={} used={} active={} refs={} cold={} class={:?}",
-                        segment.id,
-                        segment.used_spaces(),
-                        chunk.is_active_head(segment.id),
-                        segment.references_count(),
-                        segment.is_cold(),
-                        segment.segment_class()
-                    );
-                }
-                let (collected, _) =
-                    crate::ram::cleaner::combine::CombinedCleaner::combine_segments(
-                        chunk, &selected,
-                    );
-                moved_bytes += collected;
-                for (bits, version, data) in before {
-                    let cell = chunk.read_cell(bits).unwrap();
-                    assert_eq!(
-                        cell.header.version, version,
-                        "movement changed cell version"
-                    );
-                    assert_eq!(
-                        cell.data.to_owned_value(),
-                        data,
-                        "movement changed cell data"
-                    );
-                }
-            }
-            eprintln!("deterministic hash snapshot movement: collected {moved_bytes} bytes; authoritative cells unchanged");
-            assert!(moved_bytes > 0, "movement hook did not relocate a segment");
-            Some(snapshot.into_iter())
-        } else {
-            None
-        };
-        #[cfg(test)]
         let mut pending = {
             let snapshot = pending.by_ref().collect::<Vec<_>>();
             if let Some(hook) = after_snapshot.as_mut() {
@@ -1493,14 +1438,7 @@ async fn scrub_hash_index_inner(
         };
         loop {
             while workers.len() < concurrency().min(4) {
-                #[cfg(test)]
-                let next = match moved_snapshot.as_mut() {
-                    Some(snapshot) => snapshot.next(),
-                    None => pending.next(),
-                };
-                #[cfg(not(test))]
-                let next = pending.next();
-                let Some((chunk_index, ids)) = next else {
+                let Some((chunk_index, ids)) = pending.next() else {
                     break;
                 };
                 let chunks = chunks.clone();
@@ -1704,8 +1642,8 @@ fn report_hash_missing(cell: &Id, bucket: &Id) {
     }
 }
 
-/// Examples of stale entries logged this pass. Same reset discipline, and the
-/// same reason: once a stale set proves STABLE across restarts, the ids in it
+/// Examples of stale entries logged this pass. Same reset discipline as
+/// `UNREACHABLE_LOGGED`.
 static STALE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn report_stale(key: &EntryKey) {
@@ -1724,25 +1662,16 @@ fn report_stale(key: &EntryKey) {
     }
 }
 
-/// Ask the index about each key, and in `Repair` mode insert the ones it
-/// does not hold.
-///
-/// Examples logged this pass. Reset when a pass starts rather than left to
-/// run for the life of the process -- an operator who runs the scrub a
-/// second time is entitled to see examples again, and a counter that only
-/// ever counts up would silently stop explaining itself after the first run.
+/// Examples of unreachable keys logged this pass. Reset when a pass starts
+/// rather than left to run for the life of the process -- an operator who runs
+/// the scrub a second time is entitled to see examples again, and a counter
+/// that only ever counts up would silently stop explaining itself after the
+/// first run.
 static UNREACHABLE_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Examples of MISSING keys logged this pass. Same reset discipline.
 static MISSING_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Name a few of the cells whose entries are absent.
-///
-/// A count alone says how bad it is and nothing about what it is. Once a
-/// missing set proves STABLE across restarts -- the same number surviving
-/// every recovery -- it stops being a durability window and becomes a set of
-/// specific cells to go and look at, and then their ids are the whole
-/// investigation. Capped like the unreachable examples, for the same reason.
 /// A repair the index took and then did not have. Always logged, never
 /// sampled: this should be impossible, so every instance is worth a line.
 fn report_not_stuck(key: &EntryKey) {
@@ -1754,6 +1683,13 @@ fn report_not_stuck(key: &EntryKey) {
     );
 }
 
+/// Name a few of the cells whose entries are absent.
+///
+/// A count alone says how bad it is and nothing about what it is. Once a
+/// missing set proves STABLE across restarts -- the same number surviving
+/// every recovery -- it stops being a durability window and becomes a set of
+/// specific cells to go and look at, and then their ids are the whole
+/// investigation. Capped like the unreachable examples, for the same reason.
 fn report_missing(key: &EntryKey) {
     const EXAMPLES: usize = 12;
     let n = MISSING_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1816,7 +1752,29 @@ async fn reconcile(
         in_flight.push(check_one(indexers, key, mode));
     }
     while let Some(outcome) = in_flight.next().await {
-        match outcome {
+        outcome.tally(&mut report);
+        if let Some(key) = pending.next() {
+            in_flight.push(check_one(indexers, key, mode));
+        }
+    }
+    report
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    /// Inserted, and then not there when read straight back.
+    RepairNotStuck,
+    /// Inserted, and the read-back could not reach the tree.
+    RepairUnconfirmed,
+    Present,
+    Missing,
+    Repaired,
+    Unreachable,
+}
+
+impl KeyOutcome {
+    fn tally(self, report: &mut ScrubReport) {
+        match self {
             KeyOutcome::Present => report.entries_present += 1,
             KeyOutcome::Missing => report.entries_missing += 1,
             KeyOutcome::Repaired => {
@@ -1828,21 +1786,15 @@ async fn reconcile(
                 report.entries_missing += 1;
                 report.repairs_not_stuck += 1;
             }
-        }
-        if let Some(key) = pending.next() {
-            in_flight.push(check_one(indexers, key, mode));
+            // The insert was accepted, so it counts as a repair. The tree did
+            // not answer the read-back, so the pass is not clean either.
+            KeyOutcome::RepairUnconfirmed => {
+                report.entries_missing += 1;
+                report.entries_repaired += 1;
+                report.entries_unreachable += 1;
+            }
         }
     }
-    report
-}
-
-enum KeyOutcome {
-    /// Inserted, and then not there when read straight back.
-    RepairNotStuck,
-    Present,
-    Missing,
-    Repaired,
-    Unreachable,
 }
 
 /// How many index round trips are outstanding at once.
@@ -1901,10 +1853,12 @@ async fn check_one(indexers: &Arc<IndexerClients>, key: &EntryKey, mode: ScrubMo
                         report_not_stuck(key);
                         KeyOutcome::RepairNotStuck
                     }
-                    // Could not confirm either way; count it as repaired
-                    // rather than invent a failure, and let the unreachable
-                    // accounting speak for the tree.
-                    Err(_) => KeyOutcome::Repaired,
+                    // Could not confirm either way. Count the accepted
+                    // insert as a repair and the tree as unreachable.
+                    Err(error) => {
+                        report_unreachable(key, &error);
+                        KeyOutcome::RepairUnconfirmed
+                    }
                 }
             }
             // Someone else inserted it in between; it is present now.
@@ -2376,6 +2330,23 @@ mod tests {
         // about the entries they would have contributed.
         report.cells_unreadable = 1;
         assert!(!report.is_clean());
+    }
+
+    /// A repair whose read-back could not reach the tree is counted as a
+    /// repair and as unreachable, never as a confirmed repair alone.
+    #[test]
+    fn an_unconfirmed_repair_is_counted_as_unreachable() {
+        let mut confirmed = ScrubReport::default();
+        KeyOutcome::Repaired.tally(&mut confirmed);
+        assert_eq!(confirmed.entries_unreachable, 0);
+
+        let mut unconfirmed = ScrubReport::default();
+        KeyOutcome::RepairUnconfirmed.tally(&mut unconfirmed);
+        assert_eq!(unconfirmed.entries_missing, 1);
+        assert_eq!(unconfirmed.entries_repaired, 1);
+        assert_eq!(unconfirmed.entries_unreachable, 1);
+        assert_eq!(unconfirmed.repairs_not_stuck, 0);
+        assert!(!unconfirmed.is_clean());
     }
 
     /// The library function being right is not the same as the command
@@ -3717,7 +3688,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_missing_hash_entry_is_found_and_repaired() {
         let _ = env_logger::try_init();
-        let dir = TempDir::new().unwrap();
         let (server, client) = server_with_hash_schema(
             &crate::utils::test_port::unique_localhost_addr(),
             "hash_scrub_repair",
@@ -3791,7 +3761,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hash_entry_no_cell_implies_is_reported_and_pruned() {
         let _ = env_logger::try_init();
-        let dir = TempDir::new().unwrap();
         let (server, client) = server_with_hash_schema(
             &crate::utils::test_port::unique_localhost_addr(),
             "hash_scrub_prune",
@@ -4057,7 +4026,25 @@ mod tests {
         );
 
         // The whole-store form of the same statement, as an operator sees it.
-        let hash_report = scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        // With NEB_TEST_HASH_SCRUB_MOVE set, the cleaner moves every segment
+        // after the fill snapshot and before the walk visits it.
+        let hash_report = if std::env::var_os("NEB_TEST_HASH_SCRUB_MOVE").is_some() {
+            let moved_chunks = server.chunks().clone();
+            let mut hook = move |prune: bool| {
+                if !prune {
+                    move_hash_snapshot_cells(&moved_chunks);
+                }
+            };
+            scrub_hash_index_inner(
+                server.chunks(),
+                indexers,
+                ScrubMode::Verify,
+                Some(&mut hook),
+            )
+            .await
+        } else {
+            scrub_hash_index(server.chunks(), indexers, ScrubMode::Verify).await
+        };
         println!("post-recovery hash scrub: {}", hash_report);
         assert!(
             hash_report.is_clean(),
@@ -4068,9 +4055,6 @@ mod tests {
         assert_eq!(hash_report.hash_entries_missing, 0);
         assert_eq!(hash_report.hash_entries_stale, 0);
 
-        // The controlled move runs once. Its destination can be the only
-        // segment left when the next verification starts.
-        std::env::remove_var("NEB_TEST_HASH_SCRUB_MOVE");
         let all = scrub_all_indexes(server.chunks(), indexers, ScrubMode::Verify).await;
         println!("post-recovery full scrub: {}", all);
         assert!(all.is_clean(), "recovered index is not clean: {}", all);
@@ -4124,6 +4108,42 @@ mod tests {
     /// it off, `Chunk::ensure_indices` and `Chunk::remove_indices` have no builder
     /// to hand their work to, so the cells change and the buckets stay where they
     /// were.
+    /// Move every segment of every chunk with the combine cleaner, and check
+    /// that the move kept each live cell's version and data. The hash scrub
+    /// movement control runs this between the fill snapshot and the walk.
+    fn move_hash_snapshot_cells(chunks: &Arc<Chunks>) {
+        use crate::index::full_text::ToOwnedValue;
+        let mut moved_bytes = 0;
+        for chunk in &chunks.list {
+            let selected = chunk.segments();
+            let before = chunk
+                .live_cell_ids()
+                .into_iter()
+                .map(|bits| {
+                    let cell = chunk.read_cell(bits).unwrap();
+                    (bits, cell.header.version, cell.data.to_owned_value())
+                })
+                .collect::<Vec<_>>();
+            chunk.rotate_heads_for_scrub_test();
+            let (collected, _) =
+                crate::ram::cleaner::combine::CombinedCleaner::combine_segments(chunk, &selected);
+            moved_bytes += collected;
+            for (bits, version, data) in before {
+                let cell = chunk.read_cell(bits).unwrap();
+                assert_eq!(
+                    cell.header.version, version,
+                    "movement changed cell version"
+                );
+                assert_eq!(
+                    cell.data.to_owned_value(),
+                    data,
+                    "movement changed cell data"
+                );
+            }
+        }
+        assert!(moved_bytes > 0, "movement hook did not relocate a segment");
+    }
+
     async fn start_hash_crash_server(
         dir: &std::path::Path,
         group: &str,
@@ -4785,7 +4805,7 @@ mod tests {
                 .await
                 .unwrap();
             let client = server.data_client(&vec![addr.clone()]).await.unwrap();
-            let mut old = crate::index::hash::hash_index_schema();
+            let old = crate::index::hash::hash_index_schema();
             // Keep the current fields but persist the wrong physical version.
             let old = Schema::new_with_id(
                 wrong_version.get(),
