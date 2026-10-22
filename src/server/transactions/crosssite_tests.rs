@@ -2776,7 +2776,6 @@ async fn the_force_resolve_tool_decides_for_a_lost_participant() {
 
 /// A BEGIN without a decision must not retain cells or transaction pins after recovery.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "G2 evidence: BEGIN-only recovery retains a transaction pin outside the in-doubt registry"]
 async fn g2_recovery_of_a_begin_only_bracket() {
     g2_recovery_without_a_decision(false).await;
 }
@@ -2784,6 +2783,127 @@ async fn g2_recovery_of_a_begin_only_bracket() {
 #[tokio::test(flavor = "multi_thread")]
 async fn g2_recovery_of_an_open_bracket_with_cells() {
     g2_recovery_without_a_decision(true).await;
+}
+
+/// An empty part must wait for a silent peer, then preserve its COMMIT decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_recovery_of_a_begin_only_bracket_with_a_committed_peer() {
+    g2_recovery_of_an_empty_multisite_bracket(true).await;
+}
+
+/// An empty part can release its pin after the participant fence decides abort.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_recovery_of_a_begin_only_bracket_with_an_undecided_peer() {
+    g2_recovery_of_an_empty_multisite_bracket(false).await;
+}
+
+async fn g2_recovery_of_an_empty_multisite_bracket(peer_commits: bool) {
+    use super::data_site::{DataManager, Service as DataSiteService};
+    use crate::ram::chunk::TransactionScope;
+
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let group = if peer_commits {
+        "g2_empty_committed_peer"
+    } else {
+        "g2_empty_undecided_peer"
+    };
+    let (mut cluster, client) = Cluster::start(group).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    assert!(cluster.site(B).refresh_slot_placement().await);
+    let manager = coordinator(&cluster).await;
+    let tid = manager.begin().await.unwrap().unwrap();
+    let id = Id::from_parts(THERE as u64, 49_002);
+    assert_eq!(
+        late_prepare(&cluster, B, &tid, id).await,
+        DMPrepareResult::Success
+    );
+    let peer = data_site(&cluster, B);
+    assert_eq!(
+        <DataManager as DataSiteService>::commit(
+            &peer,
+            site_clock(&cluster, B),
+            tid,
+            vec![CommitOp::Write(cell_of(id, 49_002))],
+        )
+        .await
+        .payload,
+        DMCommitResult::Success
+    );
+    if peer_commits {
+        assert_eq!(
+            <DataManager as DataSiteService>::end(&peer, site_clock(&cluster, B), tid, true)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::Committed);
+    }
+
+    let a_id = cluster.site(A).server_id;
+    let b_id = cluster.site(B).server_id;
+    let image = {
+        let chunks = cluster.site(A).chunks();
+        let scope = TransactionScope::enter_with_participants(tid, vec![a_id, b_id]);
+        let pending = chunks.list[HERE as usize % chunks.list.len()]
+            .try_acquire(64, false)
+            .unwrap();
+        let entry_types: Vec<_> = pending
+            .seg
+            .entry_iter()
+            .map(|entry| entry.entry_header.entry_type)
+            .collect();
+        assert_eq!(
+            entry_types,
+            vec![EntryType::BEGIN, EntryType::PADDING],
+            "only BEGIN and the unwritten reservation must exist"
+        );
+        assert!(segment_holds_record_of(
+            &pending.seg,
+            &tid,
+            EntryType::BEGIN
+        ));
+        pending.seg.force_wal_sync().unwrap();
+        let image = cluster.power_image(A);
+        drop(pending);
+        drop(scope);
+        drop(crate::ram::chunk::take_transactional_segments());
+        crate::ram::chunk::retire_transaction_leases(&tid, &chunks.address_range()).unwrap();
+        image
+    };
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.restart_from_images(&[A], vec![image]).await;
+    assert!(
+        in_doubt_on(&cluster, A, &tid),
+        "an empty part must wait for its peer"
+    );
+    assert_eq!(held_for(&cluster, A, &tid), 1);
+    assert_eq!(outcome_on(&cluster, A, &tid), TxnOutcome::InDoubt);
+    assert!(!compact_records(cluster.site(A), &tid, EntryType::BEGIN));
+
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    wait_until("the empty part's resolution", 60, || {
+        !in_doubt_on(&cluster, A, &tid)
+    })
+    .await;
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    if peer_commits {
+        assert_eq!(outcome_on(&cluster, A, &tid), TxnOutcome::Committed);
+        assert_eq!(score_on(cluster.site(B), &id), Some(49_002));
+        cluster.power_loss_restart(A).await;
+        assert!(!in_doubt_on(&cluster, A, &tid));
+        assert_eq!(held_for(&cluster, A, &tid), 0);
+        assert_eq!(outcome_on(&cluster, A, &tid), TxnOutcome::Committed);
+    } else {
+        assert!(cluster.site(A).chunks().fences().is_fenced(&tid));
+        assert!(cluster.site(B).chunks().fences().is_fenced(&tid));
+        assert_ne!(outcome_on(&cluster, A, &tid), TxnOutcome::Committed);
+    }
+    cluster.shutdown().await;
 }
 
 async fn g2_recovery_without_a_decision(with_cells: bool) {
