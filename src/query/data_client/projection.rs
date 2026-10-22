@@ -63,7 +63,7 @@ impl IndexedDataClient {
             .iter()
             .map(|field| field.field_id)
             .collect::<Vec<_>>();
-        let selected_cells = self.read_selected_cells_from_ids(ids, &field_ids).await;
+        let selected_cells = self.read_selected_cells_from_ids(ids, &field_ids).await?;
         let mut rows = Vec::with_capacity(selected_cells.len());
         for cell in selected_cells {
             let columns = projection

@@ -967,7 +967,6 @@ mod test {
     /// 5. Query again and verify results match
     #[tokio::test(flavor = "multi_thread")]
     async fn test_e2e_range_index_recovery_with_schema() {
-        use crate::index::builder::IndexBuilder;
         use crate::index::ranged::tree::btree::storage;
         use crate::index::ranged::tree::btree::Ordering;
         use crate::query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm};
@@ -2999,7 +2998,6 @@ mod test {
     #[ignore = "stress test"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_cell_query_concurrent_writes_eventually_scan_all() {
-        use crate::index::builder::IndexBuilder;
         use crate::query::data_client::QueryOrdering;
         use crate::ram::cell::OwnedCell;
         use crate::ram::schema::SchemaUid;

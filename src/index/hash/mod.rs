@@ -294,18 +294,28 @@ impl HashIndexer {
     /// that materialised every segment before doing anything would put the
     /// bucket back into memory in one piece, which is the shape chaining
     /// exists to avoid.
+    ///
+    /// The segment is decoded strictly (`bucket_segment`): a member array, link
+    /// or owner of the wrong type is an error, never an empty segment or the end
+    /// of the chain. A segment whose owner is not `head` is an error too.
     async fn read_segment(
         &self,
+        head: Id,
         segment_id: Id,
     ) -> Result<Result<Option<(Vec<Id>, Option<Id>)>, ReadError>, RPCError> {
         match self.neb_client.read_cell(segment_id).await {
-            Ok(Ok(mut cell)) => {
-                let next = Self::cell_next(&cell);
-                let ids = match &mut cell[*HASH_INDEX_FIELD_ID] {
-                    OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => std::mem::take(ids),
-                    _ => Vec::new(),
+            Ok(Ok(cell)) => {
+                let segment = match bucket_segment(&cell) {
+                    Ok(segment) => segment,
+                    Err(error) => return Ok(Err(error)),
                 };
-                Ok(Ok(Some((ids, next))))
+                if segment.owner != head {
+                    return Ok(Err(ReadError::ExecError(format!(
+                        "hash segment {segment_id:?} belongs to bucket {:?}, not {head:?}",
+                        segment.owner
+                    ))));
+                }
+                Ok(Ok(Some((segment.ids, segment.next))))
             }
             Ok(Err(ReadError::CellDoesNotExisted)) => Ok(Ok(None)),
             Ok(Err(e)) => Ok(Err(e)),
@@ -746,13 +756,15 @@ impl HashIndexer {
     /// low-cardinality indexed value is the difference between half a megabyte
     /// and however large that value's population has grown.
     ///
-    /// De-duplication is against what has already been EMITTED rather than
-    /// against every candidate seen. That is both sufficient -- the contract
-    /// is a result without duplicates -- and free, since the result is
-    /// materialised anyway, whereas a candidate-side set would be as large as
-    /// the bucket. Duplicates are possible at all because write-side dedup
-    /// checks only the head segment: scanning the chain on every insert would
-    /// put a chain-length read on the write path.
+    /// De-duplication is against what has already been EMITTED, plus within
+    /// one segment, rather than against every candidate seen. That is both
+    /// sufficient -- the contract is a result without duplicates -- and free,
+    /// since the result is materialised anyway, whereas a candidate-side set
+    /// would be as large as the bucket. A candidate that failed verification
+    /// and appears again in a later segment is verified again. Duplicates are
+    /// possible at all because write-side dedup checks only the head segment:
+    /// scanning the chain on every insert would put a chain-length read on
+    /// the write path.
     async fn query_ids(
         &self,
         index_id: Id,
@@ -763,21 +775,27 @@ impl HashIndexer {
         let mut emitted = HashSet::new();
         let mut cursor = Some(index_id);
         let mut hops = 0usize;
+        let reader = crate::query::data_client::read::CellReader::new(
+            self.neb_client.conshash.clone(),
+            self.neb_client.group_name(),
+            self.neb_client.database_name(),
+        );
 
         while let Some(cid) = cursor {
-            let segment = match self.read_segment(cid).await {
+            let segment = match self.read_segment(index_id, cid).await {
                 Ok(Ok(Some(segment))) => segment,
-                // A missing HEAD is an empty bucket. A missing LINK is a
-                // broken chain: say so rather than quietly returning a short
-                // answer that reads like a complete one.
+                // A missing HEAD is an empty bucket.
+                Ok(Ok(None)) if cid == index_id => break,
+                // A missing LINK is a broken chain. The ids after it are
+                // unreachable, so the answer is an error, not a short list.
                 Ok(Ok(None)) => {
-                    if cid != index_id {
-                        error!(
-                            "hash bucket {:?} links to missing cell {:?}; entries after it are unreachable",
-                            index_id, cid
-                        );
-                    }
-                    break;
+                    error!(
+                        "hash bucket {:?} links to missing cell {:?}; entries after it are unreachable",
+                        index_id, cid
+                    );
+                    return Ok(Err(ReadError::ExecError(format!(
+                        "hash bucket {index_id:?} links to missing cell {cid:?}"
+                    ))));
                 }
                 Ok(Err(e)) => return Ok(Err(e)),
                 Err(e) => return Err(e),
@@ -785,42 +803,49 @@ impl HashIndexer {
             let (ids, next) = segment;
             cursor = next;
 
-            for id in ids {
-                if emitted.contains(&id) {
-                    continue;
-                }
-                if let Some(check) = check {
-                    let present = match verify {
-                        crate::index::verification::Verify::Exists => {
-                            let client = self.neb_client.locate_plain_server(id).await?;
-                            match client.existing_ids(&vec![id]).await?.pop() {
-                                Some(Ok(exists)) => exists,
-                                Some(Err(error)) => return Ok(Err(error)),
-                                None => return Ok(Err(ReadError::CellDoesNotExisted)),
-                            }
-                        }
-                        crate::index::verification::Verify::Predicate => matches!(
-                            self.neb_client
-                                .read_indexed_cell(id, check.clone())
-                                .await,
-                            Ok(Ok(_))
-                        ),
-                    };
-                    if !present {
-                        continue;
+            let mut in_segment = HashSet::new();
+            let fresh = ids
+                .into_iter()
+                .filter(|id| !emitted.contains(id) && in_segment.insert(*id))
+                .collect::<Vec<_>>();
+            // Verify one segment in one read per owner. The reader retries a
+            // failed server and returns an error rather than fewer ids.
+            let matched = match check {
+                None => fresh,
+                Some(_) if fresh.is_empty() => fresh,
+                Some(check) => match verify {
+                    crate::index::verification::Verify::Exists => {
+                        reader.existing_ids(&fresh).await?
                     }
+                    crate::index::verification::Verify::Predicate => reader
+                        .read_cells_from_ids_checked(
+                            &fresh,
+                            &vec![],
+                            &dovahkiin::expr::serde::Expr::nothing(),
+                            &dovahkiin::expr::serde::Expr::nothing(),
+                            &vec![check.clone()],
+                        )
+                        .await?
+                        .into_iter()
+                        .map(|cell| cell.id())
+                        .collect(),
+                },
+            };
+            for id in matched {
+                if emitted.insert(id) {
+                    result.push(id);
                 }
-                emitted.insert(id);
-                result.push(id);
             }
 
             hops += 1;
             if hops > MAX_CHAIN_HOPS {
                 error!(
-                    "hash bucket {:?} chain exceeded {} hops; truncating walk",
+                    "hash bucket {:?} chain exceeded {} hops",
                     index_id, MAX_CHAIN_HOPS
                 );
-                break;
+                return Ok(Err(ReadError::ExecError(format!(
+                    "hash bucket {index_id:?} chain exceeded {MAX_CHAIN_HOPS} hops"
+                ))));
             }
         }
 
@@ -1182,7 +1207,59 @@ mod tests {
         let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
         drop(held);
         thread.join().unwrap();
-        assert!(result.is_ok(), "an unrelated bucket shard must make progress");
+        assert!(
+            result.is_ok(),
+            "an unrelated bucket shard must make progress"
+        );
+        server.shutdown().await;
+    }
+
+    /// The query walk decodes segments strictly and checks that each one
+    /// belongs to the bucket it walks. A segment of another bucket, at the head
+    /// or behind a link, is an error, not ids of the wrong bucket or the end.
+    #[tokio::test]
+    async fn a_segment_of_another_bucket_is_an_error_not_a_member_list() {
+        let (server, client) = create_test_server("segment_owner").await;
+        let indexer = HashIndexer::new(&client);
+        let bucket = Id::rand();
+        let other = Id::rand();
+        let member = Id::rand();
+        client
+            .write_cell(HashIndexer::bucket_cell(
+                &other,
+                &bucket,
+                vec![member],
+                None,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        match indexer.candidates(bucket).await.unwrap() {
+            Err(ReadError::ExecError(message)) => assert!(message.contains("belongs to bucket")),
+            other => panic!("a head owned by another bucket must be an error: {other:?}"),
+        }
+
+        let linked = Id::rand();
+        let spill = Id::rand();
+        client
+            .write_cell(HashIndexer::bucket_cell(&other, &spill, vec![member], None))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .write_cell(HashIndexer::bucket_cell(
+                &linked,
+                &linked,
+                vec![],
+                Some(spill),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        match indexer.candidates(linked).await.unwrap() {
+            Err(ReadError::ExecError(message)) => assert!(message.contains("belongs to bucket")),
+            other => panic!("a link to another bucket's segment must be an error: {other:?}"),
+        }
         server.shutdown().await;
     }
 

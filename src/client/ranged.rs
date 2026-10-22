@@ -69,21 +69,7 @@ impl From<ScanOrder> for Ordering {
 }
 
 impl RangedClient {
-    /// Create a new ranged client
-    pub fn new<C>(conshash: Arc<ConsistentHashing>, raft_client: Arc<C>, group_name: &str) -> Self
-    where
-        C: AsRaftPlaneClient + 'static,
-    {
-        Self {
-            reader: crate::query::data_client::read::CellReader::new(
-                conshash.clone(),
-                group_name,
-                group_name,
-            ),
-            inner: Arc::new(RangedIndexerClient::new(&conshash, &raft_client)),
-        }
-    }
-
+    /// Create a ranged client for one database of the group.
     pub fn new_for_database<C>(
         conshash: Arc<ConsistentHashing>,
         raft_client: Arc<C>,
@@ -310,7 +296,7 @@ impl RangedCursor {
                         &dovahkiin::expr::serde::Expr::nothing(),
                         &self.checks,
                     )
-                    .await;
+                    .await?;
                 self.ids = cells.iter().map(|cell| cell.id()).collect();
                 self.cells = cells.into_iter().map(Some).collect();
             }
@@ -354,20 +340,26 @@ impl RangedCursor {
                     &dovahkiin::expr::serde::Expr::nothing(),
                     &self.checks,
                 )
-                .await;
+                .await?;
             if let Some(cell) = cells.pop() {
                 return Ok(Some(cell));
             }
         }
     }
 
+    /// The next verified id, without advancing.
     pub fn current(&self) -> Option<&Id> {
         self.ids.get(self.pos)
     }
+
+    /// The verified ids of the current block.
     pub fn current_block(&self) -> &Vec<Id> {
         &self.ids
     }
 
+    /// Advance to the next block that has a verified id.
+    ///
+    /// Returns true if there are more results.
     pub async fn next_block(&mut self) -> Result<bool, RPCError> {
         self.ids.clear();
         self.cells.clear();
@@ -378,6 +370,7 @@ impl RangedCursor {
         self.refresh().await
     }
 
+    /// Position in the verified ids of the current block.
     pub fn position(&self) -> usize {
         self.pos
     }

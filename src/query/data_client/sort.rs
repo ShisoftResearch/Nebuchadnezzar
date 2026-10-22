@@ -3,11 +3,9 @@ use std::{cmp::Ordering as CmpOrdering, collections::HashSet};
 use bifrost::rpc::RPCError;
 use dovahkiin::{ahash::HashMap, types::Id};
 
-use crate::index::ranged::tree::btree::Ordering;
-
 use crate::ram::cell::OwnedCell;
 
-use super::{IndexedDataClient, QueryOrdering, ValueRange, ValueRangeTerm};
+use super::{IndexedDataClient, QueryOrdering};
 
 impl IndexedDataClient {
     pub(super) async fn reorder_ids_by_field(
@@ -21,7 +19,7 @@ impl IndexedDataClient {
         let _ = schema;
         let mut result = ids.to_vec();
         self.sort_ids_by_field(field_id, &mut result, ordering, ordering, cached)
-            .await;
+            .await?;
         Ok(result)
     }
 
@@ -31,9 +29,23 @@ impl IndexedDataClient {
         ids: &mut [Id],
         ordering: QueryOrdering,
         cached: &HashMap<Id, OwnedCell>,
-    ) {
+    ) -> Result<(), RPCError> {
         self.sort_ids_by_field(field_id, ids, ordering, QueryOrdering::Asc, cached)
-            .await;
+            .await
+    }
+
+    /// One cell per id, from the cache when every id is cached, else from the
+    /// owners. `None` is a cell that is gone. A failed read is an error: a sort
+    /// or a DISTINCT over a partial read picks the wrong rows.
+    async fn cells_for(
+        &self,
+        ids: &[Id],
+        cached: &HashMap<Id, OwnedCell>,
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        if ids.iter().all(|id| cached.contains_key(id)) {
+            return Ok(ids.iter().map(|id| Some(cached[id].clone())).collect());
+        }
+        self.read_full_cells_aligned(ids).await
     }
 
     async fn sort_ids_by_field(
@@ -43,41 +55,23 @@ impl IndexedDataClient {
         ordering: QueryOrdering,
         tie_break_ordering: QueryOrdering,
         cached: &HashMap<Id, OwnedCell>,
-    ) {
+    ) -> Result<(), RPCError> {
         if ids.len() <= 1 {
-            return;
+            return Ok(());
         }
 
+        let cells = self.cells_for(ids, cached).await?;
         let mut feature_by_id = HashMap::default();
-        let id_list = ids.to_vec();
-        let cells = if id_list.iter().all(|id| cached.contains_key(id)) {
-            Ok(id_list.iter().map(|id| Ok(cached[id].clone())).collect())
-        } else {
-            self.index_clients.neb_client.read_all_cells(&id_list).await
-        };
-        match cells {
-            Ok(cells) => {
-                for (id, cell_res) in id_list.into_iter().zip(cells) {
-                    match cell_res {
-                        Ok(cell) => {
-                            let feature = match &cell[field_id] {
-                                dovahkiin::types::OwnedValue::Null
-                                | dovahkiin::types::OwnedValue::Array(_)
-                                | dovahkiin::types::OwnedValue::PrimArray(_)
-                                | dovahkiin::types::OwnedValue::Map(_) => None,
-                                value => Some(value.feature()),
-                            };
-                            feature_by_id.insert(id, feature);
-                        }
-                        Err(e) => {
-                            warn!("Cell read error during sort for id {:?}: {:?}", id, e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Bulk cell read error during sort: {:?}", e);
-            }
+        for (id, cell) in ids.iter().zip(cells) {
+            // A cell deleted since it was selected sorts last, like a null.
+            let feature = cell.and_then(|cell| match &cell[field_id] {
+                dovahkiin::types::OwnedValue::Null
+                | dovahkiin::types::OwnedValue::Array(_)
+                | dovahkiin::types::OwnedValue::PrimArray(_)
+                | dovahkiin::types::OwnedValue::Map(_) => None,
+                value => Some(value.feature()),
+            });
+            feature_by_id.insert(*id, feature);
         }
 
         ids.sort_unstable_by(|left, right| {
@@ -86,6 +80,7 @@ impl IndexedDataClient {
             compare_optional_features(left_feature, right_feature, ordering)
                 .then_with(|| compare_ids_for_query_order(left, right, tie_break_ordering))
         });
+        Ok(())
     }
 
     pub(super) async fn distinct_ids_by_fields(
@@ -93,61 +88,26 @@ impl IndexedDataClient {
         field_ids: &[u64],
         ids: Vec<Id>,
         cached: &HashMap<Id, OwnedCell>,
-    ) -> Vec<Id> {
+    ) -> Result<Vec<Id>, RPCError> {
         if ids.len() <= 1 {
-            return ids;
+            return Ok(ids);
         }
 
-        let id_list = ids.clone();
-        let read = if id_list.iter().all(|id| cached.contains_key(id)) {
-            Ok(id_list.iter().map(|id| Ok(cached[id].clone())).collect())
-        } else {
-            self.index_clients.neb_client.read_all_cells(&id_list).await
-        };
-        let cells = match read {
-            Ok(cells) => cells,
-            Err(e) => {
-                warn!("Bulk cell read error during DISTINCT: {:?}", e);
-                return ids;
-            }
-        };
-
+        let cells = self.cells_for(&ids, cached).await?;
         let mut seen = HashSet::new();
         let mut distinct_ids = Vec::with_capacity(ids.len());
-        for (id, cell_res) in id_list.into_iter().zip(cells) {
-            match cell_res {
-                Ok(cell) => {
-                    let key = field_ids
-                        .iter()
-                        .map(|field_id| cell[*field_id].clone())
-                        .collect::<Vec<_>>();
-                    if seen.insert(key) {
-                        distinct_ids.push(id);
-                    }
-                }
-                Err(e) => {
-                    warn!("Cell read error during DISTINCT for id {:?}: {:?}", id, e);
-                }
+        // A cell deleted since it was selected is not a row any more.
+        for (id, cell) in ids.into_iter().zip(cells) {
+            let Some(cell) = cell else { continue };
+            let key = field_ids
+                .iter()
+                .map(|field_id| cell[*field_id].clone())
+                .collect::<Vec<_>>();
+            if seen.insert(key) {
+                distinct_ids.push(id);
             }
         }
-        distinct_ids
-    }
-}
-
-pub(super) fn query_order_to_scan_order(ordering: QueryOrdering) -> Ordering {
-    match ordering {
-        QueryOrdering::Asc => Ordering::Forward,
-        QueryOrdering::Desc => Ordering::Backward,
-    }
-}
-
-pub(super) fn range_index_order_for_range(range: &ValueRange) -> Ordering {
-    match (&range.start, &range.end) {
-        (ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_), _) => Ordering::Forward,
-        (ValueRangeTerm::Open, ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_)) => {
-            Ordering::Backward
-        }
-        (ValueRangeTerm::Open, ValueRangeTerm::Open) => Ordering::Forward,
+        Ok(distinct_ids)
     }
 }
 

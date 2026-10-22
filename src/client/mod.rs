@@ -487,24 +487,6 @@ impl AsyncClient {
             .collect())
     }
 
-    pub(crate) async fn read_indexed_cell(
-        &self,
-        id: Id,
-        check: crate::index::verification::IndexCheck,
-    ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
-        let client = self.locate_plain_server(id).await?;
-        let mut cells = client
-            .read_all_cells_verified(
-                &vec![id],
-                &vec![],
-                &dovahkiin::expr::serde::Expr::nothing(),
-                &dovahkiin::expr::serde::Expr::nothing(),
-                &vec![check],
-            )
-            .await?;
-        Ok(cells.pop().unwrap_or(Err(ReadError::CellDoesNotExisted)))
-    }
-
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,
@@ -830,13 +812,28 @@ impl AsyncClient {
         Ok(ClusterFence::start(holds, lease_ms))
     }
 
+    /// The ids of every member. A membership read that fails is an RPC error,
+    /// not a panic in the caller.
+    async fn all_member_ids(&self) -> Result<Vec<u64>, RPCError> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .all_members(true)
+            .await
+            .map_err(|error| {
+                RPCError::IOError(std::io::Error::other(format!(
+                    "membership query failed: {error:?}"
+                )))
+            })?;
+        Ok(members.into_iter().map(|member| member.id).collect())
+    }
+
     /// Cells the cell indexes of every member hold live, summed.
     pub async fn live_cell_count(&self) -> Result<u64, RPCError> {
-        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut total = 0;
-        for member in members {
+        for member in self.all_member_ids().await? {
             total += self
-                .client_by_server_id(member.id)
+                .client_by_server_id(member)
                 .await?
                 .live_cell_count()
                 .await?;
@@ -854,8 +851,7 @@ impl AsyncClient {
     /// not frozen by this call: a caller that needs a stable set holds the
     /// database's write fence for the walk.
     pub async fn cell_id_scan(&self) -> Result<CellIdScan<'_>, RPCError> {
-        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
-        let mut servers: Vec<u64> = members.into_iter().map(|m| m.id).collect();
+        let mut servers = self.all_member_ids().await?;
         servers.sort_unstable();
         Ok(CellIdScan {
             client: self,
@@ -867,11 +863,12 @@ impl AsyncClient {
     }
 
     pub async fn count(&self) -> Result<u64, RPCError> {
-        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
-        let mut member_futs: FuturesUnordered<_> = members
+        let mut member_futs: FuturesUnordered<_> = self
+            .all_member_ids()
+            .await?
             .into_iter()
-            .map(|m| async move {
-                let client = self.client_by_server_id(m.id).await?;
+            .map(|member| async move {
+                let client = self.client_by_server_id(member).await?;
                 Ok(client.count().await?)
             })
             .collect();
@@ -898,11 +895,14 @@ impl AsyncClient {
         &self,
         repair: bool,
     ) -> Result<crate::index::scrub::ScrubReport, String> {
-        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let members = self
+            .all_member_ids()
+            .await
+            .map_err(|e| format!("scrub RPC failed: {:?}", e))?;
         let mut member_futs: FuturesUnordered<_> = members
             .into_iter()
-            .map(|m| async move {
-                let client = self.client_by_server_id(m.id).await?;
+            .map(|member| async move {
+                let client = self.client_by_server_id(member).await?;
                 Ok::<_, RPCError>(client.scrub_index(repair).await?)
             })
             .collect();
@@ -1231,7 +1231,7 @@ impl AsyncClient {
         }
     }
 
-    /// Certify current WAL prefixes on every member of this database.
+    /// Compare-and-set one cell, and record its durability receipt in `capture`.
     ///
     /// Contract: a cell takes plain (non-transactional) writes or transactions,
     /// not both. If a caller mixes them on one cell, Neb does not guarantee that
@@ -1967,6 +1967,8 @@ pub async fn client_by_server_name_for_database(
 }
 
 /// A walk over the live cell ids of a database. See [`AsyncClient::cell_id_scan`].
+///
+/// A walk dropped part-way leaves its server cursor to the server's idle expiry.
 pub struct CellIdScan<'a> {
     client: &'a AsyncClient,
     servers: Vec<u64>,
@@ -1983,7 +1985,8 @@ impl CellIdScan<'_> {
     }
 
     /// The next page of at most `max` ids, or `None` when every server has been
-    /// walked. A page can be empty or short without the walk being over.
+    /// walked. A page is never empty. It can be short without the walk being
+    /// over.
     pub async fn next_page(&mut self, max: u32) -> Result<Option<Vec<Id>>, RPCError> {
         loop {
             if self.current.is_none() {
@@ -2017,13 +2020,6 @@ impl CellIdScan<'_> {
                 return Ok(Some(ids));
             }
         }
-    }
-}
-
-impl Drop for CellIdScan<'_> {
-    fn drop(&mut self) {
-        // A walk dropped part-way leaves its cursor to the server's idle expiry.
-        self.current = None;
     }
 }
 

@@ -237,10 +237,14 @@ fn tree_snapshot_entries(
 }
 
 /// Decode a placement snapshot (the pair-list form; stores written with the
-/// earlier map form are reimported, not read).
-fn decode_tree_snapshot(data: &[u8]) -> Option<BTreeMap<EntryKey, TreePlacement>> {
-    utils::serde::deserialize::<Vec<(EntryKey, TreePlacement)>>(data)
-        .map(|entries| entries.into_iter().collect())
+/// earlier map form are reimported, not read). Halts on undecodable data.
+fn decode_tree_snapshot(data: &[u8]) -> BTreeMap<EntryKey, TreePlacement> {
+    decode_persisted_or_halt::<Vec<(EntryKey, TreePlacement)>>(
+        "ranged tree placement snapshot",
+        data,
+    )
+    .into_iter()
+    .collect()
 }
 
 impl StateMachineCtl for MasterTreeSM {
@@ -253,10 +257,7 @@ impl StateMachineCtl for MasterTreeSM {
         utils::serde::serialize(&tree_snapshot_entries(&self.tree))
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
-        let entries: Vec<(EntryKey, TreePlacement)> =
-            decode_persisted_or_halt("ranged tree placement snapshot", &data);
-        let tree = entries.into_iter().collect();
-        self.tree = tree;
+        self.tree = decode_tree_snapshot(&data);
         // Load the trees these placements name. `try_initialize` does this at
         // startup, but it runs BEFORE registration, so on a runtime reload it
         // saw an empty map and loaded nothing -- the placements then arrived
@@ -639,7 +640,7 @@ mod tests {
     fn placement_snapshot_round_trips_under_the_active_codec() {
         let tree = sample_tree();
         let bytes = utils::serde::serialize(&tree_snapshot_entries(&tree));
-        let restored = decode_tree_snapshot(&bytes).expect("snapshot decodes");
+        let restored = decode_tree_snapshot(&bytes);
         assert_eq!(restored.len(), tree.len());
         for (key, placement) in &tree {
             let got = restored.get(key).expect("key survives");

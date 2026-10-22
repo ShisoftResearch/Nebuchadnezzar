@@ -74,7 +74,7 @@ impl DataCursor {
     pub async fn next(&mut self) -> Result<Option<OwnedCell>, RPCError> {
         if self.buffer.len() <= self.pos {
             if self.next_block().await? {
-                if !self.refresh_batch().await {
+                if !self.refresh_batch().await? {
                     return Ok(None);
                 }
             } else {
@@ -101,7 +101,9 @@ impl DataCursor {
         Ok(false)
     }
 
-    pub async fn refresh_batch(&mut self) -> bool {
+    /// Read the cells of the current index block, moving on past blocks that
+    /// hold no row. A failed read is an error, never an empty block.
+    pub async fn refresh_batch(&mut self) -> Result<bool, RPCError> {
         while let Some(cursor) = self.index_cursor.as_ref() {
             self.buffer = self
                 .client
@@ -112,21 +114,18 @@ impl DataCursor {
                     &self.proc,
                     &self.checks,
                 )
-                .await;
+                .await?;
             self.pos = 0;
             if !self.buffer.is_empty() {
-                return true;
+                return Ok(true);
             }
-            if !matches!(
-                self.index_cursor.as_mut().unwrap().next_block().await,
-                Ok(true)
-            ) {
+            if !self.index_cursor.as_mut().unwrap().next_block().await? {
                 break;
             }
         }
         self.index_cursor = None;
         self.buffer.clear();
         self.pos = 0;
-        false
+        Ok(false)
     }
 }

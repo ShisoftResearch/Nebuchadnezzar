@@ -9,20 +9,17 @@ use itertools::Itertools;
 use crate::{
     client::client_by_server_name_for_database,
     index::{
-        ranged::{
-            client::cursor::ClientCursor,
-            tree::{btree::Ordering, service::Range},
-        },
+        ranged::tree::{btree::Ordering, service::Range},
         EntryKey, SCHEMA_SCAN_PATT_SIZE,
     },
     query::planner::normalize_selection_for_eval,
     ram::{
-        cell::OwnedCell,
+        cell::{OwnedCell, ReadError},
         types::{index_query_scalars, values_semantically_equal},
     },
 };
 
-use super::{DataCursor, IndexedDataClient, QueryOrdering, ScanPage, SCAN_BUFFER_SIZE};
+use super::{IndexedDataClient, QueryOrdering, ScanPage, SCAN_BUFFER_SIZE};
 use crate::ram::schema::SchemaUid;
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
@@ -46,28 +43,6 @@ pub fn cells_read_count() -> usize {
 }
 
 impl IndexedDataClient {
-    pub(super) async fn scan_schema_index<'a>(
-        &'a self,
-        schema: SchemaUid,
-        projection: Vec<u64>,
-        selection: Expr,
-        proc: Expr,
-        ordering: Ordering,
-    ) -> Result<DataCursor, RPCError> {
-        let key = EntryKey::for_schema(schema);
-        let index_cursor = self
-            .index_clients
-            .range_seek(
-                Range::new_inclusive_opened(key, ordering),
-                SCHEMA_SCAN_BUFFER_SIZE,
-                Some(SCHEMA_SCAN_PATT_SIZE),
-            )
-            .await?;
-        Ok(self
-            .new_cursor(index_cursor, projection, selection, proc)
-            .await)
-    }
-
     pub(super) async fn scan_schema_ids(
         &self,
         schema: SchemaUid,
@@ -196,7 +171,7 @@ impl IndexedDataClient {
                     &Expr::nothing(),
                     &vec![crate::index::verification::IndexCheck::Schema(schema)],
                 )
-                .await;
+                .await?;
             for cell in cells {
                 if cell_matches_selection(&cell, selection) {
                     selected.push(cell.id());
@@ -222,7 +197,7 @@ impl IndexedDataClient {
         schema: SchemaUid,
         selection: &Expr,
         limit: Option<usize>,
-    ) -> Vec<Id> {
+    ) -> Result<Vec<Id>, RPCError> {
         let Some(limit) = limit else {
             let cells = self
                 .read_cells_from_ids_checked(
@@ -232,15 +207,15 @@ impl IndexedDataClient {
                     &Expr::nothing(),
                     &vec![crate::index::verification::IndexCheck::Schema(schema)],
                 )
-                .await;
-            return cells
+                .await?;
+            return Ok(cells
                 .into_iter()
                 .filter(|cell| cell_matches_selection(cell, selection))
                 .map(|cell| cell.id())
-                .collect_vec();
+                .collect_vec());
         };
         if limit == 0 || candidate_ids.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let mut selected_ids = Vec::with_capacity(limit);
@@ -254,7 +229,7 @@ impl IndexedDataClient {
                     &Expr::nothing(),
                     &vec![crate::index::verification::IndexCheck::Schema(schema)],
                 )
-                .await;
+                .await?;
             selected_ids.extend(
                 cells
                     .into_iter()
@@ -266,28 +241,7 @@ impl IndexedDataClient {
                 break;
             }
         }
-        selected_ids
-    }
-
-    pub(super) async fn new_cursor<'a>(
-        &'a self,
-        index_cursor: Option<ClientCursor>,
-        projection: Vec<u64>,
-        selection: Expr,
-        proc: Expr,
-    ) -> DataCursor {
-        let mut cursor = DataCursor {
-            index_cursor,
-            checks: vec![],
-            projection,
-            selection,
-            proc,
-            client: self.clone(),
-            buffer: vec![],
-            pos: 0,
-        };
-        cursor.refresh_batch().await;
-        cursor
+        Ok(selected_ids)
     }
 
     pub(super) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {
@@ -302,7 +256,7 @@ impl IndexedDataClient {
         projection: &Vec<u64>,
         selection: &Expr,
         proc: &Expr,
-    ) -> Vec<OwnedCell> {
+    ) -> Result<Vec<OwnedCell>, RPCError> {
         self.read_cells_from_ids_checked(ids, projection, selection, proc, &vec![])
             .await
     }
@@ -314,8 +268,8 @@ impl IndexedDataClient {
         selection: &Expr,
         proc: &Expr,
         checks: &Vec<crate::index::verification::IndexCheck>,
-    ) -> Vec<OwnedCell> {
-        CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
+    ) -> Result<Vec<OwnedCell>, RPCError> {
+        self.cell_reader()
             .read_cells_from_ids_checked(ids, projection, selection, proc, checks)
             .await
     }
@@ -324,11 +278,11 @@ impl IndexedDataClient {
         &self,
         ids: &[Id],
         projection: &Vec<u64>,
-    ) -> Vec<Vec<OwnedValue>> {
+    ) -> Result<Vec<Vec<OwnedValue>>, RPCError> {
         let projected_cells = self
             .read_cells_from_ids(ids, projection, &Expr::nothing(), &Expr::nothing())
-            .await;
-        projected_cells
+            .await?;
+        Ok(projected_cells
             .into_iter()
             .map(|cell| {
                 projection
@@ -337,89 +291,147 @@ impl IndexedDataClient {
                     .map(|(index, _field_id)| cell[index].clone())
                     .collect_vec()
             })
-            .collect_vec()
+            .collect_vec())
     }
 
     pub(super) async fn read_selected_cells_from_ids(
         &self,
         ids: &[Id],
         fields: &[u64],
-    ) -> Vec<OwnedCell> {
-        let mut all_cells = vec![];
-        let mut tasks = ids
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                self.conshash
-                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
-                    .map(|sid| (i, sid, *id))
-            })
-            .sorted_by_key(|(_i, sid, _id)| *sid)
-            .chunk_by(|(_i, sid, _id)| *sid)
-            .into_iter()
-            .map(|(sid, pairs)| {
-                let mut grouped_ids = vec![];
-                let mut idx = vec![];
-                for (i, _, id) in pairs {
-                    idx.push(i);
-                    grouped_ids.push(id);
-                }
-                let fields = fields.to_vec();
-                let group_name = self.group_name.clone();
-                let database_name = self.database_name.clone();
-                let server_name = self.conshash.try_server_name(sid);
-                async move {
-                    let Some(server_name) = server_name else {
-                        // See above: an unroutable member fails these ids rather
-                        // than taking the process down.
-                        return Err(RPCError::IOError(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("no address known for server id {sid}"),
-                        )));
-                    };
-                    match client_by_server_name_for_database(
-                        sid,
-                        server_name,
-                        &group_name,
-                        &database_name,
-                    )
-                    .await
-                    {
-                        Ok(client) => client
-                            .read_all_cells_selected(&grouped_ids, &fields, true)
-                            .await
-                            .map(|cells| {
-                                cells
-                                    .into_iter()
-                                    .zip(idx)
-                                    .filter_map(|(cell_res, original_idx)| match cell_res {
-                                        Ok(cell) => Some((cell, original_idx)),
-                                        Err(e) => {
-                                            warn!(
-                                                "Selected cell read error at index {}: {:?}",
-                                                original_idx, e
-                                            );
-                                            None
-                                        }
-                                    })
-                                    .collect_vec()
-                            }),
-                        Err(e) => Err(e),
-                    }
-                }
-            })
-            .collect::<FuturesUnordered<_>>();
+    ) -> Result<Vec<OwnedCell>, RPCError> {
+        self.cell_reader().read_selected_cells(ids, fields).await
+    }
 
-        while let Some(task_res) = tasks.next().await {
-            match task_res {
-                Ok(mut cells) => all_cells.append(&mut cells),
-                Err(e) => warn!("Task error in read_selected_cells_from_ids: {:?}", e),
+    pub(super) async fn read_full_cells_aligned(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        self.cell_reader().read_full_cells_aligned(ids).await
+    }
+
+    fn cell_reader(&self) -> CellReader {
+        CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
+    }
+}
+
+/// A cell read that did not complete: the server that owns the cell did not
+/// answer, or answered with a failure that is not "absent" or "does not match".
+///
+/// A read never answers with fewer rows because a server failed. It retries
+/// the server's batch, then reads the ids one by one, and then returns this.
+/// It is carried inside `RPCError::IOError`; use [`CellReadFailure::of`] to
+/// find it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellReadFailure {
+    /// The member the read went to, or `None` when no member owns the slot.
+    pub server_id: Option<u64>,
+    /// The first id that could not be read.
+    pub id: Id,
+    /// What failed, as the transport or the server reported it.
+    pub reason: String,
+}
+
+impl CellReadFailure {
+    /// This failure as the error of a read API. Not a `From` impl: a second
+    /// `From` for `RPCError` breaks type inference of `?` in callers.
+    pub fn into_rpc_error(self) -> RPCError {
+        RPCError::IOError(std::io::Error::other(self))
+    }
+
+    /// The read failure inside an error from a read API, if it is one.
+    pub fn of(error: &RPCError) -> Option<&CellReadFailure> {
+        match error {
+            RPCError::IOError(error) => error.get_ref()?.downcast_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CellReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.server_id {
+            Some(server) => write!(
+                f,
+                "cell read of {:?} failed on server {}: {}",
+                self.id, server, self.reason
+            ),
+            None => write!(f, "cell read of {:?} failed: {}", self.id, self.reason),
+        }
+    }
+}
+
+impl std::error::Error for CellReadFailure {}
+
+/// Batch sends to one server before its ids are read one by one.
+const BATCH_READ_ATTEMPTS: u32 = 3;
+/// Wait before the second batch send. Each later wait is 4 times longer.
+const BATCH_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// One kind of cell read, sent to the server that owns the ids.
+enum CellRead {
+    Proced {
+        projection: Vec<u64>,
+        selection: Expr,
+        proc: Expr,
+    },
+    Verified {
+        projection: Vec<u64>,
+        selection: Expr,
+        proc: Expr,
+        checks: Vec<crate::index::verification::IndexCheck>,
+    },
+    Selected {
+        fields: Vec<u64>,
+    },
+}
+
+impl CellRead {
+    async fn send(
+        &self,
+        client: &crate::server::cell_rpc::AsyncServiceClient,
+        ids: &Vec<Id>,
+    ) -> Result<Vec<Result<OwnedCell, ReadError>>, RPCError> {
+        match self {
+            CellRead::Proced {
+                projection,
+                selection,
+                proc,
+            } => {
+                client
+                    .read_all_cells_proced(ids, projection, selection, proc)
+                    .await
+            }
+            CellRead::Verified {
+                projection,
+                selection,
+                proc,
+                checks,
+            } => {
+                client
+                    .read_all_cells_verified(ids, projection, selection, proc, checks)
+                    .await
+            }
+            CellRead::Selected { fields } => {
+                client.read_all_cells_selected(ids, fields, true).await
             }
         }
-
-        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
-        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
     }
+}
+
+/// Whether a per-cell error means "no row": the cell is absent, or the server
+/// read it and it does not pass the index check or the selection
+/// (`NotMatch`). These cells are dropped; that is the verified-read contract.
+///
+/// Every other per-cell error is a failed read of a cell that exists: an
+/// unavailable schema (`SchemaDoesNotExisted`, and the `ExecError` a verified
+/// read gives for it), a selection or expression that could not be evaluated
+/// (`ExecError`), a wrong owner or unreadable storage. Dropping such a cell
+/// would be a shorter answer, so it is read again alone and then reported.
+pub(crate) fn is_absent_row(error: &ReadError) -> bool {
+    matches!(
+        error,
+        ReadError::CellDoesNotExisted | ReadError::CellIdIsUnitId | ReadError::NotMatch
+    )
 }
 
 #[derive(Clone)]
@@ -509,198 +521,344 @@ impl CellReader {
         selection: &Expr,
         proc: &Expr,
         checks: &Vec<crate::index::verification::IndexCheck>,
-    ) -> Vec<OwnedCell> {
+    ) -> Result<Vec<OwnedCell>, RPCError> {
         CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
-        let normalized_selection = normalize_selection_for_eval(selection);
-        let preserve_order = normalized_selection.is_empty() && proc.is_empty();
-        let expect_full_batch = preserve_order && checks.is_empty();
-        let mut all_cells = vec![];
-        let mut ordered_cells = if preserve_order {
-            Some(vec![None; ids.len()])
+        let selection = normalize_selection_for_eval(selection);
+        let read = if checks.is_empty() {
+            CellRead::Proced {
+                projection: projection.clone(),
+                selection,
+                proc: proc.clone(),
+            }
         } else {
-            None
+            CellRead::Verified {
+                projection: projection.clone(),
+                selection,
+                proc: proc.clone(),
+                checks: checks.clone(),
+            }
         };
-        let mut tasks = ids
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                self.conshash
-                    .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
-                    .map(|sid| (i, sid, *id))
-            })
-            .sorted_by_key(|(_i, sid, _id)| *sid)
-            .chunk_by(|(_i, sid, _id)| *sid)
+        self.read_rows(ids, &read).await
+    }
+
+    pub(crate) async fn read_selected_cells(
+        &self,
+        ids: &[Id],
+        fields: &[u64],
+    ) -> Result<Vec<OwnedCell>, RPCError> {
+        let read = CellRead::Selected {
+            fields: fields.to_vec(),
+        };
+        self.read_rows(ids, &read).await
+    }
+
+    /// The rows for `ids`, in the order of `ids`, without the absent ones.
+    async fn read_rows(&self, ids: &[Id], read: &CellRead) -> Result<Vec<OwnedCell>, RPCError> {
+        Ok(self
+            .read_aligned(ids, read)
+            .await?
             .into_iter()
-            .map(|(sid, pairs)| {
-                let mut grouped_ids = vec![];
-                let mut idx = vec![];
-                for (i, _, id) in pairs {
-                    idx.push(i);
-                    grouped_ids.push(id);
-                }
-                let checks = checks.clone();
-                let projection = projection.clone();
-                let selection = normalized_selection.clone();
-                let proc = proc.clone();
-                let group_name = self.group_name.clone();
-                let database_name = self.database_name.clone();
-                let server_name = self.conshash.try_server_name(sid);
-                async move {
-                    let Some(server_name) = server_name else {
-                        // See above: an unroutable member fails these ids rather
-                        // than taking the process down.
-                        return Err(RPCError::IOError(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("no address known for server id {sid}"),
-                        )));
-                    };
-                    match client_by_server_name_for_database(
-                        sid,
-                        server_name,
-                        &group_name,
-                        &database_name,
-                    )
-                    .await
-                    {
-                        Ok(client) => {
-                            let read_res = if checks.is_empty() {
-                                client
-                                    .read_all_cells_proced(
-                                        &grouped_ids,
-                                        &projection,
-                                        &selection,
-                                        &proc,
-                                    )
-                                    .await
-                            } else {
-                                client
-                                    .read_all_cells_verified(
-                                        &grouped_ids,
-                                        &projection,
-                                        &selection,
-                                        &proc,
-                                        &checks,
-                                    )
-                                    .await
-                            }
-                            .map(|cells| {
-                                if cells.len() != idx.len() {
-                                    warn!(
-                                        "Batch cell read count mismatch: requested {}, got {}",
-                                        idx.len(),
-                                        cells.len()
-                                    );
-                                }
-                                cells
-                                    .into_iter()
-                                    .zip(idx)
-                                    .filter_map(|(cell_res, original_idx)| match cell_res {
-                                        Ok(cell) => Some((cell, original_idx)),
-                                        Err(e) => {
-                                            warn!(
-                                                "Cell read error at index {}: {:?}",
-                                                original_idx, e
-                                            );
-                                            None
-                                        }
-                                    })
-                                    .collect_vec()
-                            });
-                            match read_res {
-                                Ok(cells) => Ok(cells),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
+            .flatten()
+            .collect_vec())
+    }
+
+    /// Whole cells for `ids`, one slot per id: `None` is an absent row.
+    pub(crate) async fn read_full_cells_aligned(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
+        let read = CellRead::Proced {
+            projection: vec![],
+            selection: Expr::nothing(),
+            proc: Expr::nothing(),
+        };
+        self.read_aligned(ids, &read).await
+    }
+
+    /// One slot per id, in the order of `ids`; `None` is an absent row.
+    ///
+    /// One batch per owning server, sent at most `BATCH_READ_ATTEMPTS` times.
+    /// The ids of a batch that still fails, and the ids whose cell answered
+    /// with a failure, are read one by one. A failure there is the error.
+    async fn read_aligned(
+        &self,
+        ids: &[Id],
+        read: &CellRead,
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        let mut rows: Vec<Option<OwnedCell>> = vec![None; ids.len()];
+        let mut by_server = std::collections::BTreeMap::<u64, Vec<usize>>::new();
+        let mut one_by_one = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            match self.owner(id) {
+                Some(server) => by_server.entry(server).or_default().push(index),
+                None => one_by_one.push(index),
+            }
+        }
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server, indices)| async move {
+                let batch = indices.iter().map(|index| ids[*index]).collect_vec();
+                let answer = self.send_batch_with_retry(server, &batch, read).await;
+                (server, indices, answer)
             })
             .collect::<FuturesUnordered<_>>();
-
-        while let Some(task_res) = tasks.next().await {
-            match task_res {
-                Ok(mut cells) => {
-                    if let Some(ordered_cells) = ordered_cells.as_mut() {
-                        for (cell, original_idx) in cells.drain(..) {
-                            ordered_cells[original_idx] = Some(cell);
-                        }
-                    } else {
-                        all_cells.append(&mut cells);
-                    }
-                }
-                Err(e) => {
-                    warn!("Task error in read_cells_from_ids: {:?}", e);
-                }
-            }
-        }
-
-        if let Some(mut ordered_cells) = ordered_cells {
-            for (idx, slot) in ordered_cells.iter_mut().enumerate() {
-                if slot.is_some() || !expect_full_batch {
-                    continue;
-                }
-                let Some(sid) = self.conshash.get_server_id_for_slot(crate::slots::slot_of(&ids[idx]) as u64) else {
-                    warn!("Missing server mapping for id {:?}", ids[idx]);
-                    continue;
-                };
-                // Unknown member: it has left the ring, or a stale placement table
-                // still names it. Skipped exactly like a missing mapping above --
-                // an unroutable id is not grounds for panicking the process.
-                let Some(server_name) = self.conshash.try_server_name(sid) else {
-                    warn!("No address known for server {} holding {:?}", sid, ids[idx]);
-                    continue;
-                };
-                match client_by_server_name_for_database(
-                    sid,
-                    server_name,
-                    &self.group_name,
-                    &self.database_name,
-                )
-                .await
-                {
-                    Ok(client) => {
-                        let single_id = vec![ids[idx]];
-                        match if checks.is_empty() {
-                            client
-                                .read_all_cells_proced(&single_id, projection, selection, proc)
-                                .await
-                        } else {
-                            client
-                                .read_all_cells_verified(
-                                    &single_id, projection, selection, proc, checks,
-                                )
-                                .await
-                        } {
-                            Ok(mut cells) => match cells.pop() {
-                                Some(Ok(cell)) => {
-                                    *slot = Some(cell);
-                                }
-                                Some(Err(e)) => {
-                                    warn!("Retry cell read error at index {}: {:?}", idx, e);
-                                }
-                                None => {
-                                    warn!("Retry cell read returned no cell at index {}", idx);
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Retry task error in read_cells_from_ids: {:?}", e);
+        while let Some((server, indices, answer)) = batches.next().await {
+            match answer {
+                Ok(cells) => {
+                    for (index, cell) in indices.into_iter().zip(cells) {
+                        match cell {
+                            Ok(cell) => rows[index] = Some(cell),
+                            Err(error) if is_absent_row(&error) => {}
+                            Err(error) => {
+                                warn!(
+                                    "cell {:?} on server {} answered {:?}; reading it alone",
+                                    ids[index], server, error
+                                );
+                                one_by_one.push(index);
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Retry client creation error in read_cells_from_ids: {:?}",
-                            e
-                        );
-                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "batch read of {} cell(s) on server {} failed {} time(s) ({:?}); \
+                         reading them one by one",
+                        indices.len(),
+                        server,
+                        BATCH_READ_ATTEMPTS,
+                        error
+                    );
+                    one_by_one.extend(indices);
                 }
             }
+        }
+        one_by_one.sort_unstable();
+        for index in one_by_one {
+            rows[index] = self.read_one(ids[index], read).await?;
+        }
+        Ok(rows)
+    }
 
-            return ordered_cells.into_iter().flatten().collect_vec();
+    fn owner(&self, id: &Id) -> Option<u64> {
+        self.conshash
+            .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+    }
+
+    async fn send_batch_with_retry(
+        &self,
+        server: u64,
+        batch: &Vec<Id>,
+        read: &CellRead,
+    ) -> Result<Vec<Result<OwnedCell, ReadError>>, String> {
+        let mut last_error = String::new();
+        for attempt in 0..BATCH_READ_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(BATCH_READ_BACKOFF * 4u32.pow(attempt - 1)).await;
+            }
+            match self.send(server, batch, read, false).await {
+                Ok(cells) if cells.len() == batch.len() => return Ok(cells),
+                Ok(cells) => {
+                    last_error = format!(
+                        "server answered {} cell(s) for {} id(s)",
+                        cells.len(),
+                        batch.len()
+                    )
+                }
+                Err(error) => last_error = format!("{error:?}"),
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Read one cell from its owner. `Ok(None)` is an absent row. A cell that
+    /// names another owner is asked there once.
+    async fn read_one(&self, id: Id, read: &CellRead) -> Result<Option<OwnedCell>, RPCError> {
+        let Some(mut server) = self.owner(&id) else {
+            return Err(CellReadFailure {
+                server_id: None,
+                id,
+                reason: "no member owns the slot of this id".into(),
+            }
+            .into_rpc_error());
+        };
+        let single = vec![id];
+        for redirected in [false, true] {
+            let failure = |reason: String| CellReadFailure {
+                server_id: Some(server),
+                id,
+                reason,
+            };
+            let mut cells = self
+                .send(server, &single, read, true)
+                .await
+                .map_err(|error| failure(format!("{error:?}")).into_rpc_error())?;
+            if cells.len() != 1 {
+                return Err(
+                    failure(format!("server answered {} cell(s) for 1 id", cells.len()))
+                        .into_rpc_error(),
+                );
+            }
+            match cells.pop().unwrap() {
+                Ok(cell) => return Ok(Some(cell)),
+                Err(error) if is_absent_row(&error) => return Ok(None),
+                Err(ReadError::NotSlotOwner { owner, .. }) if !redirected && owner != server => {
+                    server = owner;
+                }
+                Err(error) => return Err(failure(format!("{error:?}")).into_rpc_error()),
+            }
+        }
+        unreachable!("the redirect is taken at most once")
+    }
+
+    async fn send(
+        &self,
+        server: u64,
+        ids: &Vec<Id>,
+        read: &CellRead,
+        one_by_one: bool,
+    ) -> Result<Vec<Result<OwnedCell, ReadError>>, RPCError> {
+        #[cfg(test)]
+        if let Some(error) = read_faults::take(server, one_by_one) {
+            return Err(error);
+        }
+        #[cfg(not(test))]
+        let _ = one_by_one;
+        let name = self.conshash.try_server_name(server).ok_or_else(|| {
+            RPCError::IOError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no address known for server id {server}"),
+            ))
+        })?;
+        let client =
+            client_by_server_name_for_database(server, name, &self.group_name, &self.database_name)
+                .await?;
+        #[allow(unused_mut)]
+        let mut cells = read.send(&client, ids).await?;
+        #[cfg(test)]
+        read_faults::rewrite_cells(server, ids, &mut cells);
+        Ok(cells)
+    }
+}
+
+/// Injected read failures per server, for the fault tests of `CellReader`.
+///
+/// Keyed by server id in a Lightning map, so tests on different servers do not
+/// share a lock; one server's counters are atomics.
+#[cfg(test)]
+pub(crate) mod read_faults {
+    use bifrost::rpc::RPCError;
+    use lightning::map::{Map, PtrHashMap};
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::{Arc, LazyLock};
+
+    /// Failures for one server. A send first spends `pass`, then fails while
+    /// the failure count of its kind is above 0. `u32::MAX` fails every send.
+    #[derive(Debug, Default)]
+    pub(crate) struct ReadFault {
+        /// The answer for this cell is replaced by this error in every send.
+        pub(crate) cell_error: Option<(crate::ram::types::Id, crate::ram::cell::ReadError)>,
+        pub(crate) pass: AtomicU32,
+        pub(crate) batch_failures: AtomicU32,
+        pub(crate) single_failures: AtomicU32,
+        pub(crate) batch_sends: AtomicU32,
+        pub(crate) single_sends: AtomicU32,
+    }
+
+    impl ReadFault {
+        pub(crate) fn batch_sends(&self) -> u32 {
+            self.batch_sends.load(SeqCst)
         }
 
-        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
-        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
+        pub(crate) fn single_sends(&self) -> u32 {
+            self.single_sends.load(SeqCst)
+        }
+    }
+
+    static FAULTS: LazyLock<PtrHashMap<u64, Arc<ReadFault>>> =
+        LazyLock::new(|| PtrHashMap::with_capacity(16));
+
+    /// Fail the sends to `server`, after `pass` sends of any kind succeed.
+    pub(crate) fn inject(
+        server: u64,
+        pass: u32,
+        batch_failures: u32,
+        single_failures: u32,
+    ) -> Arc<ReadFault> {
+        let fault = Arc::new(ReadFault {
+            pass: AtomicU32::new(pass),
+            batch_failures: AtomicU32::new(batch_failures),
+            single_failures: AtomicU32::new(single_failures),
+            ..Default::default()
+        });
+        FAULTS.insert(server, fault.clone());
+        fault
+    }
+
+    /// Answer `error` for the cell `id` in every send to `server`, as a server
+    /// that read the cell and failed would.
+    pub(crate) fn inject_cell_error(
+        server: u64,
+        id: crate::ram::types::Id,
+        error: crate::ram::cell::ReadError,
+    ) -> Arc<ReadFault> {
+        let fault = Arc::new(ReadFault {
+            cell_error: Some((id, error)),
+            ..Default::default()
+        });
+        FAULTS.insert(server, fault.clone());
+        fault
+    }
+
+    pub(super) fn rewrite_cells(
+        server: u64,
+        ids: &[crate::ram::types::Id],
+        cells: &mut [Result<crate::ram::cell::OwnedCell, crate::ram::cell::ReadError>],
+    ) {
+        let Some(fault) = FAULTS.get(&server) else {
+            return;
+        };
+        let Some((id, error)) = &fault.cell_error else {
+            return;
+        };
+        for (cell_id, cell) in ids.iter().zip(cells.iter_mut()) {
+            if cell_id == id {
+                *cell = Err(error.clone());
+            }
+        }
+    }
+
+    pub(crate) fn clear(server: u64) {
+        FAULTS.remove(&server);
+    }
+
+    pub(super) fn take(server: u64, one_by_one: bool) -> Option<RPCError> {
+        let fault = FAULTS.get(&server)?;
+        let remaining = if one_by_one {
+            fault.single_sends.fetch_add(1, SeqCst);
+            &fault.single_failures
+        } else {
+            fault.batch_sends.fetch_add(1, SeqCst);
+            &fault.batch_failures
+        };
+        if fault
+            .pass
+            .try_update(SeqCst, SeqCst, |pass| pass.checked_sub(1))
+            .is_ok()
+        {
+            return None;
+        }
+        remaining
+            .try_update(SeqCst, SeqCst, |left| match left {
+                0 => None,
+                u32::MAX => Some(u32::MAX),
+                left => Some(left - 1),
+            })
+            .ok()?;
+        Some(RPCError::IOError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "injected read failure",
+        )))
     }
 }
 

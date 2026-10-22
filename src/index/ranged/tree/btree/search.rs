@@ -174,17 +174,6 @@ where
                         pos
                     );
                     let observed_len = n.len;
-                    #[cfg(test)]
-                    if pos > observed_len {
-                        eprintln!(
-                            "BTREE_POSITION pos_slots={} len_keys={} version_start={} version_now={} node={:?}",
-                            pos,
-                            observed_len,
-                            node_handler.version,
-                            node_handler.current_version_for_test(),
-                            node_ref
-                        );
-                    }
                     // A split can change the key count after the search. Check
                     // the invariant only after read_node validates this version.
                     if pos > observed_len {
@@ -261,19 +250,12 @@ mod position_tests {
             *hook.borrow_mut() = Some(Box::new(move || {
                 std::thread::spawn(move || {
                     let mut guard = write_node::<Keys, Ptrs>(&writer_root);
-                    let old_len = guard.innode().len;
                     let (_right, pivot) =
                         guard
                             .innode_mut()
                             .split_insert(key(25), NodeCellRef::default(), 2, true);
                     assert_eq!(pivot, key(30));
                     assert_eq!(guard.innode().len, 3);
-                    eprintln!(
-                        "BTREE_CONTROL split old_len_keys={} new_len_keys={} writer_version={}",
-                        old_len,
-                        guard.innode().len,
-                        guard.version
-                    );
                 })
                 .join()
                 .unwrap();

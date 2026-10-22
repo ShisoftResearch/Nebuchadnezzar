@@ -35,7 +35,6 @@
 //! not where the cost lives.
 
 use neb::client::AsyncClient;
-use neb::index::builder::IndexBuilder;
 use neb::index::scrub::{self, ScrubMode};
 use neb::ram::cell::OwnedCell;
 use neb::ram::schema::{Field, IndexType, Schema, SchemaVid};
