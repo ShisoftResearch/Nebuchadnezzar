@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(success_count, 20, "All concurrent appends should succeed");
 
         // Verify all postings are present
-        let postings = indexer_arc.get_term_postings(SchemaUid(schema_id), field_id, term_hash);
+        let postings = indexer_arc.get_term_postings(SchemaUid(schema_id), field_id, term_hash).unwrap();
         assert_eq!(
             postings.len(),
             20,
@@ -193,7 +193,7 @@ mod tests {
         );
 
         // Verify all postings are retrievable
-        let postings = indexer_arc.get_term_postings(SchemaUid(schema_id), field_id, term_hash);
+        let postings = indexer_arc.get_term_postings(SchemaUid(schema_id), field_id, term_hash).unwrap();
         assert_eq!(
             postings.len(),
             num_docs as usize,
@@ -235,7 +235,7 @@ mod tests {
 
         // Verify versions are stored correctly
         let postings =
-            indexer.get_term_postings_with_version(SchemaUid(schema_id), field_id, term_hash);
+            indexer.get_term_postings_with_version(SchemaUid(schema_id), field_id, term_hash).unwrap();
         assert_eq!(postings.len(), 5, "Should have 5 postings");
 
         // Check that versions match
@@ -361,7 +361,7 @@ mod tests {
 
         // Verify both versions are in posting list (append-only)
         let postings =
-            indexer.get_term_postings_with_version(SchemaUid(schema_id), field_id, term_hash);
+            indexer.get_term_postings_with_version(SchemaUid(schema_id), field_id, term_hash).unwrap();
         assert_eq!(
             postings.len(),
             2,
@@ -551,7 +551,7 @@ mod tests {
         );
 
         // Verify posting list has all entries (100 docs × 5 operations each = 500 total)
-        let postings = indexer.get_term_postings(SchemaUid(schema_id), field_id, term_hash);
+        let postings = indexer.get_term_postings(SchemaUid(schema_id), field_id, term_hash).unwrap();
         assert_eq!(
             postings.len(),
             (num_ops * 5) as usize,

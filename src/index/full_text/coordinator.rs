@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::{ClientPool, RPCClient, RPCError, ServiceClient};
 use futures::future::join_all;
-use log::error;
 
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
@@ -51,15 +50,14 @@ impl DistributedInvertedIndexCoordinator {
     }
 
     /// Get all active server IDs from the consistent hash ring
-    async fn get_all_server_ids(&self) -> Vec<u64> {
-        // Get all active members from the membership
-        match self.conshash.membership().all_members(true).await {
-            Ok((members, _)) => members.into_iter().map(|m| m.id).collect(),
-            Err(e) => {
-                error!("Failed to get all members: {:?}", e);
-                vec![]
-            }
-        }
+    async fn get_all_server_ids(&self) -> Result<Vec<u64>, RPCError> {
+        let (members, _) = self
+            .conshash
+            .membership()
+            .all_members(true)
+            .await
+            .map_err(|error| shard_failure(None, format!("membership query failed: {error:?}")))?;
+        Ok(members.into_iter().map(|m| m.id).collect())
     }
 
     /// Get RPC client for a specific server
@@ -108,7 +106,7 @@ impl DistributedInvertedIndexCoordinator {
             return Ok(Ok(vec![]));
         }
 
-        let server_ids = self.get_all_server_ids().await;
+        let server_ids = self.get_all_server_ids().await?;
         if server_ids.is_empty() {
             return Ok(Ok(vec![]));
         }
@@ -135,21 +133,17 @@ impl DistributedInvertedIndexCoordinator {
         let mut all_hits: Vec<BM25Hit> = vec![];
         let _term_doc_frequencies: HashMap<u64, u64> = HashMap::new();
 
-        for response in responses {
+        // A shard that did not answer would leave its documents out of the
+        // ranking: that is an error, not a shorter result.
+        for (server_id, response) in server_ids.iter().zip(responses) {
             match response {
                 Ok(Ok(resp)) => {
                     global_doc_count += resp.local_doc_count;
                     global_total_length += resp.local_total_length;
                     all_hits.extend(resp.hits);
                 }
-                Ok(Err(e)) => {
-                    error!("RPC error from node: {:?}", e);
-                    // Continue with partial results
-                }
-                Err(e) => {
-                    error!("Failed to query node: {:?}", e);
-                    // Continue with partial results
-                }
+                Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
+                Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
             }
         }
 
@@ -233,7 +227,7 @@ impl DistributedInvertedIndexCoordinator {
 
         // For each term, collect postings from all nodes
         let mut term_postings: HashMap<u64, Vec<(Id, u32, u32)>> = HashMap::new();
-        let server_ids = self.get_all_server_ids().await;
+        let server_ids = self.get_all_server_ids().await?;
 
         for term_hash in &query_terms {
             let mut all_postings = vec![];
@@ -250,14 +244,8 @@ impl DistributedInvertedIndexCoordinator {
                     Ok(Ok(resp)) => {
                         all_postings.extend(resp.postings);
                     }
-                    Ok(Err(e)) => {
-                        error!("RPC error getting term postings: {:?}", e);
-                        // Continue with partial results
-                    }
-                    Err(e) => {
-                        error!("Failed to get term postings: {:?}", e);
-                        // Continue with partial results
-                    }
+                    Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
+                    Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
                 }
             }
 
@@ -316,7 +304,7 @@ impl DistributedInvertedIndexCoordinator {
         schema_id: SchemaUid,
         field_id: u64,
     ) -> Result<FieldStatsResponse, RPCError> {
-        let server_ids = self.get_all_server_ids().await;
+        let server_ids = self.get_all_server_ids().await?;
         let mut tasks = vec![];
 
         for server_id in &server_ids {
@@ -333,20 +321,14 @@ impl DistributedInvertedIndexCoordinator {
         let mut global_doc_count = 0u64;
         let mut global_total_length = 0u64;
 
-        for response in responses {
+        for (server_id, response) in server_ids.iter().zip(responses) {
             match response {
                 Ok(Ok(resp)) => {
                     global_doc_count += resp.doc_count;
                     global_total_length += resp.total_length;
                 }
-                Ok(Err(e)) => {
-                    error!("RPC error getting field stats: {:?}", e);
-                    // Continue with partial results
-                }
-                Err(e) => {
-                    error!("Failed to get field stats: {:?}", e);
-                    // Continue with partial results
-                }
+                Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
+                Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
             }
         }
 
@@ -355,6 +337,45 @@ impl DistributedInvertedIndexCoordinator {
             total_length: global_total_length,
         })
     }
+}
+
+/// A full-text shard that did not answer. Carried in `RPCError::IOError`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FullTextShardFailure {
+    pub server_id: Option<u64>,
+    pub reason: String,
+}
+
+impl FullTextShardFailure {
+    /// The shard failure inside an error from the coordinator, if it is one.
+    pub fn of(error: &RPCError) -> Option<&FullTextShardFailure> {
+        match error {
+            RPCError::IOError(error) => error.get_ref()?.downcast_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FullTextShardFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.server_id {
+            Some(server) => write!(
+                f,
+                "full-text shard on server {server} failed: {}",
+                self.reason
+            ),
+            None => write!(f, "full-text search failed: {}", self.reason),
+        }
+    }
+}
+
+impl std::error::Error for FullTextShardFailure {}
+
+fn shard_failure(server_id: Option<u64>, reason: String) -> RPCError {
+    RPCError::IOError(std::io::Error::other(FullTextShardFailure {
+        server_id,
+        reason,
+    }))
 }
 
 /// Helper function to create AsyncServiceClient from RPCClient

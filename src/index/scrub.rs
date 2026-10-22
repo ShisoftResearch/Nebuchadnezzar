@@ -4101,13 +4101,6 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// Registering the schema is the first start's job; a restart finds it in the
-    /// recovered catalog and answers `NameExists`, which is not an error.
-    ///
-    /// `index_enabled` is the switch this test drives the crash window with: with
-    /// it off, `Chunk::ensure_indices` and `Chunk::remove_indices` have no builder
-    /// to hand their work to, so the cells change and the buckets stay where they
-    /// were.
     /// Move every segment of every chunk with the combine cleaner, and check
     /// that the move kept each live cell's version and data. The hash scrub
     /// movement control runs this between the fill snapshot and the walk.
@@ -4144,6 +4137,13 @@ mod tests {
         assert!(moved_bytes > 0, "movement hook did not relocate a segment");
     }
 
+    /// Registering the schema is the first start's job; a restart finds it in the
+    /// recovered catalog and answers `NameExists`, which is not an error.
+    ///
+    /// `index_enabled` is the switch this test drives the crash window with: with
+    /// it off, `Chunk::ensure_indices` and `Chunk::remove_indices` have no builder
+    /// to hand their work to, so the cells change and the buckets stay where they
+    /// were.
     async fn start_hash_crash_server(
         dir: &std::path::Path,
         group: &str,

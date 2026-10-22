@@ -763,6 +763,11 @@ impl HashIndexer {
         let mut emitted = HashSet::new();
         let mut cursor = Some(index_id);
         let mut hops = 0usize;
+        let reader = crate::query::data_client::read::CellReader::new(
+            self.neb_client.conshash.clone(),
+            self.neb_client.group_name(),
+            self.neb_client.database_name(),
+        );
 
         while let Some(cid) = cursor {
             let segment = match self.read_segment(cid).await {
@@ -770,14 +775,17 @@ impl HashIndexer {
                 // A missing HEAD is an empty bucket. A missing LINK is a
                 // broken chain: say so rather than quietly returning a short
                 // answer that reads like a complete one.
+                Ok(Ok(None)) if cid == index_id => break,
+                // A missing LINK is a broken chain. The ids after it are
+                // unreachable, so the answer is an error, not a short list.
                 Ok(Ok(None)) => {
-                    if cid != index_id {
-                        error!(
-                            "hash bucket {:?} links to missing cell {:?}; entries after it are unreachable",
-                            index_id, cid
-                        );
-                    }
-                    break;
+                    error!(
+                        "hash bucket {:?} links to missing cell {:?}; entries after it are unreachable",
+                        index_id, cid
+                    );
+                    return Ok(Err(ReadError::ExecError(format!(
+                        "hash bucket {index_id:?} links to missing cell {cid:?}"
+                    ))));
                 }
                 Ok(Err(e)) => return Ok(Err(e)),
                 Err(e) => return Err(e),
@@ -785,42 +793,44 @@ impl HashIndexer {
             let (ids, next) = segment;
             cursor = next;
 
-            for id in ids {
-                if emitted.contains(&id) {
-                    continue;
-                }
-                if let Some(check) = check {
-                    let present = match verify {
-                        crate::index::verification::Verify::Exists => {
-                            let client = self.neb_client.locate_plain_server(id).await?;
-                            match client.existing_ids(&vec![id]).await?.pop() {
-                                Some(Ok(exists)) => exists,
-                                Some(Err(error)) => return Ok(Err(error)),
-                                None => return Ok(Err(ReadError::CellDoesNotExisted)),
-                            }
-                        }
-                        crate::index::verification::Verify::Predicate => matches!(
-                            self.neb_client
-                                .read_indexed_cell(id, check.clone())
-                                .await,
-                            Ok(Ok(_))
-                        ),
-                    };
-                    if !present {
-                        continue;
+            let fresh = ids
+                .into_iter()
+                .filter(|id| emitted.insert(*id))
+                .collect::<Vec<_>>();
+            // Verify one segment in one read per owner. The reader retries a
+            // failed server and returns an error rather than fewer ids.
+            let matched = match check {
+                None => fresh,
+                Some(_) if fresh.is_empty() => fresh,
+                Some(check) => match verify {
+                    crate::index::verification::Verify::Exists => {
+                        reader.existing_ids(&fresh).await?
                     }
-                }
-                emitted.insert(id);
-                result.push(id);
-            }
+                    crate::index::verification::Verify::Predicate => reader
+                        .read_cells_from_ids_checked(
+                            &fresh,
+                            &vec![],
+                            &dovahkiin::expr::serde::Expr::nothing(),
+                            &dovahkiin::expr::serde::Expr::nothing(),
+                            &vec![check.clone()],
+                        )
+                        .await?
+                        .into_iter()
+                        .map(|cell| cell.id())
+                        .collect(),
+                },
+            };
+            result.extend(matched);
 
             hops += 1;
             if hops > MAX_CHAIN_HOPS {
                 error!(
-                    "hash bucket {:?} chain exceeded {} hops; truncating walk",
+                    "hash bucket {:?} chain exceeded {} hops",
                     index_id, MAX_CHAIN_HOPS
                 );
-                break;
+                return Ok(Err(ReadError::ExecError(format!(
+                    "hash bucket {index_id:?} chain exceeded {MAX_CHAIN_HOPS} hops"
+                ))));
             }
         }
 

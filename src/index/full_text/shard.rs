@@ -349,6 +349,7 @@ impl SegmentedPostingList {
         let mut all_postings = Vec::new();
         let mut current_id = Some(self.head_segment_id(chunk_index));
 
+        let head = current_id;
         while let Some(seg_id) = current_id {
             match chunk.read_cell(seg_id.bits()) {
                 Ok(cell) => {
@@ -356,14 +357,23 @@ impl SegmentedPostingList {
                         header: cell.header().clone(),
                         data: cell.data().owned(),
                     };
-                    if let Some(segment) = PostingSegment::from_cell(&owned_cell) {
-                        all_postings.extend(segment.iter());
-                        current_id = segment.next;
-                    } else {
-                        break;
-                    }
+                    let segment = PostingSegment::from_cell(&owned_cell).ok_or_else(|| {
+                        IndexError::PostingListUnreadable {
+                            segment: seg_id,
+                            reason: "posting segment does not decode".into(),
+                        }
+                    })?;
+                    all_postings.extend(segment.iter());
+                    current_id = segment.next;
                 }
-                Err(_) => break,
+                // No head segment: this chunk has no posting for the term.
+                Err(crate::ram::cell::ReadError::CellDoesNotExisted) if current_id == head => break,
+                Err(error) => {
+                    return Err(IndexError::PostingListUnreadable {
+                        segment: seg_id,
+                        reason: format!("{error:?}"),
+                    })
+                }
             }
         }
 
@@ -814,20 +824,12 @@ impl InvertedIndexer {
         schema_id: SchemaUid,
         field_id: u64,
         term_hash: u64,
-    ) -> Vec<(Id, u32, u32)> {
-        let mut all_postings = Vec::new();
-        let seg_list = SegmentedPostingList::new(schema_id, field_id, term_hash);
-
-        // Iterate all Chunks and collect postings from each
-        for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
-            if let Ok(postings) = seg_list.iterate(chunk, chunk_index as u64) {
-                for (doc_id, _version, tf, doc_len) in postings {
-                    all_postings.push((doc_id, tf, doc_len));
-                }
-            }
-        }
-
-        all_postings
+    ) -> Result<Vec<(Id, u32, u32)>, IndexError> {
+        Ok(self
+            .get_term_postings_with_version(schema_id, field_id, term_hash)?
+            .into_iter()
+            .map(|(doc_id, _version, tf, doc_len)| (doc_id, tf, doc_len))
+            .collect())
     }
 
     /// Get postings with version information (for GC or verified search)
@@ -836,17 +838,13 @@ impl InvertedIndexer {
         schema_id: SchemaUid,
         field_id: u64,
         term_hash: u64,
-    ) -> Vec<(Id, u64, u32, u32)> {
+    ) -> Result<Vec<(Id, u64, u32, u32)>, IndexError> {
         let mut all_postings = Vec::new();
         let seg_list = SegmentedPostingList::new(schema_id, field_id, term_hash);
-
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
-            if let Ok(postings) = seg_list.iterate(chunk, chunk_index as u64) {
-                all_postings.extend(postings);
-            }
+            all_postings.extend(seg_list.iterate(chunk, chunk_index as u64)?);
         }
-
-        all_postings
+        Ok(all_postings)
     }
 
     /// Search using BM25 by iterating ALL Chunks on this server
@@ -891,10 +889,10 @@ impl InvertedIndexer {
             // Collect postings from all Chunks
             let mut all_postings = Vec::new();
             for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
-                if let Ok(chunk_postings) = seg_list.iterate(chunk, chunk_index as u64) {
-                    for (doc_id, _version, tf, doc_len) in chunk_postings {
-                        all_postings.push((doc_id, tf, doc_len));
-                    }
+                for (doc_id, _version, tf, doc_len) in
+                    seg_list.iterate(chunk, chunk_index as u64)?
+                {
+                    all_postings.push((doc_id, tf, doc_len));
                 }
             }
 
@@ -1267,6 +1265,45 @@ mod tests {
         segment.versions = vec![7, 8];
         assert!(PostingSegment::from_cell(&segment.to_cell(&id)).is_none());
         assert!(PostingSegment::from_cell(&PostingSegment::new().to_cell(&id)).is_some());
+    }
+
+    /// A posting segment that is present but does not decode, or a link to a
+    /// segment that is gone, makes the term's posting list unknown. That is an
+    /// error, not the postings read so far.
+    #[test]
+    fn an_unreadable_posting_segment_is_an_error_not_a_short_list() {
+        let chunks = create_test_chunks();
+        let list = SegmentedPostingList::new(SchemaUid(100), 7, 9);
+        let head = list.head_segment_id(0);
+        let mut segment = PostingSegment::new();
+        segment.add(Id::from_parts(1, 1), 1, 1, 1);
+        segment.add(Id::from_parts(1, 2), 1, 1, 1);
+        segment.versions.truncate(1);
+        chunks.write_cell(&mut segment.to_cell(&head)).unwrap();
+        match list.iterate(&chunks.list[0], 0) {
+            Err(IndexError::PostingListUnreadable { segment, .. }) => assert_eq!(segment, head),
+            other => panic!("an undecodable head must be an error: {other:?}"),
+        }
+
+        let linked = SegmentedPostingList::new(SchemaUid(100), 7, 10);
+        let linked_head = linked.head_segment_id(0);
+        let missing = linked.segment_id(0, 1);
+        let mut head_segment = PostingSegment::new();
+        head_segment.add(Id::from_parts(1, 3), 1, 1, 1);
+        head_segment.next = Some(missing);
+        chunks
+            .write_cell(&mut head_segment.to_cell(&linked_head))
+            .unwrap();
+        match linked.iterate(&chunks.list[0], 0) {
+            Err(IndexError::PostingListUnreadable { segment, .. }) => {
+                assert_eq!(segment, missing)
+            }
+            other => panic!("a broken link must be an error: {other:?}"),
+        }
+
+        // No head segment is a term this chunk never indexed: an empty list.
+        let absent = SegmentedPostingList::new(SchemaUid(100), 7, 11);
+        assert!(absent.iterate(&chunks.list[0], 0).unwrap().is_empty());
     }
 
     // Helper to create test chunks

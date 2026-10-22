@@ -157,8 +157,20 @@ impl<S: RowSource> IndexNestedLoopJoin<S> {
                 .await?
             {
                 Ok(ids) => ids,
-                // A missing index bucket is an empty match, not a failure.
-                Err(_) => Vec::new(),
+                // A missing bucket answers Ok with no ids. An error is a bucket
+                // that could not be read whole: joining past it loses rows.
+                Err(error) => {
+                    return Err(crate::query::data_client::CellReadFailure {
+                        server_id: None,
+                        id: IndexedDataClient::hashed_index_id(
+                            self.inner_schema,
+                            self.inner_field,
+                            &key,
+                        ),
+                        reason: format!("join probe failed: {error:?}"),
+                    }
+                    .into_rpc_error())
+                }
             };
             if ids.is_empty() {
                 continue;

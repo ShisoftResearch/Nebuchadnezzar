@@ -150,9 +150,10 @@ impl Service for InvertedIndexRPCService {
         req: TermPostingsRequest,
     ) -> BoxFuture<'_, Result<TermPostingsResponse, InvertedIndexError>> {
         async move {
-            let postings =
-                self.indexer
-                    .get_term_postings(req.schema_id, req.field_id, req.term_hash);
+            let postings = self
+                .indexer
+                .get_term_postings(req.schema_id, req.field_id, req.term_hash)
+                .map_err(|error| InvertedIndexError::SearchError(format!("{error:?}")))?;
 
             Ok(TermPostingsResponse { postings })
         }

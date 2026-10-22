@@ -302,6 +302,13 @@ impl IndexedDataClient {
         self.cell_reader().read_selected_cells(ids, fields).await
     }
 
+    pub(super) async fn read_full_cells_aligned(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        self.cell_reader().read_full_cells_aligned(ids).await
+    }
+
     fn cell_reader(&self) -> CellReader {
         CellReader::new(self.conshash.clone(), &self.group_name, &self.database_name)
     }
@@ -546,11 +553,39 @@ impl CellReader {
     }
 
     /// The rows for `ids`, in the order of `ids`, without the absent ones.
+    async fn read_rows(&self, ids: &[Id], read: &CellRead) -> Result<Vec<OwnedCell>, RPCError> {
+        Ok(self
+            .read_aligned(ids, read)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect_vec())
+    }
+
+    /// Whole cells for `ids`, one slot per id: `None` is an absent row.
+    pub(crate) async fn read_full_cells_aligned(
+        &self,
+        ids: &[Id],
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
+        CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
+        let read = CellRead::Proced {
+            projection: vec![],
+            selection: Expr::nothing(),
+            proc: Expr::nothing(),
+        };
+        self.read_aligned(ids, &read).await
+    }
+
+    /// One slot per id, in the order of `ids`; `None` is an absent row.
     ///
     /// One batch per owning server, sent at most `BATCH_READ_ATTEMPTS` times.
     /// The ids of a batch that still fails, and the ids whose cell answered
     /// with a failure, are read one by one. A failure there is the error.
-    async fn read_rows(&self, ids: &[Id], read: &CellRead) -> Result<Vec<OwnedCell>, RPCError> {
+    async fn read_aligned(
+        &self,
+        ids: &[Id],
+        read: &CellRead,
+    ) -> Result<Vec<Option<OwnedCell>>, RPCError> {
         let mut rows: Vec<Option<OwnedCell>> = vec![None; ids.len()];
         let mut by_server = std::collections::BTreeMap::<u64, Vec<usize>>::new();
         let mut one_by_one = Vec::new();
@@ -602,7 +637,7 @@ impl CellReader {
         for index in one_by_one {
             rows[index] = self.read_one(ids[index], read).await?;
         }
-        Ok(rows.into_iter().flatten().collect_vec())
+        Ok(rows)
     }
 
     fn owner(&self, id: &Id) -> Option<u64> {
@@ -703,59 +738,84 @@ impl CellReader {
 }
 
 /// Injected read failures per server, for the fault tests of `CellReader`.
+///
+/// Keyed by server id in a Lightning map, so tests on different servers do not
+/// share a lock; one server's counters are atomics.
 #[cfg(test)]
 pub(crate) mod read_faults {
     use bifrost::rpc::RPCError;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use lightning::map::{Map, PtrHashMap};
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::{Arc, LazyLock};
 
-    #[derive(Clone, Copy, Debug, Default)]
+    /// Failures for one server. A send first spends `pass`, then fails while
+    /// the failure count of its kind is above 0. `u32::MAX` fails every send.
+    #[derive(Debug, Default)]
     pub(crate) struct ReadFault {
-        /// Batch sends that fail before one succeeds; `u32::MAX` fails all.
-        pub(crate) batch_failures: u32,
-        /// One-by-one sends that fail before one succeeds; `u32::MAX` fails all.
-        pub(crate) single_failures: u32,
-        pub(crate) batch_sends: u32,
-        pub(crate) single_sends: u32,
+        pub(crate) pass: AtomicU32,
+        pub(crate) batch_failures: AtomicU32,
+        pub(crate) single_failures: AtomicU32,
+        pub(crate) batch_sends: AtomicU32,
+        pub(crate) single_sends: AtomicU32,
     }
 
-    static FAULTS: Mutex<Option<HashMap<u64, ReadFault>>> = Mutex::new(None);
+    impl ReadFault {
+        pub(crate) fn batch_sends(&self) -> u32 {
+            self.batch_sends.load(SeqCst)
+        }
 
-    pub(crate) fn inject(server: u64, batch_failures: u32, single_failures: u32) {
-        FAULTS
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(
-                server,
-                ReadFault {
-                    batch_failures,
-                    single_failures,
-                    ..Default::default()
-                },
-            );
+        pub(crate) fn single_sends(&self) -> u32 {
+            self.single_sends.load(SeqCst)
+        }
     }
 
-    pub(crate) fn clear(server: u64) -> Option<ReadFault> {
-        FAULTS.lock().unwrap().as_mut()?.remove(&server)
+    static FAULTS: LazyLock<PtrHashMap<u64, Arc<ReadFault>>> =
+        LazyLock::new(|| PtrHashMap::with_capacity(16));
+
+    /// Fail the sends to `server`, after `pass` sends of any kind succeed.
+    pub(crate) fn inject(
+        server: u64,
+        pass: u32,
+        batch_failures: u32,
+        single_failures: u32,
+    ) -> Arc<ReadFault> {
+        let fault = Arc::new(ReadFault {
+            pass: AtomicU32::new(pass),
+            batch_failures: AtomicU32::new(batch_failures),
+            single_failures: AtomicU32::new(single_failures),
+            ..Default::default()
+        });
+        FAULTS.insert(server, fault.clone());
+        fault
+    }
+
+    pub(crate) fn clear(server: u64) {
+        FAULTS.remove(&server);
     }
 
     pub(super) fn take(server: u64, one_by_one: bool) -> Option<RPCError> {
-        let mut faults = FAULTS.lock().unwrap();
-        let fault = faults.as_mut()?.get_mut(&server)?;
+        let fault = FAULTS.get(&server)?;
         let remaining = if one_by_one {
-            fault.single_sends += 1;
-            &mut fault.single_failures
+            fault.single_sends.fetch_add(1, SeqCst);
+            &fault.single_failures
         } else {
-            fault.batch_sends += 1;
-            &mut fault.batch_failures
+            fault.batch_sends.fetch_add(1, SeqCst);
+            &fault.batch_failures
         };
-        if *remaining == 0 {
+        if fault
+            .pass
+            .try_update(SeqCst, SeqCst, |pass| pass.checked_sub(1))
+            .is_ok()
+        {
             return None;
         }
-        if *remaining != u32::MAX {
-            *remaining -= 1;
-        }
+        remaining
+            .try_update(SeqCst, SeqCst, |left| match left {
+                0 => None,
+                u32::MAX => Some(u32::MAX),
+                left => Some(left - 1),
+            })
+            .ok()?;
         Some(RPCError::IOError(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "injected read failure",

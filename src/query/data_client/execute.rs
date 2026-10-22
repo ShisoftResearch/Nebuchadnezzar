@@ -24,6 +24,17 @@ use super::{
 };
 use crate::ram::schema::SchemaUid;
 
+/// A hash bucket that could not be read whole. An absent bucket is an empty
+/// match and never reaches this; a broken chain or an unreadable segment does.
+fn bucket_read_failure(bucket: Id, error: crate::ram::cell::ReadError) -> RPCError {
+    super::read::CellReadFailure {
+        server_id: None,
+        id: bucket,
+        reason: format!("hash bucket read failed: {error:?}"),
+    }
+    .into_rpc_error()
+}
+
 impl IndexedDataClient {
     pub(super) async fn execute_clause_ids(
         &self,
@@ -36,15 +47,14 @@ impl IndexedDataClient {
             IndexedClausePlan::HashedEq { field_id, value } => {
                 let mut ids = Vec::new();
                 for bucket in Self::hashed_query_index_ids(schema, *field_id, value) {
-                    if let Ok(hits) = self
+                    let hits = self
                         .index_clients
                         .hashed_client
                         .indexer
                         .candidates(bucket)
                         .await?
-                    {
-                        ids = union_ids_ordered(ids, &hits);
-                    }
+                        .map_err(|error| bucket_read_failure(bucket, error))?;
+                    ids = union_ids_ordered(ids, &hits);
                 }
                 Ok(ids)
             }
@@ -58,7 +68,7 @@ impl IndexedDataClient {
                     .await?
                 {
                     Ok(ids) => Ok(ids),
-                    Err(_) => Ok(Vec::new()),
+                    Err(error) => Err(bucket_read_failure(index_id, error)),
                 }
             }
             IndexedClausePlan::Ranged { field_id, range } => {

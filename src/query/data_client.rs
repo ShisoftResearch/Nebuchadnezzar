@@ -859,14 +859,14 @@ impl IndexedDataClient {
                 ordering,
                 &verified_cells,
             )
-            .await;
+            .await?;
         } else if explicit_order_by_field.is_none() && !preserve_relevance_order {
             sort_ids_by_query_order(&mut selected_ids, ordering);
         }
         if let Some(field_ids) = distinct_fields.as_ref() {
             selected_ids = self
                 .distinct_ids_by_fields(field_ids, selected_ids, &verified_cells)
-                .await;
+                .await?;
         }
         if let Some(limit) = effective_limit {
             selected_ids.truncate(limit);
@@ -1049,7 +1049,9 @@ impl IndexedDataClient {
                 .await?
             {
                 Ok(ids) => matched_ids.extend(ids),
-                Err(_) => {}
+                // An absent bucket answers an empty list; an error is a bucket
+                // that could not be read whole, and its ids would be missing.
+                Err(error) => return Ok(Err(error)),
             }
         }
         Ok(Ok(matched_ids.into_iter().unique().collect()))
