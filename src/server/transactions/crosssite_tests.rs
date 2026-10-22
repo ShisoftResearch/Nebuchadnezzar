@@ -2106,7 +2106,7 @@ fn fences_after_power_loss(cluster: &Cluster, index: usize) -> std::collections:
         return std::collections::BTreeSet::new();
     };
     let log = crate::ram::fence::FenceLog::new(path.parent().unwrap().to_str());
-    log.load(true).unwrap()
+    log.load(true).unwrap().fenced
 }
 
 /// F3: the fence is durable before the fenced site answers `Fenced`.
@@ -2771,6 +2771,131 @@ async fn the_force_resolve_tool_decides_for_a_lost_participant() {
     assert!(!in_doubt_on(&cluster, A, &parked));
     assert_eq!(score_on(cluster.site(A), &parked_ids[0]), None);
     super::data_site::silent_peers_for_test().lock().remove(&b_id);
+    cluster.shutdown().await;
+}
+
+/// A completed abort must not regain doubt after a power loss before compaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn p1_preexisting_aborted_cells_reenroll_after_second_recovery() {
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let (mut cluster, client) = Cluster::start("p1_aborted_cells_second_recovery").await;
+    let (manager, tid, ids, _) = prepared_transaction(&cluster, &client, 49_003, 49_003).await;
+    drop(manager);
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid));
+    cluster.site(A).cleaner().pause();
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    wait_until("the first abort resolution", 60, || {
+        !in_doubt_on(&cluster, A, &tid)
+    })
+    .await;
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    assert_eq!(score_on(cluster.site(A), &ids[0]), None);
+    assert!(cluster.site(A).chunks().fences().is_fenced(&tid));
+    assert!(cluster.site(B).chunks().fences().is_fenced(&tid));
+    assert!(cluster
+        .site(A)
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segments())
+        .any(|segment| segment_holds_record_of(&segment, &tid, EntryType::BEGIN)));
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    let reenrolled = in_doubt_on(&cluster, A, &tid);
+    let pins = held_for(&cluster, A, &tid);
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    cluster.shutdown().await;
+    assert!(!reenrolled && pins == 0,
+        "P1_PREEXISTING: an aborted bracket regained doubt after its second recovery: reenrolled={reenrolled}, pins={pins}");
+}
+
+/// A local fence does not exclude an earlier commit at a silent peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn g11_a_local_fence_waits_for_a_silent_committed_peer() {
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let (mut cluster, client) = Cluster::start("g11_fence_committed_peer").await;
+    let (tid, ids, scores) = torn_transaction(&cluster, &client, 49_004).await;
+    wait_status_synced(&cluster, B, &tid).await;
+    assert_eq!(data_site(&cluster, A).fence_here(&tid), FenceAnswer::Fenced);
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    assert!(cluster.site(A).chunks().fences().is_fenced(&tid));
+    assert!(in_doubt_on(&cluster, A, &tid));
+    assert!(held_for(&cluster, A, &tid) > 0);
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+    wait_until("A's commit despite its local fence", 60, || {
+        !in_doubt_on(&cluster, A, &tid)
+    })
+    .await;
+    assert_eq!(score_on(cluster.site(A), &ids[0]), Some(scores[0]));
+    assert_all_or_nothing(&cluster, &ids, &scores, "local fence with a committed peer");
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    cluster.shutdown().await;
+}
+
+/// A refused abort settlement keeps its bracket pinned until a durable retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn g11_a_refused_abort_settlement_keeps_its_bracket() {
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let (mut cluster, client) = Cluster::start("g11_refused_abort_settlement").await;
+    let (manager, tid, ids, _) = prepared_transaction(&cluster, &client, 49_005, 49_005).await;
+    drop(manager);
+    let b_id = cluster.site(B).server_id;
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.power_loss_restart(A).await;
+    assert!(in_doubt_on(&cluster, A, &tid));
+    cluster.site(A).cleaner().pause();
+    // Establish the complete fence decision while the background resolver waits.
+    assert_eq!(data_site(&cluster, A).fence_here(&tid), FenceAnswer::Fenced);
+    assert_eq!(data_site(&cluster, B).fence_here(&tid), FenceAnswer::Fenced);
+    let wal = cluster.temp[A].path().join("wal");
+    crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal, true);
+    let runtime = cluster.site(A).current_database();
+    let chunks = runtime.chunks();
+    let bracket = chunks.take_unresolved(&tid).unwrap();
+    assert!(!crate::server::finish_in_doubt_bracket(
+        &runtime, bracket, false
+    ));
+    assert!(in_doubt_on(&cluster, A, &tid));
+    assert!(held_for(&cluster, A, &tid) > 0);
+    assert_eq!(score_on(cluster.site(A), &ids[0]), None);
+    assert!(chunks.fences().load(true).unwrap().aborted.is_empty());
+    crate::ram::segs::power_loss_model::fail_wal_syncs_under(&wal, false);
+    let bracket = chunks.take_unresolved(&tid).unwrap();
+    assert!(crate::server::finish_in_doubt_bracket(
+        &runtime, bracket, false
+    ));
+    assert!(!in_doubt_on(&cluster, A, &tid));
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    drop(runtime);
+    cluster.power_loss_restart(A).await;
+    assert!(!in_doubt_on(&cluster, A, &tid));
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    assert_eq!(score_on(cluster.site(A), &ids[0]), None);
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
     cluster.shutdown().await;
 }
 

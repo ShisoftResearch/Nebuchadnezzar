@@ -1725,7 +1725,7 @@ impl DataManager {
             ForceResolveResult::Resolved
         } else {
             ForceResolveResult::Failed(String::from(
-                "the resolved COMMIT could not be written; the transaction stays in doubt",
+                "the resolution could not be written; the transaction stays in doubt",
             ))
         }
     }
