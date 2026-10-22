@@ -444,7 +444,8 @@ impl FenceLog {
         let _state = shard.state.lock();
         let path = shard.path.as_ref().expect("a fence log with a directory");
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(&record(txn, true)[..RECORD_SIZE / 2]).unwrap();
+        file.write_all(&record(txn, true)[..RECORD_SIZE / 2])
+            .unwrap();
         file.sync_data().unwrap();
         crate::ram::segs::power_loss_model::record_synced(
             &Some(path.to_string_lossy().to_string()),
@@ -620,7 +621,10 @@ mod tests {
         assert_eq!(parse(&cut).unwrap().fenced, [kept].into_iter().collect());
         let mut garbled = data.clone();
         garbled.extend_from_slice(&[0u8; RECORD_SIZE]);
-        assert_eq!(parse(&garbled).unwrap().fenced, [kept].into_iter().collect());
+        assert_eq!(
+            parse(&garbled).unwrap().fenced,
+            [kept].into_iter().collect()
+        );
         let mut interior = garbled.clone();
         interior.extend_from_slice(&record(&test_hlc(5, 5), false));
         assert_eq!(parse(&interior), Err(FenceLogError::ChecksumMismatch));

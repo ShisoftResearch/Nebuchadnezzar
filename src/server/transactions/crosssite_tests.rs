@@ -2877,9 +2877,18 @@ async fn a_cut_abort_settlement_waits_for_a_silent_peer_then_settles() {
     cluster.power_loss_restart(A).await;
     cluster.site(A).cleaner().pause();
     let recovered = cluster.site(A).chunks().fences().load(true).unwrap();
-    assert!(recovered.fenced.contains(&tid), "the fence before the cut record stays");
-    assert!(recovered.aborted.is_empty(), "a cut settlement settles nothing");
-    assert!(in_doubt_on(&cluster, A, &tid), "a silent peer keeps the bracket in doubt");
+    assert!(
+        recovered.fenced.contains(&tid),
+        "the fence before the cut record stays"
+    );
+    assert!(
+        recovered.aborted.is_empty(),
+        "a cut settlement settles nothing"
+    );
+    assert!(
+        in_doubt_on(&cluster, A, &tid),
+        "a silent peer keeps the bracket in doubt"
+    );
     assert!(held_for(&cluster, A, &tid) > 0);
     super::data_site::silent_peers_for_test()
         .lock()
