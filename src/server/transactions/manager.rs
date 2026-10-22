@@ -2540,14 +2540,14 @@ mod tests {
         prepare_with_a_ring_address_gap(false).await;
     }
 
-    /// G5/F4 evidence: a commit refused with `CannotLocateCellServer` removes
-    /// the manager record but leaves the participant's prepare lock held. The
+    /// G5/F4: a commit refused with `CannotLocateCellServer` removes the
+    /// manager record but leaves the participant's prepare lock held. The
     /// client abort then gets `TransactionNotFound`. Conflicting retries fail
-    /// before lease expiry and after presumed abort, until the separate cell
-    /// lock timeout permits a retry. The classification stays `CommitNotApplied`.
+    /// before lease expiry. The lease sweeper's presumed abort releases the
+    /// cell lock with the leases, so the next retry prepares and commits at
+    /// once.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "G5/F4 evidence; behavior change pending a Codex Sol decision"]
-    async fn commit_cannot_locate_cell_server_leaves_a_conflicting_retry_refused() {
+    async fn presumed_abort_releases_cell_locks_for_a_conflicting_retry() {
         use super::Service as _;
         let _ = env_logger::try_init();
         let address = crate::utils::test_port::unique_localhost_addr();
@@ -2584,7 +2584,6 @@ mod tests {
             manager.prepare(tid.clone()).await,
             Ok(TMPrepareResult::Success)
         ));
-        let prepared_at = tokio::time::Instant::now();
         assert!(participant.has_transaction_for_test(&tid));
         assert!(crate::ram::chunk::transaction_has_leases(&tid, &store));
 
@@ -2649,40 +2648,22 @@ mod tests {
         );
         assert!(runtime.chunks().read_cell(&id).is_err());
 
-        // Presumed abort releases the leases but leaves the cell lock held.
+        // Presumed abort releases the leases and the cell lock together, so
+        // the retry right after it succeeds without the 30,000 ms lock timeout.
         let retry = manager.begin().await.unwrap();
         assert!(matches!(
             manager.write(retry.clone(), counter_cell(1, id, 8)).await,
             Ok(TxnExecResult::Accepted(()))
         ));
-        let refused = manager.prepare(retry).await;
-        warn!("G5/F4 control: retry after presumed abort = {:?}", refused);
-        assert!(matches!(
-            refused,
-            Ok(TMPrepareResult::DMPrepareError(
-                DMPrepareResult::NotRealizable
-            ))
-        ));
-
-        // The cell lock has a separate 30 s timeout. Retry after it expires.
-        tokio::time::sleep_until(prepared_at + Duration::from_secs(31)).await;
-        let retry = manager.begin().await.unwrap();
-        assert!(matches!(
-            manager.write(retry.clone(), counter_cell(1, id, 9)).await,
-            Ok(TxnExecResult::Accepted(()))
-        ));
         let prepared = manager.prepare(retry.clone()).await;
-        warn!(
-            "G5/F4 control: retry after cell lock timeout = {:?}",
-            prepared
-        );
+        warn!("G5/F4 control: retry after presumed abort = {:?}", prepared);
         assert!(matches!(prepared, Ok(TMPrepareResult::Success)));
         assert_eq!(manager.commit(retry).await, Ok(EndResult::Success));
         assert_eq!(
             runtime.chunks().read_cell(&id).unwrap().to_owned().data["score"]
                 .u64()
                 .copied(),
-            Some(9)
+            Some(8)
         );
         manager.shutdown.store(true, Ordering::Relaxed);
         server.shutdown().await;

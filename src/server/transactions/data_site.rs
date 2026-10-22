@@ -1177,8 +1177,19 @@ impl DataManager {
             // close, and the heads stay held until it succeeds.
             return false;
         }
+        // No `end` follows a presumed abort, so the cell locks must go with
+        // the decision. Capture the cells and the owner it covers before the
+        // decision: the removal below drops the transaction record.
+        let expected_owner = txn
+            .coordinator_id
+            .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
+        let locked_cell_ids = Self::guarded_txn_cell_ids(&txn);
         let outcome = self.abort_locked(tid, &mut txn);
         drop(txn);
+        let aborted = matches!(
+            &outcome,
+            AbortResult::Success(_) | AbortResult::CheckFailed(CheckError::AlreadyAborted)
+        );
         match outcome {
             AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
                 warn!(
@@ -1197,6 +1208,12 @@ impl DataManager {
                     tid, other
                 );
             }
+        }
+        if aborted {
+            // The decision covers these cells and this owner. A cell that
+            // another transaction owns stays with it: `attempt_lock_release`
+            // clears only an owner equal to `expected_owner`.
+            self.attempt_lock_release(expected_owner.as_ref(), &locked_cell_ids);
         }
         self.record_decision(tid, TxnOutcome::Aborted);
         self.wipe_out_transaction(tid);
