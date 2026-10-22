@@ -6679,6 +6679,8 @@ mod tests {
             meta.lock_acquired_at = Some(get_time() - LOCK_TIMEOUT_MS - 1);
         }
 
+        // The stale lock of an applied, undecided transaction is not
+        // reclaimed (NEB-TXN-3): T2 dies as the younger requester.
         let prepare_t2 = <DataManager as Service>::prepare(
             &manager,
             25,
@@ -6693,12 +6695,15 @@ mod tests {
         )
         .await
         .payload;
-        assert_eq!(prepare_t2, DMPrepareResult::Success);
+        assert_eq!(prepare_t2, DMPrepareResult::NotRealizable);
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t2_owner.clone())
+            Some(t1_owner.clone())
         );
 
+        // The abort still validates ownership before it rolls back. Move the
+        // lock to T2 by hand to check that.
+        manager.set_cell_owner_for_test(&cell_id, Some(t2_owner.clone()));
         let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
             .await
             .payload;
@@ -6714,24 +6719,8 @@ mod tests {
         assert_eq!(t1_txn.state, TxnState::Committed);
         assert!(t1_txn.history.contains_key(&cell_id));
         drop(t1_txn);
+        manager.set_cell_owner_for_test(&cell_id, Some(t1_owner));
 
-        assert_ne!(
-            manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t1_owner)
-        );
-        assert_eq!(
-            manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t2_owner.clone())
-        );
-
-        let abort_t2 = <DataManager as Service>::abort(&manager, t2.clone(), t2.clone())
-            .await
-            .payload;
-        assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
-            .await
-            .payload;
-        assert_eq!(end_t2, EndResult::Success);
 
         let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
