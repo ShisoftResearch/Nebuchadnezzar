@@ -784,9 +784,7 @@ impl HashIndexer {
         while let Some(cid) = cursor {
             let segment = match self.read_segment(index_id, cid).await {
                 Ok(Ok(Some(segment))) => segment,
-                // A missing HEAD is an empty bucket. A missing LINK is a
-                // broken chain: say so rather than quietly returning a short
-                // answer that reads like a complete one.
+                // A missing HEAD is an empty bucket.
                 Ok(Ok(None)) if cid == index_id => break,
                 // A missing LINK is a broken chain. The ids after it are
                 // unreachable, so the answer is an error, not a short list.

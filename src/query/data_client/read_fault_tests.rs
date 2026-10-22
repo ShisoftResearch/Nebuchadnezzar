@@ -10,7 +10,7 @@ use crate::{
     ram::{
         cell::OwnedCell,
         schema::{Field, IndexType, Schema, SchemaVid},
-        types::{Map, OwnedMap, Type, Value},
+        types::{Map, OwnedMap, Type},
     },
     server::{NebServer, ServerOptions, Service},
 };
@@ -776,6 +776,55 @@ async fn phrase_boosting_never_ranks_from_a_failed_read() {
             assert!(message.contains("injected read failure"), "{message}")
         }
         other => panic!("a failed candidate read must fail the search: {other:?}"),
+    }
+    server.shutdown().await;
+}
+
+/// An expression (`proc`) that fails on a cell is a failed read of that cell,
+/// on both paths: the server evaluates it for an uncached read, and the client
+/// evaluates it for cells the index query already read and cached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_expression_is_an_error_on_the_server_and_the_cached_path() {
+    let (server, client, owner, _dir) = fixture("read_fault_proc").await;
+    let failing = dovahkiin::integrated::lisp::parse_to_serde_expr("(no-such-function 1u64)")
+        .unwrap()[0]
+        .clone();
+    // `price >= 1` is index-served: the cells are cached and the client
+    // evaluates the expression. `note > 0` is not: the server evaluates it.
+    for (path, selection) in [
+        ("cached path", compare(">=", PRICE, 1)),
+        ("server path", compare(">", NOTE, 0)),
+    ] {
+        let rows = client
+            .scan_all(
+                SchemaUid(SCHEMA),
+                vec![],
+                selection.clone(),
+                Expr::nothing(),
+                QueryOrdering::Asc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.buffer.len(),
+            ROWS as usize,
+            "{path}: the scan itself works"
+        );
+        let failed = client
+            .scan_all(
+                SchemaUid(SCHEMA),
+                vec![],
+                selection,
+                failing.clone(),
+                QueryOrdering::Asc,
+            )
+            .await;
+        assert_read_failure_with(
+            path,
+            &failed.map(|rows| rows.buffer.len()).unwrap_err(),
+            owner,
+            "ExecError",
+        );
     }
     server.shutdown().await;
 }

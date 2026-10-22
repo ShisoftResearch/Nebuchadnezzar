@@ -948,20 +948,20 @@ impl InvertedIndexer {
             let candidates = &mut hits[0..rerank_limit];
             let candidate_ids: Vec<Id> = candidates.iter().map(|h| h.id).collect();
 
-            // Fetch the candidates' content through the reader: a server that
-            // cannot be read is an error, never an unboosted ranking. A
-            // candidate whose cell is gone gets no boost.
-            let cells = crate::query::data_client::read::CellReader::new(
-                self.neb_client.conshash.clone(),
-                self.neb_client.group_name(),
-                self.neb_client.database_name(),
-            )
-            .read_full_cells_aligned(&candidate_ids)
-            .await
-            .map_err(IndexError::RPCError)?;
-            // Determine if we have a potential phrase (query with spaces)
+            // Only a query with spaces can be a phrase.
             let query_phrase = query.trim().to_lowercase();
             if query_phrase.contains(' ') {
+                // Fetch the candidates' content through the reader: a server
+                // that cannot be read is an error, never an unboosted ranking.
+                // A candidate whose cell is gone gets no boost.
+                let cells = crate::query::data_client::read::CellReader::new(
+                    self.neb_client.conshash.clone(),
+                    self.neb_client.group_name(),
+                    self.neb_client.database_name(),
+                )
+                .read_full_cells_aligned(&candidate_ids)
+                .await
+                .map_err(IndexError::RPCError)?;
                 for (candidate, cell) in candidates.iter_mut().zip(cells) {
                     if cell.is_some_and(|cell| value_contains_phrase(cell.data(), &query_phrase)) {
                         candidate.score *= 2.0;

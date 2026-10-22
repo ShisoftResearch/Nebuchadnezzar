@@ -1017,7 +1017,19 @@ impl IndexedDataClient {
                 interpreter.unset_global_val();
                 match evaluated {
                     Ok(value) => cell.data = value.owned_val().unwrap_or(OwnedValue::NA),
-                    Err(_) => continue,
+                    // The same answer as the server path, where an expression
+                    // error is a failed read of an existing cell, not a dropped
+                    // row.
+                    Err(error) => {
+                        return Err(read::CellReadFailure {
+                            server_id: self
+                                .conshash
+                                .get_server_id_for_slot(crate::slots::slot_of(&cell.id()) as u64),
+                            id: cell.id(),
+                            reason: format!("{:?}", ReadError::ExecError(error)),
+                        }
+                        .into_rpc_error())
+                    }
                 }
             }
             result.push(cell);

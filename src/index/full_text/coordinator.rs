@@ -96,13 +96,26 @@ impl DistributedInvertedIndexCoordinator {
     }
 
     /// Get all active server IDs from the consistent hash ring
-    async fn get_all_server_ids(&self) -> Result<Vec<u64>, RPCError> {
-        let (members, _) = self
-            .conshash
-            .membership()
-            .all_members(true)
-            .await
-            .map_err(|error| shard_failure(None, format!("membership query failed: {error:?}")))?;
+    /// The members to ask, read within the call's `deadline`.
+    async fn get_all_server_ids(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<u64>, RPCError> {
+        let (members, _) =
+            tokio::time::timeout_at(deadline, self.conshash.membership().all_members(true))
+                .await
+                .map_err(|_| {
+                    shard_failure(
+                        None,
+                        format!(
+                            "no membership answer within the search deadline of {} ms",
+                            self.deadline.as_millis()
+                        ),
+                    )
+                })?
+                .map_err(|error| {
+                    shard_failure(None, format!("membership query failed: {error:?}"))
+                })?;
         Ok(members.into_iter().map(|m| m.id).collect())
     }
 
@@ -153,7 +166,7 @@ impl DistributedInvertedIndexCoordinator {
         }
 
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let server_ids = self.get_all_server_ids().await?;
+        let server_ids = self.get_all_server_ids(deadline).await?;
         if server_ids.is_empty() {
             return Ok(Ok(vec![]));
         }
@@ -270,7 +283,7 @@ impl DistributedInvertedIndexCoordinator {
 
         // For each term, collect postings from all nodes
         let mut term_postings: HashMap<u64, Vec<(Id, u32, u32)>> = HashMap::new();
-        let server_ids = self.get_all_server_ids().await?;
+        let server_ids = self.get_all_server_ids(deadline).await?;
 
         for term_hash in &query_terms {
             let mut all_postings = vec![];
@@ -345,7 +358,7 @@ impl DistributedInvertedIndexCoordinator {
         field_id: u64,
     ) -> Result<FieldStatsResponse, RPCError> {
         let deadline = tokio::time::Instant::now() + self.deadline;
-        let server_ids = self.get_all_server_ids().await?;
+        let server_ids = self.get_all_server_ids(deadline).await?;
         let responses = join_all(server_ids.iter().map(|server_id| {
             let req = FieldStatsRequest {
                 schema_id,
