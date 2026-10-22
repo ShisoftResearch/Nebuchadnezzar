@@ -526,7 +526,7 @@ fn numeric_value_type(field: &crate::ram::schema::Field) -> Option<AggregateValu
     match field.data_type {
         Type::I8 | Type::I16 | Type::I32 | Type::I64 => Some(AggregateValueType::Signed),
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => Some(AggregateValueType::Unsigned),
-        Type::F32 | Type::F64 => Some(AggregateValueType::Float),
+        Type::F32 | Type::F64 | Type::F16 => Some(AggregateValueType::Float),
         _ => None,
     }
 }
@@ -563,6 +563,7 @@ fn owned_value_to_f64(value: &OwnedValue) -> Option<f64> {
         OwnedValue::U64(value) => Some(*value as f64),
         OwnedValue::F32(value) => Some(*value as f64),
         OwnedValue::F64(value) => Some(*value),
+        OwnedValue::F16(value) => Some(value.to_f64()),
         _ => None,
     }
 }

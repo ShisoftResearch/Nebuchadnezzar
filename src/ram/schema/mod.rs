@@ -5,6 +5,7 @@ use bifrost_hasher::hash_str;
 
 use crate::ram::types::Id;
 use dovahkiin::types::{OwnedValue, Type};
+use half::f16;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1819,6 +1820,10 @@ pub fn coerce_value(value: &OwnedValue, target: Type) -> Option<OwnedValue> {
         (U16(v), Type::F64) => F64(*v as f64),
         (U32(v), Type::F64) => F64(*v as f64),
         (F32(v), Type::F64) => F64(*v as f64),
+        (F16(v), Type::F32) => F32(v.to_f32()),
+        (F16(v), Type::F64) => F64(v.to_f64()),
+        (I8(v), Type::F16) => F16(f16::from_f32(*v as f32)),
+        (U8(v), Type::F16) => F16(f16::from_f32(*v as f32)),
 
         _ => return None,
     })
@@ -1842,6 +1847,7 @@ pub fn widening_exists(from: Type, to: Type) -> bool {
         Type::U64 => OwnedValue::U64(0),
         Type::F32 => OwnedValue::F32(0.0),
         Type::F64 => OwnedValue::F64(0.0),
+        Type::F16 => OwnedValue::F16(f16::from_bits(0)),
         _ => return false,
     };
     coerce_value(&probe, to).is_some()
@@ -4395,5 +4401,44 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod f16_revision_tests {
+    use super::*;
+    #[test]
+    fn f16_index_admission_returns_typed_errors() {
+        for field in [
+            Field::new_indexed_vector(
+                "half",
+                Type::F16,
+                4,
+                vec![IndexType::Vector(
+                    crate::index::vector::VectorIndexConfig::hnsw(
+                        crate::index::vector::MetricEncoding::L2,
+                        crate::index::vector::HnswConfig::default(),
+                    ),
+                )],
+            ),
+            Field::new_indexed(
+                "half",
+                Type::F16,
+                vec![IndexType::Embedding(
+                    crate::index::embedding::EmbeddingIndexConfig::new(
+                        crate::index::embedding::EmbeddingModel::from("test-model"),
+                        crate::index::vector::VectorIndexConfig::hnsw(
+                            crate::index::vector::MetricEncoding::L2,
+                            crate::index::vector::HnswConfig::default(),
+                        ),
+                    ),
+                )],
+            ),
+        ] {
+            assert!(matches!(
+                field.validate_for_registration("half"),
+                Err(NewSchemaError::InvalidSchema(_))
+            ));
+        }
     }
 }

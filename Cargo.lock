@@ -728,6 +728,7 @@ dependencies = [
  "bifrost_hasher",
  "bifrost_plugins",
  "byteorder",
+ "half 2.7.1",
  "lazy_static",
  "log",
  "serde",
@@ -1150,6 +1151,7 @@ checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "cfg-if",
  "crunchy",
+ "serde",
  "zerocopy",
 ]
 
@@ -1954,6 +1956,7 @@ dependencies = [
  "env_logger",
  "futures",
  "futures-timer",
+ "half 2.7.1",
  "itertools 0.14.0",
  "jieba-rs",
  "lazy_static",
