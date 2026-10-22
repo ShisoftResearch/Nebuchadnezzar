@@ -193,6 +193,37 @@ fn take_prepare_delay_after_fence_check(
     hooks.remove(&key)
 }
 
+/// Test hook: a lease sweep with this idle time stops after its
+/// participant fence round, before it ends any transaction.
+#[cfg(test)]
+static SWEEP_AFTER_FENCE_HOOK: Mutex<Option<(Duration, Arc<PrepareDelayState>)>> =
+    parking_lot::const_mutex(None);
+
+#[cfg(test)]
+pub(crate) fn install_sweep_after_fence_hook(idle: Duration) -> PrepareDelayHandle {
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    *SWEEP_AFTER_FENCE_HOOK.lock() = Some((idle, state.clone()));
+    // The key names no cell, so the handle owns no prepare registration.
+    PrepareDelayHandle {
+        key: (TxnId::default(), Id::from_parts(u64::MAX, u64::MAX)),
+        state,
+    }
+}
+
+#[cfg(test)]
+fn take_sweep_after_fence_hook(idle: Duration) -> Option<Arc<PrepareDelayState>> {
+    let mut slot = SWEEP_AFTER_FENCE_HOOK.lock();
+    match slot.as_ref() {
+        Some((hooked, _)) if *hooked == idle => slot.take().map(|(_, state)| state),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelayHandle {
     let key = (tid, id);
@@ -376,9 +407,11 @@ struct Transaction {
     /// tear it. Set under the transaction lock before the first record is
     /// written, and checked by every abort path under the same lock.
     decided_commit: bool,
-    /// A COMMIT of this site is durable, or the commit point passed. False
-    /// while `decided_commit` is set only on a commit point whose COMMIT may
-    /// or may not be on disk: it answers `InDoubt` then.
+    /// The commit can be reported as done: a COMMIT of this site is durable,
+    /// or the transaction has other participants and is decided here. False
+    /// while `decided_commit` is set only by a single-site close whose
+    /// retraction is not durable (`CommitRefusal::Unresolved`): a later
+    /// retracted close then reports the refusal, not `Success`.
     commit_durable: bool,
     /// A participant fenced this transaction here (D29), and the fence is
     /// synced in the fence log. The coordinator's `end` is refused from now
@@ -737,6 +770,22 @@ impl DataManager {
             })
     }
 
+    /// Whether the owner of a cell lock has applied writes here that can
+    /// still be aborted. Its lock is never reclaimed as stale: the abort of
+    /// the owner rolls its writes back only while it owns the cells, and a
+    /// reader without the lock would see writes that can still be aborted.
+    /// The lease sweeper ends such a transaction. A busy owner counts as one:
+    /// the caller holds a cell lock, so it must not wait for the owner's lock.
+    fn owner_waits_with_writes(&self, owner: &TxnPriority) -> bool {
+        self.find_transaction(&owner.tid).is_some_and(|txn_lock| {
+            txn_lock.try_lock().map_or(true, |txn| {
+                txn.state == TxnState::Committed
+                    && !txn.history.is_empty()
+                    && !txn.decided_commit
+            })
+        })
+    }
+
     fn existing_cell_meta_mutex(&self, id: &Id) -> Option<CellMetaMutex> {
         crate::profile_lock!(H07, self.cells.entry(id)).as_ref().cloned()
     }
@@ -1071,7 +1120,12 @@ impl DataManager {
     /// A transaction holding write heads past `idle` has lost its
     /// coordinator, or is about to be told something late. In order:
     ///
-    /// 1. Run the participant fence (`terminate_in_doubt_transactions`) and
+    /// All steps act on one listing of the idle transactions, made before
+    /// step 1. A transaction that becomes idle while step 1 waits for a peer
+    /// goes to the next pass: steps 2 and 3 never end a transaction that the
+    /// participant fence did not see.
+    ///
+    /// 1. Run the participant fence (`terminate_in_doubt`) and
     ///    finish the ones it decides commit. Runs first because closing a
     ///    bracket needs the leases every later step gives up.
     /// 2. Abort the ones it decides abort, and the ones of this site alone:
@@ -1084,15 +1138,28 @@ impl DataManager {
     ///    it committed something whose spans were just disowned.
     /// 3. Retire whatever is left: leases no participant object knows about.
     pub(crate) async fn sweep_idle_transactions(&self, idle: std::time::Duration) {
-        let hold = self.terminate_in_doubt_transactions(idle).await;
         let store = self.chunks().address_range();
-        for tid in crate::ram::chunk::transactions_with_idle_leases(idle, &store) {
-            if hold.contains(&tid) {
-                continue;
-            }
-            self.presume_abort(&tid);
+        let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+        let hold = self.terminate_in_doubt(&candidates).await;
+        #[cfg(test)]
+        if let Some(state) = take_sweep_after_fence_hook(idle) {
+            Self::await_prepare_delay(&state).await;
         }
-        for tid in crate::ram::chunk::expire_transaction_leases(idle, &store, &hold) {
+        let ended: Vec<TxnId> = candidates
+            .into_iter()
+            .filter(|tid| !hold.contains(tid))
+            .collect();
+        for tid in &ended {
+            self.presume_abort(tid);
+        }
+        // A transaction that kept its object is decided COMMIT, and the next
+        // pass retries its close; only leases without an object are retired.
+        let orphans = ended
+            .into_iter()
+            .filter(|tid| self.find_transaction(tid).is_none())
+            .filter(|tid| crate::ram::chunk::transaction_lease_count(tid, &store) > 0)
+            .collect();
+        for tid in crate::ram::chunk::retire_expired_transaction_leases(orphans, idle, &store) {
             self.wipe_out_transaction(&tid);
         }
     }
@@ -1153,7 +1220,7 @@ impl DataManager {
     ///   coordinator sends the decision to every participant at once, so
     ///   another site can already hold a durable COMMIT, and a rollback here
     ///   would tear the transaction. Its entries, locks and heads stay, and
-    ///   the lease sweeper finishes it (`terminate_in_doubt_transactions`).
+    ///   the lease sweeper finishes it (`terminate_in_doubt`).
     /// * With no other participant (Q4), it rolls back only if no COMMIT
     ///   fsync succeeded and the retraction is synced. If one COMMIT fsync
     ///   succeeded, recovery commits the transaction from it, so it stays
@@ -1184,7 +1251,7 @@ impl DataManager {
         txn.durable_commit |= durable;
         let durable = txn.durable_commit;
         let store = self.chunks().address_range();
-        let multi_site = self.has_other_participants(&txn.participants);
+        let multi_site = self.holds_multi_site_part(&txn.participants);
         let mut status = None;
         if multi_site {
             // Before the first record, as `decided_commit` promises: from
@@ -1376,16 +1443,11 @@ impl DataManager {
     /// never gets here. That case is recovery's (see
     /// `resolve_in_doubt_after_recovery`), and it runs the same protocol with
     /// the participants its BEGIN records name.
-    pub(crate) async fn terminate_in_doubt_transactions(
-        &self,
-        idle: std::time::Duration,
-    ) -> std::collections::BTreeSet<TxnId> {
-        let store = self.chunks().address_range();
-        let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+    async fn terminate_in_doubt(&self, candidates: &[TxnId]) -> std::collections::BTreeSet<TxnId> {
         // Transactions whose leases must NOT be released this round.
         let mut hold = std::collections::BTreeSet::new();
         let me = self.database_runtime.rpc.server_id;
-        for tid in candidates {
+        for tid in candidates.iter().cloned() {
             // The transaction lock is READ and dropped before the network
             // call. Holding it across the await would also make this future
             // non-Send.
@@ -1488,6 +1550,17 @@ impl DataManager {
             }
         }
         hold
+    }
+
+    /// `terminate_in_doubt` for the transactions idle for `idle` now.
+    #[cfg(test)]
+    pub(crate) async fn terminate_in_doubt_transactions(
+        &self,
+        idle: std::time::Duration,
+    ) -> std::collections::BTreeSet<TxnId> {
+        let store = self.chunks().address_range();
+        let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+        self.terminate_in_doubt(&candidates).await
     }
 
     /// The participant fence for one in-doubt transaction (D29).
@@ -1774,9 +1847,13 @@ impl DataManager {
         Ok((chunk_id, id))
     }
 
-    fn has_other_participants(&self, participants: &[u64]) -> bool {
+    /// Whether this site holds a part of a multi-site transaction: it is a
+    /// participant, and another participant exists. A site that only read
+    /// the transaction is not a participant. It holds no bracket and no peer
+    /// asks it, so it writes no status cell.
+    fn holds_multi_site_part(&self, participants: &[u64]) -> bool {
         let me = self.database_runtime.rpc.server_id;
-        participants.iter().any(|peer| *peer != me)
+        participants.contains(&me) && participants.iter().any(|peer| *peer != me)
     }
 
     /// Whether this site's COMMIT and status cell of `txn` are synced: no
@@ -1915,9 +1992,8 @@ impl DataManager {
 
     /// Remember what this site decided, so a peer in doubt can be told.
     ///
-    /// Recorded at `end`, at `abort`, at a presumed abort, and when the
-    /// commit point answers a transaction it never decided. Bounded: see
-    /// `DECISION_MEMORY`.
+    /// Recorded at `end`, at a presumed abort, and when a single-site close
+    /// finds its COMMIT durable. Bounded: see `DECISION_MEMORY`.
     fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
         self.decided.insert(tid.clone(), outcome);
         self.decision_order.insert(tid.clone());
@@ -3428,6 +3504,105 @@ mod tests {
             .await
             .payload;
         assert_eq!(end, EndResult::Success);
+        server.shutdown().await;
+    }
+
+    /// An applied transaction that waits for its decision keeps its cell
+    /// locks after the stale-lock timeout. A later prepare that took the lock
+    /// would leave the applied write without an owner, and the abort could not
+    /// roll it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_lock_of_an_applied_transaction_is_not_reclaimed() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_applied_stale_lock";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell = Id::allocated(0, 0, 9301);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell, 5, 0);
+        let applied = test_hlc(1, 9301);
+        let write = |expectation| PrepareOp {
+            id: cell,
+            expectation,
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9301,
+                &applied,
+                vec![write(CellExpectation::Present(version))]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &applied,
+                vec![CommitOp::Update(counter_cell(
+                    schema.vid.get(),
+                    cell,
+                    50,
+                    "applied"
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // The decision is late: the lock is older than the stale-lock timeout.
+        manager.cell_meta_for_test(&cell).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let later = test_hlc(2, 9302);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9302,
+                &later,
+                vec![write(CellExpectation::Present(version))]
+            )
+            .await,
+            DMPrepareResult::NotRealizable
+        );
+        assert_eq!(
+            manager.cell_meta_for_test(&cell).lock().owner,
+            Some(TxnPriority::new(applied.clone(), 9301)),
+            "the applied transaction must keep its lock"
+        );
+        let abort = <DataManager as Service>::abort(&manager, applied.clone(), applied.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        assert_eq!(
+            runtime.chunks().read_cell(&cell).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(5),
+            "the abort must undo the applied write"
+        );
+        // Control: the stale lock of a transaction that applied nothing is
+        // still reclaimed.
+        let idle = test_hlc(3, 9303);
+        let reclaimer = test_hlc(4, 9304);
+        let other = Id::allocated(0, 0, 9302);
+        let other_version = seed_cell_version(&runtime, schema.vid.get(), other, 6, 0);
+        let other_write = PrepareOp {
+            id: other,
+            expectation: CellExpectation::Present(other_version),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 9303, &idle, vec![other_write.clone()]).await,
+            DMPrepareResult::Success
+        );
+        manager.cell_meta_for_test(&other).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        assert_eq!(
+            prepare_ops_local(&manager, 9304, &reclaimer, vec![other_write]).await,
+            DMPrepareResult::Success
+        );
         server.shutdown().await;
     }
 
@@ -7496,7 +7671,7 @@ impl Service for DataManager {
                                 .map(|acquired| current_time - acquired)
                                 .unwrap_or(0);
 
-                            if lock_age > LOCK_TIMEOUT_MS {
+                            if lock_age > LOCK_TIMEOUT_MS && !self.owner_waits_with_writes(&owner) {
                                 warn!(
                                     "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
                                     lock_age, owner, requester
