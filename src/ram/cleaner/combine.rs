@@ -4,7 +4,6 @@ use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SegmentClass, SEGMENT_SIZE};
 use itertools::Itertools;
-use lightning::map::Map;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;

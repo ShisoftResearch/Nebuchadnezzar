@@ -6,7 +6,6 @@ use bifrost_hasher::hash_str;
 use crate::ram::types::Id;
 use dovahkiin::types::{OwnedValue, Type};
 use half::f16;
-use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
@@ -4440,5 +4439,39 @@ mod f16_revision_tests {
                 Err(NewSchemaError::InvalidSchema(_))
             ));
         }
+    }
+
+    #[test]
+    fn f16_widens_only_where_every_value_is_exact() {
+        for (from, to) in [
+            (Type::F16, Type::F32),
+            (Type::F16, Type::F64),
+            (Type::I8, Type::F16),
+            (Type::U8, Type::F16),
+        ] {
+            assert!(widening_exists(from, to), "{from:?} -> {to:?}");
+        }
+        for (from, to) in [
+            (Type::F32, Type::F16),
+            (Type::F64, Type::F16),
+            (Type::I16, Type::F16),
+            (Type::U16, Type::F16),
+            (Type::F16, Type::I32),
+        ] {
+            assert!(!widening_exists(from, to), "{from:?} -> {to:?}");
+        }
+        let half = half::f16::from_f32(-2.5);
+        assert_eq!(
+            coerce_value(&OwnedValue::F16(half), Type::F64),
+            Some(OwnedValue::F64(-2.5))
+        );
+        assert_eq!(
+            coerce_value(&OwnedValue::I8(i8::MIN), Type::F16),
+            Some(OwnedValue::F16(half::f16::from_f32(-128.0)))
+        );
+        assert_eq!(
+            coerce_value(&OwnedValue::U8(u8::MAX), Type::F16),
+            Some(OwnedValue::F16(half::f16::from_f32(255.0)))
+        );
     }
 }

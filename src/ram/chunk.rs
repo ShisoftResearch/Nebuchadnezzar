@@ -745,8 +745,8 @@ fn end_lease(
         LeaseExit::Rewind => {
             // Everything from where the transaction found the cursor to where
             // the cursor is now is the transaction's own: it owned the head the
-            // whole time. Includes a span with no BEGIN (a lease taken by the
-            // unbracketed fallback), whose entries must vanish just the same.
+            // whole time. Includes a span with no BEGIN, whose entries must
+            // vanish just the same.
             // A stale owner may still be inside a write it claimed before
             // the revocation (claims are taken under the lock that revoked
             // it). Let that entry land first, so the padding covers it.
@@ -2300,9 +2300,8 @@ impl Chunk {
             crate::ram::bracket::MIN_COMMIT_ENTRY_SIZE
         );
         for head in heads {
-            // A part with no BEGIN (a lease the unbracketed fallback took) has
-            // nothing to close, and one already closed must not be closed
-            // twice.
+            // A part with no BEGIN has nothing to close, and one already
+            // closed must not be closed twice.
             if !head.bracket_is_open() {
                 continue;
             }
@@ -3554,7 +3553,7 @@ impl Chunk {
     pub(crate) fn release_append_heads_for_test(&self) -> Vec<u64> {
         let mut heads = Vec::new();
         for slot in self.head_pool.iter().chain(self.blob_head_pool.iter()) {
-            let lookup = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
+            let _lookup = crate::ram::qsbr::QsbrSection::new(&self.qsbr);
             let old = slot.swap(HEAD_SEG_ID_EMPTY, Ordering::AcqRel);
             if old != HEAD_SEG_ID_EMPTY && old != HEAD_SEG_ID_ALLOCATING {
                 if let Some(segment) = self.segs.get(&(old as usize)) {
@@ -6314,9 +6313,9 @@ impl Chunks {
     /// open. The caller retains the heads during rollback.
     ///
     /// A transaction holding no lease here has nothing bracketed to close: a
-    /// read-only one, one whose writes all failed, or one whose writes could
-    /// not be given a head and went out unbracketed (and were fsynced at
-    /// apply). That is answered `Ok`, which makes it the CALLER's job to know
+    /// read-only one, or one whose writes all failed (a write that gets no
+    /// head fails with `TransactionHeadUnavailable`). That is answered `Ok`,
+    /// which makes it the CALLER's job to know
     /// that no other exit -- an abort, a sweeper -- already ended the leases
     /// of a transaction that did write; `DataManager` keeps that knowledge in
     /// the transaction object it serializes every decision through.

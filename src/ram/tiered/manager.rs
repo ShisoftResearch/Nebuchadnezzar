@@ -4,7 +4,6 @@ use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
 use crate::ram::tiered::SharedMemoryPool;
-use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -49,24 +48,6 @@ const RECLAIM_CHUNKS_PER_PASS: usize = 4;
 
 /// Minimum spacing between "eviction could not free anything" warnings.
 const STALL_WARN_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Releases the global-eviction latch on drop, including on early return or
-/// panic, so a failed pass cannot wedge eviction off permanently.
-struct EvictionFlight<'a>(&'a AtomicBool);
-
-impl<'a> EvictionFlight<'a> {
-    fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| EvictionFlight(flag))
-    }
-}
-
-impl Drop for EvictionFlight<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
 
 struct ChunkTierState {
     last_known_count: AtomicUsize,

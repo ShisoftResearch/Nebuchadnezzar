@@ -24,11 +24,11 @@ use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use crate::server::storage_lock::StorageDirectoryLocks;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub mod cell_rpc;
 pub mod database;
@@ -2413,7 +2413,6 @@ impl NebServer {
 
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
-            use crate::index::builder::IndexBuilder;
             let _ = self.await_index_tasks().await;
             info!("All pending index tasks completed");
 

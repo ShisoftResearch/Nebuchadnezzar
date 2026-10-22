@@ -303,3 +303,54 @@ async fn durable_ack_rewind_refuses_stale_receipts_after_offsets_are_reused() {
         "a rewind is not a sync failure"
     );
 }
+
+#[tokio::test]
+async fn durable_ack_rewind_keeps_receipts_before_the_retained_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = store(&dir);
+    let seg = segment(&chunks);
+    let _pause = PauseRewindSync::new(&seg);
+    let kept = append(&seg, 0, true);
+    let waiting = append(&seg, 1, true);
+    let retained = seg.wal_append_position();
+    let retracted = append(&seg, 2, true);
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    kept.file.set_gate(gate.clone());
+    let mut pending_waiting = Box::pin(wait(vec![waiting.clone()]));
+    let mut pending_retracted = Box::pin(wait(vec![retracted.clone()]));
+    assert!(futures::poll!(&mut pending_waiting).is_pending());
+    assert!(futures::poll!(&mut pending_retracted).is_pending());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while kept.file.test_gate_pending() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The protection of an old version takes a token of the COMMIT receipt.
+    let protection = crate::ram::cleaner::protection::Protection::default();
+    let txn = crate::server::transactions::test_hlc(1, 1);
+    protection.pin_until_covered(&txn, Arc::new(vec![kept.token()]));
+    seg.truncate_wal_to(retained).unwrap();
+    gate.wait();
+    let timeout = std::time::Duration::from_secs(1);
+    tokio::time::timeout(timeout, pending_waiting)
+        .await
+        .unwrap()
+        .expect("a receipt before the retained length must stay valid");
+    assert!(
+        tokio::time::timeout(timeout, pending_retracted)
+            .await
+            .unwrap()
+            .is_err(),
+        "a receipt after the retained length must fail"
+    );
+    wait(vec![kept.clone()])
+        .await
+        .expect("a later wait for a retained receipt must succeed");
+    assert!(kept.file.covers_receipt(kept.offset, kept.epoch));
+    assert!(
+        !protection.transaction_pending(),
+        "a synced, retained COMMIT receipt must release the pin of the old version"
+    );
+}

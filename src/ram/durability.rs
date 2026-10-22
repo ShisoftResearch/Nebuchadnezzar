@@ -87,7 +87,9 @@ struct Progress {
     failed: Option<DurabilityError>,
     running: bool,
     requested: Option<(u64, u64)>,
-    released: u64,
+    /// The length that each rewind kept, by the epoch that it ended.
+    /// `rewinds.len()` is the current epoch.
+    rewinds: Vec<u64>,
     waiters: Vec<Waiter>,
     #[cfg(test)]
     fail_sync: bool,
@@ -95,6 +97,23 @@ struct Progress {
     gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     capture_gate: Option<Arc<std::sync::Barrier>>,
+}
+
+impl Progress {
+    /// The highest offset that a receipt of `epoch` still certifies: the
+    /// smallest length that a later rewind kept. `None` for an epoch that
+    /// this file did not reach yet.
+    fn stable_prefix(&self, epoch: u64) -> Option<u64> {
+        let later = self.rewinds.get(usize::try_from(epoch).ok()?..)?;
+        Some(later.iter().copied().min().unwrap_or(u64::MAX))
+    }
+
+    /// Whether the bytes before `offset`, as of `epoch`, are still the bytes
+    /// of the file.
+    fn certifies(&self, offset: u64, epoch: u64) -> bool {
+        self.stable_prefix(epoch)
+            .is_some_and(|prefix| offset <= prefix)
+    }
 }
 
 pub struct DurableFile {
@@ -155,7 +174,7 @@ impl DurableFile {
                 failed: None,
                 running: false,
                 requested: None,
-                released: 0,
+                rewinds: Vec::new(),
                 waiters: Vec::new(),
                 #[cfg(test)]
                 fail_sync: false,
@@ -175,7 +194,6 @@ impl DurableFile {
             p.directory = Some(std::path::PathBuf::from(directory));
             self.end.store(header_end, Release);
             p.durable = (crate::ram::wal_format::FILE_HEADER_SIZE as u64).min(header_end);
-            p.released = p.durable;
         }
         Ok(())
     }
@@ -244,8 +262,12 @@ impl DurableFile {
         }
     }
 
+    /// Remove the bytes after `end`. A receipt for an offset after `end`
+    /// fails. A receipt for an offset at or before `end` stays valid: its
+    /// bytes are still in the file.
     pub fn truncate(&self, end: u64) {
         let mut p = self.progress.lock();
+        p.rewinds.push(end);
         p.epoch += 1;
         self.epoch.store(p.epoch, Release);
         #[cfg(test)]
@@ -254,7 +276,11 @@ impl DurableFile {
         let refuse_stale = true;
         if refuse_stale {
             let error = self.rewound(p.epoch - 1, p.epoch);
-            for waiter in p.waiters.drain(..) {
+            let (removed, kept) = std::mem::take(&mut p.waiters)
+                .into_iter()
+                .partition(|waiter| waiter.offset > end);
+            p.waiters = kept;
+            for waiter in removed {
                 let now = Instant::now();
                 let _ = waiter.sender.send(Completion {
                     result: Err(error.clone()),
@@ -265,7 +291,6 @@ impl DurableFile {
         }
         self.end.store(end, Release);
         p.durable = p.durable.min(end);
-        p.released = p.released.min(end);
     }
     pub fn snapshot(&self) -> (u64, u64) {
         let p = self.progress.lock();
@@ -273,7 +298,7 @@ impl DurableFile {
     }
     pub fn covers_receipt(&self, offset: u64, epoch: u64) -> bool {
         let p = self.progress.lock();
-        p.epoch == epoch && p.failed.is_none() && p.namespaced && p.durable >= offset
+        p.certifies(offset, epoch) && p.failed.is_none() && p.namespaced && p.durable >= offset
     }
 
     pub fn covers(&self, offset: u64) -> bool {
@@ -320,17 +345,16 @@ impl DurableFile {
                 sequence: self.sequence,
                 message: error.to_string(),
             });
-        } else if p.failed.is_none() && p.epoch == epoch {
-            self.end.fetch_max(end, Release);
-            p.durable = p.durable.max(end);
-            p.released = p.released.max(end);
+        } else if p.failed.is_none() {
+            // A rewind during the sync keeps the bytes before its length.
+            if let Some(prefix) = p.stable_prefix(epoch) {
+                let synced = end.min(prefix);
+                self.end.fetch_max(synced, Release);
+                p.durable = p.durable.max(synced);
+            }
         }
         let failed = p.failed.clone();
-        let durable = if p.namespaced {
-            p.durable.min(p.released)
-        } else {
-            0
-        };
+        let durable = if p.namespaced { p.durable } else { 0 };
         let (started, finished) = timing.unwrap_or_else(|| {
             let now = Instant::now();
             (now, now)
@@ -355,7 +379,7 @@ impl DurableFile {
     pub(crate) fn request_sync(self: &Arc<Self>, offset: u64, epoch: u64) {
         let mut progress = self.progress.lock();
         if progress.failed.is_some()
-            || progress.epoch != epoch
+            || !progress.certifies(offset, epoch)
             || (progress.namespaced && progress.durable >= offset)
         {
             return;
@@ -366,7 +390,8 @@ impl DurableFile {
         let requested = progress
             .requested
             .map_or(offset, |(old, _)| old.max(offset));
-        progress.requested = Some((requested, epoch));
+        // Every request that is still valid is valid in the current epoch.
+        progress.requested = Some((requested, progress.epoch));
         if !progress.running {
             progress.running = true;
             let file = self.clone();
@@ -390,7 +415,7 @@ impl DurableFile {
             let refuse_stale = std::env::var_os("NEB_TEST_DISABLE_TRUNCATE_FAILURE").is_none();
             #[cfg(not(test))]
             let refuse_stale = true;
-            if refuse_stale && epoch != p.epoch {
+            if refuse_stale && !p.certifies(offset, epoch) {
                 return Err(self.rewound(epoch, p.epoch));
             }
             let descriptor = p.file.as_ref().and_then(std::sync::Weak::upgrade);
@@ -401,7 +426,7 @@ impl DurableFile {
                     sequence: self.sequence,
                 });
             }
-            if offset <= p.durable.min(p.released) && p.namespaced {
+            if offset <= p.durable && p.namespaced {
                 return Ok(std::time::Duration::ZERO);
             }
             let (sender, receiver) = oneshot::channel();
@@ -440,7 +465,7 @@ impl DurableFile {
                 let mut p = self.progress.lock();
                 p.waiters.retain(|w| !w.sender.is_canceled());
                 if p.requested.is_some_and(|(offset, epoch)| {
-                    epoch != p.epoch || (p.namespaced && p.durable >= offset)
+                    !p.certifies(offset, epoch) || (p.namespaced && p.durable >= offset)
                 }) {
                     p.requested = None;
                 }
@@ -462,7 +487,7 @@ impl DurableFile {
                 } else {
                     end
                 };
-                (end, p.epoch, end.saturating_sub(p.released))
+                (end, p.epoch, end.saturating_sub(p.durable))
             };
             #[cfg(test)]
             {

@@ -1,5 +1,4 @@
 use crate::index::scrub::{ScrubMode, ScrubReport};
-use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete, post_schema_evolve};
 use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
