@@ -509,7 +509,8 @@ async fn idxinflight_buffered_hit_outlives_successful_update() {
                 crate::index::verification::IndexCheck::Ranged(key_range),
             ],
         )
-        .await;
+        .await
+        .unwrap();
     println!(
         "IDXINFLIGHT_BUFFERED price=1 raw={:?} counter={} checked={:?}",
         captured.current_block(),

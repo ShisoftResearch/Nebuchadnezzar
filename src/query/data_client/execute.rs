@@ -281,7 +281,7 @@ impl IndexedDataClient {
                     &dovahkiin::expr::serde::Expr::nothing(),
                     &checks,
                 )
-                .await;
+                .await?;
             for cell in read {
                 if super::read::cell_matches_selection(&cell, disjunct.residual()) {
                     verified_ids.push(cell.id());

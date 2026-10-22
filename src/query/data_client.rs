@@ -37,7 +37,7 @@ pub use capability::{IdQueryCapability, PredicateRequirement};
 pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor, ScanPage};
 use ids::sort_ids_by_query_order;
 pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
-pub use read::{cells_read_count, ScalarSelection, UnsupportedScalarSelection};
+pub use read::{cells_read_count, CellReadFailure, ScalarSelection, UnsupportedScalarSelection};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
 
@@ -214,7 +214,7 @@ impl IndexedDataClient {
             buffer: vec![],
             pos: 0,
         };
-        cursor.refresh_batch().await;
+        cursor.refresh_batch().await?;
         Ok(cursor)
     }
     pub async fn scan_all<'a>(
@@ -245,11 +245,11 @@ impl IndexedDataClient {
         }
         let cells = if id_cursor.cells.is_empty() {
             self.read_cells_from_ids(&ids, &projection, &Expr::nothing(), &proc)
-                .await
+                .await?
         } else {
             let full = self
                 .materialize_query_cells(&ids, &mut id_cursor.cells)
-                .await;
+                .await?;
             self.project_and_process_cells(full, &projection, &proc)
                 .await?
         };
@@ -312,7 +312,7 @@ impl IndexedDataClient {
         } else {
             let cells = self
                 .materialize_query_cells(&ids, &mut id_cursor.cells)
-                .await;
+                .await?;
             let fields = projection.iter().map(|field| field.field_id).collect();
             let cells = self
                 .project_and_process_cells(cells, &fields, &Expr::nothing())
@@ -373,7 +373,7 @@ impl IndexedDataClient {
         }
         let cells = self
             .materialize_query_cells(&ids, &mut id_cursor.cells)
-            .await;
+            .await?;
         Ok(DataCursor {
             checks: vec![],
             index_cursor: None,
@@ -484,11 +484,11 @@ impl IndexedDataClient {
             Vec::new()
         } else if id_cursor.cells.is_empty() {
             self.read_projected_rows_from_ids(&ids, &required_fields)
-                .await
+                .await?
         } else {
             let full = self
                 .materialize_query_cells(&ids, &mut id_cursor.cells)
-                .await;
+                .await?;
             self.project_and_process_cells(full, &required_fields, &Expr::nothing())
                 .await?
                 .into_iter()
@@ -848,7 +848,7 @@ impl IndexedDataClient {
                 &selection,
                 filter_limit,
             )
-            .await
+            .await?
         } else {
             ordered_candidate_ids
         };
@@ -940,7 +940,8 @@ impl IndexedDataClient {
     ///
     /// Public so join operators outside this module can materialise only the
     /// rows an index probe actually matched, rather than a whole side.
-    pub async fn read_cells(&self, ids: &[Id]) -> Vec<crate::ram::cell::OwnedCell> {
+    /// A failed read of a cell is an error, never a shorter answer.
+    pub async fn read_cells(&self, ids: &[Id]) -> Result<Vec<OwnedCell>, RPCError> {
         self.read_cells_from_ids(ids, &vec![], &Expr::nothing(), &Expr::nothing())
             .await
     }
@@ -949,7 +950,7 @@ impl IndexedDataClient {
         &self,
         ids: &[Id],
         cached: &mut HashMap<Id, OwnedCell>,
-    ) -> Vec<OwnedCell> {
+    ) -> Result<Vec<OwnedCell>, RPCError> {
         let missing: Vec<Id> = ids
             .iter()
             .filter(|id| !cached.contains_key(id))
@@ -957,11 +958,11 @@ impl IndexedDataClient {
             .collect();
         for cell in self
             .read_cells_from_ids(&missing, &vec![], &Expr::nothing(), &Expr::nothing())
-            .await
+            .await?
         {
             cached.insert(cell.id(), cell);
         }
-        ids.iter().filter_map(|id| cached.remove(id)).collect()
+        Ok(ids.iter().filter_map(|id| cached.remove(id)).collect())
     }
 
     async fn project_and_process_cells(
@@ -1075,3 +1076,6 @@ mod tests;
 
 #[cfg(test)]
 mod verification_tests;
+
+#[cfg(test)]
+mod read_fault_tests;

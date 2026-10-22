@@ -296,7 +296,7 @@ impl RangedCursor {
                         &dovahkiin::expr::serde::Expr::nothing(),
                         &self.checks,
                     )
-                    .await;
+                    .await?;
                 self.ids = cells.iter().map(|cell| cell.id()).collect();
                 self.cells = cells.into_iter().map(Some).collect();
             }
@@ -340,7 +340,7 @@ impl RangedCursor {
                     &dovahkiin::expr::serde::Expr::nothing(),
                     &self.checks,
                 )
-                .await;
+                .await?;
             if let Some(cell) = cells.pop() {
                 return Ok(Some(cell));
             }

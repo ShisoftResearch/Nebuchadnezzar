@@ -163,7 +163,7 @@ impl<S: RowSource> IndexNestedLoopJoin<S> {
             if ids.is_empty() {
                 continue;
             }
-            for inner in self.client.read_cells(&ids).await {
+            for inner in self.client.read_cells(&ids).await? {
                 // Re-check the key: a hash bucket holds collisions as well as
                 // matches, so the index narrows but does not decide.
                 if join_key(&inner, self.inner_field).as_ref() == Some(&key) {
