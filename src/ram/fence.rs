@@ -23,8 +23,18 @@
 //!   crc      u32      CRC32C over the 20 bytes before it
 //! ```
 //!
-//! A malformed header or record is a typed error that stops the start.
-//! Recovery never discards an unreadable abort settlement.
+//! A torn append can cut the final record short or leave it with a bad
+//! checksum. Its sync did not return, so no caller was told that it is
+//! durable, and the record ends the log. The same applies to a file shorter
+//! than its header: its creation did not complete. Each start rewrites the
+//! logs (`FenceLog::reset`), so no later append follows the torn bytes. Any
+//! other malformed header or record is a typed error that stops the start.
+//! Recovery never discards an abort settlement that a caller was told is
+//! durable.
+//!
+//! A failed append removes its bytes again and closes its file for the rest
+//! of the process: after a failed sync, the state of the page cache is not
+//! known. Later records of that file fail until the next start.
 //!
 //! A fence must outlive the transaction at this site (TLA+ F3, F6): a site
 //! with no bracket of the transaction answers `Unknown` and must still refuse
@@ -61,11 +71,11 @@ pub enum FenceLogError {
     UnsupportedVersion(u8),
     /// A record has an unknown decision tag.
     InvalidDecision(u32),
-    /// The file has an incomplete header.
+    /// The file is shorter than a header and is not a prefix of one.
     TruncatedHeader,
-    /// The file ends inside a record.
+    /// A record before the final record is incomplete.
     TruncatedRecord,
-    /// A record fails its checksum.
+    /// A record before the final record fails its checksum.
     ChecksumMismatch,
 }
 
@@ -82,7 +92,9 @@ impl std::fmt::Display for FenceLogError {
                 write!(f, "the fence record has decision tag {tag}")
             }
             FenceLogError::TruncatedHeader => write!(f, "the fence log header is incomplete"),
-            FenceLogError::TruncatedRecord => write!(f, "the fence log ends inside a record"),
+            FenceLogError::TruncatedRecord => {
+                write!(f, "a fence record before the final record is incomplete")
+            }
             FenceLogError::ChecksumMismatch => {
                 write!(f, "the fence record checksum does not match")
             }
@@ -125,7 +137,12 @@ pub struct FenceRecords {
 /// Read every fence and abort settlement a log holds.
 fn parse(data: &[u8]) -> Result<FenceRecords, FenceLogError> {
     if data.len() < HEADER_SIZE {
-        return Err(FenceLogError::TruncatedHeader);
+        // A creation that did not complete: no record was written yet.
+        return if header().starts_with(data) {
+            Ok(FenceRecords::default())
+        } else {
+            Err(FenceLogError::TruncatedHeader)
+        };
     }
     if data[..4] != FENCE_LOG_MAGIC {
         return Err(FenceLogError::NotAFenceLog);
@@ -133,15 +150,18 @@ fn parse(data: &[u8]) -> Result<FenceRecords, FenceLogError> {
     if data[4] != FENCE_LOG_VERSION {
         return Err(FenceLogError::UnsupportedVersion(data[4]));
     }
-    if (data.len() - HEADER_SIZE) % RECORD_SIZE != 0 {
-        return Err(FenceLogError::TruncatedRecord);
-    }
+    let body = &data[HEADER_SIZE..];
+    // A torn append damages only the final record: each append returns
+    // only after its sync, and a failed append removes its bytes.
+    let torn_tail = body.len() % RECORD_SIZE != 0;
+    let whole = body.len() / RECORD_SIZE;
     let mut records = FenceRecords::default();
-    let mut cursor = HEADER_SIZE;
-    while cursor + RECORD_SIZE <= data.len() {
-        let bytes = &data[cursor..cursor + RECORD_SIZE];
+    for (index, bytes) in body.chunks_exact(RECORD_SIZE).enumerate() {
         let crc = u32::from_le_bytes(bytes[20..].try_into().unwrap());
         if crc != crc32c(&bytes[..20]) {
+            if index + 1 == whole && !torn_tail {
+                break;
+            }
             return Err(FenceLogError::ChecksumMismatch);
         }
         let txn = TxnId {
@@ -156,13 +176,16 @@ fn parse(data: &[u8]) -> Result<FenceRecords, FenceLogError> {
             tag => return Err(FenceLogError::InvalidDecision(tag)),
         }
         records.fenced.insert(txn);
-        cursor += RECORD_SIZE;
     }
     Ok(records)
 }
 
 struct State {
     file: Option<File>,
+    /// The length of `file`: the header and the complete records.
+    len: u64,
+    /// Set by a failed append. The file takes no more records in this process.
+    failed: Option<String>,
     records: FenceRecords,
 }
 
@@ -200,6 +223,8 @@ impl FenceLog {
                 }),
                 state: Mutex::new(State {
                     file: None,
+                    len: 0,
+                    failed: None,
                     records: FenceRecords::default(),
                 }),
             }),
@@ -276,6 +301,8 @@ impl FenceLog {
                     (HEADER_SIZE + records.fenced.len() * RECORD_SIZE) as u64,
                 );
                 state.file = Some(OpenOptions::new().append(true).open(path)?);
+                state.len = (HEADER_SIZE + records.fenced.len() * RECORD_SIZE) as u64;
+                state.failed = None;
             }
             state.records = records;
         }
@@ -302,6 +329,11 @@ impl FenceLog {
         if state.records.aborted.contains(txn) || (!aborted && state.records.fenced.contains(txn)) {
             return Ok(());
         }
+        if let Some(error) = &state.failed {
+            return Err(io::Error::other(format!(
+                "an earlier append to this fence log failed: {error}"
+            )));
+        }
         #[cfg(test)]
         if aborted
             && crate::ram::segs::power_loss_model::wal_sync_fails(
@@ -327,22 +359,33 @@ impl FenceLog {
                         File::open(dir)?.sync_all()?;
                     }
                 }
+                state.len = file.metadata()?.len();
                 state.file = Some(file);
             }
         }
+        let len = state.len;
         if let Some(file) = state.file.as_mut() {
-            file.write_all(&record(txn, aborted))?;
-            #[cfg(not(test))]
-            file.sync_data()?;
+            if let Err(error) = Self::append_synced(file, &record(txn, aborted)) {
+                // Remove the refused bytes, so that no record follows them.
+                let restored = file.set_len(len);
+                state.file = None;
+                state.failed = Some(match restored {
+                    Ok(()) => error.to_string(),
+                    Err(truncate_error) => {
+                        format!("{error}; removing the refused bytes failed: {truncate_error}")
+                    }
+                });
+                return Err(error);
+            }
+            state.len += RECORD_SIZE as u64;
             #[cfg(test)]
             if !FENCE_SYNC_SKIPPED_FOR_TEST.load(Ordering::Acquire) {
-                file.sync_data()?;
                 crate::ram::segs::power_loss_model::record_synced(
                     &shard
                         .path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
-                    file,
+                    state.file.as_ref().unwrap(),
                 );
             }
         }
@@ -353,6 +396,21 @@ impl FenceLog {
             self.count.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
+    }
+
+    fn append_synced(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if FENCE_APPEND_FAILS_FOR_TEST.load(Ordering::Acquire) {
+            // A torn append: part of the record reaches the file.
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        file.write_all(bytes)?;
+        #[cfg(test)]
+        if FENCE_SYNC_SKIPPED_FOR_TEST.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        file.sync_data()
     }
 
     pub fn is_fenced(&self, txn: &TxnId) -> bool {
@@ -402,6 +460,11 @@ pub fn fences_to_keep(
 /// Test hook for a reverted control: record fences without the sync.
 #[cfg(test)]
 pub(crate) static FENCE_SYNC_SKIPPED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: the next appends write half a record and fail.
+#[cfg(test)]
+static FENCE_APPEND_FAILS_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
@@ -478,11 +541,21 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_record_and_another_version_are_refused() {
+    fn a_torn_final_record_ends_the_log_and_another_version_is_refused() {
+        let kept = test_hlc(3, 3);
         let mut data = header().to_vec();
-        data.extend_from_slice(&record(&test_hlc(3, 3), false));
-        data.extend_from_slice(&record(&test_hlc(4, 4), false)[..10]);
-        assert_eq!(parse(&data), Err(FenceLogError::TruncatedRecord));
+        data.extend_from_slice(&record(&kept, false));
+        let mut cut = data.clone();
+        cut.extend_from_slice(&record(&test_hlc(4, 4), true)[..10]);
+        assert_eq!(parse(&cut).unwrap().fenced, [kept].into_iter().collect());
+        let mut garbled = data.clone();
+        garbled.extend_from_slice(&[0u8; RECORD_SIZE]);
+        assert_eq!(parse(&garbled).unwrap().fenced, [kept].into_iter().collect());
+        let mut interior = garbled.clone();
+        interior.extend_from_slice(&record(&test_hlc(5, 5), false));
+        assert_eq!(parse(&interior), Err(FenceLogError::ChecksumMismatch));
+        assert_eq!(parse(&header()[..5]), Ok(FenceRecords::default()));
+        assert_eq!(parse(&[]), Ok(FenceRecords::default()));
         let mut other = header().to_vec();
         other[4] = FENCE_LOG_VERSION + 1;
         assert_eq!(
@@ -539,19 +612,54 @@ mod tests {
         let mut old = header();
         old[4] = 2;
         assert_eq!(load_error(&old), FenceLogError::UnsupportedVersion(2));
-        assert_eq!(load_error(&header()[..4]), FenceLogError::TruncatedHeader);
+        assert_eq!(load_error(b"NEBX"), FenceLogError::TruncatedHeader);
         let mut bytes = header().to_vec();
         bytes.extend_from_slice(&record(&test_hlc(1, 1), true));
         bytes[HEADER_SIZE] ^= 1;
-        assert_eq!(load_error(&bytes), FenceLogError::ChecksumMismatch);
+        let mut followed = bytes.clone();
+        followed.extend_from_slice(&record(&test_hlc(3, 1), false));
+        assert_eq!(load_error(&followed), FenceLogError::ChecksumMismatch);
         bytes[HEADER_SIZE] ^= 1;
         bytes[HEADER_SIZE + 16..HEADER_SIZE + 20].copy_from_slice(&2u32.to_le_bytes());
         let crc = crc32c(&bytes[HEADER_SIZE..HEADER_SIZE + 20]);
         bytes[HEADER_SIZE + 20..].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(load_error(&bytes), FenceLogError::InvalidDecision(2));
-        assert_eq!(
-            load_error(&bytes[..bytes.len() - 1]),
-            FenceLogError::TruncatedRecord
+        let mut interior = bytes.clone();
+        interior.truncate(bytes.len() - 1);
+        interior.extend_from_slice(&record(&test_hlc(2, 1), true));
+        assert_eq!(load_error(&interior), FenceLogError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn a_failed_append_removes_its_bytes_and_closes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = FenceLog::new(dir.path().to_str());
+        log.reset(FenceRecords::default()).unwrap();
+        let kept = test_hlc(1, 1);
+        let shard = fence_shard(&kept);
+        let same_file: Vec<_> = (2..10_000)
+            .map(|n| test_hlc(n, 1))
+            .filter(|tid| fence_shard(tid) == shard)
+            .take(2)
+            .collect();
+        log.record(&kept).unwrap();
+        FENCE_APPEND_FAILS_FOR_TEST.store(true, Ordering::Release);
+        let refused = log.record_abort(&same_file[0]);
+        FENCE_APPEND_FAILS_FOR_TEST.store(false, Ordering::Release);
+        assert!(refused.is_err());
+        assert!(
+            log.record(&same_file[1]).is_err(),
+            "a file whose append failed takes no more records"
         );
+        assert!(!log.is_fenced(&same_file[0]));
+        let path = log.shards[shard].path.clone().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (HEADER_SIZE + RECORD_SIZE) as u64,
+            "the refused bytes are removed"
+        );
+        let recovered = FenceLog::new(dir.path().to_str()).load(true).unwrap();
+        assert_eq!(recovered.fenced, [kept].into_iter().collect());
+        assert!(recovered.aborted.is_empty());
     }
 }
