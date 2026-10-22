@@ -8918,6 +8918,18 @@ impl Service for DataManager {
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
         };
+        if self.database_runtime.indexer().is_none() {
+            // No index work to order: the apply, and the undo of a partial
+            // apply, run inside the call.
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase_guard = phase_guard;
+            let payload = self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells);
+            if !matches!(payload, DMCommitResult::Success) {
+                self.undo_partial_apply(&tid);
+                self.mark_restored(&tid);
+            }
+            return self.response_with(payload);
+        }
         let gate = txn_lock.lock().index_gate.clone();
         async move {
             let _fence_guard = fence_guard;
