@@ -9,10 +9,7 @@ use itertools::Itertools;
 use crate::{
     client::client_by_server_name_for_database,
     index::{
-        ranged::{
-            client::cursor::ClientCursor,
-            tree::{btree::Ordering, service::Range},
-        },
+        ranged::tree::{btree::Ordering, service::Range},
         EntryKey, SCHEMA_SCAN_PATT_SIZE,
     },
     query::planner::normalize_selection_for_eval,
@@ -22,7 +19,7 @@ use crate::{
     },
 };
 
-use super::{DataCursor, IndexedDataClient, QueryOrdering, ScanPage, SCAN_BUFFER_SIZE};
+use super::{IndexedDataClient, QueryOrdering, ScanPage, SCAN_BUFFER_SIZE};
 use crate::ram::schema::SchemaUid;
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
@@ -46,28 +43,6 @@ pub fn cells_read_count() -> usize {
 }
 
 impl IndexedDataClient {
-    pub(super) async fn scan_schema_index<'a>(
-        &'a self,
-        schema: SchemaUid,
-        projection: Vec<u64>,
-        selection: Expr,
-        proc: Expr,
-        ordering: Ordering,
-    ) -> Result<DataCursor, RPCError> {
-        let key = EntryKey::for_schema(schema);
-        let index_cursor = self
-            .index_clients
-            .range_seek(
-                Range::new_inclusive_opened(key, ordering),
-                SCHEMA_SCAN_BUFFER_SIZE,
-                Some(SCHEMA_SCAN_PATT_SIZE),
-            )
-            .await?;
-        Ok(self
-            .new_cursor(index_cursor, projection, selection, proc)
-            .await)
-    }
-
     pub(super) async fn scan_schema_ids(
         &self,
         schema: SchemaUid,
@@ -267,27 +242,6 @@ impl IndexedDataClient {
             }
         }
         selected_ids
-    }
-
-    pub(super) async fn new_cursor<'a>(
-        &'a self,
-        index_cursor: Option<ClientCursor>,
-        projection: Vec<u64>,
-        selection: Expr,
-        proc: Expr,
-    ) -> DataCursor {
-        let mut cursor = DataCursor {
-            index_cursor,
-            checks: vec![],
-            projection,
-            selection,
-            proc,
-            client: self.clone(),
-            buffer: vec![],
-            pos: 0,
-        };
-        cursor.refresh_batch().await;
-        cursor
     }
 
     pub(super) async fn existing_ids(&self, ids: &[Id]) -> Result<Vec<Id>, RPCError> {

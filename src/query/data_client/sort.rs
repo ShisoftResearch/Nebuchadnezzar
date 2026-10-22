@@ -3,11 +3,9 @@ use std::{cmp::Ordering as CmpOrdering, collections::HashSet};
 use bifrost::rpc::RPCError;
 use dovahkiin::{ahash::HashMap, types::Id};
 
-use crate::index::ranged::tree::btree::Ordering;
-
 use crate::ram::cell::OwnedCell;
 
-use super::{IndexedDataClient, QueryOrdering, ValueRange, ValueRangeTerm};
+use super::{IndexedDataClient, QueryOrdering};
 
 impl IndexedDataClient {
     pub(super) async fn reorder_ids_by_field(
@@ -131,23 +129,6 @@ impl IndexedDataClient {
             }
         }
         distinct_ids
-    }
-}
-
-pub(super) fn query_order_to_scan_order(ordering: QueryOrdering) -> Ordering {
-    match ordering {
-        QueryOrdering::Asc => Ordering::Forward,
-        QueryOrdering::Desc => Ordering::Backward,
-    }
-}
-
-pub(super) fn range_index_order_for_range(range: &ValueRange) -> Ordering {
-    match (&range.start, &range.end) {
-        (ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_), _) => Ordering::Forward,
-        (ValueRangeTerm::Open, ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_)) => {
-            Ordering::Backward
-        }
-        (ValueRangeTerm::Open, ValueRangeTerm::Open) => Ordering::Forward,
     }
 }
 

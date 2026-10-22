@@ -2184,13 +2184,13 @@ impl NebServer {
         // start an indexed server, load a database, unload it, check the entry is
         // gone -- passes alone and destabilises the suite: A/B'd at 3/3 clean
         // without it and 1/3 with it, the casualty being the unrelated
-        // `a_migrated_cell_is_still_found_by_a_ranged_scan`. The reason is a few
-        // lines above -- unloading calls `IndexBuilder::await_all_indices()`,
-        // which is PROCESS-GLOBAL, so one database's unload reaches into another
-        // database's in-flight index work. That coupling is the bug worth fixing;
-        // until it is, this retirement is verified by inspection (the registry is
-        // read only by status reporting, so retiring an entry cannot affect any
-        // operation path) rather than by a test that makes the suite lie.
+        // `a_migrated_cell_is_still_found_by_a_ranged_scan`. The cause was the
+        // index drain a few lines above: it was process-global then, so one
+        // database's unload reached into another database's index work. The
+        // drain now waits only for this database's client (`await_index_tasks`),
+        // so the test can be tried again. Until then, this retirement is verified
+        // by inspection (the registry is read only by status reporting, so
+        // retiring an entry cannot affect any operation path).
         ranged::tree::service::retire_local_tree_service(
             runtime.group_name(),
             runtime.database_name(),
@@ -2413,7 +2413,6 @@ impl NebServer {
 
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
-            use crate::index::builder::IndexBuilder;
             let _ = self.await_index_tasks().await;
             info!("All pending index tasks completed");
 
@@ -2434,7 +2433,7 @@ impl NebServer {
                 );
             }
 
-            // IndexBuilder::await_all_indices() joins the spawned index tasks, and ranged
+            // `await_index_tasks` joins the spawned index tasks, and ranged
             // tree inserts are applied directly by TreeService before the RPC resolves.
             // There is no separate Raft commit barrier to wait on here, so a fixed sleep
             // only makes shutdown liveness depend on timer scheduling.

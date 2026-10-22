@@ -20,7 +20,6 @@ use super::{
     ids::{
         clause_execution_order, intersect_ids_ordered, sort_ids_by_query_order, union_ids_ordered,
     },
-    sort::range_index_order_for_range,
     IndexedDataClient, QueryHitTable, QueryHitType, QueryOrdering, ValueRange,
 };
 use crate::ram::schema::SchemaUid;

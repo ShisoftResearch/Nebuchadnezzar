@@ -1,4 +1,3 @@
-use crate::index::builder::IndexBuilder;
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
 use crate::ram::schema::{SchemaUid, SchemaVid};

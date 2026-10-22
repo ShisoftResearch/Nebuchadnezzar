@@ -1240,7 +1240,6 @@ impl Clone for InvertedIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::builder::IndexBuilder;
     use crate::ram::schema::LocalSchemasCache;
     use crate::server::ServerMeta;
     use bifrost::conshash::weights::Weights;

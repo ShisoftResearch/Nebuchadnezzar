@@ -1,6 +1,5 @@
 use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::{
-    index::builder::IndexBuilder,
     index::builder::IndexError,
     index::embedding::{
         EmbeddingHit, EmbeddingIndexConfig, EmbeddingIndexerCore, EmbeddingModel,

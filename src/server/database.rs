@@ -178,6 +178,8 @@ mod tests {
     use crate::utils::test_temp::temp_path;
     use super::*;
 
+    /// Raft snapshots go through `utils::serde`: serde_json in debug, serde_cbor
+    /// in release. `cargo test` and `cargo test --release` cover both codecs.
     #[test]
     fn catalog_recover_round_trips_a_snapshot() {
         let mut sm = DatabaseCatalogSM::new("g");
@@ -217,31 +219,6 @@ mod tests {
             enable_recovery: false,
             disable_storage_locks: true,
         }
-    }
-
-    /// Raft snapshots go through `utils::serde`: serde_json in debug, serde_cbor
-    /// in release. `cargo test` and `cargo test --release` cover both codecs.
-    #[test]
-    fn catalog_snapshot_round_trips_under_the_active_codec() {
-        let mut sm = DatabaseCatalogSM {
-            sm_id: 1,
-            map: HashMap::new(),
-        };
-        for name in ["alpha", "beta"] {
-            sm.map.insert(
-                name.to_string(),
-                DatabaseCatalogEntry {
-                    name: name.to_string(),
-                },
-            );
-        }
-        let snapshot = StateMachineCtl::snapshot(&sm);
-        let mut restored = DatabaseCatalogSM {
-            sm_id: 1,
-            map: HashMap::new(),
-        };
-        futures::executor::block_on(StateMachineCtl::recover(&mut restored, snapshot));
-        assert_eq!(restored.map, sm.map);
     }
 
     #[test]
