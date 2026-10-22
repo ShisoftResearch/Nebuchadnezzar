@@ -448,6 +448,8 @@ struct Transaction {
     /// complete. Until then no lock of this transaction is released or
     /// reclaimed as stale.
     restored: bool,
+    /// How many times the sweep retried the restoration; it limits the log.
+    restore_attempts: u32,
     /// Orders the secondary-index work of this transaction. The apply holds
     /// it until its index tasks are done, and every abort path holds it
     /// until its undo tasks are done and its locks are released.
@@ -747,6 +749,7 @@ impl DataManager {
                 status_cell_attempted: false,
                 unrestored: BTreeSet::new(),
                 restored: false,
+                restore_attempts: 0,
                 index_gate: Arc::new(tokio::sync::Mutex::new(())),
             }));
 
@@ -1217,7 +1220,7 @@ impl DataManager {
             .filter(|tid| !hold.contains(tid))
             .collect();
         for tid in &ended {
-            self.presume_abort(tid).await;
+            self.presume_abort(tid, false).await;
         }
         // A transaction that kept its object is decided COMMIT, and the next
         // pass retries its close; only leases without an object are retired.
@@ -1239,7 +1242,25 @@ impl DataManager {
             return EndResult::CheckFailed(CheckError::NotExisted);
         };
         let _gate = gate.lock().await;
-        // Option 6: Two-Phase Lock Release with Verification and Retry
+        self.end_transaction_locked(tid, durable).await
+    }
+
+    /// `end` for the lease sweep. `None` if another request holds the index
+    /// gate of `tid`: the sweep holds the transaction and tries again at the
+    /// next pass, rather than wait for that request's index RPCs.
+    async fn end_from_sweep(&self, tid: &TxnId) -> Option<EndResult> {
+        let Some(gate) = self.index_gate(tid) else {
+            return Some(EndResult::CheckFailed(CheckError::NotExisted));
+        };
+        let Ok(_gate) = gate.try_lock() else {
+            debug!("transaction {:?} is busy; the next sweep ends it", tid);
+            return None;
+        };
+        Some(self.end_transaction_locked(tid, false).await)
+    }
+
+    /// `end_transaction` with the index gate of `tid` already held.
+    async fn end_transaction_locked(&self, tid: &TxnId, durable: bool) -> EndResult {
         let (affected_cell_ids, txn_state, expected_owner, unrestored) = {
             let Some(txn_lock) = self.find_transaction(tid) else {
                 return EndResult::CheckFailed(CheckError::NotExisted);
@@ -1295,11 +1316,9 @@ impl DataManager {
             }
         }
 
-        // Attempt lock release with retries
+        // Release the locks, with bounded retries.
         let mut retry_attempt = 0;
-        let mut lock_release_result = None;
-
-        while retry_attempt <= MAX_LOCK_RELEASE_RETRIES {
+        let lock_release_result = loop {
             if retry_attempt > 0 {
                 debug!(
                     "Retrying lock release for {:?} (attempt {}/{})",
@@ -1320,8 +1339,7 @@ impl DataManager {
                     tid,
                     self.txns.len()
                 );
-                lock_release_result = Some(Ok(()));
-                break;
+                break Ok(());
             } else if retry_attempt == MAX_LOCK_RELEASE_RETRIES {
                 // Retries exhausted - CRITICAL ERROR
                 error!(
@@ -1337,8 +1355,7 @@ impl DataManager {
                         failure.cell_id, failure.reason
                     );
                 }
-                lock_release_result = Some(Err((released_count, total_cells, failed_releases)));
-                break;
+                break Err((released_count, total_cells, failed_releases));
             } else {
                 // Partial failure on this attempt, will retry
                 error!(
@@ -1359,7 +1376,7 @@ impl DataManager {
             }
 
             retry_attempt += 1;
-        }
+        };
         // The decision completed before lock release. Old versions stayed
         // referenced through the append result and any required rollback.
         // Recorded only once the outcome is real: for a commit that means
@@ -1389,12 +1406,11 @@ impl DataManager {
 
         // Return appropriate result based on lock release outcome
         match lock_release_result {
-            Some(Ok(())) => {
+            Ok(()) => {
                 debug!("ENDED: {:?} with all locks released", tid);
                 EndResult::Success
             }
-            Some(Err((released, total, failures))) => {
-                // Option 1: Hard error on lock release failure
+            Err((released, total, failures)) => {
                 error!(
                     "ENDED: {:?} with lock release failures ({}/{} released)",
                     tid, released, total
@@ -1411,11 +1427,6 @@ impl DataManager {
                     }
                 }
             }
-            None => {
-                // This shouldn't happen, but handle it gracefully
-                error!("ENDED: {:?} with unknown lock release status", tid);
-                EndResult::LockReleaseRetriesExhausted { failures: vec![] }
-            }
         }
     }
 
@@ -1426,12 +1437,28 @@ impl DataManager {
     /// decision, through `finish_aborted`. The index gate is held from the
     /// abort to the release: the undo index tasks complete first, and the
     /// object stays, so no stale reclaim takes a cell in between.
-    async fn presume_abort(&self, tid: &TxnId) -> bool {
+    ///
+    /// The lease sweep passes `wait = false`: if another request holds the
+    /// index gate (an indexed commit awaiting its index RPCs), the
+    /// transaction is skipped until the next pass, so one slow index RPC
+    /// does not stop the sweep for every other transaction. A skipped
+    /// transaction keeps its object, so the sweep does not retire its leases.
+    async fn presume_abort(&self, tid: &TxnId, wait: bool) -> bool {
         let Some(gate) = self.index_gate(tid) else {
             // Nothing to roll back here; the retire pass reclaims the heads.
             return false;
         };
-        let _gate = gate.lock().await;
+        let _gate = if wait {
+            gate.lock().await
+        } else {
+            match gate.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    debug!("transaction {:?} is busy; the next sweep presumes it", tid);
+                    return false;
+                }
+            }
+        };
         let (outcome, index_results) =
             IndexBuilder::with_request_index_scope(|| self.presume_abort_locked(tid)).await;
         self.warn_on_index_wait_results(tid, index_results);
@@ -1455,9 +1482,12 @@ impl DataManager {
                 );
             }
             other => {
-                // Could not roll back (ownership moved or no coordinator). The
-                // wipe retires whatever is still open, so no head leaves with
-                // its bracket open.
+                // Could not roll back (ownership moved, no coordinator), or the
+                // rewind of a clean restore failed (`WriteError`). The wipe
+                // retires whatever is still open, so no head leaves with its
+                // bracket open. No lock is released here: a later prepare
+                // takes a lock whose owner object is gone after the
+                // stale-lock timeout.
                 error!(
                     "transaction {:?} held its write heads past the lease timeout; its presumed \
                      abort ended with {:?}",
@@ -1535,7 +1565,11 @@ impl DataManager {
                 self.aborted.remove(&tid);
                 continue;
             };
-            let _gate = gate.lock().await;
+            // A busy gate is an RPC of this transaction still running; the
+            // next pass tries again rather than wait for it.
+            let Ok(_gate) = gate.try_lock() else {
+                continue;
+            };
             let (idle_for, index_results) =
                 IndexBuilder::with_request_index_scope(|| self.retry_restoration(&tid)).await;
             self.warn_on_index_wait_results(&tid, index_results);
@@ -1556,6 +1590,9 @@ impl DataManager {
             return None;
         }
         let pending: Vec<Id> = txn.unrestored.iter().copied().collect();
+        if !pending.is_empty() {
+            txn.restore_attempts = txn.restore_attempts.saturating_add(1);
+        }
         for id in pending {
             let Some((location, version, previous_write)) = txn.history.get(&id).map(|history| {
                 (
@@ -1564,6 +1601,11 @@ impl DataManager {
                     history.previous_write.clone(),
                 )
             }) else {
+                error!(
+                    "transaction {:?}: cell {:?} waits for restoration but has no undo entry; \
+                     it is taken as restored",
+                    tid, id
+                );
                 txn.unrestored.remove(&id);
                 continue;
             };
@@ -1577,10 +1619,15 @@ impl DataManager {
                     warn!("transaction {:?}: cell {:?} is restored on retry", tid, id);
                 }
                 Err(error) => {
-                    debug!(
-                        "transaction {:?}: cell {:?} still cannot be restored: {:?}",
-                        tid, id, error
-                    );
+                    // Once, then at attempts 2, 4, 8, ...: one line per pass
+                    // would flood the log.
+                    if txn.restore_attempts.is_power_of_two() {
+                        warn!(
+                            "transaction {:?}: cell {:?} still cannot be restored after {} \
+                             attempt(s): {:?}",
+                            tid, id, txn.restore_attempts, error
+                        );
+                    }
                 }
             }
         }
@@ -1853,9 +1900,10 @@ impl DataManager {
             if decided_commit {
                 // This site was TOLD to commit and could not finish closing
                 // its brackets. There is nothing to ask anyone: finish it.
-                let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
-                    .await
-                    .payload;
+                let Some(ended) = self.end_from_sweep(&tid).await else {
+                    hold.insert(tid);
+                    continue;
+                };
                 if !matches!(ended, EndResult::Success) {
                     error!(
                         "transaction {:?} was decided COMMIT here and still cannot close its \
@@ -1906,9 +1954,10 @@ impl DataManager {
                         );
                         continue;
                     }
-                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone(), false)
-                        .await
-                        .payload;
+                    let Some(ended) = self.end_from_sweep(&tid).await else {
+                        hold.insert(tid);
+                        continue;
+                    };
                     if !matches!(ended, EndResult::Success) {
                         error!(
                             "transaction {:?} was resolved COMMITTED but this site could not \
@@ -2169,7 +2218,7 @@ impl DataManager {
                     other
                 )),
                 (ForcedOutcome::Abort, _) => {
-                    self.presume_abort(tid).await;
+                    self.presume_abort(tid, true).await;
                     ForceResolveResult::Resolved
                 }
             };
@@ -4230,7 +4279,7 @@ mod tests {
             .get_mut(&ids[0])
             .unwrap()
             .current_version += 1;
-        assert!(manager.presume_abort(&tid).await);
+        assert!(manager.presume_abort(&tid, true).await);
         assert_eq!(owner_of(&manager, &ids[0]), Some(owner.clone()));
         assert_eq!(owner_of(&manager, &ids[1]), None);
         assert_eq!(score_of(&runtime, &ids[1]), Some(5));
@@ -4663,6 +4712,59 @@ mod tests {
             EndResult::Success
         );
         assert_eq!(owner_of(&manager, &id), None);
+        server.shutdown().await;
+    }
+
+    /// The lease sweep skips a transaction whose index gate a commit holds.
+    /// With the forward index task of A held, the sweep still finishes the
+    /// aborted transaction B and returns; A waits for the next pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_index_gate_does_not_stop_the_sweep() {
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("sweep_busy_index_gate", 998).await;
+        let busy_id = Id::allocated(0, 0, 9411);
+        let done_id = Id::allocated(0, 0, 9412);
+        let busy = test_hlc(1, 9411);
+        let done = test_hlc(1, 9412);
+        // B: applied, aborted, and no `end` came.
+        update_applied(&manager, &runtime, &schema, &done, done_id).await;
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, done.clone(), done.clone())
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        // A: an update whose forward index task is held, so its commit holds
+        // the index gate.
+        let versions = seed_indexed(&runtime, &schema, &[busy_id]).await;
+        assert_eq!(
+            prepare_ops_local(&manager, 9411, &busy, present_writes(&[busy_id], &versions)).await,
+            DMPrepareResult::Success
+        );
+        let hold = crate::index::builder::hold_index_task("forward", busy_id);
+        let commit = commit_ops_local(&manager, &busy, updates_to(&schema, &[busy_id], 50));
+        let sweep = async {
+            hold.wait_until_entered().await;
+            let finished = tokio::time::timeout(
+                Duration::from_secs(10),
+                manager.sweep_idle_transactions(Duration::ZERO),
+            )
+            .await
+            .is_ok();
+            let done_finished = !manager.has_transaction_for_test(&done);
+            hold.release();
+            (finished, done_finished)
+        };
+        let (committed, (finished, done_finished)) = tokio::join!(commit, sweep);
+        assert!(finished, "the sweep waited for a busy index gate");
+        assert!(done_finished, "the sweep must finish the aborted transaction");
+        assert_eq!(owner_of(&manager, &done_id), None);
+        assert_eq!(committed, DMCommitResult::Success);
+        assert!(
+            manager.has_transaction_for_test(&busy),
+            "the busy transaction is skipped, not presumed abort"
+        );
         server.shutdown().await;
     }
 
