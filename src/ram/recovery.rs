@@ -585,11 +585,6 @@ impl BracketLedger {
         let parts = take_replay_map(&self.parts);
         let closed = take_replay_map(&self.closed_parts);
         let status_cells = drain_replay_queue(&self.status_cells);
-        // An empty BEGIN still needs a decision from the participant fence.
-        // Give every part a bracket so resolution can release its pins.
-        for txn in parts.keys() {
-            pending.entry(txn.clone()).or_default();
-        }
         // An open bracket of a transaction whose status cell this store holds
         // is committed (D31): a status cell in the index came from a
         // committed bracket, and it survives the compaction that drops the
@@ -635,6 +630,11 @@ impl BracketLedger {
         }
         let mut incomplete = std::collections::HashSet::new();
         for (txn, parts) in parts.iter() {
+            // A transaction with only BEGIN never completed local prepare.
+            // It has no entries to protect or resolve.
+            if !pending.contains_key(txn) {
+                continue;
+            }
             // A missing local decision cannot be replaced by lease absence.
             // Keep every part, including the surviving COMMIT, until settlement.
             if !parts
@@ -745,10 +745,7 @@ impl BracketLedger {
                     txn,
                     cells.len()
                 );
-                let mut chunks: Vec<usize> = parts[&txn]
-                    .iter()
-                    .map(|(chunk_id, _)| *chunk_id)
-                    .collect();
+                let mut chunks: Vec<usize> = cells.iter().map(|cell| cell.chunk_id).collect();
                 chunks.sort_unstable();
                 chunks.dedup();
                 let participants = participants.remove(&txn).unwrap_or_default();
