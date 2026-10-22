@@ -2542,9 +2542,9 @@ mod tests {
 
     /// G5/F4 evidence: a commit refused with `CannotLocateCellServer` removes
     /// the manager record but leaves the participant's prepare lock held. The
-    /// client abort then gets `TransactionNotFound`, and an immediate retry of
-    /// a conflicting transaction is refused until the lease sweeper presumes
-    /// abort. The classification stays `CommitNotApplied`.
+    /// client abort then gets `TransactionNotFound`. Conflicting retries fail
+    /// before lease expiry and after presumed abort, until the separate cell
+    /// lock timeout permits a retry. The classification stays `CommitNotApplied`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "G5/F4 evidence; behavior change pending a Codex Sol decision"]
     async fn commit_cannot_locate_cell_server_leaves_a_conflicting_retry_refused() {
@@ -2563,10 +2563,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // The slot names a server that is not a member, so the commit lookup
-        // fails while the participant is the real server.
-        let absent_server = u64::MAX;
-        ring.set_slot_overrides(Some(vec![absent_server]), 1);
+        ring.set_slot_overrides(Some(vec![server.server_id]), 1);
         let manager = TransactionManager::new(Arc::new(TransactionManagerDeps {
             database_runtime: runtime.clone(),
             server_id: server.server_id,
@@ -2574,20 +2571,9 @@ mod tests {
             member_pool: Arc::new(ClientPool::new()),
             hlc: server.hlc.clone(),
         }));
-        let participant = manager
-            .deps
-            .get_member_by_server_id(server.server_id)
-            .await
-            .unwrap();
-        let service_id = data_site::generate_scoped_service_id(
-            manager.deps.database_runtime.group_name(),
-            manager.deps.database_runtime.database_name(),
-        );
-        let client = data_site::AsyncServiceClient::new_with_service_id(service_id, &participant);
-        // A cached client lets prepare reach the participant even though the
-        // slot names an absent server.
-        manager.data_sites.insert(absent_server, client.clone());
-
+        let participant = runtime.data_site().unwrap();
+        let store = runtime.chunks().address_range();
+        let lease_timeout = Duration::from_secs(5);
         let id = Id::from_parts(0, 71);
         let tid = manager.begin().await.unwrap();
         assert!(matches!(
@@ -2598,9 +2584,19 @@ mod tests {
             manager.prepare(tid.clone()).await,
             Ok(TMPrepareResult::Success)
         ));
+        let prepared_at = tokio::time::Instant::now();
+        assert!(participant.has_transaction_for_test(&tid));
+        assert!(crate::ram::chunk::transaction_has_leases(&tid, &store));
 
-        // Commit cannot locate the participant: the manager removes its record.
-        manager.data_sites.remove(&absent_server);
+        // Inject the coordinator's lookup failure only after prepare records
+        // the real participant. An absent peer in that record prevents abort.
+        {
+            let txn_lock = manager.get_transaction(&tid).unwrap();
+            let mut txn = txn_lock.lock().await;
+            let objects = txn.affected_objects.remove(&server.server_id).unwrap();
+            assert!(txn.affected_objects.is_empty());
+            txn.affected_objects.insert(u64::MAX, objects);
+        }
         assert!(matches!(
             manager.commit(tid.clone()).await,
             Err(TMError::CannotLocateCellServer)
@@ -2611,23 +2607,82 @@ mod tests {
             Err(TMError::TransactionNotFound)
         ));
 
-        // The participant still holds the prepare lock. Put the client back so
-        // the retry reaches it, then prepare a conflicting transaction at once.
-        manager.data_sites.insert(absent_server, client);
+        // A sweep before expiry must keep the lease and the conflicting lock.
+        for delay in [Duration::ZERO, Duration::from_secs(1)] {
+            tokio::time::sleep(delay).await;
+            assert!(
+                !crate::ram::chunk::transactions_with_idle_leases(lease_timeout, &store)
+                    .contains(&tid)
+            );
+            participant.sweep_idle_transactions(lease_timeout).await;
+            assert!(participant.has_transaction_for_test(&tid));
+            assert!(crate::ram::chunk::transaction_has_leases(&tid, &store));
+            let retry = manager.begin().await.unwrap();
+            assert!(matches!(
+                manager.write(retry.clone(), counter_cell(1, id, 8)).await,
+                Ok(TxnExecResult::Accepted(()))
+            ));
+            let refused = manager.prepare(retry).await;
+            warn!("G5/F4 control: retry before lease expiry = {:?}", refused);
+            assert!(
+                matches!(
+                    refused,
+                    Ok(TMPrepareResult::DMPrepareError(
+                        DMPrepareResult::NotRealizable
+                    ))
+                ),
+                "the participant's prepare lock must refuse the retry: {:?}",
+                refused
+            );
+        }
+
+        tokio::time::sleep(lease_timeout).await;
+        assert!(
+            crate::ram::chunk::transactions_with_idle_leases(lease_timeout, &store).contains(&tid)
+        );
+        participant.sweep_idle_transactions(lease_timeout).await;
+        assert!(!participant.has_transaction_for_test(&tid));
+        assert!(!crate::ram::chunk::transaction_has_leases(&tid, &store));
+        assert_eq!(
+            participant.txn_outcome(&tid),
+            transactions::TxnOutcome::Aborted
+        );
+        assert!(runtime.chunks().read_cell(&id).is_err());
+
+        // Presumed abort releases the leases but leaves the cell lock held.
         let retry = manager.begin().await.unwrap();
         assert!(matches!(
             manager.write(retry.clone(), counter_cell(1, id, 8)).await,
             Ok(TxnExecResult::Accepted(()))
         ));
-        let refused = manager.prepare(retry.clone()).await;
-        warn!("G5/F4 control: immediate conflicting retry prepare = {:?}", refused);
-        assert!(
-            matches!(
-                refused,
-                Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
-            ),
-            "the participant's prepare lock must refuse the retry: {:?}",
-            refused
+        let refused = manager.prepare(retry).await;
+        warn!("G5/F4 control: retry after presumed abort = {:?}", refused);
+        assert!(matches!(
+            refused,
+            Ok(TMPrepareResult::DMPrepareError(
+                DMPrepareResult::NotRealizable
+            ))
+        ));
+
+        // The cell lock has a separate 30 s timeout. Retry after it expires.
+        tokio::time::sleep_until(prepared_at + Duration::from_secs(31)).await;
+        let retry = manager.begin().await.unwrap();
+        assert!(matches!(
+            manager.write(retry.clone(), counter_cell(1, id, 9)).await,
+            Ok(TxnExecResult::Accepted(()))
+        ));
+        let prepared = manager.prepare(retry.clone()).await;
+        warn!(
+            "G5/F4 control: retry after cell lock timeout = {:?}",
+            prepared
+        );
+        assert!(matches!(prepared, Ok(TMPrepareResult::Success)));
+        assert_eq!(manager.commit(retry).await, Ok(EndResult::Success));
+        assert_eq!(
+            runtime.chunks().read_cell(&id).unwrap().to_owned().data["score"]
+                .u64()
+                .copied(),
+            Some(9)
         );
         manager.shutdown.store(true, Ordering::Relaxed);
         server.shutdown().await;
