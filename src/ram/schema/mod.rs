@@ -4403,3 +4403,42 @@ mod tests {
         server.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod f16_revision_tests {
+    use super::*;
+    #[test]
+    fn f16_index_admission_returns_typed_errors() {
+        for field in [
+            Field::new_indexed_vector(
+                "half",
+                Type::F16,
+                4,
+                vec![IndexType::Vector(
+                    crate::index::vector::VectorIndexConfig::hnsw(
+                        crate::index::vector::MetricEncoding::L2,
+                        crate::index::vector::HnswConfig::default(),
+                    ),
+                )],
+            ),
+            Field::new_indexed(
+                "half",
+                Type::F16,
+                vec![IndexType::Embedding(
+                    crate::index::embedding::EmbeddingIndexConfig::new(
+                        crate::index::embedding::EmbeddingModel::from("test-model"),
+                        crate::index::vector::VectorIndexConfig::hnsw(
+                            crate::index::vector::MetricEncoding::L2,
+                            crate::index::vector::HnswConfig::default(),
+                        ),
+                    ),
+                )],
+            ),
+        ] {
+            assert!(matches!(
+                field.validate_for_registration("half"),
+                Err(NewSchemaError::InvalidSchema(_))
+            ));
+        }
+    }
+}
