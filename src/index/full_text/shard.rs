@@ -67,23 +67,21 @@ pub struct FieldStats {
 }
 
 impl FieldStats {
+    /// `None` unless both counts are present as `U64`: a missing count is not 0.
     fn from_value(value: &OwnedValue) -> Option<Self> {
-        if let OwnedValue::Map(_) = value {
-            let doc_count = match &value[*DOC_COUNT_FIELD_ID] {
-                OwnedValue::U64(v) => *v,
-                _ => 0,
-            };
-            let total_length = match &value[*TOTAL_LENGTH_FIELD_ID] {
-                OwnedValue::U64(v) => *v,
-                _ => 0,
-            };
-            Some(FieldStats {
-                doc_count,
-                total_length,
-            })
-        } else {
-            None
-        }
+        let OwnedValue::Map(_) = value else {
+            return None;
+        };
+        let OwnedValue::U64(doc_count) = value[*DOC_COUNT_FIELD_ID] else {
+            return None;
+        };
+        let OwnedValue::U64(total_length) = value[*TOTAL_LENGTH_FIELD_ID] else {
+            return None;
+        };
+        Some(FieldStats {
+            doc_count,
+            total_length,
+        })
     }
 
     fn to_value(&self) -> OwnedValue {
@@ -358,8 +356,8 @@ impl SegmentedPostingList {
                         data: cell.data().owned(),
                     };
                     let segment = PostingSegment::from_cell(&owned_cell).ok_or_else(|| {
-                        IndexError::PostingListUnreadable {
-                            segment: seg_id,
+                        IndexError::FullTextUnreadable {
+                            cell: seg_id,
                             reason: "posting segment does not decode".into(),
                         }
                     })?;
@@ -369,8 +367,8 @@ impl SegmentedPostingList {
                 // No head segment: this chunk has no posting for the term.
                 Err(crate::ram::cell::ReadError::CellDoesNotExisted) if current_id == head => break,
                 Err(error) => {
-                    return Err(IndexError::PostingListUnreadable {
-                        segment: seg_id,
+                    return Err(IndexError::FullTextUnreadable {
+                        cell: seg_id,
                         reason: format!("{error:?}"),
                     })
                 }
@@ -393,6 +391,17 @@ struct PostingSegment {
 }
 
 impl PostingSegment {
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        Self {
+            next: self.next,
+            doc_ids: self.doc_ids.clone(),
+            versions: self.versions.clone(),
+            term_freqs: self.term_freqs.clone(),
+            doc_lengths: self.doc_lengths.clone(),
+        }
+    }
+
     fn new() -> Self {
         Self {
             next: None,
@@ -414,44 +423,54 @@ impl PostingSegment {
         self.doc_lengths.push(doc_len);
     }
 
+    /// Decode a posting segment. `None` when any mandatory field is missing or
+    /// has the wrong type, or when the 4 arrays do not have one entry per
+    /// document: `iter` zips them, so a short array would drop postings.
     fn from_cell(cell: &OwnedCell) -> Option<Self> {
         if cell.header().schema != *INVERTED_SEGMENT_SCHEMA_ID {
             return None;
         }
 
         let data = cell.data();
-        let mut segment = Self::new();
-
-        // Read next pointer. `to_cell` writes the unit id for "no next".
-        if let OwnedValue::Id(id) = &data[*SEGMENT_NEXT_FIELD_ID] {
-            if !id.is_unit_id() {
-                segment.next = Some(*id);
-            }
-        }
-
-        // Read arrays
-        if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = &data[*SEGMENT_DOC_IDS_FIELD_ID] {
-            segment.doc_ids = ids.clone();
-        }
-        if let OwnedValue::PrimArray(OwnedPrimArray::U64(vers)) = &data[*SEGMENT_VERSIONS_FIELD_ID]
-        {
-            segment.versions = vers.clone();
-        }
-        if let OwnedValue::PrimArray(OwnedPrimArray::U32(tfs)) = &data[*SEGMENT_TERM_FREQS_FIELD_ID]
-        {
-            segment.term_freqs = tfs.clone();
-        }
-        if let OwnedValue::PrimArray(OwnedPrimArray::U32(lengths)) =
+        // `to_cell` writes the unit id for "no next segment".
+        let next = match &data[*SEGMENT_NEXT_FIELD_ID] {
+            OwnedValue::Id(id) if id.is_unit_id() => None,
+            OwnedValue::Id(id) => Some(*id),
+            _ => return None,
+        };
+        let OwnedValue::PrimArray(OwnedPrimArray::Id(doc_ids)) = &data[*SEGMENT_DOC_IDS_FIELD_ID]
+        else {
+            return None;
+        };
+        let OwnedValue::PrimArray(OwnedPrimArray::U64(versions)) =
+            &data[*SEGMENT_VERSIONS_FIELD_ID]
+        else {
+            return None;
+        };
+        let OwnedValue::PrimArray(OwnedPrimArray::U32(term_freqs)) =
+            &data[*SEGMENT_TERM_FREQS_FIELD_ID]
+        else {
+            return None;
+        };
+        let OwnedValue::PrimArray(OwnedPrimArray::U32(doc_lengths)) =
             &data[*SEGMENT_DOC_LENGTHS_FIELD_ID]
+        else {
+            return None;
+        };
+        let documents = doc_ids.len();
+        if versions.len() != documents
+            || term_freqs.len() != documents
+            || doc_lengths.len() != documents
         {
-            segment.doc_lengths = lengths.clone();
-        }
-
-        if segment.versions.len() != segment.doc_ids.len() {
             return None;
         }
-
-        Some(segment)
+        Some(Self {
+            next,
+            doc_ids: doc_ids.clone(),
+            versions: versions.clone(),
+            term_freqs: term_freqs.clone(),
+            doc_lengths: doc_lengths.clone(),
+        })
     }
 
     fn to_cell(&self, id: &Id) -> OwnedCell {
@@ -568,6 +587,11 @@ impl InvertedIndexer {
     /// `DocMeta` payloads behind the `Arc<Mutex<..>>`, which live on the heap.
     pub fn resident_bytes(&self) -> usize {
         (self.field_stats.resident_pages() + self.doc_metadata.resident_pages()) * 4096
+    }
+
+    /// The member this indexer serves.
+    pub(crate) fn server_id(&self) -> u64 {
+        self.server_id
     }
 
     pub fn new(
@@ -769,53 +793,47 @@ impl InvertedIndexer {
         Ok(())
     }
 
-    /// Get field statistics from memory, loading from disk if not found
-    pub fn get_field_stats(&self, schema_id: SchemaUid, field_id: u64) -> FieldStats {
+    /// Get field statistics from memory, loading from disk if not found.
+    ///
+    /// No statistics cell is a field this server has not indexed: zero counts.
+    /// A statistics cell that cannot be read or decoded is an error; default
+    /// counts would rank every document with the wrong IDF and length norm.
+    pub fn get_field_stats(
+        &self,
+        schema_id: SchemaUid,
+        field_id: u64,
+    ) -> Result<FieldStats, IndexError> {
         let stats_key = Self::stats_key(schema_id, field_id);
 
         // Check memory first
         if let Some(stats_arc) = self.field_stats.get(&stats_key) {
-            return stats_arc.lock().clone();
+            return Ok(stats_arc.lock().clone());
         }
 
         // Not in memory, try loading from disk
         let stats_id = Self::stats_cell_id(schema_id, field_id);
+        let unreadable = |reason: String| IndexError::FullTextUnreadable {
+            cell: stats_id,
+            reason,
+        };
         match self.chunks.read_cell(&stats_id) {
             Ok(cell) => {
-                info!(
-                    "Found stats cell for schema {} field {}: {:?}",
-                    schema_id, field_id, stats_id
-                );
                 let owned_cell = OwnedCell {
                     header: cell.header().clone(),
                     data: cell.data().owned(),
                 };
-                if let Some(loaded_stats) = FieldStats::from_value(owned_cell.data()) {
-                    info!(
-                        "Loaded stats from disk: doc_count={}, total_length={}",
-                        loaded_stats.doc_count, loaded_stats.total_length
-                    );
-                    // Cache in memory for future use using get_or_insert
-                    let stats_arc = self
-                        .field_stats
-                        .get_or_insert(stats_key, || Arc::new(Mutex::new(loaded_stats.clone())));
-                    return stats_arc.lock().clone();
-                } else {
-                    warn!(
-                        "Failed to parse stats from cell for schema {} field {}",
-                        schema_id, field_id
-                    );
-                }
+                let loaded_stats = FieldStats::from_value(owned_cell.data())
+                    .ok_or_else(|| unreadable("field statistics do not decode".into()))?;
+                // Cache in memory for future use using get_or_insert
+                let stats_arc = self
+                    .field_stats
+                    .get_or_insert(stats_key, || Arc::new(Mutex::new(loaded_stats.clone())));
+                let stats = stats_arc.lock().clone();
+                Ok(stats)
             }
-            Err(e) => {
-                warn!(
-                    "Stats cell not found for schema {} field {} (id: {:?}): {:?}",
-                    schema_id, field_id, stats_id, e
-                );
-            }
+            Err(crate::ram::cell::ReadError::CellDoesNotExisted) => Ok(FieldStats::default()),
+            Err(error) => Err(unreadable(format!("{error:?}"))),
         }
-
-        FieldStats::default()
     }
 
     /// Get postings for a specific term by iterating ALL Chunks on this server
@@ -875,7 +893,7 @@ impl InvertedIndexer {
         }
 
         // Get stats (from memory cache if available)
-        let stats = self.get_field_stats(schema_id, field_id);
+        let stats = self.get_field_stats(schema_id, field_id)?;
 
         if stats.doc_count == 0 {
             return Ok(vec![]);
@@ -930,35 +948,23 @@ impl InvertedIndexer {
             let candidates = &mut hits[0..rerank_limit];
             let candidate_ids: Vec<Id> = candidates.iter().map(|h| h.id).collect();
 
-            // Fetch actual cell content
-            if let Ok(cells) = self.neb_client.read_all_cells(&candidate_ids).await {
-                // Determine if we have a potential phrase (query with spaces)
-                let query_phrase = query.trim().to_lowercase();
-
-                if query_phrase.contains(' ') {
-                    log::info!(
-                        "Reranking for phrase: '{}', candidates: {}",
-                        query_phrase,
-                        cells.len()
-                    );
-                    for (i, result) in cells.into_iter().enumerate() {
-                        match result {
-                            Ok(cell) => {
-                                let boost = if value_contains_phrase(cell.data(), &query_phrase) {
-                                    log::info!("Found phrase match in doc idx {}", i);
-                                    2.0
-                                } else {
-                                    1.0
-                                };
-
-                                if boost > 1.0 {
-                                    candidates[i].score *= boost;
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to read cell for candidate {}: {:?}", i, e);
-                            }
-                        }
+            // Fetch the candidates' content through the reader: a server that
+            // cannot be read is an error, never an unboosted ranking. A
+            // candidate whose cell is gone gets no boost.
+            let cells = crate::query::data_client::read::CellReader::new(
+                self.neb_client.conshash.clone(),
+                self.neb_client.group_name(),
+                self.neb_client.database_name(),
+            )
+            .read_full_cells_aligned(&candidate_ids)
+            .await
+            .map_err(IndexError::RPCError)?;
+            // Determine if we have a potential phrase (query with spaces)
+            let query_phrase = query.trim().to_lowercase();
+            if query_phrase.contains(' ') {
+                for (candidate, cell) in candidates.iter_mut().zip(cells) {
+                    if cell.is_some_and(|cell| value_contains_phrase(cell.data(), &query_phrase)) {
+                        candidate.score *= 2.0;
                     }
                 }
             }
@@ -1269,6 +1275,84 @@ mod tests {
         assert!(PostingSegment::from_cell(&PostingSegment::new().to_cell(&id)).is_some());
     }
 
+    /// `iter` zips the 4 arrays, so a short term-frequency or length array
+    /// would drop postings. Such a segment does not decode.
+    #[test]
+    fn a_posting_segment_with_a_short_array_does_not_decode() {
+        let id = Id::from_parts(12, 35);
+        let mut segment = PostingSegment::new();
+        segment.add(Id::from_parts(1, 1), 1, 2, 20);
+        segment.add(Id::from_parts(1, 2), 1, 3, 30);
+        let mut short_freqs = PostingSegment {
+            term_freqs: vec![2],
+            ..segment.clone_for_test()
+        };
+        assert!(PostingSegment::from_cell(&short_freqs.to_cell(&id)).is_none());
+        short_freqs.term_freqs = vec![2, 3];
+        short_freqs.doc_lengths = vec![20];
+        assert!(PostingSegment::from_cell(&short_freqs.to_cell(&id)).is_none());
+        assert_eq!(
+            PostingSegment::from_cell(&segment.to_cell(&id))
+                .unwrap()
+                .iter()
+                .count(),
+            2
+        );
+    }
+
+    /// Statistics that do not decode would rank with default counts. They are
+    /// an error for the statistics read and for the search; an absent
+    /// statistics cell is a field with no documents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn field_statistics_that_do_not_decode_are_an_error_not_zero_counts() {
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(),
+            "field_stats_unreadable",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let indexer = server
+            .indexer()
+            .unwrap()
+            .clients
+            .fulltext_indexer()
+            .unwrap()
+            .clone();
+        let stats_id = InvertedIndexer::stats_cell_id(SchemaUid(100), 9);
+        // A cell of another schema where the statistics cell should be.
+        server
+            .chunks()
+            .write_cell(&mut PostingSegment::new().to_cell(&stats_id))
+            .unwrap();
+        match indexer.get_field_stats(SchemaUid(100), 9) {
+            Err(IndexError::FullTextUnreadable { cell, .. }) => assert_eq!(cell, stats_id),
+            other => panic!("undecodable statistics must be an error: {other:?}"),
+        }
+        match indexer
+            .bm25_search(SchemaUid(100), 9, "anything", 5, false)
+            .await
+        {
+            Err(IndexError::FullTextUnreadable { cell, .. }) => assert_eq!(cell, stats_id),
+            other => panic!("a search over undecodable statistics must fail: {other:?}"),
+        }
+        let absent = indexer.get_field_stats(SchemaUid(100), 10).unwrap();
+        assert_eq!((absent.doc_count, absent.total_length), (0, 0));
+        server.shutdown().await;
+    }
+
     /// A posting segment that is present but does not decode, or a link to a
     /// segment that is gone, makes the term's posting list unknown. That is an
     /// error, not the postings read so far.
@@ -1283,7 +1367,7 @@ mod tests {
         segment.versions.truncate(1);
         chunks.write_cell(&mut segment.to_cell(&head)).unwrap();
         match list.iterate(&chunks.list[0], 0) {
-            Err(IndexError::PostingListUnreadable { segment, .. }) => assert_eq!(segment, head),
+            Err(IndexError::FullTextUnreadable { cell, .. }) => assert_eq!(cell, head),
             other => panic!("an undecodable head must be an error: {other:?}"),
         }
 
@@ -1297,8 +1381,8 @@ mod tests {
             .write_cell(&mut head_segment.to_cell(&linked_head))
             .unwrap();
         match linked.iterate(&chunks.list[0], 0) {
-            Err(IndexError::PostingListUnreadable { segment, .. }) => {
-                assert_eq!(segment, missing)
+            Err(IndexError::FullTextUnreadable { cell, .. }) => {
+                assert_eq!(cell, missing)
             }
             other => panic!("a broken link must be an error: {other:?}"),
         }
@@ -1549,7 +1633,9 @@ mod tests {
 
             // Test search via the indexer directly
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
+                let stats = indexer
+                    .get_field_stats(SchemaUid(schema_id), content_field_id)
+                    .unwrap();
                 assert_eq!(stats.doc_count, 2, "Should have 2 documents indexed");
 
                 let hits = indexer
@@ -1701,7 +1787,9 @@ mod tests {
         // Verify all documents are searchable
         if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
+                let stats = indexer
+                    .get_field_stats(SchemaUid(schema_id), content_field_id)
+                    .unwrap();
                 assert_eq!(
                     stats.doc_count, num_docs as u64,
                     "Should have {} documents indexed, got {}",
@@ -1879,7 +1967,9 @@ mod tests {
         // Verify all documents are searchable
         if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
+                let stats = indexer
+                    .get_field_stats(SchemaUid(schema_id), content_field_id)
+                    .unwrap();
                 info!(
                     "Stats: doc_count={}, total_length={}",
                     stats.doc_count, stats.total_length
@@ -2204,7 +2294,9 @@ mod tests {
         indexer.update_stats_for_add(&meta2);
 
         // Verify stats
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats.doc_count, 2);
         assert!(stats.total_length > 0);
 
@@ -2344,7 +2436,9 @@ mod tests {
         );
 
         // Verify it's indexed
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats.doc_count, 1);
 
         // Remove document
@@ -2364,7 +2458,9 @@ mod tests {
         );
 
         // Verify it's removed
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats.doc_count, 0);
 
         // Search should return nothing
@@ -2449,7 +2545,9 @@ mod tests {
 
         // Verify data is persisted by reading from disk
         // We can check that stats are persisted
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats.doc_count, doc_ids.len() as u64);
 
         // Search should still work after flush
@@ -3175,8 +3273,9 @@ mod tests {
         info!("Verifying stats exist in memory before flushing...");
         if let Some(index_builder) = server1.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
-                let stats_before_flush =
-                    inverted_indexer.get_field_stats(SchemaUid(schema_id), content_field_id);
+                let stats_before_flush = inverted_indexer
+                    .get_field_stats(SchemaUid(schema_id), content_field_id)
+                    .unwrap();
                 info!(
                     "Stats in memory before flush: doc_count={}, total_length={}",
                     stats_before_flush.doc_count, stats_before_flush.total_length

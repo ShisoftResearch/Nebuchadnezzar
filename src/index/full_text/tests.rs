@@ -303,7 +303,9 @@ mod tests {
         }
 
         // Verify final stats
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(
             stats.doc_count, num_docs,
             "Doc count should match number of added documents"
@@ -376,7 +378,9 @@ mod tests {
         );
 
         // Verify stats reflect update (not double-counting)
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats.doc_count, 1, "Should have 1 document (updated)");
         assert_eq!(stats.total_length, 8, "Should have updated length");
     }
@@ -483,7 +487,9 @@ mod tests {
         }
 
         // Verify final stats: 30 - 10 + 10 = 30 documents
-        let stats = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(
             stats.doc_count, 30,
             "Should have 30 documents after mixed operations"
@@ -587,7 +593,9 @@ mod tests {
         indexer.add_document(&meta1).unwrap();
         indexer.update_stats_for_add(&meta1);
 
-        let stats1 = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats1 = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats1.doc_count, 1);
         assert_eq!(stats1.total_length, 10);
 
@@ -606,7 +614,9 @@ mod tests {
         indexer.add_document(&meta2).unwrap();
         indexer.update_stats_for_add(&meta2);
 
-        let stats2 = indexer.get_field_stats(SchemaUid(schema_id), field_id);
+        let stats2 = indexer
+            .get_field_stats(SchemaUid(schema_id), field_id)
+            .unwrap();
         assert_eq!(stats2.doc_count, 1, "Doc count should still be 1");
         assert_eq!(
             stats2.total_length, 15,

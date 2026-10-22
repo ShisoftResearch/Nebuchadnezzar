@@ -199,11 +199,11 @@ pub enum IndexError {
     WriteError(WriteError),
     RPCError(RPCError),
     Other(String),
-    /// A full-text posting segment exists and cannot be read or decoded. The
-    /// list past it is unknown, so a search over it is an error, not a
-    /// shorter list.
-    PostingListUnreadable {
-        segment: Id,
+    /// A full-text cell (a posting segment or a field statistics cell) exists
+    /// and cannot be read or decoded. A search over it is an error, not a
+    /// shorter or differently ranked answer.
+    FullTextUnreadable {
+        cell: Id,
         reason: String,
     },
 }

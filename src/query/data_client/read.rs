@@ -418,19 +418,19 @@ impl CellRead {
     }
 }
 
-/// Whether a per-cell error means "no row": the cell is absent, or it does not
-/// pass the index check, the selection or the expression. These cells are
-/// dropped; that is the verified-read contract. Any other per-cell error is a
-/// failed read of a cell that can exist (wrong owner, unreadable storage).
-fn is_absent_row(error: &ReadError) -> bool {
+/// Whether a per-cell error means "no row": the cell is absent, or the server
+/// read it and it does not pass the index check or the selection
+/// (`NotMatch`). These cells are dropped; that is the verified-read contract.
+///
+/// Every other per-cell error is a failed read of a cell that exists: an
+/// unavailable schema (`SchemaDoesNotExisted`, and the `ExecError` a verified
+/// read gives for it), a selection or expression that could not be evaluated
+/// (`ExecError`), a wrong owner or unreadable storage. Dropping such a cell
+/// would be a shorter answer, so it is read again alone and then reported.
+pub(crate) fn is_absent_row(error: &ReadError) -> bool {
     matches!(
         error,
-        ReadError::CellDoesNotExisted
-            | ReadError::CellIdIsUnitId
-            | ReadError::NotMatch
-            | ReadError::ExecError(_)
-            | ReadError::SchemaDoesNotExisted(_)
-            | ReadError::CellTypeIsNotMapForSelect
+        ReadError::CellDoesNotExisted | ReadError::CellIdIsUnitId | ReadError::NotMatch
     )
 }
 
@@ -733,7 +733,11 @@ impl CellReader {
         let client =
             client_by_server_name_for_database(server, name, &self.group_name, &self.database_name)
                 .await?;
-        read.send(&client, ids).await
+        #[allow(unused_mut)]
+        let mut cells = read.send(&client, ids).await?;
+        #[cfg(test)]
+        read_faults::rewrite_cells(server, ids, &mut cells);
+        Ok(cells)
     }
 }
 
@@ -752,6 +756,8 @@ pub(crate) mod read_faults {
     /// the failure count of its kind is above 0. `u32::MAX` fails every send.
     #[derive(Debug, Default)]
     pub(crate) struct ReadFault {
+        /// The answer for this cell is replaced by this error in every send.
+        pub(crate) cell_error: Option<(crate::ram::types::Id, crate::ram::cell::ReadError)>,
         pub(crate) pass: AtomicU32,
         pub(crate) batch_failures: AtomicU32,
         pub(crate) single_failures: AtomicU32,
@@ -787,6 +793,39 @@ pub(crate) mod read_faults {
         });
         FAULTS.insert(server, fault.clone());
         fault
+    }
+
+    /// Answer `error` for the cell `id` in every send to `server`, as a server
+    /// that read the cell and failed would.
+    pub(crate) fn inject_cell_error(
+        server: u64,
+        id: crate::ram::types::Id,
+        error: crate::ram::cell::ReadError,
+    ) -> Arc<ReadFault> {
+        let fault = Arc::new(ReadFault {
+            cell_error: Some((id, error)),
+            ..Default::default()
+        });
+        FAULTS.insert(server, fault.clone());
+        fault
+    }
+
+    pub(super) fn rewrite_cells(
+        server: u64,
+        ids: &[crate::ram::types::Id],
+        cells: &mut [Result<crate::ram::cell::OwnedCell, crate::ram::cell::ReadError>],
+    ) {
+        let Some(fault) = FAULTS.get(&server) else {
+            return;
+        };
+        let Some((id, error)) = &fault.cell_error else {
+            return;
+        };
+        for (cell_id, cell) in ids.iter().zip(cells.iter_mut()) {
+            if cell_id == id {
+                *cell = Err(error.clone());
+            }
+        }
     }
 
     pub(crate) fn clear(server: u64) {

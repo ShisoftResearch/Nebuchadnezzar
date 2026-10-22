@@ -1,6 +1,5 @@
 use futures::{Future, Stream};
 
-pub mod cell_id;
 pub mod repeat;
 
 pub trait DataSource<T, P>: Stream<Item = T> + Sized {

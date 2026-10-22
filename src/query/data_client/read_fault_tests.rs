@@ -173,13 +173,14 @@ async fn resumable_page(client: &IndexedDataClient) -> Result<ScanPage, RPCError
 
 /// The error must be a `CellReadFailure` that names `server`.
 fn assert_read_failure(what: &str, error: &RPCError, server: u64) {
+    assert_read_failure_with(what, error, server, "injected read failure");
+}
+
+fn assert_read_failure_with(what: &str, error: &RPCError, server: u64, reason: &str) {
     let failure = CellReadFailure::of(error)
         .unwrap_or_else(|| panic!("{what}: not a cell read failure: {error:?}"));
     assert_eq!(failure.server_id, Some(server), "{what}: {failure}");
-    assert!(
-        failure.reason.contains("injected read failure"),
-        "{what}: {failure}"
-    );
+    assert!(failure.reason.contains(reason), "{what}: {failure}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -647,4 +648,134 @@ async fn one_failing_owner_of_two_never_shortens_the_answer() {
     for server in servers {
         server.shutdown().await;
     }
+}
+
+/// A server that read a cell and could not answer for it (an unavailable
+/// schema, a selection it could not evaluate) answers with a per-cell error.
+/// That cell exists, so the read is an error, not a shorter answer. A cell that
+/// fails the check (`NotMatch`) is still dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_the_server_could_not_answer_for_is_an_error_not_a_dropped_row() {
+    use crate::ram::cell::ReadError;
+    let (server, client, owner, _dir) = fixture("read_fault_cell_error").await;
+    for (error, reason) in [
+        (
+            ReadError::SchemaDoesNotExisted(SCHEMA),
+            "SchemaDoesNotExisted",
+        ),
+        (
+            ReadError::ExecError("index candidate schema is absent".into()),
+            "index candidate schema is absent",
+        ),
+        (
+            ReadError::ExecError("cannot evaluate".into()),
+            "cannot evaluate",
+        ),
+        (ReadError::StaleCellPointer, "StaleCellPointer"),
+    ] {
+        let fault = read_faults::inject_cell_error(owner, id(3), error);
+        let query = indexed_query(&client).await;
+        let page = resumable_page(&client).await;
+        read_faults::clear(owner);
+        assert_read_failure_with(
+            "indexed query",
+            &query.map(|ids| ids.len()).unwrap_err(),
+            owner,
+            reason,
+        );
+        assert_read_failure_with(
+            "resumable page",
+            &page.map(|page| page.ids.len()).unwrap_err(),
+            owner,
+            reason,
+        );
+        // The failed cell was read alone once more before the error.
+        assert!(fault.single_sends() >= 1, "{fault:?}");
+    }
+
+    read_faults::inject_cell_error(owner, id(3), ReadError::NotMatch);
+    let query = indexed_query(&client).await;
+    read_faults::clear(owner);
+    let expected: Vec<Id> = all_ids()
+        .into_iter()
+        .filter(|other| *other != id(3))
+        .collect();
+    assert_eq!(
+        sorted(query.unwrap()),
+        expected,
+        "NotMatch is a rejected row"
+    );
+    server.shutdown().await;
+}
+
+/// BM25 phrase boosting reads the candidates. A failed read must fail the
+/// search, not rank the candidates as if no phrase matched.
+#[tokio::test(flavor = "multi_thread")]
+async fn phrase_boosting_never_ranks_from_a_failed_read() {
+    const TEXT: &str = "text";
+    let (server, client, owner, _dir) = fixture("read_fault_phrase").await;
+    let neb = server
+        .data_client(&vec![server.rpc.address.clone()])
+        .await
+        .unwrap();
+    let text_schema = SCHEMA + 2;
+    neb.new_schema_with_id(Schema::new_with_id(
+        text_schema,
+        "read_fault_phrase_text",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            TEXT,
+            Type::String,
+            vec![IndexType::Fulltext],
+        )]),
+        false,
+        false,
+    ))
+    .await
+    .unwrap()
+    .unwrap();
+    for (seq, text) in [
+        (1, "a ranked search engine"),
+        (2, "search engine ranked by phrase"),
+        (3, "cooking without a search"),
+    ] {
+        let mut data = OwnedValue::Map(OwnedMap::new());
+        data[TEXT] = OwnedValue::String(text.into());
+        neb.write_cell(OwnedCell::new_with_id(
+            SchemaVid(text_schema),
+            &Id::from_parts(LOCALITY, 1_000 + seq),
+            data,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    server.await_index_tasks().await;
+    let search = |client: &IndexedDataClient| {
+        let client = client.clone();
+        async move {
+            client
+                .bm25_search(
+                    SchemaUid(text_schema),
+                    hash_str(TEXT),
+                    "search engine",
+                    2,
+                    true,
+                )
+                .await
+        }
+    };
+    let ranked = search(&client).await.unwrap().unwrap();
+    assert_eq!(ranked.len(), 2);
+
+    read_faults::inject(owner, 0, ALWAYS, ALWAYS);
+    let failed = search(&client).await;
+    read_faults::clear(owner);
+    match failed {
+        Ok(Err(crate::ram::cell::ReadError::ExecError(message))) => {
+            assert!(message.contains("injected read failure"), "{message}")
+        }
+        other => panic!("a failed candidate read must fail the search: {other:?}"),
+    }
+    server.shutdown().await;
 }

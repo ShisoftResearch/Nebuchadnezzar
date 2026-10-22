@@ -101,12 +101,38 @@ service! {
 
 service_with_id!(InvertedIndexRPCService, DEFAULT_SERVICE_ID);
 
+/// Shards made slow on purpose, for the coordinator deadline test.
+#[cfg(test)]
+pub(crate) mod slow_shards {
+    use lightning::map::{Map, PtrHashMap};
+    use std::sync::LazyLock;
+
+    static DELAYS: LazyLock<PtrHashMap<u64, u64>> = LazyLock::new(|| PtrHashMap::with_capacity(16));
+
+    /// `search_local` on `server` waits `millis` before it answers.
+    pub(crate) fn delay(server: u64, millis: u64) {
+        DELAYS.insert(server, millis);
+    }
+
+    pub(crate) fn clear(server: u64) {
+        DELAYS.remove(&server);
+    }
+
+    pub(super) async fn wait(server: u64) {
+        if let Some(millis) = DELAYS.get(&server) {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+    }
+}
+
 impl Service for InvertedIndexRPCService {
     fn search_local(
         &self,
         req: InvertedSearchRequest,
     ) -> BoxFuture<'_, Result<InvertedSearchResponse, InvertedIndexError>> {
         async move {
+            #[cfg(test)]
+            slow_shards::wait(self.indexer.server_id()).await;
             let hits = self
                 .indexer
                 .bm25_search(
@@ -119,7 +145,10 @@ impl Service for InvertedIndexRPCService {
                 .await
                 .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 
-            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id);
+            let stats = self
+                .indexer
+                .get_field_stats(req.schema_id, req.field_id)
+                .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 
             Ok(InvertedSearchResponse {
                 hits,
@@ -135,7 +164,10 @@ impl Service for InvertedIndexRPCService {
         req: FieldStatsRequest,
     ) -> BoxFuture<'_, Result<FieldStatsResponse, InvertedIndexError>> {
         async move {
-            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id);
+            let stats = self
+                .indexer
+                .get_field_stats(req.schema_id, req.field_id)
+                .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 
             Ok(FieldStatsResponse {
                 doc_count: stats.doc_count,

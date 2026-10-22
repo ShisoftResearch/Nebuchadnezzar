@@ -32,7 +32,15 @@ pub struct DistributedInvertedIndexCoordinator {
     client_pool: Arc<ClientPool>,
     group_name: String,
     database_name: String,
+    deadline: std::time::Duration,
 }
+
+/// The time one coordinator call (a search, with its rerank, or a statistics
+/// read) may take over all shards. A shard that has not answered by then
+/// fails the call with `FullTextShardFailure`. TCP calls have their own send
+/// and response timeouts, but a call to the local shard does not go through
+/// TCP, so without this bound a stalled local shard stalls the search.
+pub const SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl DistributedInvertedIndexCoordinator {
     pub fn new(
@@ -46,6 +54,44 @@ impl DistributedInvertedIndexCoordinator {
             client_pool,
             group_name: group_name.into(),
             database_name: database_name.into(),
+            deadline: SEARCH_DEADLINE,
+        }
+    }
+
+    /// Replace `SEARCH_DEADLINE` for this coordinator.
+    pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// One shard call, bounded by the call's `deadline`. Every failure,
+    /// including no answer in time, is a `FullTextShardFailure` for the shard.
+    async fn ask_shard<T, F, Fut>(
+        &self,
+        deadline: tokio::time::Instant,
+        server_id: u64,
+        call: F,
+    ) -> Result<T, RPCError>
+    where
+        F: FnOnce(Arc<AsyncServiceClient>) -> Fut,
+        Fut: std::future::Future<Output = Result<Result<T, InvertedIndexError>, RPCError>>,
+    {
+        let answer = tokio::time::timeout_at(deadline, async {
+            let client = self.get_client(server_id).await?;
+            call(client).await
+        })
+        .await;
+        match answer {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(shard_failure(Some(server_id), format!("{error:?}"))),
+            Ok(Err(error)) => Err(shard_failure(Some(server_id), format!("{error:?}"))),
+            Err(_) => Err(shard_failure(
+                Some(server_id),
+                format!(
+                    "no answer within the search deadline of {} ms",
+                    self.deadline.as_millis()
+                ),
+            )),
         }
     }
 
@@ -106,15 +152,14 @@ impl DistributedInvertedIndexCoordinator {
             return Ok(Ok(vec![]));
         }
 
+        let deadline = tokio::time::Instant::now() + self.deadline;
         let server_ids = self.get_all_server_ids().await?;
         if server_ids.is_empty() {
             return Ok(Ok(vec![]));
         }
 
-        // Step 1: Query all nodes in parallel
-        let mut tasks = vec![];
-        for server_id in &server_ids {
-            let client = self.get_client(*server_id).await?;
+        // Step 1: Query all nodes in parallel, each bounded by the deadline.
+        let responses = join_all(server_ids.iter().map(|server_id| {
             let req = InvertedSearchRequest {
                 schema_id,
                 field_id,
@@ -122,10 +167,11 @@ impl DistributedInvertedIndexCoordinator {
                 limit,        // Each node returns top K
                 phrase_boost, // Apply local phrase boosting if requested
             };
-            tasks.push(async move { client.search_local(req).await });
-        }
-
-        let responses = join_all(tasks).await;
+            self.ask_shard(deadline, *server_id, move |client| async move {
+                client.search_local(req).await
+            })
+        }))
+        .await;
 
         // Step 2: Collect results and statistics
         let mut global_doc_count = 0u64;
@@ -135,16 +181,11 @@ impl DistributedInvertedIndexCoordinator {
 
         // A shard that did not answer would leave its documents out of the
         // ranking: that is an error, not a shorter result.
-        for (server_id, response) in server_ids.iter().zip(responses) {
-            match response {
-                Ok(Ok(resp)) => {
-                    global_doc_count += resp.local_doc_count;
-                    global_total_length += resp.local_total_length;
-                    all_hits.extend(resp.hits);
-                }
-                Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-                Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-            }
+        for response in responses {
+            let resp = response?;
+            global_doc_count += resp.local_doc_count;
+            global_total_length += resp.local_total_length;
+            all_hits.extend(resp.hits);
         }
 
         if global_doc_count == 0 {
@@ -155,6 +196,7 @@ impl DistributedInvertedIndexCoordinator {
         let final_hits = if rerank {
             // Recompute BM25 scores with global statistics
             self.rerank_with_global_stats(
+                deadline,
                 schema_id,
                 field_id,
                 query,
@@ -198,6 +240,7 @@ impl DistributedInvertedIndexCoordinator {
     /// and recomputes BM25 scores with global IDF values.
     async fn rerank_with_global_stats(
         &self,
+        deadline: tokio::time::Instant,
         schema_id: SchemaUid,
         field_id: u64,
         query: &str,
@@ -233,20 +276,17 @@ impl DistributedInvertedIndexCoordinator {
             let mut all_postings = vec![];
 
             for server_id in &server_ids {
-                let client = self.get_client(*server_id).await?;
                 let req = TermPostingsRequest {
                     schema_id,
                     field_id,
                     term_hash: *term_hash,
                 };
-
-                match client.get_term_postings(req).await {
-                    Ok(Ok(resp)) => {
-                        all_postings.extend(resp.postings);
-                    }
-                    Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-                    Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-                }
+                let resp = self
+                    .ask_shard(deadline, *server_id, move |client| async move {
+                        client.get_term_postings(req).await
+                    })
+                    .await?;
+                all_postings.extend(resp.postings);
             }
 
             term_postings.insert(*term_hash, all_postings);
@@ -304,32 +344,25 @@ impl DistributedInvertedIndexCoordinator {
         schema_id: SchemaUid,
         field_id: u64,
     ) -> Result<FieldStatsResponse, RPCError> {
+        let deadline = tokio::time::Instant::now() + self.deadline;
         let server_ids = self.get_all_server_ids().await?;
-        let mut tasks = vec![];
-
-        for server_id in &server_ids {
-            let client = self.get_client(*server_id).await?;
+        let responses = join_all(server_ids.iter().map(|server_id| {
             let req = FieldStatsRequest {
                 schema_id,
                 field_id,
             };
-            tasks.push(async move { client.get_field_stats(req).await });
-        }
-
-        let responses = join_all(tasks).await;
+            self.ask_shard(deadline, *server_id, move |client| async move {
+                client.get_field_stats(req).await
+            })
+        }))
+        .await;
 
         let mut global_doc_count = 0u64;
         let mut global_total_length = 0u64;
-
-        for (server_id, response) in server_ids.iter().zip(responses) {
-            match response {
-                Ok(Ok(resp)) => {
-                    global_doc_count += resp.doc_count;
-                    global_total_length += resp.total_length;
-                }
-                Ok(Err(e)) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-                Err(e) => return Err(shard_failure(Some(*server_id), format!("{e:?}"))),
-            }
+        for response in responses {
+            let resp = response?;
+            global_doc_count += resp.doc_count;
+            global_total_length += resp.total_length;
         }
 
         Ok(FieldStatsResponse {
@@ -916,6 +949,97 @@ mod tests {
         assert_eq!(hits[0].id, doc_id);
 
         info!("Single-shard distributed search test passed!");
+    }
+
+    /// A shard that does not answer fails the search at the deadline, with a
+    /// typed error that names it. The local shard is called without TCP, so
+    /// no transport timeout would end the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_shard_fails_the_search_at_the_deadline() {
+        let _ = env_logger::try_init();
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(),
+            "slow_shard_test",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let schema_id = 502u32;
+        let content_field = "content";
+        let content_field_id = hash_str(content_field);
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "slow_shard_test_schema",
+            None,
+            crate::ram::schema::Field::new_schema(vec![crate::ram::schema::Field::new_indexed(
+                content_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            )]),
+            false,
+            false,
+        );
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+        let doc_id = (0..1000)
+            .map(|i| Id::from_parts(i, i))
+            .find(|id| server.consh.get_server_id(id.locality() as u64) == Some(server.server_id))
+            .expect("an owned document id");
+        let mut cell_data = OwnedMap::new();
+        cell_data.insert(content_field, OwnedValue::String("hello slow shard".into()));
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc_id, OwnedValue::Map(cell_data));
+        server.chunks().write_cell(&mut cell).unwrap();
+        server
+            .indexer()
+            .unwrap()
+            .ensure_indices(&cell, &schema, None);
+        let _ = server.await_index_tasks().await;
+
+        let coordinator = DistributedInvertedIndexCoordinator::new(
+            server.consh.clone(),
+            server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
+        )
+        .with_deadline(Duration::from_millis(300));
+        let search = || {
+            coordinator.distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "hello",
+                10,
+                false,
+                false,
+            )
+        };
+        assert_eq!(search().await.unwrap().unwrap()[0].id, doc_id);
+
+        super::super::rpc::slow_shards::delay(server.server_id, 3_000);
+        let began = std::time::Instant::now();
+        let slow = search().await;
+        let waited = began.elapsed();
+        super::super::rpc::slow_shards::clear(server.server_id);
+        let error = slow.expect_err("a shard that does not answer must fail the search");
+        let failure = FullTextShardFailure::of(&error).expect("a typed shard failure");
+        assert_eq!(failure.server_id, Some(server.server_id), "{failure}");
+        assert!(failure.reason.contains("deadline"), "{failure}");
+        assert!(
+            waited < Duration::from_millis(2_000),
+            "the search waited {waited:?} for a 300 ms deadline"
+        );
+        server.shutdown().await;
     }
 
     /// Test empty query handling
