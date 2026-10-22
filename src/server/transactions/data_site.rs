@@ -259,6 +259,21 @@ fn take_apply_panic_hook(tid: &TxnId, id: &Id) -> bool {
         .is_some_and(|hooks| hooks.lock().remove(&(tid.clone(), *id)))
 }
 
+/// Test hook: the apply burst fails right after this cell is written, as a
+/// later write that finds no space.
+#[cfg(test)]
+static APPLY_ERROR_HOOKS: Mutex<BTreeSet<(TxnId, Id)>> = parking_lot::const_mutex(BTreeSet::new());
+
+#[cfg(test)]
+pub(crate) fn install_apply_error_after_cell(tid: TxnId, id: Id) {
+    APPLY_ERROR_HOOKS.lock().insert((tid, id));
+}
+
+#[cfg(test)]
+fn take_apply_error_hook(tid: &TxnId, id: &Id) -> bool {
+    APPLY_ERROR_HOOKS.lock().remove(&(tid.clone(), *id))
+}
+
 #[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
@@ -425,6 +440,10 @@ struct Transaction {
     /// first try no status cell of the transaction can exist here, so the
     /// close does not search the probes for one (D44).
     status_cell_attempted: bool,
+    /// An abort of this object restored every applied cell and rewound its
+    /// spans. Only then may a presumed abort that finds it already aborted
+    /// release its cell locks.
+    abort_clean: bool,
 }
 
 /// Test hook: a site does not send `synced` notices, as one whose notices
@@ -536,6 +555,12 @@ fn settle_sweep_interval() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+/// The cell locks that a presumed abort releases, for `presume_abort`.
+struct PresumedAbortRelease {
+    owner: Option<TxnPriority>,
+    cells: Vec<Id>,
 }
 
 /// What `close_committed_brackets` did.
@@ -712,6 +737,7 @@ impl DataManager {
                 fenced: false,
                 durable_commit: false,
                 status_cell_attempted: false,
+                abort_clean: false,
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -771,7 +797,7 @@ impl DataManager {
     }
 
     /// Whether the owner of a cell lock has applied writes here that can
-    /// still be aborted. Its lock is never reclaimed as stale: the abort of
+    /// still be aborted (`Committed`, or `Prepared` with a partial apply). Its lock is never reclaimed as stale: the abort of
     /// the owner rolls its writes back only while it owns the cells, and a
     /// reader without the lock would see writes that can still be aborted.
     /// The lease sweeper ends such a transaction. A busy owner counts as one:
@@ -779,7 +805,7 @@ impl DataManager {
     fn owner_waits_with_writes(&self, owner: &TxnPriority) -> bool {
         self.find_transaction(&owner.tid).is_some_and(|txn_lock| {
             txn_lock.try_lock().map_or(true, |txn| {
-                txn.state == TxnState::Committed
+                txn.state != TxnState::Aborted
                     && !txn.history.is_empty()
                     && !txn.decided_commit
             })
@@ -1041,6 +1067,7 @@ impl DataManager {
             );
             return Err(error.into_write_error());
         }
+        txn.abort_clean = failures.is_none();
         Ok(failures)
     }
 
@@ -1078,6 +1105,7 @@ impl DataManager {
                 );
                 return AbortResult::WriteError(error.into_write_error());
             }
+            txn.abort_clean = true;
             drop(guards_to_drop);
             return AbortResult::Success(None);
         }
@@ -1150,7 +1178,7 @@ impl DataManager {
             .filter(|tid| !hold.contains(tid))
             .collect();
         for tid in &ended {
-            self.presume_abort(tid);
+            self.presume_abort(tid).await;
         }
         // A transaction that kept its object is decided COMMIT, and the next
         // pass retries its close; only leases without an object are retired.
@@ -1166,30 +1194,62 @@ impl DataManager {
 
     /// Presumed abort for a transaction whose coordinator went silent.
     /// Returns whether the transaction was ended here.
-    fn presume_abort(&self, tid: &TxnId) -> bool {
+    ///
+    /// No `end` follows a presumed abort, so the cell locks go with the
+    /// decision. They go only after the secondary-index rollback of the
+    /// abort is complete: index restoration runs as tasks, and a retry that
+    /// took the lock earlier could have its new index entry removed by an
+    /// old restoration task.
+    async fn presume_abort(&self, tid: &TxnId) -> bool {
+        let (release, index_results) =
+            IndexBuilder::with_request_index_scope(|| self.presume_abort_locked(tid)).await;
+        self.warn_on_index_wait_results(tid, index_results);
+        let Some(release) = release else {
+            return false;
+        };
+        // A cell that another transaction owns stays with it:
+        // `attempt_lock_release` clears only an owner equal to `owner`.
+        self.attempt_lock_release(release.owner.as_ref(), &release.cells);
+        true
+    }
+
+    /// The decision half of `presume_abort`: abort, record and remove the
+    /// transaction. Returns the cell locks the abort covers, or `None` if the
+    /// transaction was not ended here.
+    fn presume_abort_locked(&self, tid: &TxnId) -> Option<PresumedAbortRelease> {
         let Some(txn_lock) = self.find_transaction(tid) else {
             // Nothing to roll back here; the retire pass reclaims the heads.
-            return false;
+            return None;
         };
         let mut txn = txn_lock.lock();
         if txn.decided_commit {
             // Finishing it is the only option; termination retries the
             // close, and the heads stay held until it succeeds.
-            return false;
+            return None;
         }
-        // No `end` follows a presumed abort, so the cell locks must go with
-        // the decision. Capture the cells and the owner it covers before the
-        // decision: the removal below drops the transaction record.
-        let expected_owner = txn
+        // Captured before the decision: the removal below drops the record.
+        let owner = txn
             .coordinator_id
             .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
         let locked_cell_ids = Self::guarded_txn_cell_ids(&txn);
         let outcome = self.abort_locked(tid, &mut txn);
+        let abort_clean = txn.abort_clean;
         drop(txn);
-        let aborted = matches!(
-            &outcome,
-            AbortResult::Success(_) | AbortResult::CheckFailed(CheckError::AlreadyAborted)
-        );
+        // A lock goes only with a cell that holds no write of this
+        // transaction any more. A cell whose restore failed keeps its owner,
+        // so readers wait rather than read an aborted write; an abort that is
+        // not proven clean releases nothing.
+        let cells = match &outcome {
+            AbortResult::Success(None) => locked_cell_ids,
+            AbortResult::Success(Some(failures)) => locked_cell_ids
+                .into_iter()
+                .filter(|id| failures.iter().all(|failure| failure.id != *id))
+                .collect(),
+            AbortResult::CheckFailed(CheckError::AlreadyAborted) if abort_clean => {
+                locked_cell_ids
+            }
+            _ => Vec::new(),
+        };
         match outcome {
             AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
                 warn!(
@@ -1209,15 +1269,9 @@ impl DataManager {
                 );
             }
         }
-        if aborted {
-            // The decision covers these cells and this owner. A cell that
-            // another transaction owns stays with it: `attempt_lock_release`
-            // clears only an owner equal to `expected_owner`.
-            self.attempt_lock_release(expected_owner.as_ref(), &locked_cell_ids);
-        }
         self.record_decision(tid, TxnOutcome::Aborted);
         self.wipe_out_transaction(tid);
-        true
+        Some(PresumedAbortRelease { owner, cells })
     }
 
     /// The commit decision's physical half: every bracket gets its COMMIT,
@@ -1797,7 +1851,7 @@ impl DataManager {
                     other
                 )),
                 (ForcedOutcome::Abort, _) => {
-                    self.presume_abort(tid);
+                    self.presume_abort(tid).await;
                     ForceResolveResult::Resolved
                 }
             };
@@ -2482,6 +2536,12 @@ impl DataManager {
                                     if take_apply_panic_hook(tid, &cell_id) {
                                         panic!("test hook: apply panics after writing {cell_id:?}");
                                     }
+                                    #[cfg(test)]
+                                    if take_apply_error_hook(tid, &cell_id) {
+                                        write_error =
+                                            Some((cell_id, WriteError::CannotAllocateSpace));
+                                        break;
+                                    }
                                 }
                                 Err(error) => {
                                     write_error = Some((cell_id, error));
@@ -2615,6 +2675,13 @@ impl DataManager {
             // Drop what this attempt recorded: the next transaction on this
             // thread must not inherit segments (nor pin them alive).
             drop(crate::ram::chunk::take_transactional_segments());
+            // The earlier writes of this attempt are applied. Undo them now,
+            // as the panic and the sync-failure paths do: until the
+            // coordinator's abort arrives they would be visible, and nothing
+            // decides them.
+            if !txn.history.is_empty() {
+                let _ = self.rollback_and_rewind(tid, &mut txn, &guarded_cell_ids, &mut cell_guards);
+            }
             return Self::map_commit_write_error(&txn, id, error);
         }
 
@@ -3620,6 +3687,352 @@ mod tests {
             prepare_ops_local(&manager, 9304, &reclaimer, vec![other_write]).await,
             DMPrepareResult::Success
         );
+        server.shutdown().await;
+    }
+
+    fn owner_of(manager: &Arc<DataManager>, id: &Id) -> Option<TxnPriority> {
+        manager.cell_meta_for_test(id).lock().owner.clone()
+    }
+
+    fn score_of(runtime: &Arc<crate::server::DatabaseRuntime>, id: &Id) -> Option<u64> {
+        let cell = runtime.chunks().read_cell(id).ok()?.to_owned();
+        cell.data["score"].u64().copied()
+    }
+
+    /// A later write of the apply fails after an earlier one was applied.
+    /// The participant undoes the earlier write before it answers, so a
+    /// stale-lock reclaim before the coordinator's abort exposes nothing, and
+    /// the abort leaves the cell absent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_later_write_undoes_the_earlier_writes_of_the_apply() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_partial_apply";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let first = Id::allocated(0, 0, 9311);
+        let second = Id::allocated(0, 0, 9312);
+        let insert = |id| PrepareOp {
+            id,
+            expectation: CellExpectation::Absent,
+            intent: PrepareIntent::Write,
+        };
+        let applied = test_hlc(1, 9311);
+        assert_eq!(
+            prepare_ops_local(&manager, 9311, &applied, vec![insert(first), insert(second)])
+                .await,
+            DMPrepareResult::Success
+        );
+        install_apply_error_after_cell(applied.clone(), first);
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &applied,
+                vec![
+                    CommitOp::Write(counter_cell(schema.vid.get(), first, 1, "partial")),
+                    CommitOp::Write(counter_cell(schema.vid.get(), second, 2, "partial")),
+                ],
+            )
+            .await,
+            DMCommitResult::WriteError(first, WriteError::CannotAllocateSpace)
+        );
+        assert_eq!(score_of(&runtime, &first), None, "the applied write must be undone");
+        assert_eq!(
+            crate::ram::chunk::transaction_lease_count(&applied, &runtime.chunks().address_range()),
+            0
+        );
+        // The coordinator is late: a later prepare reclaims the stale lock.
+        manager.cell_meta_for_test(&first).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let later = test_hlc(2, 9313);
+        assert_eq!(
+            prepare_ops_local(&manager, 9313, &later, vec![insert(first)]).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(score_of(&runtime, &first), None);
+        let abort = <DataManager as Service>::abort(&manager, applied.clone(), applied.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::CheckFailed(CheckError::AlreadyAborted));
+        assert_eq!(score_of(&runtime, &first), None);
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &later,
+                vec![CommitOp::Write(counter_cell(schema.vid.get(), first, 3, "later"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, later.clone(), later.clone(), false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(score_of(&runtime, &first), Some(3));
+        server.shutdown().await;
+    }
+
+    /// G5/F4: after the lease sweep presumes a transaction abort, a reader of
+    /// its cell is served at once, not told to wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_after_the_sweep_is_not_blocked() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_reader_after_sweep";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell = Id::allocated(0, 0, 9321);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell, 5, 0);
+        let applied = test_hlc(1, 9321);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9321,
+                &applied,
+                vec![PrepareOp {
+                    id: cell,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &applied,
+                vec![CommitOp::Update(counter_cell(schema.vid.get(), cell, 50, "undecided"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let reader = test_hlc(2, 9322);
+        let before = <DataManager as Service>::read(&manager, 0, reader.clone(), reader.clone(), cell)
+            .await
+            .payload;
+        assert!(matches!(before, TxnExecResult::Wait), "{before:?}");
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        assert!(!manager.has_transaction_for_test(&applied));
+        assert_eq!(owner_of(&manager, &cell), None);
+        let after = <DataManager as Service>::read(&manager, 0, reader.clone(), reader, cell)
+            .await
+            .payload;
+        match after {
+            TxnExecResult::Accepted(read) => {
+                assert_eq!(read.data["score"].u64().copied(), Some(5));
+            }
+            other => panic!("the reader must be served after the sweep: {other:?}"),
+        }
+        server.shutdown().await;
+    }
+
+    /// A presumed abort whose restore failed on one cell releases the lock
+    /// of the restored cell only. The failed cell keeps its owner, so readers
+    /// wait rather than read the aborted write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presumed_abort_keeps_the_lock_of_a_cell_it_could_not_restore() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_presume_failed_restore";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let ids = [Id::allocated(0, 0, 9331), Id::allocated(0, 0, 9332)];
+        let versions = ids.map(|id| seed_cell_version(&runtime, schema.vid.get(), id, 5, 0));
+        let tid = test_hlc(1, 9331);
+        let owner = TxnPriority::new(tid.clone(), 9331);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9331,
+                &tid,
+                ids.iter()
+                    .zip(versions)
+                    .map(|(id, version)| PrepareOp {
+                        id: *id,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    })
+                    .collect()
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                ids.iter()
+                    .map(|id| CommitOp::Update(counter_cell(schema.vid.get(), *id, 50, "new")))
+                    .collect()
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // Inject one restore failure without changing persisted bytes.
+        manager
+            .txns
+            .get(&tid)
+            .unwrap()
+            .lock()
+            .history
+            .get_mut(&ids[0])
+            .unwrap()
+            .current_version += 1;
+        assert!(manager.presume_abort(&tid).await);
+        assert_eq!(owner_of(&manager, &ids[0]), Some(owner));
+        assert_eq!(owner_of(&manager, &ids[1]), None);
+        assert_eq!(score_of(&runtime, &ids[1]), Some(5));
+        server.shutdown().await;
+    }
+
+    /// A presumed abort that finds the transaction already aborted releases
+    /// the locks only if that abort is proven clean.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presumed_abort_of_an_aborted_transaction_releases_only_a_clean_abort() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_presume_already_aborted";
+        let server = start_lease_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        for (seq, clean) in [(9341u64, false), (9342, true)] {
+            let tid = test_hlc(1, seq);
+            let cell = Id::allocated(0, 0, seq);
+            prepare_local_txn(&manager, &tid, vec![cell]);
+            {
+                let txn_lock = manager.txns.get(&tid).unwrap();
+                let mut txn = txn_lock.lock();
+                txn.state = TxnState::Aborted;
+                txn.abort_clean = clean;
+            }
+            assert!(manager.presume_abort(&tid).await);
+            assert!(!manager.has_transaction_for_test(&tid));
+            assert_eq!(
+                owner_of(&manager, &cell).is_none(),
+                clean,
+                "clean abort: {clean}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    /// An immediate indexed retry after a presumed abort. The locks go only
+    /// after the index rollback of the abort, so the retry's index entry
+    /// stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_indexed_retry_after_a_presumed_abort_keeps_its_index_entry() {
+        use crate::ram::schema::{Field, IndexType};
+        use dovahkiin::types::Type;
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 16 * SEGMENT_SIZE,
+                db_size: 16 * SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![
+                    NebService::Cell,
+                    NebService::Transaction,
+                    NebService::RangedIndexer,
+                ],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address,
+            "presumed_abort_indexed_retry",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        server.cleaner().pause();
+        let runtime = server.current_database();
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I64),
+            Field::new_unindexed("name", Type::String),
+            Field::new_indexed_nullable("score", Type::U64, vec![IndexType::Ranged]),
+        ]);
+        let schema = Schema::new_with_id(994, "presumed_abort_index", None, fields, false, false);
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema.clone());
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let indexer = runtime.indexer().unwrap();
+        let id = Id::allocated(0, 0, 9351);
+        let key = crate::index::EntryKey::from_props(
+            &id,
+            &OwnedValue::U64(5).feature(),
+            hash_str("score"),
+            schema.uid,
+        );
+        let insert = vec![PrepareOp {
+            id,
+            expectation: CellExpectation::Absent,
+            intent: PrepareIntent::Write,
+        }];
+        let first = test_hlc(1, 9351);
+        assert_eq!(
+            prepare_ops_local(&manager, 9351, &first, insert.clone()).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &first,
+                vec![CommitOp::Write(counter_cell(schema.vid.get(), id, 5, "first"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert!(indexer.clients.ranged_client.contains(&key).await.unwrap());
+        assert!(
+            crate::ram::chunk::transaction_lease_count(&first, &runtime.chunks().address_range())
+                > 0
+        );
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        assert_eq!(owner_of(&manager, &id), None);
+        assert!(
+            !indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            "the lock went before the index rollback of the abort"
+        );
+        let retry = test_hlc(2, 9352);
+        assert_eq!(
+            prepare_ops_local(&manager, 9352, &retry, insert).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &retry,
+                vec![CommitOp::Write(counter_cell(schema.vid.get(), id, 5, "retry"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, retry.clone(), retry, false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        indexer.await_indices().await;
+        assert!(
+            indexer.clients.ranged_client.contains(&key).await.unwrap(),
+            "the retry's index entry must stay"
+        );
+        assert_eq!(score_of(&runtime, &id), Some(5));
         server.shutdown().await;
     }
 
@@ -6736,8 +7149,12 @@ mod tests {
         assert_eq!(t1_txn.state, TxnState::Committed);
         assert!(t1_txn.history.contains_key(&cell_id));
         drop(t1_txn);
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t2_owner.clone()),
+            "the refused abort must leave the foreign owner unchanged"
+        );
         manager.set_cell_owner_for_test(&cell_id, Some(t1_owner));
-
 
         let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
