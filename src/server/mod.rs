@@ -3640,12 +3640,18 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     }
     let mut waiting = Vec::new();
     for bracket in in_doubt {
-        if bracket.participants.iter().all(|participant| *participant == me) {
-            discard_in_doubt(
+        if bracket
+            .participants
+            .iter()
+            .all(|participant| *participant == me)
+        {
+            if !discard_in_doubt(
                 chunks,
                 &bracket,
                 "a transaction of this site alone, with no COMMIT here",
-            );
+            ) {
+                waiting.push(bracket);
+            }
         } else {
             waiting.push(bracket);
         }
@@ -3757,7 +3763,11 @@ async fn resolve_round(
                 }
             }
             transactions::data_site::InDoubtDecision::Abort => {
-                finish_in_doubt_bracket_or_keep(database_runtime, bracket, false);
+                if let Some(unresolved) =
+                    finish_in_doubt_bracket_or_keep(database_runtime, bracket, false)
+                {
+                    waiting.push(unresolved);
+                }
             }
             transactions::data_site::InDoubtDecision::Wait => waiting.push(bracket),
         }
@@ -3766,8 +3776,7 @@ async fn resolve_round(
 }
 
 /// Resolve one in-doubt bracket: commit it or discard it. Returns the
-/// bracket if it stays in doubt, because the commit could not be made
-/// durable.
+/// bracket if the decision could not be made durable.
 fn finish_in_doubt_bracket_or_keep(
     database_runtime: &Arc<DatabaseRuntime>,
     bracket: crate::ram::recovery::InDoubtBracket,
@@ -3777,12 +3786,12 @@ fn finish_in_doubt_bracket_or_keep(
         if !apply_resolved_commit(database_runtime, &bracket) {
             return Some(bracket);
         }
-    } else {
-        discard_in_doubt(
-            &database_runtime.chunks,
-            &bracket,
-            "every participant is fenced, aborted, or never held it",
-        );
+    } else if !discard_in_doubt(
+        &database_runtime.chunks,
+        &bracket,
+        "every participant is fenced, aborted, or never held it",
+    ) {
+        return Some(bracket);
     }
     None
 }
@@ -3820,7 +3829,14 @@ fn discard_in_doubt(
     chunks: &crate::ram::chunk::Chunks,
     bracket: &crate::ram::recovery::InDoubtBracket,
     why: &str,
-) {
+) -> bool {
+    if let Err(error) = chunks.fences().record_abort(&bracket.txn) {
+        error!(
+            "cannot sync the abort settlement of {:?}: {}; it stays in doubt and pinned",
+            bracket.txn, error
+        );
+        return false;
+    }
     info!(
         "transaction {:?} was in doubt after recovery and is discarded ({}); {} bracketed \
          cell(s) dropped",
@@ -3831,6 +3847,7 @@ fn discard_in_doubt(
     chunks.release_transaction_pins(&bracket.txn);
     chunks.txn_status().end_resolving(&bracket.txn);
     crate::ram::recovery::BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Make a commit that a participant reported HERE, then install its cells.

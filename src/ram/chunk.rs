@@ -6174,6 +6174,14 @@ impl Chunks {
                 .expect("spawn stats-sweeper");
         }
 
+        let previous = chunks_arc
+            .fences
+            .load(enable_recovery)
+            .unwrap_or_else(|error| {
+                panic!("cannot read the fence log, refusing to start: {error}")
+            });
+        let mut physical_in_doubt = std::collections::BTreeSet::new();
+
         // Attempt recovery if enabled
         if enable_recovery {
             info!("Recovery enabled, attempting to recover from storage");
@@ -6193,7 +6201,18 @@ impl Chunks {
                 &chunks_arc.recovered_origin_floors,
                 Some(recovery_files),
             ) {
-                Ok(brackets) => {
+                Ok(mut brackets) => {
+                    physical_in_doubt.extend(brackets.in_doubt.iter().map(|bracket| bracket.txn));
+                    // A settlement proves abort; a local fence alone does not.
+                    // Exclude settled brackets before the resolver registers them.
+                    brackets.in_doubt.retain(|bracket| {
+                        if previous.aborted.contains(&bracket.txn) {
+                            chunks_arc.release_transaction_pins(&bracket.txn);
+                            false
+                        } else {
+                            true
+                        }
+                    });
                     info!(
                         "Recovery completed successfully: {} committed and {} in-doubt \
                          transaction(s) found in brackets",
@@ -6251,14 +6270,6 @@ impl Chunks {
         // transactions in doubt now, and every recent one, also of a
         // transaction with no bracket here (TLA+ F3). A log this build cannot
         // read stops the start, like any store file that does not decode.
-        let previous = chunks_arc
-            .fences
-            .load(enable_recovery)
-            .unwrap_or_else(|error| {
-                panic!("cannot read the fence log, refusing to start: {error}")
-            });
-        let in_doubt: std::collections::BTreeSet<_> =
-            chunks_arc.txn_status.resolving().into_iter().collect();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -6266,7 +6277,9 @@ impl Chunks {
         chunks_arc
             .fences
             .reset(crate::ram::fence::fences_to_keep(
-                &previous, &in_doubt, now_ms,
+                &previous,
+                &physical_in_doubt,
+                now_ms,
             ))
             .unwrap_or_else(|error| {
                 panic!("cannot write the fence log, refusing to start: {error}")

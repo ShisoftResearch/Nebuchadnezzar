@@ -7,23 +7,24 @@
 //! that must survive a crash and a power loss.
 //!
 //! Records use 64 independent append-only files beside the WAL files.
-//! Version 2 assigns each transaction to a file with `fence_shard`.
-//! Version 1 is refused; this code does not read or migrate its single log.
+//! Version 3 adds an abort settlement after every participant excludes commit.
+//! A fence alone does not prove abort. Recovery excludes a bracket only when
+//! its abort settlement is durable. Other versions are refused.
 //!
 //! ```text
 //! header (8 bytes)
 //!   magic    [u8; 4]  b"NEBF"
 //!   version  u8       FENCE_LOG_VERSION
 //!   reserved [u8; 3]
-//! record (20 bytes), repeated
+//! record (24 bytes), repeated
 //!   txn ts   u64
 //!   txn node u64
-//!   crc      u32      CRC32C over the 16 bytes before it
+//!   aborted  u32      0 = fence, 1 = settled abort
+//!   crc      u32      CRC32C over the 20 bytes before it
 //! ```
 //!
-//! A record that is cut short or fails its CRC ends the log: it was not
-//! synced, so the site never answered `Fenced` for it. Another version, or
-//! another magic, is a typed error that stops the start (§10.1).
+//! A malformed header or record is a typed error that stops the start.
+//! Recovery never discards an unreadable abort settlement.
 //!
 //! A fence must outlive the transaction at this site (TLA+ F3, F6): a site
 //! with no bracket of the transaction answers `Unknown` and must still refuse
@@ -45,10 +46,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FENCE_LOG_MAGIC: [u8; 4] = *b"NEBF";
-pub const FENCE_LOG_VERSION: u8 = 2;
+pub const FENCE_LOG_VERSION: u8 = 3;
 const FENCE_SHARDS: usize = 64;
 const HEADER_SIZE: usize = 8;
-const RECORD_SIZE: usize = 20;
+const RECORD_SIZE: usize = 24;
 pub const FENCE_LOG_FILE: &str = "txn-fences.nfence";
 
 /// Why a fence log cannot be read.
@@ -58,6 +59,14 @@ pub enum FenceLogError {
     NotAFenceLog,
     /// The file has a version that this build does not read.
     UnsupportedVersion(u8),
+    /// A record has an unknown decision tag.
+    InvalidDecision(u32),
+    /// The file has an incomplete header.
+    TruncatedHeader,
+    /// The file ends inside a record.
+    TruncatedRecord,
+    /// A record fails its checksum.
+    ChecksumMismatch,
 }
 
 impl std::fmt::Display for FenceLogError {
@@ -69,6 +78,14 @@ impl std::fmt::Display for FenceLogError {
                 "the fence log has version {version}; this build reads only version \
                  {FENCE_LOG_VERSION}"
             ),
+            FenceLogError::InvalidDecision(tag) => {
+                write!(f, "the fence record has decision tag {tag}")
+            }
+            FenceLogError::TruncatedHeader => write!(f, "the fence log header is incomplete"),
+            FenceLogError::TruncatedRecord => write!(f, "the fence log ends inside a record"),
+            FenceLogError::ChecksumMismatch => {
+                write!(f, "the fence record checksum does not match")
+            }
         }
     }
 }
@@ -88,21 +105,27 @@ fn header() -> [u8; HEADER_SIZE] {
     header
 }
 
-fn record(txn: &TxnId) -> [u8; RECORD_SIZE] {
+fn record(txn: &TxnId, aborted: bool) -> [u8; RECORD_SIZE] {
     let mut bytes = [0u8; RECORD_SIZE];
     bytes[..8].copy_from_slice(&txn.ts.to_le_bytes());
     bytes[8..16].copy_from_slice(&txn.node.to_le_bytes());
-    let crc = crc32c(&bytes[..16]);
-    bytes[16..].copy_from_slice(&crc.to_le_bytes());
+    bytes[16..20].copy_from_slice(&u32::from(aborted).to_le_bytes());
+    let crc = crc32c(&bytes[..20]);
+    bytes[20..].copy_from_slice(&crc.to_le_bytes());
     bytes
 }
 
-/// Read every fence a log holds.
-fn parse(data: &[u8]) -> Result<BTreeSet<TxnId>, FenceLogError> {
+/// The durable fences and the subset with a settled abort.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FenceRecords {
+    pub fenced: BTreeSet<TxnId>,
+    pub aborted: BTreeSet<TxnId>,
+}
+
+/// Read every fence and abort settlement a log holds.
+fn parse(data: &[u8]) -> Result<FenceRecords, FenceLogError> {
     if data.len() < HEADER_SIZE {
-        // The header is synced when the file is created; a shorter file
-        // was created and never synced, so it holds no fence.
-        return Ok(BTreeSet::new());
+        return Err(FenceLogError::TruncatedHeader);
     }
     if data[..4] != FENCE_LOG_MAGIC {
         return Err(FenceLogError::NotAFenceLog);
@@ -110,26 +133,37 @@ fn parse(data: &[u8]) -> Result<BTreeSet<TxnId>, FenceLogError> {
     if data[4] != FENCE_LOG_VERSION {
         return Err(FenceLogError::UnsupportedVersion(data[4]));
     }
-    let mut fences = BTreeSet::new();
+    if (data.len() - HEADER_SIZE) % RECORD_SIZE != 0 {
+        return Err(FenceLogError::TruncatedRecord);
+    }
+    let mut records = FenceRecords::default();
     let mut cursor = HEADER_SIZE;
     while cursor + RECORD_SIZE <= data.len() {
         let bytes = &data[cursor..cursor + RECORD_SIZE];
-        let crc = u32::from_le_bytes(bytes[16..].try_into().unwrap());
-        if crc != crc32c(&bytes[..16]) {
-            break;
+        let crc = u32::from_le_bytes(bytes[20..].try_into().unwrap());
+        if crc != crc32c(&bytes[..20]) {
+            return Err(FenceLogError::ChecksumMismatch);
         }
-        fences.insert(TxnId {
+        let txn = TxnId {
             ts: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             node: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-        });
+        };
+        match u32::from_le_bytes(bytes[16..20].try_into().unwrap()) {
+            0 => {}
+            1 => {
+                records.aborted.insert(txn);
+            }
+            tag => return Err(FenceLogError::InvalidDecision(tag)),
+        }
+        records.fenced.insert(txn);
         cursor += RECORD_SIZE;
     }
-    Ok(fences)
+    Ok(records)
 }
 
 struct State {
     file: Option<File>,
-    fenced: BTreeSet<TxnId>,
+    records: FenceRecords,
 }
 
 struct FenceShard {
@@ -138,7 +172,7 @@ struct FenceShard {
 }
 
 fn fence_shard(txn: &TxnId) -> usize {
-    // This mapping is part of version 2. Keep it independent of Rust's Hash.
+    // Keep the shard mapping independent of Rust's Hash.
     let mut key = txn.ts ^ txn.node.rotate_left(23);
     key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     key = (key ^ (key >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -166,7 +200,7 @@ impl FenceLog {
                 }),
                 state: Mutex::new(State {
                     file: None,
-                    fenced: BTreeSet::new(),
+                    records: FenceRecords::default(),
                 }),
             }),
             count: AtomicUsize::new(0),
@@ -176,10 +210,10 @@ impl FenceLog {
     /// Read the fences of the last run. Called once at start, before the
     /// store serves. `recover` false means a fresh store: the old log is
     /// dropped.
-    pub fn load(&self, recover: bool) -> io::Result<BTreeSet<TxnId>> {
-        let mut fences = BTreeSet::new();
+    pub fn load(&self, recover: bool) -> io::Result<FenceRecords> {
+        let mut records = FenceRecords::default();
         if !recover {
-            return Ok(fences);
+            return Ok(records);
         }
         for shard in &self.shards {
             let Some(path) = &shard.path else { continue };
@@ -190,29 +224,34 @@ impl FenceLog {
             };
             let mut data = Vec::new();
             file.read_to_end(&mut data)?;
-            fences.extend(
-                parse(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-            );
+            let found =
+                parse(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            records.fenced.extend(found.fenced);
+            records.aborted.extend(found.aborted);
         }
-        Ok(fences)
+        Ok(records)
     }
 
-    /// Keep `fences` and only those: write them to a new log, sync it, and
+    /// Keep `records` and only those: write them to a new log, sync it, and
     /// put it in place of the old one.
-    pub fn reset(&self, fences: BTreeSet<TxnId>) -> io::Result<()> {
-        let count = fences.len();
-        let mut partitions: [BTreeSet<TxnId>; FENCE_SHARDS] =
-            std::array::from_fn(|_| BTreeSet::new());
-        for txn in fences {
-            partitions[fence_shard(&txn)].insert(txn);
+    pub fn reset(&self, records: FenceRecords) -> io::Result<()> {
+        let count = records.fenced.len();
+        let mut partitions: [FenceRecords; FENCE_SHARDS] =
+            std::array::from_fn(|_| FenceRecords::default());
+        for txn in records.fenced {
+            let partition = &mut partitions[fence_shard(&txn)];
+            if records.aborted.contains(&txn) {
+                partition.aborted.insert(txn);
+            }
+            partition.fenced.insert(txn);
         }
-        for (i, (shard, fences)) in self.shards.iter().zip(partitions).enumerate() {
+        for (i, (shard, records)) in self.shards.iter().zip(partitions).enumerate() {
             let mut state = crate::profile_lock!(H14, shard.state.lock());
             if let Some(path) = &shard.path {
                 // Keep shard zero's header as the layout marker, even empty.
-                if i != 0 && fences.is_empty() && !path.exists() {
+                if i != 0 && records.fenced.is_empty() && !path.exists() {
                     state.file = None;
-                    state.fenced = fences;
+                    state.records = records;
                     continue;
                 }
                 if let Some(dir) = path.parent() {
@@ -222,8 +261,8 @@ impl FenceLog {
                 {
                     let mut file = File::create(&staging)?;
                     file.write_all(&header())?;
-                    for txn in &fences {
-                        file.write_all(&record(txn))?;
+                    for txn in &records.fenced {
+                        file.write_all(&record(txn, records.aborted.contains(txn)))?;
                     }
                     file.sync_all()?;
                 }
@@ -234,11 +273,11 @@ impl FenceLog {
                 #[cfg(test)]
                 crate::ram::segs::power_loss_model::record_synced_len(
                     &Some(path.to_string_lossy().to_string()),
-                    (HEADER_SIZE + fences.len() * RECORD_SIZE) as u64,
+                    (HEADER_SIZE + records.fenced.len() * RECORD_SIZE) as u64,
                 );
                 state.file = Some(OpenOptions::new().append(true).open(path)?);
             }
-            state.fenced = fences;
+            state.records = records;
         }
         self.count.store(count, Ordering::Release);
         Ok(())
@@ -247,10 +286,32 @@ impl FenceLog {
     /// Record a fence of `txn`, synced. Returns only when a power loss can
     /// no longer drop it.
     pub fn record(&self, txn: &TxnId) -> io::Result<()> {
+        self.record_decision(txn, false)
+    }
+
+    /// Sync an abort settlement before the recovered bracket releases its pins.
+    /// The caller first excludes commit at every participant, or applies an
+    /// explicit operator decision. A local fence alone does not permit this.
+    pub(crate) fn record_abort(&self, txn: &TxnId) -> io::Result<()> {
+        self.record_decision(txn, true)
+    }
+
+    fn record_decision(&self, txn: &TxnId, aborted: bool) -> io::Result<()> {
         let shard = &self.shards[fence_shard(txn)];
         let mut state = crate::profile_lock!(H14, shard.state.lock());
-        if state.fenced.contains(txn) {
+        if state.records.aborted.contains(txn) || (!aborted && state.records.fenced.contains(txn)) {
             return Ok(());
+        }
+        #[cfg(test)]
+        if aborted
+            && crate::ram::segs::power_loss_model::wal_sync_fails(
+                &shard
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+            )
+        {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         if state.file.is_none() {
             if let Some(path) = &shard.path {
@@ -270,7 +331,7 @@ impl FenceLog {
             }
         }
         if let Some(file) = state.file.as_mut() {
-            file.write_all(&record(txn))?;
+            file.write_all(&record(txn, aborted))?;
             #[cfg(not(test))]
             file.sync_data()?;
             #[cfg(test)]
@@ -285,8 +346,12 @@ impl FenceLog {
                 );
             }
         }
-        state.fenced.insert(txn.clone());
-        self.count.fetch_add(1, Ordering::AcqRel);
+        if aborted {
+            state.records.aborted.insert(*txn);
+        }
+        if state.records.fenced.insert(*txn) {
+            self.count.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
 
@@ -295,6 +360,7 @@ impl FenceLog {
             return false;
         }
         crate::profile_lock!(H14, self.shards[fence_shard(txn)].state.lock())
+            .records
             .fenced
             .contains(txn)
     }
@@ -316,16 +382,21 @@ pub fn fence_retention() -> std::time::Duration {
 /// The fences a start keeps: those of the transactions in doubt, and those
 /// younger than `fence_retention` by the transaction's clock.
 pub fn fences_to_keep(
-    previous: &BTreeSet<TxnId>,
+    previous: &FenceRecords,
     in_doubt: &BTreeSet<TxnId>,
     now_ms: u64,
-) -> BTreeSet<TxnId> {
+) -> FenceRecords {
     let horizon = now_ms.saturating_sub(fence_retention().as_millis() as u64);
-    previous
+    // Use the physical brackets before settled aborts are excluded. Otherwise
+    // an old settlement could expire while its BEGIN still survives.
+    let fenced: BTreeSet<_> = previous
+        .fenced
         .iter()
         .filter(|txn| in_doubt.contains(*txn) || txn.wall_ms() >= horizon)
-        .cloned()
-        .collect()
+        .copied()
+        .collect();
+    let aborted = previous.aborted.intersection(&fenced).copied().collect();
+    FenceRecords { fenced, aborted }
 }
 
 /// Test hook for a reverted control: record fences without the sync.
@@ -343,25 +414,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().to_string();
         let log = FenceLog::new(Some(&path));
-        log.reset(BTreeSet::new()).unwrap();
+        log.reset(FenceRecords::default()).unwrap();
         log.record(&test_hlc(1, 1)).unwrap();
         log.record(&test_hlc(2, 1)).unwrap();
         assert!(log.is_fenced(&test_hlc(1, 1)));
         let reloaded = FenceLog::new(Some(&path));
         let fences = reloaded.load(true).unwrap();
-        assert_eq!(fences.len(), 2);
+        assert_eq!(fences.fenced.len(), 2);
         reloaded
-            .reset([test_hlc(2, 1)].into_iter().collect())
+            .reset(FenceRecords {
+                fenced: [test_hlc(2, 1)].into_iter().collect(),
+                aborted: BTreeSet::new(),
+            })
             .unwrap();
         let again = FenceLog::new(Some(&path)).load(true).unwrap();
-        assert_eq!(again, [test_hlc(2, 1)].into_iter().collect());
+        assert_eq!(again.fenced, [test_hlc(2, 1)].into_iter().collect());
     }
 
     #[test]
     fn independent_fence_files_do_not_wait_for_each_other() {
         let dir = tempfile::tempdir().unwrap();
         let log = std::sync::Arc::new(FenceLog::new(dir.path().to_str()));
-        log.reset(BTreeSet::new()).unwrap();
+        log.reset(FenceRecords::default()).unwrap();
         let first = test_hlc(1, 1);
         let second = (2..1000)
             .map(|n| test_hlc(n, 1))
@@ -381,7 +455,10 @@ mod tests {
         thread.join().unwrap();
         assert!(result.is_ok());
         assert_eq!(
-            FenceLog::new(dir.path().to_str()).load(true).unwrap(),
+            FenceLog::new(dir.path().to_str())
+                .load(true)
+                .unwrap()
+                .fenced,
             [second].into_iter().collect()
         );
     }
@@ -401,11 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_record_ends_the_log_and_another_version_is_refused() {
+    fn a_torn_record_and_another_version_are_refused() {
         let mut data = header().to_vec();
-        data.extend_from_slice(&record(&test_hlc(3, 3)));
-        data.extend_from_slice(&record(&test_hlc(4, 4))[..10]);
-        assert_eq!(parse(&data).unwrap().len(), 1);
+        data.extend_from_slice(&record(&test_hlc(3, 3), false));
+        data.extend_from_slice(&record(&test_hlc(4, 4), false)[..10]);
+        assert_eq!(parse(&data), Err(FenceLogError::TruncatedRecord));
         let mut other = header().to_vec();
         other[4] = FENCE_LOG_VERSION + 1;
         assert_eq!(
@@ -413,5 +490,68 @@ mod tests {
             Err(FenceLogError::UnsupportedVersion(FENCE_LOG_VERSION + 1))
         );
         assert_eq!(parse(b"WALRxxxx"), Err(FenceLogError::NotAFenceLog));
+    }
+    #[test]
+    fn g11_abort_settlement_survives_reload_reset_and_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = FenceLog::new(dir.path().to_str());
+        log.reset(FenceRecords::default()).unwrap();
+        let aborted = test_hlc(1, 1);
+        let fenced = test_hlc(2, 1);
+        log.record(&aborted).unwrap();
+        log.record(&fenced).unwrap();
+        assert!(log.load(true).unwrap().aborted.is_empty());
+        log.record_abort(&aborted).unwrap();
+        // Repeated fences cannot erase an abort or count it twice.
+        log.record(&aborted).unwrap();
+        log.record_abort(&aborted).unwrap();
+        assert_eq!(log.len(), 2);
+        let recovered = log.load(true).unwrap();
+        assert_eq!(recovered.aborted, [aborted].into_iter().collect());
+        let now_ms = fence_retention().as_millis() as u64 + 1_000;
+        let retained = fences_to_keep(&recovered, &[aborted].into_iter().collect(), now_ms);
+        assert_eq!(retained.fenced, [aborted].into_iter().collect());
+        assert_eq!(retained.aborted, [aborted].into_iter().collect());
+        let reloaded = FenceLog::new(dir.path().to_str());
+        reloaded.reset(retained).unwrap();
+        let recovered = reloaded.load(true).unwrap();
+        assert_eq!(recovered.aborted, [aborted].into_iter().collect());
+        assert!(fences_to_keep(&recovered, &BTreeSet::new(), now_ms)
+            .aborted
+            .is_empty());
+    }
+
+    #[test]
+    fn g11_unreadable_settlements_and_version_two_are_typed_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FENCE_LOG_FILE);
+        let load_error = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            let error = FenceLog::new(dir.path().to_str()).load(true).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<FenceLogError>()
+                .unwrap()
+                .clone()
+        };
+        let mut old = header();
+        old[4] = 2;
+        assert_eq!(load_error(&old), FenceLogError::UnsupportedVersion(2));
+        assert_eq!(load_error(&header()[..4]), FenceLogError::TruncatedHeader);
+        let mut bytes = header().to_vec();
+        bytes.extend_from_slice(&record(&test_hlc(1, 1), true));
+        bytes[HEADER_SIZE] ^= 1;
+        assert_eq!(load_error(&bytes), FenceLogError::ChecksumMismatch);
+        bytes[HEADER_SIZE] ^= 1;
+        bytes[HEADER_SIZE + 16..HEADER_SIZE + 20].copy_from_slice(&2u32.to_le_bytes());
+        let crc = crc32c(&bytes[HEADER_SIZE..HEADER_SIZE + 20]);
+        bytes[HEADER_SIZE + 20..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(load_error(&bytes), FenceLogError::InvalidDecision(2));
+        assert_eq!(
+            load_error(&bytes[..bytes.len() - 1]),
+            FenceLogError::TruncatedRecord
+        );
     }
 }
