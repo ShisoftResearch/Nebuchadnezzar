@@ -90,7 +90,8 @@ pub const BEGIN_FORMAT_VERSION: u8 = 2;
 /// ```
 ///
 /// Every part of a transaction carries the same participant set. The set
-/// comes from the coordinator at prepare. The commit point is its lowest id.
+/// comes from the coordinator at prepare. A site in doubt asks the other
+/// participants (the participant fence, D29).
 pub fn encode_begin(txn: &TxnId, participants: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(TXN_ID_SIZE + 4 + participants.len() * size_of::<u64>());
     encode_txn_id(txn, &mut out);
