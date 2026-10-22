@@ -422,9 +422,11 @@ impl PostingSegment {
         let data = cell.data();
         let mut segment = Self::new();
 
-        // Read next pointer
+        // Read next pointer. `to_cell` writes the unit id for "no next".
         if let OwnedValue::Id(id) = &data[*SEGMENT_NEXT_FIELD_ID] {
-            segment.next = Some(*id);
+            if !id.is_unit_id() {
+                segment.next = Some(*id);
+            }
         }
 
         // Read arrays
@@ -1304,6 +1306,16 @@ mod tests {
         // No head segment is a term this chunk never indexed: an empty list.
         let absent = SegmentedPostingList::new(SchemaUid(100), 7, 11);
         assert!(absent.iterate(&chunks.list[0], 0).unwrap().is_empty());
+
+        // `to_cell` writes the unit id for "no next segment": the list ends
+        // there, and that is not a broken link.
+        let single = SegmentedPostingList::new(SchemaUid(100), 7, 12);
+        let mut only = PostingSegment::new();
+        only.add(Id::from_parts(1, 4), 1, 1, 1);
+        chunks
+            .write_cell(&mut only.to_cell(&single.head_segment_id(0)))
+            .unwrap();
+        assert_eq!(single.iterate(&chunks.list[0], 0).unwrap().len(), 1);
     }
 
     // Helper to create test chunks
