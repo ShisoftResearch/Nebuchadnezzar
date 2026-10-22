@@ -2774,6 +2774,288 @@ async fn the_force_resolve_tool_decides_for_a_lost_participant() {
     cluster.shutdown().await;
 }
 
+/// A BEGIN without a decision must not retain cells or transaction pins after recovery.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_recovery_of_a_begin_only_bracket() {
+    g2_recovery_without_a_decision(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_recovery_of_an_open_bracket_with_cells() {
+    g2_recovery_without_a_decision(true).await;
+}
+
+/// An incomplete prepare cannot commit and must not pin an empty site across restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_recovery_of_a_begin_only_bracket_with_a_prepared_peer() {
+    use super::data_site::{DataManager, Service as DataSiteService};
+    use crate::ram::chunk::TransactionScope;
+
+    crate::ram::segs::power_loss_model::enable();
+    std::env::set_var("NEB_RESOLVE_STARTUP_WAIT_SECS", "2");
+    let (mut cluster, client) = Cluster::start("g2_empty_prepared_peer").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    for index in [A, B] {
+        assert!(cluster.site(index).refresh_slot_placement().await);
+    }
+    let manager = coordinator(&cluster).await;
+    let tid = manager.begin().await.unwrap().unwrap();
+    let ids = [
+        Id::from_parts(HERE as u64, 49_002),
+        Id::from_parts(THERE as u64, 49_002),
+    ];
+    for id in ids {
+        manager
+            .write(tid, cell_of(id, 49_002))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    for (index, id) in [A, B].into_iter().zip(ids) {
+        assert_eq!(
+            late_prepare(&cluster, index, &tid, id).await,
+            DMPrepareResult::Success
+        );
+    }
+    let peer = data_site(&cluster, B);
+    assert_eq!(
+        <DataManager as DataSiteService>::commit(
+            &peer,
+            site_clock(&cluster, B),
+            tid,
+            vec![CommitOp::Write(cell_of(ids[1], 49_002))],
+        )
+        .await
+        .payload,
+        DMCommitResult::Success
+    );
+    assert_eq!(outcome_on(&cluster, B, &tid), TxnOutcome::InDoubt);
+    let a_id = cluster.site(A).server_id;
+    let b_id = cluster.site(B).server_id;
+    let image_a = {
+        // This cut precedes A's first entry and its participant apply response.
+        let chunks = cluster.site(A).chunks();
+        let scope = TransactionScope::enter_with_participants(tid, vec![a_id, b_id]);
+        let pending = chunks.list[HERE as usize % chunks.list.len()]
+            .try_acquire(64, false)
+            .unwrap();
+        let entry_types: Vec<_> = pending
+            .seg
+            .entry_iter()
+            .map(|entry| entry.entry_header.entry_type)
+            .collect();
+        assert_eq!(entry_types, vec![EntryType::BEGIN, EntryType::PADDING]);
+        assert!(segment_holds_record_of(
+            &pending.seg,
+            &tid,
+            EntryType::BEGIN
+        ));
+        pending.seg.force_wal_sync().unwrap();
+        let image = cluster.power_image(A);
+        drop(pending);
+        drop(scope);
+        drop(crate::ram::chunk::take_transactional_segments());
+        crate::ram::chunk::retire_transaction_leases(&tid, &chunks.address_range()).unwrap();
+        image
+    };
+    let image_b = cluster.power_image(B);
+    // The coordinator never received A's apply success and cannot send end.
+    assert!(!matches!(
+        manager.commit(tid).await,
+        Ok(Ok(EndResult::Success | EndResult::DecidedPending))
+    ));
+    drop(manager);
+    drop(peer);
+
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .insert(b_id);
+    cluster.restart_from_images(&[A], vec![image_a]).await;
+    cluster.site(A).cleaner().pause();
+    assert!(!in_doubt_on(&cluster, A, &tid));
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    assert!(matches!(
+        outcome_on(&cluster, A, &tid),
+        TxnOutcome::Unknown | TxnOutcome::Aborted
+    ));
+    assert_eq!(score_on(cluster.site(A), &ids[0]), None);
+    assert!(cluster
+        .site(A)
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segments())
+        .any(|segment| segment_holds_record_of(&segment, &tid, EntryType::BEGIN)));
+
+    // The old BEGIN survives this cut. It must not regain a pin or logical doubt.
+    cluster.power_loss_restart(A).await;
+    assert!(!in_doubt_on(&cluster, A, &tid));
+    assert_eq!(held_for(&cluster, A, &tid), 0);
+    assert!(matches!(
+        outcome_on(&cluster, A, &tid),
+        TxnOutcome::Unknown | TxnOutcome::Aborted
+    ));
+    super::data_site::silent_peers_for_test()
+        .lock()
+        .remove(&b_id);
+
+    cluster.restart_from_images(&[B], vec![image_b]).await;
+    for (index, id) in [A, B].into_iter().zip(ids) {
+        assert!(!in_doubt_on(&cluster, index, &tid));
+        assert_eq!(held_for(&cluster, index, &tid), 0);
+        assert_eq!(score_on(cluster.site(index), &id), None);
+        assert!(matches!(
+            outcome_on(&cluster, index, &tid),
+            TxnOutcome::Unknown | TxnOutcome::Aborted
+        ));
+        assert!(compact_records(cluster.site(index), &tid, EntryType::BEGIN));
+        assert_eq!(
+            cluster.site(index).chunks().durable_txn_status(&tid),
+            DurableTxnStatus::Aborted
+        );
+    }
+    assert!(cluster.site(A).chunks().fences().is_fenced(&tid));
+    assert!(cluster.site(B).chunks().fences().is_fenced(&tid));
+    cluster.shutdown().await;
+}
+
+async fn g2_recovery_without_a_decision(with_cells: bool) {
+    use crate::client::transaction::{Transaction, TxnError};
+    use crate::ram::chunk::TransactionScope;
+    use std::cell::Cell;
+
+    crate::ram::segs::power_loss_model::enable();
+    let group = if with_cells {
+        "g2_open_cells"
+    } else {
+        "g2_begin_only"
+    };
+    let (mut cluster, client) = Cluster::start(group).await;
+    place_slot(&cluster, &client, HERE, A).await;
+    assert!(cluster.site(A).refresh_slot_placement().await);
+    let address = cluster.addresses[A].clone();
+    let server_id = cluster.site(A).server_id;
+    let manager = super::new_async_client_for_database(&address, group, group)
+        .await
+        .unwrap();
+    let tid = manager.begin().await.unwrap().unwrap();
+    let id = Id::from_parts(HERE as u64, 49_001);
+    manager
+        .write(tid, cell_of(id, 49_001))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let image = if with_cells {
+        assert_eq!(
+            manager.prepare(tid).await.unwrap().unwrap(),
+            TMPrepareResult::Success
+        );
+        assert_eq!(score_on(cluster.site(A), &id), Some(49_001));
+        cluster.power_image(A)
+    } else {
+        // Stop after the real writer appends BEGIN, before its first cell append.
+        // The image precedes reservation cancellation and shutdown cleanup.
+        let chunks = cluster.site(A).chunks();
+        let scope = TransactionScope::enter_with_participants(tid, vec![server_id]);
+        let pending = chunks.list[HERE as usize % chunks.list.len()]
+            .try_acquire(64, false)
+            .unwrap();
+        assert!(segment_holds_record_of(
+            &pending.seg,
+            &tid,
+            EntryType::BEGIN
+        ));
+        assert_eq!(
+            pending
+                .seg
+                .entry_iter()
+                .filter(|entry| entry.entry_header.entry_type == EntryType::CELL)
+                .count(),
+            0,
+            "the cut must precede the first cell"
+        );
+        pending.seg.force_wal_sync().unwrap();
+        let image = cluster.power_image(A);
+        drop(pending);
+        drop(scope);
+        drop(crate::ram::chunk::take_transactional_segments());
+        crate::ram::chunk::retire_transaction_leases(&tid, &chunks.address_range()).unwrap();
+        image
+    };
+    let parts: Vec<_> = cluster
+        .site(A)
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segments())
+        .filter(|segment| segment_holds_record_of(segment, &tid, EntryType::BEGIN))
+        .collect();
+    assert_eq!(parts.len(), 1, "the fixture must contain one open part");
+    assert!(!segment_holds_record_of(&parts[0], &tid, EntryType::COMMIT));
+    drop(parts);
+    drop(manager);
+    cluster.restart_from_images(&[A], vec![image]).await;
+    assert_eq!(cluster.addresses[A], address);
+    assert_eq!(cluster.site(A).server_id, server_id);
+    assert_eq!(
+        score_on(cluster.site(A), &id),
+        None,
+        "recovery must not apply undecided cells"
+    );
+    assert!(
+        !in_doubt_on(&cluster, A, &tid),
+        "startup must settle a single-site transaction"
+    );
+    assert!(matches!(
+        outcome_on(&cluster, A, &tid),
+        TxnOutcome::Unknown | TxnOutcome::Aborted
+    ));
+
+    let restarted_manager = super::new_async_client_for_database(&address, group, group)
+        .await
+        .unwrap();
+    for durable in [false, true] {
+        // The coordinator lost its volatile state. That cannot prove a client outcome.
+        let txn = Transaction {
+            tid,
+            state: Cell::new(if with_cells {
+                TxnState::Prepared
+            } else {
+                TxnState::Started
+            }),
+            client: restarted_manager.clone(),
+        };
+        let result = if durable {
+            txn.commit_durable().await
+        } else {
+            txn.commit().await
+        };
+        assert!(
+            matches!(result, Err(TxnError::OutcomeUnknown)),
+            "a lost coordinator must not report Committed: {result:?}"
+        );
+    }
+    data_site(&cluster, A)
+        .sweep_idle_transactions(Duration::ZERO)
+        .await;
+    let pinned: Vec<_> = cluster
+        .site(A)
+        .chunks()
+        .list
+        .iter()
+        .flat_map(|chunk| chunk.segments())
+        .filter(|segment| segment.protection.holds_transaction(&tid))
+        .map(|segment| (segment.chunk_id, segment.id))
+        .collect();
+    cluster.shutdown().await;
+    assert!(
+        pinned.is_empty(),
+        "an undecided bracket must not retain transaction pins after recovery: {pinned:?}"
+    );
+}
+
 /// D33: a coordinator that loses a site's answer after `end` was sent
 /// reports `OutcomeUnknown`, and the client maps it to a typed error.
 #[tokio::test(flavor = "multi_thread")]

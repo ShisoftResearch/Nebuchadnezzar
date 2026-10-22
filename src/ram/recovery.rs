@@ -630,6 +630,11 @@ impl BracketLedger {
         }
         let mut incomplete = std::collections::HashSet::new();
         for (txn, parts) in parts.iter() {
+            // A transaction with only BEGIN never completed local prepare.
+            // It has no entries to protect or resolve.
+            if !pending.contains_key(txn) {
+                continue;
+            }
             // A missing local decision cannot be replaced by lease absence.
             // Keep every part, including the surviving COMMIT, until settlement.
             if !parts
