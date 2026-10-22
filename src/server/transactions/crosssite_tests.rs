@@ -3203,7 +3203,9 @@ async fn a_lost_end_answer_is_reported_as_outcome_unknown() {
     cluster.shutdown().await;
 }
 
-/// A site refusal does not undo another site's commit (D33).
+/// A site refusal does not undo another site's commit (D33). Site B refuses
+/// its COMMIT as a full store does, site A commits, and the client is told
+/// that the transaction committed. B keeps it decided and closes it later.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_commit_outcome_store_full_can_already_be_committed() {
     use crate::client::transaction::Transaction;
@@ -3211,41 +3213,43 @@ async fn client_commit_outcome_store_full_can_already_be_committed() {
     let (cluster, client) = Cluster::start("client_commit_store_full").await;
     place_slot(&cluster, &client, HERE, A).await;
     place_slot(&cluster, &client, THERE, B).await;
-    let read_id = Id::from_parts(THERE as u64, 40_001);
-    client
-        .write_cell(cell_of(read_id, 1))
-        .await
-        .unwrap()
-        .unwrap();
     let manager = coordinator(&cluster).await;
-    for (seq, reader) in [(40_002, true), (40_003, false)] {
-        let tid = manager.begin().await.unwrap().unwrap();
-        let write_id = Id::from_parts(HERE as u64, seq);
-        if reader {
-            manager.read(tid, read_id).await.unwrap().unwrap();
-        }
+    let tid = manager.begin().await.unwrap().unwrap();
+    let ids = [
+        Id::from_parts(HERE as u64, 40_002),
+        Id::from_parts(THERE as u64, 40_003),
+    ];
+    for id in &ids {
         manager
-            .write(tid, cell_of(write_id, seq))
+            .write(tid, cell_of(*id, 40_002))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            manager.prepare(tid).await.unwrap().unwrap(),
-            TMPrepareResult::Success
-        );
-        let txn = Transaction {
-            tid,
-            state: Cell::new(TxnState::Prepared),
-            client: manager.clone(),
-        };
-        let result = txn.commit().await;
-        // The writer decided COMMIT. A reader's cleanup refusal cannot undo it.
-        assert!(result.is_ok(), "the writer's decision must win: {result:?}");
-        assert_eq!(score_on(cluster.site(A), &write_id), Some(seq));
-        assert_eq!(
-            data_site(&cluster, A).txn_outcome(&tid),
-            TxnOutcome::Committed
-        );
+    }
+    assert_eq!(
+        manager.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    crate::ram::chunk::refuse_next_commit_for_test(cluster.site(B).chunks().base_addr, tid);
+    let txn = Transaction {
+        tid,
+        state: Cell::new(TxnState::Prepared),
+        client: manager.clone(),
+    };
+    let result = txn.commit().await;
+    assert!(result.is_ok(), "A's COMMIT decides the transaction: {result:?}");
+    let refusing = data_site(&cluster, B);
+    assert!(
+        refusing.has_transaction_for_test(&tid),
+        "test setup: B must refuse its COMMIT and keep the transaction decided"
+    );
+    refusing.sweep_idle_transactions(Duration::ZERO).await;
+    assert!(
+        !refusing.has_transaction_for_test(&tid),
+        "B must close the decided transaction"
+    );
+    for (site, id) in [(A, ids[0]), (B, ids[1])] {
+        assert_eq!(score_on(cluster.site(site), &id), Some(40_002));
     }
     cluster.shutdown().await;
 }
