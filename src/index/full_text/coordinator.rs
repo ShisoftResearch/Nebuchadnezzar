@@ -992,7 +992,8 @@ mod tests {
             false,
         );
         server.meta().schemas.debug_only_new_schema(schema.clone());
-        let doc_id = (0..1000)
+        // From 1: `Id::from_parts(0, 0)` is the unit id.
+        let doc_id = (1..1000)
             .map(|i| Id::from_parts(i, i))
             .find(|id| server.consh.get_server_id(id.locality() as u64) == Some(server.server_id))
             .expect("an owned document id");
