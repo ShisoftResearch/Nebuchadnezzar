@@ -1305,7 +1305,7 @@ impl DataManager {
                     "Retrying lock release for {:?} (attempt {}/{})",
                     tid, retry_attempt, MAX_LOCK_RELEASE_RETRIES
                 );
-                tokio::time::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS)).await;
+                std::thread::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS));
             }
 
             let (released_count, failed_releases) =
