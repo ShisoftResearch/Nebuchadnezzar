@@ -28,9 +28,13 @@ use super::entry::ENTRY_HEAD_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArchiveOutcome {
+    /// The image is in a synced backup, and the WAL is removed.
     Archived,
+    /// The existing backup stays the durable copy. Nothing was written.
     AlreadyArchived,
+    /// A head, a claim, a pin or a seal job holds the segment. Try again later.
     Refused,
+    /// The store has no backup storage.
     Unconfigured,
 }
 
@@ -2395,7 +2399,7 @@ impl Segment {
                      blocks. The existing backup is authoritative.",
                     self.id, self.chunk_id, self.seq_id, via
                 );
-                return Ok(ArchiveOutcome::Unconfigured);
+                return Ok(ArchiveOutcome::AlreadyArchived);
             }
 
             // A segment holding appended bytes must yield at least one entry.
@@ -2682,9 +2686,8 @@ image, not an empty segment; archiving it would persist the damage.",
                 "Segment {} has no backup storage configured, cannot archive",
                 self.id
             );
-            return Ok(ArchiveOutcome::AlreadyArchived);
+            return Ok(ArchiveOutcome::Unconfigured);
         }
-        return Ok(ArchiveOutcome::AlreadyArchived);
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {

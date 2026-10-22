@@ -6,7 +6,6 @@ use bifrost_hasher::hash_str;
 use crate::ram::types::Id;
 use dovahkiin::types::{OwnedValue, Type};
 use half::f16;
-use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;

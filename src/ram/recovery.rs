@@ -11,7 +11,6 @@ use crate::ram::types::Id;
 use crate::utils::keyed_state::KeyedState;
 use crossbeam::queue::SegQueue;
 use lightning::aarc::Arc as AArc;
-use lightning::map::WordMap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
@@ -2907,7 +2906,6 @@ mod tests {
     use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
-    use lightning::map::WordMap;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
