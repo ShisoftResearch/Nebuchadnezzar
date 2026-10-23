@@ -553,12 +553,8 @@ impl AsyncClient {
         self.client_by_server_id(current_owner).await
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn write_cell(
         &self,
         cell: OwnedCell,
@@ -595,12 +591,8 @@ impl AsyncClient {
         tokio::task::consume_budget().await;
         res
     }
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn update_cell(
         &self,
         cell: OwnedCell,
@@ -631,12 +623,8 @@ impl AsyncClient {
         tokio::task::consume_budget().await;
         res
     }
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn upsert_cell(
         &self,
         cell: OwnedCell,
@@ -674,12 +662,8 @@ impl AsyncClient {
     /// Results are returned in the same order as `cells`. Used by B-tree
     /// write-back to drain many dirty pages at once.
     ///
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn upsert_all_cells(
         &self,
         cells: Vec<OwnedCell>,
@@ -710,12 +694,8 @@ impl AsyncClient {
         }
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell(id).await? {
@@ -916,12 +896,8 @@ impl AsyncClient {
         Ok(total)
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_update_cell(
         &self,
         id: Id,
@@ -943,12 +919,8 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_set_field(
         &self,
         id: Id,
@@ -971,12 +943,8 @@ impl AsyncClient {
             other => Ok(other),
         }
     }
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn write_cell_durable(
         &self,
         cell: OwnedCell,
@@ -1014,12 +982,8 @@ impl AsyncClient {
         res
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn update_cell_durable(
         &self,
         cell: OwnedCell,
@@ -1051,12 +1015,8 @@ impl AsyncClient {
         res
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn upsert_cell_durable(
         &self,
         cell: OwnedCell,
@@ -1089,12 +1049,8 @@ impl AsyncClient {
         res
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn remove_cell_durable(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell_durable(id).await? {
@@ -1147,12 +1103,8 @@ impl AsyncClient {
         Ok(first.map_or(Ok(()), Err))
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn write_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1197,12 +1149,8 @@ impl AsyncClient {
         res
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn remove_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1233,12 +1181,8 @@ impl AsyncClient {
 
     /// Compare-and-set one cell, and record its durability receipt in `capture`.
     ///
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_update_cell_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1269,12 +1213,8 @@ impl AsyncClient {
         }
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_set_field_captured(
         &self,
         capture: &CapturedWriteBatch,
@@ -1306,12 +1246,8 @@ impl AsyncClient {
         }
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn write_all_cells_durable(
         &self,
         cells: Vec<OwnedCell>,
@@ -1343,12 +1279,8 @@ impl AsyncClient {
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn upsert_all_cells_durable(
         &self,
         cells: Vec<OwnedCell>,
@@ -1380,12 +1312,8 @@ impl AsyncClient {
         Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_update_cell_durable(
         &self,
         id: Id,
@@ -1408,12 +1336,8 @@ impl AsyncClient {
         }
     }
 
-    /// Contract: a cell takes plain (non-transactional) writes or transactions,
-    /// not both. If a caller mixes them on one cell, Neb does not guarantee that
-    /// an acknowledged plain write or delete survives the resolution of an
-    /// in-doubt transaction: after a restart with a transaction T in doubt, the
-    /// plain write and T's write can get the same version, and only one is kept;
-    /// an acknowledged delete is undone when the resolution installs T's cell.
+    /// Contract: a cell takes plain writes or transactions, not both. See
+    /// [`crate::client::transaction`].
     pub async fn compare_version_and_set_field_durable(
         &self,
         id: Id,

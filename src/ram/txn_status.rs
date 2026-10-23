@@ -377,6 +377,7 @@ impl TxnStatusRegistry {
             .is_some_and(|entry| entry.is_some())
     }
 
+    #[cfg(test)]
     pub fn resolving(&self) -> Vec<TxnId> {
         self.resolving.keys().collect()
     }

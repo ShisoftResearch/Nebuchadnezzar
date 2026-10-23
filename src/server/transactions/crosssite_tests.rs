@@ -358,7 +358,11 @@ async fn torn_transaction_seq(
     let limit = super::manager::stop_end_fanout_after_commit_point(tid.clone());
     let _ = txn.commit(tid.clone()).await;
     drop(limit);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // B's COMMIT sync is queued (D19): wait for it, not for a fixed time.
+    wait_until("B's COMMIT is durable", 10, || {
+        cluster.site(B).chunks().durable_txn_status(&tid) == DurableTxnStatus::Committed
+    })
+    .await;
 
     assert_eq!(
         cluster.site(A).chunks().durable_txn_status(&tid),
@@ -3271,50 +3275,141 @@ async fn a_lost_end_answer_is_reported_as_outcome_unknown() {
     cluster.shutdown().await;
 }
 
-/// A site refusal does not undo another site's commit (D33).
+/// A site refusal does not undo another site's commit (D33). Site B refuses
+/// its COMMIT as a full store does, site A commits, and the client is told
+/// that the transaction committed. B keeps it decided and closes it later.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_commit_outcome_store_full_can_already_be_committed() {
-    use crate::client::transaction::{Transaction, TxnError};
+    use crate::client::transaction::Transaction;
     use std::cell::Cell;
     let (cluster, client) = Cluster::start("client_commit_store_full").await;
     place_slot(&cluster, &client, HERE, A).await;
     place_slot(&cluster, &client, THERE, B).await;
-    let read_id = Id::from_parts(THERE as u64, 40_001);
+    let manager = coordinator(&cluster).await;
+    let tid = manager.begin().await.unwrap().unwrap();
+    let ids = [
+        Id::from_parts(HERE as u64, 40_002),
+        Id::from_parts(THERE as u64, 40_003),
+    ];
+    for id in &ids {
+        manager
+            .write(tid, cell_of(*id, 40_002))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        manager.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    crate::ram::chunk::refuse_next_commit_for_test(cluster.site(B).chunks().base_addr, tid);
+    let txn = Transaction {
+        tid,
+        state: Cell::new(TxnState::Prepared),
+        client: manager.clone(),
+    };
+    let result = txn.commit().await;
+    assert!(result.is_ok(), "A's COMMIT decides the transaction: {result:?}");
+    let refusing = data_site(&cluster, B);
+    assert!(
+        refusing.has_transaction_for_test(&tid),
+        "test setup: B must refuse its COMMIT and keep the transaction decided"
+    );
+    refusing.sweep_idle_transactions(Duration::ZERO).await;
+    assert!(
+        !refusing.has_transaction_for_test(&tid),
+        "B must close the decided transaction"
+    );
+    for (site, id) in [(A, ids[0]), (B, ids[1])] {
+        assert_eq!(score_on(cluster.site(site), &id), Some(40_002));
+    }
+    cluster.shutdown().await;
+}
+
+/// A site that only READ a transaction holds no bracket and is not a
+/// participant. Its `end` closes the transaction and releases its read locks,
+/// so a later writer of the read cell is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_site_ends_and_releases_its_read_locks() {
+    let (cluster, client) = Cluster::start("read_only_site_end").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let read_id = Id::from_parts(THERE as u64, 41_001);
     client
         .write_cell(cell_of(read_id, 1))
         .await
         .unwrap()
         .unwrap();
     let manager = coordinator(&cluster).await;
-    for (seq, reader) in [(40_002, true), (40_003, false)] {
-        let tid = manager.begin().await.unwrap().unwrap();
-        let write_id = Id::from_parts(HERE as u64, seq);
-        if reader {
-            manager.read(tid, read_id).await.unwrap().unwrap();
-        }
-        manager
-            .write(tid, cell_of(write_id, seq))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            manager.prepare(tid).await.unwrap().unwrap(),
-            TMPrepareResult::Success
-        );
-        let txn = Transaction {
-            tid,
-            state: Cell::new(TxnState::Prepared),
-            client: manager.clone(),
-        };
-        let result = txn.commit().await;
-        // The writer decided COMMIT. A reader's cleanup refusal cannot undo it.
-        assert!(result.is_ok(), "the writer's decision must win: {result:?}");
-        assert_eq!(score_on(cluster.site(A), &write_id), Some(seq));
-        assert_eq!(
-            data_site(&cluster, A).txn_outcome(&tid),
-            TxnOutcome::Committed
-        );
-    }
+    let tid = manager.begin().await.unwrap().unwrap();
+    manager.read(tid, read_id).await.unwrap().unwrap();
+    let write_id = Id::from_parts(HERE as u64, 41_002);
+    manager
+        .write(tid, cell_of(write_id, 7))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        manager.commit(tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    assert_eq!(score_on(cluster.site(A), &write_id), Some(7));
+    let reader = data_site(&cluster, B);
+    assert!(
+        !reader.has_transaction_for_test(&tid),
+        "the read-only site must end the transaction"
+    );
+    // A later transaction writes the cell the first one read.
+    let writer = manager.begin().await.unwrap().unwrap();
+    manager
+        .update(writer, cell_of(read_id, 2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.prepare(writer).await.unwrap().unwrap(),
+        TMPrepareResult::Success,
+        "the read lock of the ended transaction must be released"
+    );
+    assert_eq!(
+        manager.commit(writer).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    assert_eq!(score_on(cluster.site(B), &read_id), Some(2));
+    cluster.shutdown().await;
+}
+
+/// The lease sweep acts on one listing of idle transactions. A transaction
+/// that becomes idle while the participant fence round runs did not run the
+/// fence, so the same pass must not presume it abort.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_idle_after_the_fence_round_is_not_presumed_abort() {
+    let (cluster, client) = Cluster::start("sweep_single_listing").await;
+    place_slot(&cluster, &client, HERE, A).await;
+    place_slot(&cluster, &client, THERE, B).await;
+    let site = data_site(&cluster, A);
+    let hook = super::data_site::install_sweep_after_fence_hook(Duration::ZERO);
+    let apply = async {
+        hook.wait_until_entered().await;
+        let prepared = prepared_transaction(&cluster, &client, 61_000, 61).await;
+        hook.release();
+        prepared
+    };
+    let ((), (txn, tid, ids, scores)) =
+        tokio::join!(site.sweep_idle_transactions(Duration::ZERO), apply);
+    assert!(
+        site.has_transaction_for_test(&tid),
+        "the sweep must not end a transaction that the fence round did not see"
+    );
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    assert_eq!(halves(&cluster, &ids, &scores), (true, true));
     cluster.shutdown().await;
 }
 

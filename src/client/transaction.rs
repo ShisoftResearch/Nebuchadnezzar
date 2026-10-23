@@ -298,8 +298,7 @@ impl Transaction {
             }
             Err(bifrost::rpc::RPCError::RequestError(
                 bifrost::rpc::RPCRequestError::FunctionIdNotFound
-                | bifrost::rpc::RPCRequestError::ServiceIdNotFound
-                | bifrost::rpc::RPCRequestError::BadRequest,
+                | bifrost::rpc::RPCRequestError::ServiceIdNotFound,
             )) => {
                 self.state.set(previous_state);
                 Err(TxnError::CommitNotApplied)
@@ -439,6 +438,34 @@ mod commit_outcome_tests {
                 Err(TxnError::ManagerError(TMError::InvalidTransactionState(actual))) if actual == state)
             );
         }
+    }
+
+    /// `encode_res` sends `BadRequest` as byte 255, and `decode_res` reads
+    /// byte 255 as `Other`. The client therefore never sees `BadRequest`.
+    #[tokio::test]
+    async fn commit_outcome_bad_request_wire_byte_is_other() {
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let rpc = RPCClient::new_async(&address).await.unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let length = socket.read_u32().await.unwrap();
+            let mut request = vec![0; length as usize];
+            socket.read_exact(&mut request).await.unwrap();
+            assert!(request.len() > 24, "a commit request must arrive");
+            let mut reply = BytesMut::from(&request[..8]);
+            reply.put_u8(255);
+            socket.write_u32(reply.len() as u32).await.unwrap();
+            socket.write_all(&reply).await.unwrap();
+        });
+        let txn = Transaction {
+            tid: TxnId::default(),
+            state: StdCell::new(TxnState::Prepared),
+            client: manager::AsyncServiceClient::new_with_service_id(0, &rpc),
+        };
+        let result = txn.commit().await;
+        peer.await.unwrap();
+        assert!(matches!(result, Err(TxnError::OutcomeUnknown)), "{result:?}");
     }
 
     #[tokio::test]

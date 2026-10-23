@@ -821,9 +821,8 @@ pub struct InDoubtBracket {
     /// these are the cells that must be installed. The entries themselves are
     /// still in the segments -- only the index placement is deferred.
     pub cells: Vec<PendingBracketCell>,
-    /// The servers that hold a bracket for it, from its BEGIN records. The
-    /// lowest id is the commit point: see
-    /// `crate::server::transactions::commit_point`. Empty for a BEGIN written
+    /// The servers that hold a bracket for it, from its BEGIN records: the
+    /// peers that the participant fence asks. Empty for a BEGIN written
     /// outside a coordinated transaction, which this site decides alone.
     pub participants: Vec<u64>,
 }
