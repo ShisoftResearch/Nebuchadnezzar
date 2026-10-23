@@ -292,18 +292,10 @@ impl HashIndexer {
     ///
     /// `batch` must be free of duplicates; `add_index` drains it from a set.
     /// Ids held directly in one bucket cell.
+    #[cfg(test)]
     fn cell_ids(cell: &OwnedCell) -> Option<&Vec<Id>> {
         match &cell[*HASH_INDEX_FIELD_ID] {
             OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => Some(ids),
-            _ => None,
-        }
-    }
-
-    /// Next cell in the bucket chain, if this one has spilled. Null, NA and a
-    /// missing field all mean "end of chain".
-    fn cell_next(cell: &OwnedCell) -> Option<Id> {
-        match &cell[*HASH_NEXT_FIELD_ID] {
-            OwnedValue::Id(id) => Some(*id),
             _ => None,
         }
     }
@@ -418,21 +410,11 @@ impl HashIndexer {
             }
 
             match read_bucket(&self.neb_client, *index_id).await {
-                Ok(Ok(mut cell)) => {
+                Ok(Ok(cell)) => {
                     let version = cell.header.version;
-                    let next = Self::cell_next(&cell);
-                    // Take the head's ids out rather than copying them: the
-                    // cell is dropped as soon as the write is issued, so a
-                    // clone bought nothing and cost a copy of the whole head.
-                    let head: Vec<Id> = match &mut cell[*HASH_INDEX_FIELD_ID] {
-                        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => std::mem::take(ids),
-                        other => {
-                            return Err(WriteError::DataMismatchSchema(
-                                Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id),
-                                other.clone(),
-                            ))
-                        }
-                    };
+                    let segment = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+                    let next = segment.next;
+                    let head = segment.ids;
 
                     // Head size drives the cost of this path: it is read,
                     // scanned and written whole on every append.
@@ -648,7 +630,7 @@ impl HashIndexer {
             cell_id, index_id
         );
 
-        for retry in 0..MAX_CAS_RETRIES {
+        'retry: for retry in 0..MAX_CAS_RETRIES {
             // Locate the segment holding it.
             let mut cursor = Some(*index_id);
             let mut hops = 0usize;
@@ -658,27 +640,22 @@ impl HashIndexer {
                 match read_bucket(neb_client, cid).await {
                     Ok(Ok(cell)) => {
                         let version = cell.header.version;
-                        if let Some(ids) = Self::cell_ids(&cell) {
-                            if ids.contains(cell_id) {
-                                holder = Some((cid, version, ids.clone()));
-                                break;
-                            }
+                        let segment = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+                        if segment.ids.contains(cell_id) {
+                            holder = Some((cid, version, segment.ids));
+                            break;
                         }
-                        cursor = Self::cell_next(&cell);
+                        cursor = segment.next;
                     }
                     Ok(Err(ReadError::CellDoesNotExisted)) => break,
                     Ok(Err(e)) if Self::retryable_read_error(&e) => {
                         tokio::task::yield_now().await;
-                        cursor = None;
-                        holder = None;
-                        break;
+                        continue 'retry;
                     }
                     Ok(Err(e)) => return Err(WriteError::ReadError(e)),
                     Err(_) => {
                         tokio::task::yield_now().await;
-                        cursor = None;
-                        holder = None;
-                        break;
+                        continue 'retry;
                     }
                 }
                 hops += 1;
@@ -1116,6 +1093,7 @@ mod tests {
             data.insert("value", old.clone());
             let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data));
             client.write_cell(cell.clone()).await.unwrap().unwrap();
+            assert_eq!(client.read_cell(id).await.unwrap().unwrap()[field], old);
             client
                 .upsert_cell(HashIndexer::bucket_cell(
                     &index_id,
@@ -1140,6 +1118,7 @@ mod tests {
             }
             cell[field] = OwnedValue::U64(20);
             client.update_cell(cell).await.unwrap().unwrap();
+            assert_eq!(client.read_cell(id).await.unwrap().unwrap()[field], OwnedValue::U64(20));
             inject(
                 segment,
                 if transport {
@@ -1154,9 +1133,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let values =
-                futures::future::join_all(ids.iter().map(|id| client.read_cell(*id))).await;
-            eprintln!("G23 case={case} remove={result:?} exists={ids:?} cells={values:?}");
+            let mut values = Vec::new();
+            for returned_id in &ids {
+                let returned = client.read_cell(*returned_id).await.unwrap().unwrap();
+                assert_eq!(returned[field], OwnedValue::U64(20));
+                values.push(returned[field].clone());
+            }
+            eprintln!("G23 case={case} old={old:?} remove={result:?} exists={ids:?} values={values:?}");
             if result.is_ok() && ids.contains(&id) {
                 failures.push(case);
             }
