@@ -423,8 +423,8 @@ impl CellRead {
 /// (`NotMatch`). These cells are dropped; that is the verified-read contract.
 ///
 /// Every other per-cell error is a failed read of a cell that exists: an
-/// unavailable schema (`SchemaDoesNotExisted`, and the `ExecError` a verified
-/// read gives for it), a selection or expression that could not be evaluated
+/// unavailable schema (`SchemaDoesNotExisted`), a selection or expression
+/// that could not be evaluated
 /// (`ExecError`), a wrong owner or unreadable storage. Dropping such a cell
 /// would be a shorter answer, so it is read again alone and then reported.
 pub(crate) fn is_absent_row(error: &ReadError) -> bool {
