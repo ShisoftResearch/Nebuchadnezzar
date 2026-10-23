@@ -686,10 +686,6 @@ impl<'v> SharedCellData<'v> {
                 std::backtrace::Backtrace::capture()
             );
             error!("{}", msg);
-            if cfg!(debug_assertions) {
-                // This shall never happen, need to debug and fix it in testing
-                panic!("{}", msg);
-            }
             return Err(ReadError::SchemaDoesNotExisted(schema_id.get()));
         }
     }
@@ -1109,10 +1105,6 @@ pub fn select_from_chunk_raw<'v>(
             chunk.locate_segment(ptr).map(|seg| seg.id)
         );
         error!("{}", msg);
-        if cfg!(debug_assertions) {
-            // This shall never happen, need to debug and fix it in testing
-            panic!("{}", msg);
-        }
         return Err(ReadError::SchemaDoesNotExisted(schema_id.get()));
     }
 }

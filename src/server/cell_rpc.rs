@@ -491,28 +491,45 @@ mod tests {
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         crate::index::query_metrics::reads(false, 1);
-        future::ready(
-            self.database_runtime
-                .chunks()
-                .read_cell(&key)
-                .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(false, &cell); cell})
-                .map_err(|e| self.redirect_read_if_not_owner(&key, e)),
-        )
+        async move {
+            self.read_with_schema_refresh(|| {
+                self.database_runtime
+                    .chunks()
+                    .read_cell(&key)
+                    .map(|c| c.to_owned())
+            })
+            .await
+            .map(|cell| {
+                crate::index::query_metrics::payload(false, &cell);
+                cell
+            })
+            .map_err(|e| self.redirect_read_if_not_owner(&key, e))
+        }
         .boxed()
     }
     fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         crate::index::query_metrics::reads(false, keys.len());
-        future::ready(
-            keys.into_iter()
-                .map(|id| {
-                    self.database_runtime
-                        .chunks()
-                        .read_cell(&id)
-                        .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(false, &cell); cell})
-                        .map_err(|e| self.redirect_read_if_not_owner(id, e))
-                })
-                .collect(),
-        )
+        let keys = keys.clone();
+        async move {
+            let mut cells = Vec::with_capacity(keys.len());
+            for id in keys {
+                cells.push(
+                    self.read_with_schema_refresh(|| {
+                        self.database_runtime
+                            .chunks()
+                            .read_cell(&id)
+                            .map(|c| c.to_owned())
+                    })
+                    .await
+                    .map(|cell| {
+                        crate::index::query_metrics::payload(false, &cell);
+                        cell
+                    })
+                    .map_err(|e| self.redirect_read_if_not_owner(&id, e)),
+                );
+            }
+            cells
+        }
         .boxed()
     }
     fn read_all_cells_selected(
@@ -522,16 +539,27 @@ impl Service for NebRPCService {
         need_header: bool,
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         crate::index::query_metrics::reads(true, keys.len());
-        future::ready(
-            keys.into_iter()
-                .map(|id| {
-                    self.database_runtime
-                        .chunks()
-                        .read_selected(&id, colums.as_slice(), need_header)
-                        .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(true, &cell); cell})
-                })
-                .collect(),
-        )
+        let keys = keys.clone();
+        let colums = colums.clone();
+        async move {
+            let mut cells = Vec::with_capacity(keys.len());
+            for id in keys {
+                cells.push(
+                    self.read_with_schema_refresh(|| {
+                        self.database_runtime
+                            .chunks()
+                            .read_selected(&id, &colums, need_header)
+                            .map(|c| c.to_owned())
+                    })
+                    .await
+                    .map(|cell| {
+                        crate::index::query_metrics::payload(true, &cell);
+                        cell
+                    }),
+                );
+            }
+            cells
+        }
         .boxed()
     }
     fn read_cell_select(
@@ -541,13 +569,21 @@ impl Service for NebRPCService {
         need_header: bool,
     ) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         crate::index::query_metrics::reads(true, 1);
-        future::ready(
-            self.database_runtime
-                .chunks()
-                .read_selected(&id, fields.as_slice(), need_header)
-                .map(|c| {let cell=c.to_owned(); crate::index::query_metrics::payload(true, &cell); cell})
-                .map_err(|e| self.redirect_read_if_not_owner(&id, e)),
-        )
+        let fields = fields.clone();
+        async move {
+            self.read_with_schema_refresh(|| {
+                self.database_runtime
+                    .chunks()
+                    .read_selected(&id, &fields, need_header)
+                    .map(|c| c.to_owned())
+            })
+            .await
+            .map(|cell| {
+                crate::index::query_metrics::payload(true, &cell);
+                cell
+            })
+            .map_err(|e| self.redirect_read_if_not_owner(&id, e))
+        }
         .boxed()
     }
     fn head_cell(&self, key: Id) -> BoxFuture<'_, Result<CellHeader, ReadError>> {
@@ -1717,6 +1753,38 @@ static SCHEMA_DELETE_AFTER_CHECK: std::sync::LazyLock<lightning::map::PtrHashMap
     });
 
 impl NebRPCService {
+    async fn refresh_local_schema_cache_for_read(&self, schema_id: u32) -> Result<(), ReadError> {
+        match self.neb_client.schema_by_id(schema_id).await {
+            Ok(Some(schema)) => {
+                self.database_runtime
+                    .schemas()
+                    .cache_schema_from_cluster(schema);
+                Ok(())
+            }
+            Ok(None) => Err(ReadError::SchemaDoesNotExisted(schema_id)),
+            Err(error) => {
+                warn!(
+                    "Failed to refresh schema {} before read retry: {:?}",
+                    schema_id, error
+                );
+                Err(ReadError::SchemaDoesNotExisted(schema_id))
+            }
+        }
+    }
+
+    async fn read_with_schema_refresh(
+        &self,
+        read: impl Fn() -> Result<OwnedCell, ReadError>,
+    ) -> Result<OwnedCell, ReadError> {
+        match read() {
+            Err(ReadError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_local_schema_cache_for_read(schema_id).await?;
+                read()
+            }
+            other => other,
+        }
+    }
+
     fn read_cells_checked(
         &self,
         keys: &Vec<Id>,
@@ -1725,6 +1793,55 @@ impl NebRPCService {
         proc: &Expr,
         checks: &[crate::index::verification::IndexCheck],
     ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
+        let mut cells = self.read_cells_checked_once(keys, colums, filter, proc, checks);
+        if !cells
+            .iter()
+            .any(|cell| matches!(cell, Err(ReadError::SchemaDoesNotExisted(_))))
+        {
+            return future::ready(cells).boxed();
+        }
+        let keys = keys.clone();
+        let colums = colums.clone();
+        let filter = filter.clone();
+        let proc = proc.clone();
+        let checks = checks.to_vec();
+        async move {
+            let mut refreshed: std::collections::HashMap<u32, Result<(), ReadError>> =
+                std::collections::HashMap::new();
+            for (key, cell) in keys.into_iter().zip(cells.iter_mut()) {
+                let schema_id = match cell {
+                    Err(ReadError::SchemaDoesNotExisted(schema_id)) => *schema_id,
+                    _ => continue,
+                };
+                let refresh = match refreshed.get(&schema_id) {
+                    Some(result) => result.clone(),
+                    None => {
+                        let result = self.refresh_local_schema_cache_for_read(schema_id).await;
+                        refreshed.insert(schema_id, result.clone());
+                        result
+                    }
+                };
+                *cell = match refresh {
+                    Ok(()) => self
+                        .read_cells_checked_once(&vec![key], &colums, &filter, &proc, &checks)
+                        .pop()
+                        .expect("one result per cell"),
+                    Err(error) => Err(error),
+                };
+            }
+            cells
+        }
+        .boxed()
+    }
+
+    fn read_cells_checked_once(
+        &self,
+        keys: &Vec<Id>,
+        colums: &Vec<u64>,
+        filter: &Expr,
+        proc: &Expr,
+        checks: &[crate::index::verification::IndexCheck],
+    ) -> Vec<Result<OwnedCell, ReadError>> {
         crate::index::query_metrics::reads(!colums.is_empty() && checks.is_empty(), keys.len());
         if !checks.is_empty() {
             crate::index::verification::record_verified_cell_reads(keys.len());
@@ -1764,7 +1881,7 @@ impl NebRPCService {
                         .schemas()
                         .get(&cell.header.schema)
                         .ok_or_else(|| {
-                            ReadError::ExecError("index candidate schema is absent".into())
+                            ReadError::SchemaDoesNotExisted(cell.header.schema.get())
                         })?;
                     let selected = query_schemas.entry(cell.header.schema).or_insert_with(|| {
                         crate::index::verification::query_schema(&schema, checks)
@@ -1785,7 +1902,7 @@ impl NebRPCService {
                             .database_runtime
                             .schemas()
                             .get(&cell.header.schema)
-                            .unwrap();
+                            .ok_or(ReadError::SchemaDoesNotExisted(cell.header.schema.get()))?;
                         owned.data = OwnedValue::Array(
                             colums
                                 .iter()
@@ -1863,9 +1980,9 @@ impl NebRPCService {
                     })
                 })
                 .collect();
-            return future::ready(cells).boxed();
+            return cells;
         }
-        return future::ready(cells).boxed();
+        return cells;
     }
 
     pub fn new(
