@@ -312,18 +312,6 @@ impl HashIndexer {
         result
     }
 
-    /// Fold a batch of ids into the bucket cell in one read-modify-CAS.
-    ///
-    /// `batch` must be free of duplicates; `add_index` drains it from a set.
-    /// Ids held directly in one bucket cell.
-    #[cfg(test)]
-    fn cell_ids(cell: &OwnedCell) -> Option<&Vec<Id>> {
-        match &cell[*HASH_INDEX_FIELD_ID] {
-            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => Some(ids),
-            _ => None,
-        }
-    }
-
     /// `owner` is the head of the chain this cell belongs to; a head is its own
     /// owner.
     fn bucket_cell(owner: &Id, index_id: &Id, ids: Vec<Id>, next: Option<Id>) -> OwnedCell {
@@ -404,6 +392,7 @@ impl HashIndexer {
         // an estimate of what fits, and an estimate that is ever wrong must
         // degrade into a spill rather than into a lost index entry.
         let mut force_spill = false;
+        let mut last_error = WriteError::CellVersionMismatch;
         for retry in 0..MAX_CAS_RETRIES {
             // Try to create the bucket before reading it.
             //
@@ -422,11 +411,13 @@ impl HashIndexer {
                     // Bucket already there: fall through and merge into it.
                     Ok(Err(WriteError::CellAlreadyExisted)) => {}
                     Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                        last_error = e;
                         tokio::task::yield_now().await;
                         continue;
                     }
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
+                        last_error = WriteError::NetworkingError;
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -436,7 +427,7 @@ impl HashIndexer {
             match read_bucket(&self.neb_client, *index_id).await {
                 Ok(Ok(cell)) => {
                     let version = cell.header.version;
-                    let segment = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+                    let segment = into_bucket_segment(cell).map_err(WriteError::ReadError)?;
                     let next = segment.next;
                     let head = segment.ids;
 
@@ -489,6 +480,7 @@ impl HashIndexer {
                             // reaching here means BUCKET_CAPACITY is sized too
                             // close to the limit and wants lowering.
                             Ok(Err(WriteError::CellIsTooLarge(size))) => {
+                                last_error = WriteError::CellIsTooLarge(size);
                                 warn!(
                                     "hash bucket {:?} refused a {}-id append at {} bytes despite a \
                                      capacity of {}; spilling. Lower NEB_HASH_BUCKET_CAPACITY.",
@@ -501,11 +493,13 @@ impl HashIndexer {
                                 continue;
                             }
                             Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                                last_error = e;
                                 tokio::task::yield_now().await;
                                 continue;
                             }
                             Ok(Err(e)) => return Err(e),
                             Err(_) => {
+                                last_error = WriteError::NetworkingError;
                                 tokio::task::yield_now().await;
                                 continue;
                             }
@@ -525,11 +519,13 @@ impl HashIndexer {
                     match self.neb_client.write_cell(frozen).await {
                         Ok(Ok(_)) | Ok(Err(WriteError::CellAlreadyExisted)) => {}
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            last_error = e;
                             tokio::task::yield_now().await;
                             continue;
                         }
                         Ok(Err(e)) => return Err(e),
                         Err(_) => {
+                            last_error = WriteError::NetworkingError;
                             tokio::task::yield_now().await;
                             continue;
                         }
@@ -546,6 +542,7 @@ impl HashIndexer {
                             return Ok(());
                         }
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            last_error = e;
                             // Our frozen cell was never reachable; drop it and
                             // re-derive from whatever the head is now.
                             let _ = self.neb_client.remove_cell(frozen_id).await;
@@ -557,6 +554,7 @@ impl HashIndexer {
                             return Err(e);
                         }
                         Err(_) => {
+                            last_error = WriteError::NetworkingError;
                             let _ = self.neb_client.remove_cell(frozen_id).await;
                             tokio::task::yield_now().await;
                             continue;
@@ -567,24 +565,31 @@ impl HashIndexer {
                     let cell = Self::bucket_cell(index_id, index_id, batch.to_vec(), None);
                     match self.neb_client.write_cell(cell).await {
                         Ok(Ok(_)) => return Ok(()),
-                        Ok(Err(WriteError::CellAlreadyExisted)) => continue,
+                        Ok(Err(WriteError::CellAlreadyExisted)) => {
+                            last_error = WriteError::CellAlreadyExisted;
+                            continue;
+                        }
                         Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            last_error = e;
                             tokio::task::yield_now().await;
                             continue;
                         }
                         Ok(Err(e)) => return Err(e),
                         Err(_) => {
+                            last_error = WriteError::NetworkingError;
                             tokio::task::yield_now().await;
                             continue;
                         }
                     }
                 }
                 Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    last_error = WriteError::ReadError(e);
                     tokio::task::yield_now().await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(WriteError::ReadError(e)),
                 Err(_) => {
+                    last_error = WriteError::NetworkingError;
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -596,7 +601,7 @@ impl HashIndexer {
             batch.len(),
             index_id
         );
-        Err(WriteError::CellVersionMismatch)
+        Err(last_error)
     }
 
     /// Remove `cell_id` from whichever cell of the bucket chain holds it.
@@ -654,6 +659,7 @@ impl HashIndexer {
             cell_id, index_id
         );
 
+        let mut last_error = WriteError::CellVersionMismatch;
         'retry: for retry in 0..MAX_CAS_RETRIES {
             // Locate the segment holding it.
             let mut cursor = Some(*index_id);
@@ -664,20 +670,28 @@ impl HashIndexer {
                 match read_bucket(neb_client, cid).await {
                     Ok(Ok(cell)) => {
                         let version = cell.header.version;
-                        let segment = bucket_segment(&cell).map_err(WriteError::ReadError)?;
+                        let segment = owned_bucket_fields(&cell).map_err(WriteError::ReadError)?;
+                        if segment.owner != *index_id {
+                            return Err(WriteError::ReadError(ReadError::ExecError(format!(
+                                "hash segment {cid:?} belongs to bucket {:?}, not {index_id:?}",
+                                segment.owner
+                            ))));
+                        }
                         if segment.ids.contains(cell_id) {
-                            holder = Some((cid, version, segment.ids));
+                            holder = Some((cid, version, segment.ids.to_vec()));
                             break;
                         }
                         cursor = segment.next;
                     }
                     Ok(Err(ReadError::CellDoesNotExisted)) => break,
                     Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                        last_error = WriteError::ReadError(e);
                         tokio::task::yield_now().await;
                         continue 'retry;
                     }
                     Ok(Err(e)) => return Err(WriteError::ReadError(e)),
                     Err(_) => {
+                        last_error = WriteError::NetworkingError;
                         tokio::task::yield_now().await;
                         continue 'retry;
                     }
@@ -718,12 +732,14 @@ impl HashIndexer {
                     return Ok(());
                 }
                 Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                    last_error = e;
                     debug!("CAS retry {} for remove_index", retry + 1);
                     tokio::task::yield_now().await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
+                    last_error = WriteError::NetworkingError;
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -734,7 +750,7 @@ impl HashIndexer {
             "Max CAS retries exceeded for remove_index({:?}, {:?})",
             cell_id, index_id
         );
-        Err(WriteError::CellVersionMismatch)
+        Err(last_error)
     }
 
     /// Remove a member from the exact segment that the prune inspected.
@@ -964,24 +980,64 @@ where
     cell.data().get_in_by_ids(&vec![field_id]).to_owned_value()
 }
 
+struct BucketFields<'a> {
+    owner: Id,
+    ids: &'a [Id],
+    next: Option<Id>,
+}
+
+fn bucket_fields<'a>(
+    ids: &'a OwnedValue,
+    owner: &OwnedValue,
+    next: &OwnedValue,
+) -> Result<BucketFields<'a>, ReadError> {
+    let ids = match ids {
+        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids.as_slice(),
+        _ => return Err(ReadError::ExecError("invalid hash member array".into())),
+    };
+    let owner = match owner {
+        OwnedValue::Id(id) => *id,
+        _ => return Err(ReadError::ExecError("invalid hash owner".into())),
+    };
+    let next = match next {
+        OwnedValue::Id(id) => Some(*id),
+        OwnedValue::Null => None,
+        _ => return Err(ReadError::ExecError("invalid hash next link".into())),
+    };
+    Ok(BucketFields { owner, ids, next })
+}
+
+fn owned_bucket_fields(cell: &OwnedCell) -> Result<BucketFields<'_>, ReadError> {
+    bucket_fields(
+        cell.data.get_by_id(*HASH_INDEX_FIELD_ID),
+        cell.data.get_by_id(*HASH_OWNER_FIELD_ID),
+        cell.data.get_by_id(*HASH_NEXT_FIELD_ID),
+    )
+}
+
+/// Consume a validated bucket without copying its member array.
+fn into_bucket_segment(mut cell: OwnedCell) -> Result<BucketSegment, ReadError> {
+    let BucketFields { owner, next, .. } = owned_bucket_fields(&cell)?;
+    let ids = match &mut cell[*HASH_INDEX_FIELD_ID] {
+        OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => std::mem::take(ids),
+        _ => unreachable!("the member array was validated"),
+    };
+    Ok(BucketSegment { owner, ids, next })
+}
+
 /// Read a bucket cell out of any cell form.
 pub(crate) fn bucket_segment<C>(cell: &C) -> Result<BucketSegment, ReadError>
 where
     C: Cell,
     <C::Value as Value>::Out: ToOwnedValue,
 {
-    let ids = match bucket_field(cell, *HASH_INDEX_FIELD_ID) {
+    let ids = bucket_field(cell, *HASH_INDEX_FIELD_ID);
+    let owner = bucket_field(cell, *HASH_OWNER_FIELD_ID);
+    let next = bucket_field(cell, *HASH_NEXT_FIELD_ID);
+    let BucketFields { owner, next, .. } = bucket_fields(&ids, &owner, &next)?;
+    let ids = match ids {
         OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids,
-        _ => return Err(ReadError::ExecError("invalid hash member array".into())),
-    };
-    let owner = match bucket_field(cell, *HASH_OWNER_FIELD_ID) {
-        OwnedValue::Id(id) => id,
-        _ => return Err(ReadError::ExecError("invalid hash owner".into())),
-    };
-    let next = match bucket_field(cell, *HASH_NEXT_FIELD_ID) {
-        OwnedValue::Id(id) => Some(id),
-        OwnedValue::Null => None,
-        _ => return Err(ReadError::ExecError("invalid hash next link".into())),
+        _ => unreachable!("the member array was validated"),
     };
     Ok(BucketSegment { owner, ids, next })
 }
@@ -1142,7 +1198,8 @@ mod tests {
                 _ => unreachable!(),
             };
             let expected = bucket_segment(&cell).unwrap();
-            let decoded = bucket_segment(&cell).unwrap();
+            assert_eq!(owned_bucket_fields(&cell).unwrap().ids.as_ptr(), original);
+            let decoded = into_bucket_segment(cell).unwrap();
             assert_eq!(decoded.owner, expected.owner);
             assert_eq!(decoded.next, expected.next);
             assert_eq!(decoded.ids, expected.ids);
@@ -1152,6 +1209,42 @@ mod tests {
                 "the decoder copied the member array"
             );
         }
+    }
+
+    #[test]
+    fn g23_owned_bucket_decoder_matches_strict_field_checks() {
+        let owner = Id::rand();
+        for field in [
+            *HASH_INDEX_FIELD_ID,
+            *HASH_NEXT_FIELD_ID,
+            *HASH_OWNER_FIELD_ID,
+        ] {
+            for missing in [false, true] {
+                let mut cell = HashIndexer::bucket_cell(&owner, &owner, vec![Id::rand()], None);
+                if missing {
+                    let OwnedValue::Map(map) = &mut cell.data else {
+                        unreachable!()
+                    };
+                    map.map.remove(&field);
+                } else {
+                    cell[field] = OwnedValue::U64(7);
+                }
+                match bucket_segment(&cell) {
+                    Ok(expected) => {
+                        let actual = into_bucket_segment(cell).unwrap();
+                        assert_eq!(actual.owner, expected.owner);
+                        assert_eq!(actual.next, expected.next);
+                        assert_eq!(actual.ids, expected.ids);
+                    }
+                    Err(expected) => assert_eq!(into_bucket_segment(cell).err().unwrap(), expected),
+                }
+            }
+        }
+        let cell = OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &owner, OwnedValue::Null);
+        assert_eq!(
+            into_bucket_segment(cell.clone()).err(),
+            bucket_segment(&cell).err()
+        );
     }
 
     #[tokio::test]
@@ -1275,6 +1368,7 @@ mod tests {
                 },
             );
             let result = HashIndexer::remove_index_inner(&client, &id, &index_id).await;
+            assert!(result.is_ok(), "a one-shot fault must be retried: {result:?}");
             let ids = indexer
                 .query(index_id, field, &old, Verify::Exists)
                 .await
@@ -1583,7 +1677,7 @@ mod tests {
         indexer.remove_index(&member, &index_id).await.unwrap();
         assert_eq!(bucket.removal_handoffs.load(Ordering::Relaxed), 0);
         let stored = client.read_cell(index_id).await.unwrap().unwrap();
-        assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
+        assert!(bucket_segment(&stored).unwrap().ids.is_empty());
         server.shutdown().await;
     }
 
@@ -1608,7 +1702,7 @@ mod tests {
         );
         result.unwrap().unwrap();
         let stored = client.read_cell(index_id).await.unwrap().unwrap();
-        assert!(HashIndexer::cell_ids(&stored).unwrap().is_empty());
+        assert!(bucket_segment(&stored).unwrap().ids.is_empty());
         server.shutdown().await;
     }
 
