@@ -149,15 +149,39 @@ mod write_read_faults {
         Transport,
         Cell(OwnedCell),
     }
-    static REPLIES: LazyLock<PtrHashMap<Id, Arc<Reply>>> =
+    pub struct Fault {
+        reply: Reply,
+        persistent: bool,
+        pub attempts: AtomicUsize,
+    }
+    static REPLIES: LazyLock<PtrHashMap<Id, Arc<Fault>>> =
         LazyLock::new(|| PtrHashMap::with_capacity(16));
 
     pub fn inject(id: Id, reply: Reply) {
-        REPLIES.insert(id, Arc::new(reply));
+        install(id, reply, false);
+    }
+    pub fn persistent(id: Id, reply: Reply) -> Arc<Fault> {
+        install(id, reply, true)
+    }
+    fn install(id: Id, reply: Reply, persistent: bool) -> Arc<Fault> {
+        let fault = Arc::new(Fault {
+            reply,
+            persistent,
+            attempts: AtomicUsize::new(0),
+        });
+        REPLIES.insert(id, fault.clone());
+        fault
+    }
+    pub fn clear(id: Id) {
+        REPLIES.remove(&id);
     }
     pub fn take(id: Id) -> Option<Result<Result<OwnedCell, ReadError>, RPCError>> {
-        let reply = REPLIES.remove(&id)?;
-        Some(match reply.as_ref() {
+        let fault = REPLIES.get(&id)?;
+        if !fault.persistent {
+            clear(id);
+        }
+        fault.attempts.fetch_add(1, Ordering::Relaxed);
+        Some(match &fault.reply {
             Reply::Read(error) => Ok(Err(error.clone())),
             Reply::Transport => Err(RPCError::IOError(std::io::Error::other(
                 "injected read failure",
@@ -1057,6 +1081,129 @@ mod tests {
     use crate::server::{NebServer, ServerOptions, Service};
     use std::sync::Arc;
     use tokio::task::JoinSet;
+
+    #[tokio::test]
+    async fn g23_persistent_bucket_reads_preserve_the_last_error() {
+        use write_read_faults::{clear, persistent, Reply};
+        let (server, client) = create_test_server("g23_persistent").await;
+        let indexer = HashIndexer::new(&client);
+        let mut failures = vec![];
+        for remove in [false, true] {
+            for transport in [false, true] {
+                let bucket = Id::rand();
+                let member = Id::rand();
+                indexer.add_index(&member, &bucket).await.unwrap();
+                let fault = persistent(
+                    bucket,
+                    if transport {
+                        Reply::Transport
+                    } else {
+                        Reply::Read(ReadError::SegmentPromotionFailed)
+                    },
+                );
+                let result = if remove {
+                    HashIndexer::remove_index_inner(&client, &member, &bucket).await
+                } else {
+                    indexer.apply_chunk(&bucket, &[Id::rand()]).await
+                };
+                clear(bucket);
+                assert_eq!(
+                    fault.attempts.load(Ordering::Relaxed),
+                    MAX_CAS_RETRIES as usize
+                );
+                eprintln!("G23 persistent remove={remove} transport={transport}: {result:?}");
+                let expected = if transport {
+                    WriteError::NetworkingError
+                } else {
+                    WriteError::ReadError(ReadError::SegmentPromotionFailed)
+                };
+                if result != Err(expected) {
+                    failures.push((remove, transport));
+                }
+                assert_eq!(
+                    bucket_segment(&client.read_cell(bucket).await.unwrap().unwrap())
+                        .unwrap()
+                        .ids,
+                    vec![member]
+                );
+            }
+        }
+        server.shutdown().await;
+        assert!(failures.is_empty(), "wrong exhaustion error: {failures:?}");
+    }
+
+    #[test]
+    fn g23_owned_bucket_decoder_keeps_the_member_allocation() {
+        let owner = Id::rand();
+        for next in [None, Some(Id::rand())] {
+            let cell = HashIndexer::bucket_cell(&owner, &owner, vec![Id::rand(), Id::rand()], next);
+            let original = match &cell[*HASH_INDEX_FIELD_ID] {
+                OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => ids.as_ptr(),
+                _ => unreachable!(),
+            };
+            let expected = bucket_segment(&cell).unwrap();
+            let decoded = bucket_segment(&cell).unwrap();
+            assert_eq!(decoded.owner, expected.owner);
+            assert_eq!(decoded.next, expected.next);
+            assert_eq!(decoded.ids, expected.ids);
+            assert_eq!(
+                decoded.ids.as_ptr(),
+                original,
+                "the decoder copied the member array"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn g23_remove_rejects_a_segment_of_another_bucket() {
+        let (server, client) = create_test_server("g23_foreign_owner").await;
+        let mut failures = vec![];
+        for tail in [false, true] {
+            let bucket = Id::rand();
+            let segment = if tail { Id::rand() } else { bucket };
+            let owner = Id::rand();
+            let member = Id::rand();
+            client
+                .write_cell(HashIndexer::bucket_cell(
+                    &owner,
+                    &segment,
+                    vec![member],
+                    None,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if tail {
+                client
+                    .write_cell(HashIndexer::bucket_cell(
+                        &bucket,
+                        &bucket,
+                        vec![],
+                        Some(segment),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let result = HashIndexer::remove_index_inner(&client, &member, &bucket).await;
+            eprintln!("G23 foreign owner tail={tail}: {result:?}");
+            if !matches!(result, Err(WriteError::ReadError(ReadError::ExecError(_)))) {
+                failures.push(tail);
+            } else {
+                assert_eq!(
+                    bucket_segment(&client.read_cell(segment).await.unwrap().unwrap())
+                        .unwrap()
+                        .ids,
+                    vec![member]
+                );
+            }
+        }
+        server.shutdown().await;
+        assert!(
+            failures.is_empty(),
+            "removal changed a foreign segment: {failures:?}"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn g23_transient_remove_read_must_not_leave_a_changed_cell() {

@@ -423,6 +423,8 @@ pub struct NebRPCService {
     cell_scans: CellScans,
     captured_receipts: CapturedReceipts,
     fence_leases: Arc<FenceLeases>,
+    #[cfg(test)]
+    schema_refreshes: AtomicU64,
 }
 
 #[cfg(test)]
@@ -1754,6 +1756,9 @@ static SCHEMA_DELETE_AFTER_CHECK: std::sync::LazyLock<lightning::map::PtrHashMap
 
 impl NebRPCService {
     async fn refresh_local_schema_cache_for_read(&self, schema_id: u32) -> Result<(), ReadError> {
+        #[cfg(test)]
+        self.schema_refreshes
+            .fetch_add(1, atomic::Ordering::Relaxed);
         match self.neb_client.schema_by_id(schema_id).await {
             Ok(Some(schema)) => {
                 self.database_runtime
@@ -1995,6 +2000,8 @@ impl NebRPCService {
             cell_scans: CellScans::default(),
             captured_receipts: CapturedReceipts::default(),
             fence_leases: Arc::new(FenceLeases::default()),
+            #[cfg(test)]
+            schema_refreshes: AtomicU64::new(0),
         })
     }
     async fn refresh_local_schema_cache_for_write(&self, schema_id: u32) -> Result<(), WriteError> {

@@ -164,3 +164,39 @@ async fn g23_schema_refresh_retries_the_read_only_once() {
     assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn g23_batch_reads_refresh_each_absent_schema_once() {
+    let name = "g23_batch_absent";
+    let (rpc, server, _dir, id) = g23_schema_fixture(name, false).await;
+    server.database_runtime.schemas().evict_test_schema(name);
+    let ids = vec![id, id];
+    let fields = vec![bifrost_hasher::hash_str("value")];
+    let mut failures = vec![];
+    for case in 0..3 {
+        let before = rpc.schema_refreshes.load(atomic::Ordering::Relaxed);
+        let cells = match case {
+            0 => rpc.read_all_cells(&ids).await,
+            1 => rpc.read_all_cells_selected(&ids, &fields, true).await,
+            _ => {
+                rpc.read_all_cells_proced(&ids, &fields, &Expr::nothing(), &Expr::nothing())
+                    .await
+            }
+        };
+        assert_eq!(cells.len(), ids.len());
+        assert!(cells.iter().all(|cell| matches!(
+            cell,
+            Err(ReadError::SchemaDoesNotExisted(IDCONTRACT_SCHEMA))
+        )));
+        let refreshes = rpc.schema_refreshes.load(atomic::Ordering::Relaxed) - before;
+        eprintln!("G23 batch case={case} refreshes={refreshes}");
+        if refreshes != 1 {
+            failures.push(case);
+        }
+    }
+    server.shutdown().await;
+    assert!(
+        failures.is_empty(),
+        "duplicate schema refreshes: {failures:?}"
+    );
+}
