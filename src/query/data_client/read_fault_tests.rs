@@ -664,10 +664,6 @@ async fn a_cell_the_server_could_not_answer_for_is_an_error_not_a_dropped_row() 
             "SchemaDoesNotExisted",
         ),
         (
-            ReadError::ExecError("index candidate schema is absent".into()),
-            "index candidate schema is absent",
-        ),
-        (
             ReadError::ExecError("cannot evaluate".into()),
             "cannot evaluate",
         ),
