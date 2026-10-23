@@ -429,6 +429,8 @@ pub struct NebRPCService {
 mod tests {
     use super::*;
     include!("cell_rpc/idcontract_tests.rs");
+    use lightning::map::Map;
+    include!("cell_rpc/g23_tests.rs");
 
     #[test]
     fn unrelated_cursor_lookup_and_close_progress_beside_a_held_entry() {
@@ -1707,6 +1709,13 @@ impl Service for NebRPCService {
 }
 
 dispatch_rpc_service_functions!(NebRPCService);
+#[cfg(test)]
+static SCHEMA_DELETE_AFTER_CHECK: std::sync::LazyLock<lightning::map::PtrHashMap<Id, String>> =
+    std::sync::LazyLock::new(|| {
+        use lightning::map::Map;
+        lightning::map::PtrHashMap::with_capacity(16)
+    });
+
 impl NebRPCService {
     fn read_cells_checked(
         &self,
@@ -1761,6 +1770,13 @@ impl NebRPCService {
                         crate::index::verification::query_schema(&schema, checks)
                     });
                     crate::index::verification::matches(&cell, selected, checks)?;
+                    #[cfg(test)]
+                    {
+                        use lightning::map::Map;
+                        if let Some(name) = SCHEMA_DELETE_AFTER_CHECK.remove(id) {
+                            self.database_runtime.schemas().evict_test_schema(&name);
+                        }
+                    }
                 }
                 if !checks.is_empty() {
                     let mut owned = cell.to_owned();

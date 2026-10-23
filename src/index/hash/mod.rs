@@ -127,6 +127,46 @@ pub struct HashIndexer {
     buckets: KeyedState<Id, Arc<Bucket>>,
 }
 
+async fn read_bucket(
+    client: &AsyncClient,
+    id: Id,
+) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+    #[cfg(test)]
+    if let Some(reply) = write_read_faults::take(id) {
+        return reply;
+    }
+    client.read_cell(id).await
+}
+
+#[cfg(test)]
+mod write_read_faults {
+    use super::*;
+    use lightning::map::{Map, PtrHashMap};
+    use std::sync::LazyLock;
+
+    pub enum Reply {
+        Read(ReadError),
+        Transport,
+        Cell(OwnedCell),
+    }
+    static REPLIES: LazyLock<PtrHashMap<Id, Arc<Reply>>> =
+        LazyLock::new(|| PtrHashMap::with_capacity(16));
+
+    pub fn inject(id: Id, reply: Reply) {
+        REPLIES.insert(id, Arc::new(reply));
+    }
+    pub fn take(id: Id) -> Option<Result<Result<OwnedCell, ReadError>, RPCError>> {
+        let reply = REPLIES.remove(&id)?;
+        Some(match reply.as_ref() {
+            Reply::Read(error) => Ok(Err(error.clone())),
+            Reply::Transport => Err(RPCError::IOError(std::io::Error::other(
+                "injected read failure",
+            ))),
+            Reply::Cell(cell) => Ok(Ok(cell.clone())),
+        })
+    }
+}
+
 impl HashIndexer {
     fn retryable_write_error(err: &WriteError) -> bool {
         matches!(
@@ -377,7 +417,7 @@ impl HashIndexer {
                 }
             }
 
-            match self.neb_client.read_cell(*index_id).await {
+            match read_bucket(&self.neb_client, *index_id).await {
                 Ok(Ok(mut cell)) => {
                     let version = cell.header.version;
                     let next = Self::cell_next(&cell);
@@ -615,7 +655,7 @@ impl HashIndexer {
             let mut holder: Option<(Id, u64, Vec<Id>)> = None;
             loop {
                 let Some(cid) = cursor else { break };
-                match neb_client.read_cell(cid).await {
+                match read_bucket(neb_client, cid).await {
                     Ok(Ok(cell)) => {
                         let version = cell.header.version;
                         if let Some(ids) = Self::cell_ids(&cell) {
@@ -1040,6 +1080,145 @@ mod tests {
     use crate::server::{NebServer, ServerOptions, Service};
     use std::sync::Arc;
     use tokio::task::JoinSet;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn g23_transient_remove_read_must_not_leave_a_changed_cell() {
+        use crate::index::verification::Verify;
+        use write_read_faults::{inject, Reply};
+        let (server, client) = create_test_server("g23_transient").await;
+        let schema = Schema::new_with_id(
+            59301,
+            "g23_value",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("value", Type::U64)]),
+            false,
+            false,
+        );
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let field = hash_str("value");
+        let old = OwnedValue::U64(10);
+        let index_id = get_hash_id_from_value(schema.uid, field, &old);
+        let indexer = HashIndexer::new(&client);
+        let mut failures = vec![];
+        for (case, tail, transport) in [
+            (0, false, false),
+            (1, false, true),
+            (2, true, false),
+            (3, true, true),
+        ] {
+            let id = Id::rand();
+            let segment = if tail { Id::rand() } else { index_id };
+            let mut data = OwnedMap::new();
+            data.insert("value", old.clone());
+            let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data));
+            client.write_cell(cell.clone()).await.unwrap().unwrap();
+            client
+                .upsert_cell(HashIndexer::bucket_cell(
+                    &index_id,
+                    &segment,
+                    vec![id],
+                    None,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if tail {
+                client
+                    .upsert_cell(HashIndexer::bucket_cell(
+                        &index_id,
+                        &index_id,
+                        vec![],
+                        Some(segment),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            cell[field] = OwnedValue::U64(20);
+            client.update_cell(cell).await.unwrap().unwrap();
+            inject(
+                segment,
+                if transport {
+                    Reply::Transport
+                } else {
+                    Reply::Read(ReadError::NetworkingError)
+                },
+            );
+            let result = HashIndexer::remove_index_inner(&client, &id, &index_id).await;
+            let ids = indexer
+                .query(index_id, field, &old, Verify::Exists)
+                .await
+                .unwrap()
+                .unwrap();
+            let values =
+                futures::future::join_all(ids.iter().map(|id| client.read_cell(*id))).await;
+            eprintln!("G23 case={case} remove={result:?} exists={ids:?} cells={values:?}");
+            if result.is_ok() && ids.contains(&id) {
+                failures.push(case);
+            }
+            if result.is_ok() && !ids.contains(&id) {
+                assert!(
+                    !bucket_segment(&client.read_cell(segment).await.unwrap().unwrap())
+                        .unwrap()
+                        .ids
+                        .contains(&id)
+                );
+            }
+        }
+        server.shutdown().await;
+        assert!(
+            failures.is_empty(),
+            "remove returned Ok but Exists returned changed cells: cases {failures:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn g23_hash_writes_reject_invalid_bucket_fields() {
+        use write_read_faults::{inject, Reply};
+        let (server, client) = create_test_server("g23_decoder").await;
+        let indexer = HashIndexer::new(&client);
+        let mut failures = vec![];
+        for remove in [false, true] {
+            for field in [
+                *HASH_INDEX_FIELD_ID,
+                *HASH_NEXT_FIELD_ID,
+                *HASH_OWNER_FIELD_ID,
+            ] {
+                let index_id = Id::rand();
+                let member = Id::rand();
+                indexer.add_index(&member, &index_id).await.unwrap();
+                let mut invalid = client.read_cell(index_id).await.unwrap().unwrap();
+                invalid[field] = OwnedValue::U64(7);
+                inject(index_id, Reply::Cell(invalid));
+                let result = if remove {
+                    indexer.remove_index(&member, &index_id).await
+                } else {
+                    indexer.apply_chunk(&index_id, &[Id::rand()]).await
+                };
+                eprintln!("G23 remove={remove} invalid_field={field} result={result:?}");
+                if !matches!(result, Err(WriteError::ReadError(ReadError::ExecError(_)))) {
+                    failures.push((remove, field));
+                }
+                if result.is_err() {
+                    assert_eq!(
+                        bucket_segment(&client.read_cell(index_id).await.unwrap().unwrap())
+                            .unwrap()
+                            .ids,
+                        vec![member]
+                    );
+                }
+            }
+        }
+        server.shutdown().await;
+        assert!(
+            failures.is_empty(),
+            "invalid buckets were accepted: {failures:?}"
+        );
+    }
 
     /// Helper function to create a test server
     async fn create_test_server(name: &str) -> (Arc<NebServer>, Arc<AsyncClient>) {

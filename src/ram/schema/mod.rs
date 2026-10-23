@@ -1275,6 +1275,10 @@ impl LocalSchemasCache {
     pub fn apply_rename(&self, uid: SchemaUid, new_name: &str) {
         self.map.rename_schema(uid, new_name)
     }
+    #[cfg(test)]
+    pub(crate) fn evict_test_schema(&self, name: &str) {
+        self.map.del_schema(name);
+    }
     pub fn cache_schema_from_cluster(&self, schema: Schema) {
         let m = &self.map;
         m.new_schema(schema)

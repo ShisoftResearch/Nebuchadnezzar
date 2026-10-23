@@ -1364,6 +1364,30 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    #[tokio::test]
+    async fn g23_scope_panic_does_not_capture_later_unscoped_tasks() {
+        let owner = Arc::new(PendingIndexTasks::default());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(IndexBuilder::with_request_index_scope(|| {
+                new_index_task(&owner, async { Ok(()) });
+                panic!("injected scope panic");
+            }));
+        }));
+        assert!(panicked.is_err());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        new_index_task(&owner, async move {
+            tx.send(()).unwrap();
+            Ok(())
+        });
+        let completed = tokio::time::timeout(Duration::from_secs(1), rx).await;
+        assert!(
+            completed.is_ok(),
+            "the leaked scope captured the unscoped task"
+        );
+        assert!(REQUEST_INDEX_TASKS.with(|scopes| scopes.borrow().is_empty()));
+        owner.await_indices().await;
+    }
+
     fn collect_embedding_metas(indices: Vec<IndexRes>) -> Vec<EmbeddingIndexMeta> {
         let mut embedding_metas = Vec::new();
         for res in indices {
