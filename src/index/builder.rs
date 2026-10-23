@@ -672,6 +672,34 @@ async fn index_task_point(point: &'static str, cell: Id) {
     released.await;
 }
 
+struct RequestIndexScope;
+
+impl RequestIndexScope {
+    fn enter() -> Self {
+        REQUEST_INDEX_TASKS.with(|scopes| scopes.borrow_mut().push(Vec::new()));
+        Self
+    }
+
+    fn finish(self) -> Vec<BoxFuture<'static, Result<(), IndexError>>> {
+        REQUEST_INDEX_TASKS.with(|scopes| {
+            std::mem::take(
+                scopes
+                    .borrow_mut()
+                    .last_mut()
+                    .expect("the request owns a scope"),
+            )
+        })
+    }
+}
+
+impl Drop for RequestIndexScope {
+    fn drop(&mut self) {
+        let tasks = REQUEST_INDEX_TASKS
+            .with(|scopes| scopes.borrow_mut().pop().expect("the request owns a scope"));
+        drop(tasks);
+    }
+}
+
 fn new_index_task(
     owner: &Arc<PendingIndexTasks>,
     task: impl Future<Output = Result<(), IndexError>> + Send + 'static,
@@ -986,15 +1014,9 @@ impl IndexBuilder {
     pub(crate) fn collect_test_index_tasks<R>(
         op: impl FnOnce() -> R,
     ) -> (R, Vec<BoxFuture<'static, Result<(), IndexError>>>) {
-        REQUEST_INDEX_TASKS.with(|scopes| {
-            scopes.borrow_mut().push(Vec::new());
-            let result = op();
-            let tasks = scopes
-                .borrow_mut()
-                .pop()
-                .expect("the test owns an index scope");
-            (result, tasks)
-        })
+        let scope = RequestIndexScope::enter();
+        let result = op();
+        (result, scope.finish())
     }
 
     // Scope index tasks spawned by a single request so callers can wait only on
@@ -1006,15 +1028,9 @@ impl IndexBuilder {
         R: Send + 'a,
         F: FnOnce() -> R + 'a,
     {
-        let (res, tasks) = REQUEST_INDEX_TASKS.with(|scopes| {
-            scopes.borrow_mut().push(Vec::new());
-            let res = op();
-            let tasks = scopes
-                .borrow_mut()
-                .pop()
-                .expect("request index scope stack should not be empty");
-            (res, tasks)
-        });
+        let scope = RequestIndexScope::enter();
+        let res = op();
+        let tasks = scope.finish();
 
         async move {
             if tasks.is_empty() {
@@ -1386,6 +1402,37 @@ mod tests {
         );
         assert!(REQUEST_INDEX_TASKS.with(|scopes| scopes.borrow().is_empty()));
         owner.await_indices().await;
+    }
+
+    #[tokio::test]
+    async fn g23_nested_scope_panic_keeps_the_outer_tasks() {
+        let owner = Arc::new(PendingIndexTasks::default());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_, results) = IndexBuilder::with_request_index_scope(|| {
+            let before = completed.clone();
+            new_index_task(&owner, async move {
+                before.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(IndexBuilder::with_request_index_scope(|| {
+                    panic!("nested scope panic")
+                }));
+            }));
+            assert!(panicked.is_err());
+            let after = completed.clone();
+            new_index_task(&owner, async move {
+                after.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        })
+        .await;
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .into_iter()
+            .all(|result| matches!(result, Ok(Ok(())))));
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert!(REQUEST_INDEX_TASKS.with(|scopes| scopes.borrow().is_empty()));
     }
 
     fn collect_embedding_metas(indices: Vec<IndexRes>) -> Vec<EmbeddingIndexMeta> {
