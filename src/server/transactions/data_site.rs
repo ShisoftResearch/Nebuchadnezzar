@@ -3093,19 +3093,14 @@ impl DataManager {
         crate::utils::multisite::point("before_p0", tid);
         #[cfg(feature = "occ_phase_profile")]
         let sync_phase = super::phase_profile::guard(super::phase_profile::Phase::PrepareSync);
-        for segment in &entry_segments {
-            if let Err(error) = segment.force_wal_sync() {
-                error!(
-                    "Failed to sync WAL for segment {} (chunk {}) during commit: {:?}",
-                    segment.id, segment.chunk_id, error
-                );
-                sync_failure.get_or_insert(error);
-            } else {
-                debug!(
-                    "Synced segment {} (chunk {}) WAL to disk for transaction commit",
-                    segment.id, segment.chunk_id
-                );
-            }
+        // Through each file's group sync, all files at once: one at a time,
+        // a transaction over 8 chunks waited for 8 syncs in a row.
+        if let Err(error) = crate::ram::segs::Segment::sync_shared(&entry_segments) {
+            error!(
+                "Failed to sync WAL for transaction {:?} during commit: {:?}",
+                tid, error
+            );
+            sync_failure = Some(error);
         }
         #[cfg(feature = "occ_phase_profile")]
         drop(sync_phase);

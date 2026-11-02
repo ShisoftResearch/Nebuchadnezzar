@@ -655,7 +655,9 @@ async fn abort_profile(base: &str, txns: u64, tasks: u64, abort: bool, operation
     let before = (
         neb::ram::segs::wal_counters(),
         neb::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+        // Prepare syncs run in the group syncer, commit-path forced syncs inline.
+        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+            + neb::ram::durability::GROUP_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
     );
     #[cfg(feature = "abort_profile")]
     drop(neb::ram::abort_profile::take());
@@ -746,7 +748,9 @@ async fn abort_profile(base: &str, txns: u64, tasks: u64, abort: bool, operation
     let after = (
         neb::ram::segs::wal_counters(),
         neb::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+        // Prepare syncs run in the group syncer, commit-path forced syncs inline.
+        neb::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+            + neb::ram::durability::GROUP_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
     );
     let delta = after.0.minus(&before.0);
     let per = |v: u64| v as f64 / total as f64;
@@ -759,7 +763,7 @@ async fn abort_profile(base: &str, txns: u64, tasks: u64, abort: bool, operation
         per(after.1 - before.1)
     );
     println!(
-        "METRIC prof_t{tasks}_forced_syncs_per_txn {:.2}",
+        "METRIC prof_t{tasks}_wal_syncs_per_txn {:.2}",
         per(after.2 - before.2)
     );
     println!(

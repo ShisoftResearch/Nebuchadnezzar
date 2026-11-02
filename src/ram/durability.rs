@@ -77,6 +77,10 @@ struct Completion {
 struct Waiter {
     offset: u64,
     sender: oneshot::Sender<Completion>,
+    /// The caller blocks until this sync lands (a transaction's prepare).
+    /// The test model never holds such a sync back.
+    #[cfg(test)]
+    explicit: bool,
 }
 struct Progress {
     file: Option<std::sync::Weak<File>>,
@@ -404,6 +408,24 @@ impl DurableFile {
         offset: u64,
         epoch: u64,
     ) -> Result<std::time::Duration, DurabilityError> {
+        self.wait_with(offset, epoch, false).await
+    }
+
+    /// `wait` for a caller that cannot proceed until the sync lands.
+    pub(crate) async fn wait_explicit(
+        self: &Arc<Self>,
+        offset: u64,
+        epoch: u64,
+    ) -> Result<std::time::Duration, DurabilityError> {
+        self.wait_with(offset, epoch, true).await
+    }
+
+    async fn wait_with(
+        self: &Arc<Self>,
+        offset: u64,
+        epoch: u64,
+        #[allow(unused_variables)] explicit: bool,
+    ) -> Result<std::time::Duration, DurabilityError> {
         WAIT_CALLS.fetch_add(1, Relaxed);
         let queued = Instant::now();
         let receiver = {
@@ -430,7 +452,12 @@ impl DurableFile {
                 return Ok(std::time::Duration::ZERO);
             }
             let (sender, receiver) = oneshot::channel();
-            p.waiters.push(Waiter { offset, sender });
+            p.waiters.push(Waiter {
+                offset,
+                sender,
+                #[cfg(test)]
+                explicit,
+            });
             if !p.running {
                 p.running = true;
                 let file = self.clone();
@@ -498,14 +525,20 @@ impl DurableFile {
             }
             #[cfg(test)]
             loop {
-                let directory = self.progress.lock().directory.clone();
+                let (directory, explicit) = {
+                    let p = self.progress.lock();
+                    (
+                        p.directory.clone(),
+                        p.waiters.iter().any(|waiter| waiter.explicit),
+                    )
+                };
                 let paused = directory.is_some_and(|directory| {
                     PAUSED_RECEIPT_SYNCS
                         .lock()
                         .iter()
                         .any(|prefix| directory.starts_with(prefix))
                 });
-                if !paused {
+                if !paused || explicit {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -514,7 +547,9 @@ impl DurableFile {
             GROUP_SYNCS.fetch_add(1, Relaxed);
             GROUP_BYTES.fetch_add(bytes, Relaxed);
             #[cfg(test)]
-            let result = if self.progress.lock().fail_sync {
+            let result = if self.progress.lock().fail_sync
+                || crate::ram::segs::power_loss_model::wal_sync_fails(&self.model_path())
+            {
                 Err(io::Error::from_raw_os_error(libc::EIO))
             } else {
                 file.sync_data()
@@ -524,26 +559,27 @@ impl DurableFile {
             let result = result.and_then(|()| self.publish_namespace());
             #[cfg(test)]
             if result.is_ok() {
-                let directory = self.progress.lock().directory.clone();
-                if let Some(directory) = directory {
-                    crate::ram::segs::power_loss_model::record_synced_len(
-                        &Some(
-                            directory
-                                .join(format!(
-                                    "{}-{}-{}.nlog",
-                                    self.chunk, self.segment, self.sequence
-                                ))
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
-                        end,
-                    );
-                }
+                crate::ram::segs::power_loss_model::record_synced_len(&self.model_path(), end);
             }
             let finished = Instant::now();
             SYNC_NS.fetch_add(nanos(finished.duration_since(started)), Relaxed);
             self.publish(end, epoch, &result, Some((started, finished)));
         }
+    }
+
+    /// This WAL file's path in the power-loss model.
+    #[cfg(test)]
+    fn model_path(&self) -> Option<String> {
+        let directory = self.progress.lock().directory.clone()?;
+        Some(
+            directory
+                .join(format!(
+                    "{}-{}-{}.nlog",
+                    self.chunk, self.segment, self.sequence
+                ))
+                .to_string_lossy()
+                .to_string(),
+        )
     }
 
     pub(crate) fn publish_namespace(&self) -> io::Result<()> {

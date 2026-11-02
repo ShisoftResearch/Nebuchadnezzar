@@ -610,10 +610,9 @@ async fn power_cut_participants_resolve(durable: bool) {
             .unwrap()
             .unwrap();
     }
-    // A forced sync that the watermark covers does not run `fsync`.
+    // A segment that an earlier sync already covered needs no `fsync`.
     let forced = || {
-        crate::ram::segs::FORCED_WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
-            + crate::ram::segs::COVERED_FORCED_SYNCS.load(std::sync::atomic::Ordering::Relaxed)
+        crate::ram::segs::PREPARE_SYNCED_SEGMENTS.load(std::sync::atomic::Ordering::Relaxed)
     };
     let before_prepare = forced();
     txn.prepare(tid.clone()).await.unwrap().unwrap();

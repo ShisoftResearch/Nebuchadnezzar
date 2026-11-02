@@ -74,6 +74,9 @@ pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 /// sync (a group sync or another transaction's) took these bytes to disk, so
 /// no `fsync` ran. Group commit on the forced path.
 pub static COVERED_FORCED_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Segments that a transaction's prepare made durable through the group
+/// sync, whether a sync ran for it or an earlier one already covered it.
+pub static PREPARE_SYNCED_SEGMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
 /// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). A
@@ -2882,6 +2885,28 @@ image, not an empty segment; archiving it would persist the damage.",
         self.file_state.lock().durability.clone()
     }
 
+    /// Make the WAL bytes appended to `segments` durable through each file's
+    /// group sync. Transactions that wrote one file share its syncs, and the
+    /// files sync in parallel.
+    pub fn sync_shared(segments: &[lightning::aarc::Arc<Segment>]) -> io::Result<()> {
+        let mut receipts = Vec::with_capacity(segments.len());
+        for segment in segments {
+            if let Some(receipt) = segment.durable_receipt()? {
+                receipts.push(receipt);
+            }
+        }
+        if !receipts.is_empty() {
+            futures::executor::block_on(futures::future::try_join_all(
+                receipts
+                    .iter()
+                    .map(|receipt| receipt.file.wait_explicit(receipt.offset, receipt.epoch)),
+            ))
+            .map_err(io::Error::other)?;
+        }
+        PREPARE_SYNCED_SEGMENTS.fetch_add(segments.len() as u64, Relaxed);
+        Ok(())
+    }
+
     pub fn durable_receipt(&self) -> io::Result<Option<crate::ram::durability::Receipt>> {
         let mut state = self.file_state.lock();
         if state.wal.is_none() {
@@ -4768,6 +4793,38 @@ mod tests {
             synced,
             "bytes appended after a retraction must get their own sync, not the old watermark"
         );
+    }
+
+    #[test]
+    fn a_prepare_sync_lands_while_queued_syncs_are_held_and_reports_failures() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+        ));
+        let allocator = SegmentAllocator::new(0, 2 * SEGMENT_SIZE);
+        let segments: Vec<_> = (0..2)
+            .map(|_| lightning::aarc::Arc::new(allocator.alloc_seg(&manager).unwrap()))
+            .collect();
+        for seg in &segments {
+            Segment::store_padding_header(seg.addr, 8);
+            Segment::store_padding_header(seg.addr + 8, 8);
+            seg.write_wal(seg.addr, 8, false).unwrap();
+        }
+        // Queued syncs are held back; the prepare blocks on its own and
+        // must still land, in both files.
+        crate::ram::durability::pause_receipt_syncs_under(dir.path(), true);
+        Segment::sync_shared(&segments).unwrap();
+        crate::ram::durability::pause_receipt_syncs_under(dir.path(), false);
+        for seg in &segments {
+            assert!(seg.durable_receipt().unwrap().is_none(), "prepared bytes are durable");
+        }
+
+        segments[0].write_wal(segments[0].addr + 8, 8, false).unwrap();
+        power_loss_model::fail_wal_syncs_under(dir.path(), true);
+        let result = Segment::sync_shared(&segments);
+        power_loss_model::fail_wal_syncs_under(dir.path(), false);
+        assert!(result.is_err(), "a failed sync fails the prepare");
     }
 
     #[tokio::test]
