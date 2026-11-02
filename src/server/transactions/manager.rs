@@ -347,6 +347,11 @@ struct Transaction {
     pinned_servers: HashSet<u64>,
 }
 
+/// Backoffs of the manager after a participant answered `Wait` (a cell held
+/// by another transaction), and the time they slept, summed over callers.
+pub static BACKOFF_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BACKOFF_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 service! {
     rpc begin() -> Result<TxnId, TMError>;
     rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError>;
@@ -494,7 +499,13 @@ impl TransactionManager {
         let backoff_ms = backoff_ms.min(config.max_backoff_ms);
 
         debug!("Backing off for {}ms (attempt {})", backoff_ms, attempt);
+        let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        BACKOFF_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BACKOFF_WAIT_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(())
     }
 
