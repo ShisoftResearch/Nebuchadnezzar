@@ -354,3 +354,48 @@ async fn durable_ack_rewind_keeps_receipts_before_the_retained_length() {
         "a synced, retained COMMIT receipt must release the pin of the old version"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_commit_sync_rides_the_next_caller_sync_on_its_file() {
+    TEST_COMMIT_SYNC_DELAY_MS.store(10_000, Relaxed);
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = store(&dir);
+    let seg = segment(&chunks);
+    let _pause = PauseRewindSync::new(&seg);
+    let commit = append(&seg, 0, true);
+    let before = GROUP_SYNCS.load(Relaxed);
+    commit.file.request_sync(commit.offset, commit.epoch);
+    // The next transaction's entries on the same head, and its prepare.
+    let entries = append(&seg, 1, true);
+    entries
+        .file
+        .wait_explicit(entries.offset, entries.epoch)
+        .await
+        .unwrap();
+    assert!(commit.file.covers(commit.offset));
+    assert_eq!(
+        GROUP_SYNCS.load(Relaxed) - before,
+        1,
+        "one sync covers the queued COMMIT and the entries after it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_commit_sync_lands_by_its_deadline_without_a_caller() {
+    TEST_COMMIT_SYNC_DELAY_MS.store(50, Relaxed);
+    let dir = tempfile::tempdir().unwrap();
+    let chunks = store(&dir);
+    let seg = segment(&chunks);
+    let _pause = PauseRewindSync::new(&seg);
+    let commit = append(&seg, 0, true);
+    let started = std::time::Instant::now();
+    commit.file.request_sync(commit.offset, commit.epoch);
+    while !commit.file.covers(commit.offset) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a queued COMMIT sync must land without a caller"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+}

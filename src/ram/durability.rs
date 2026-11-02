@@ -46,6 +46,95 @@ pub static FAILED_SEGMENTS: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static GROUP_SYNCS: AtomicU64 = AtomicU64::new(0);
 
+/// How long a queued COMMIT sync may wait for a sync that a caller makes on
+/// the same file. `NEB_COMMIT_SYNC_DELAY_MS`, 5 ms by default, 0 to sync at
+/// once. Kept below the 10 ms background sync interval of the default
+/// durability.
+pub fn commit_sync_delay() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_COMMIT_SYNC_DELAY_MS.load(Relaxed);
+        if ms != u64::MAX {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms = std::env::var("NEB_COMMIT_SYNC_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+#[cfg(test)]
+pub(crate) static TEST_COMMIT_SYNC_DELAY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Fires the deadlines of deferred COMMIT syncs. One thread: a deadline only
+/// moves a sync to the pool, which does the work.
+struct DelayTimer;
+
+impl DelayTimer {
+    fn schedule(deadline: Instant, file: std::sync::Weak<DurableFile>) {
+        static TIMER: LazyLock<
+            std::sync::mpsc::Sender<(Instant, std::sync::Weak<DurableFile>)>,
+        > = LazyLock::new(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("durable-sync-delay".into())
+                .spawn(move || DelayTimer::run(receiver))
+                .expect("spawn the COMMIT sync delay timer");
+            sender
+        });
+        let _ = TIMER.send((deadline, file));
+    }
+
+    fn run(receiver: std::sync::mpsc::Receiver<(Instant, std::sync::Weak<DurableFile>)>) {
+        struct Due(Instant, std::sync::Weak<DurableFile>);
+        impl PartialEq for Due {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl Eq for Due {}
+        impl PartialOrd for Due {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Due {
+            // Earliest deadline first in a max-heap.
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.0.cmp(&self.0)
+            }
+        }
+        let mut due = std::collections::BinaryHeap::new();
+        loop {
+            let next = match due.peek() {
+                Some(Due(deadline, _)) => {
+                    receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => receiver
+                    .recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match next {
+                Ok((deadline, file)) => due.push(Due(deadline, file)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            let now = Instant::now();
+            while due.peek().is_some_and(|Due(deadline, _)| *deadline <= now) {
+                let Due(_, file) = due.pop().unwrap();
+                if let Some(file) = file.upgrade() {
+                    file.kick();
+                }
+            }
+        }
+    }
+}
+
 static POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
         .num_threads(8)
@@ -91,6 +180,11 @@ struct Progress {
     failed: Option<DurabilityError>,
     running: bool,
     requested: Option<(u64, u64)>,
+    /// When the oldest uncovered request arrived: its sync is due at this
+    /// instant plus `commit_sync_delay`.
+    requested_since: Option<Instant>,
+    /// A deadline for this file is with the delay timer.
+    kick_scheduled: bool,
     /// The length that each rewind kept, by the epoch that it ended.
     /// `rewinds.len()` is the current epoch.
     rewinds: Vec<u64>,
@@ -178,6 +272,8 @@ impl DurableFile {
                 failed: None,
                 running: false,
                 requested: None,
+                requested_since: None,
+                kick_scheduled: false,
                 rewinds: Vec::new(),
                 waiters: Vec::new(),
                 #[cfg(test)]
@@ -396,11 +492,53 @@ impl DurableFile {
             .map_or(offset, |(old, _)| old.max(offset));
         // Every request that is still valid is valid in the current epoch.
         progress.requested = Some((requested, progress.epoch));
-        if !progress.running {
+        progress.requested_since.get_or_insert_with(Instant::now);
+        if !progress.running && !self.defer(&mut progress) {
             progress.running = true;
             let file = self.clone();
             POOL.spawn(move || file.run(descriptor));
         }
+    }
+
+    /// Hold back a sync that only queued decisions need, until its deadline
+    /// or until a caller that waits makes a sync of its own, which covers
+    /// them too. The next transaction on a head usually syncs it well
+    /// before the deadline, so one sync serves its entries and the COMMIT
+    /// before them. `false` when the sync is due now.
+    fn defer(self: &Arc<Self>, progress: &mut Progress) -> bool {
+        if !progress.waiters.is_empty() {
+            return false;
+        }
+        let Some(since) = progress.requested_since else {
+            return false;
+        };
+        let deadline = since + commit_sync_delay();
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !progress.kick_scheduled {
+            progress.kick_scheduled = true;
+            DelayTimer::schedule(deadline, Arc::downgrade(self));
+        }
+        true
+    }
+
+    /// A deadline passed: sync what the queued decisions still need.
+    fn kick(self: &Arc<Self>) {
+        let mut progress = self.progress.lock();
+        progress.kick_scheduled = false;
+        if progress.running || progress.requested.is_none() || progress.failed.is_some() {
+            return;
+        }
+        let Some(descriptor) = progress.file.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        if self.defer(&mut progress) {
+            return;
+        }
+        progress.running = true;
+        let file = self.clone();
+        POOL.spawn(move || file.run(descriptor));
     }
 
     pub async fn wait(
@@ -495,8 +633,13 @@ impl DurableFile {
                     !p.certifies(offset, epoch) || (p.namespaced && p.durable >= offset)
                 }) {
                     p.requested = None;
+                    p.requested_since = None;
                 }
                 if p.failed.is_some() || (p.waiters.is_empty() && p.requested.is_none()) {
+                    p.running = false;
+                    return;
+                }
+                if self.defer(&mut p) {
                     p.running = false;
                     return;
                 }
