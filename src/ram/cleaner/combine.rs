@@ -7,7 +7,11 @@ use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+/// Combine rounds undone because a destination segment could not be
+/// archived (an I/O error on the backup store). The sources kept their data.
+pub static COMBINE_ARCHIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 use libc;
 use std::sync::Arc;
@@ -484,7 +488,7 @@ impl CombinedCleaner {
     ) -> Option<Vec<usize>> {
         let reserved = Self::reserve_destinations(chunk, &pending_segments)?;
         // Use global thread pool for segment allocation
-        Some(COMBINE_ALLOC_POOL.install(|| {
+        let staged: Vec<_> = COMBINE_ALLOC_POOL.install(|| {
             pending_segments
                 .into_par_iter()
                 .zip(reserved.into_par_iter())
@@ -564,8 +568,41 @@ impl CombinedCleaner {
                     return (new_seg, cell_mapping);
                 })
                 .map(|(segment, cells)| {
+                    // Every destination is archived before any is published:
+                    // a failed archive must leave the round undone, not half
+                    // done with some cells repointed and their sources gone.
+                    let archived = segment.archive();
+                    (segment, cells, archived)
+                })
+                .collect()
+        });
+        let failed = staged.iter().find_map(|(segment, _, archived)| {
+            archived.as_ref().err().map(|e| (segment.id, e.to_string()))
+        });
+        if let Some((segment_id, error)) = failed {
+            // An I/O error on the backup store. Nothing is published or
+            // repointed yet, so dropping the destinations leaves the sources
+            // whole; a later round retries.
+            error!(
+                "Combine in chunk {}: archiving destination segment {} failed: {}; the round \
+                 is undone ({} destination segments discarded) and the sources keep their data",
+                chunk.id,
+                segment_id,
+                error,
+                staged.len()
+            );
+            COMBINE_ARCHIVE_FAILURES.fetch_add(1, Relaxed);
+            for (segment, _, _) in staged {
+                segment.dispense();
+                segment.mem_drop(chunk);
+            }
+            return None;
+        }
+        Some(COMBINE_ALLOC_POOL.install(|| {
+            staged
+                .into_par_iter()
+                .map(|(segment, cells, archive_result)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
-                    let archive_result = segment.archive();
                     match archive_result {
                         Ok(true) => {
                             trace!("Segment {} archived successfully", segment.id);
@@ -586,16 +623,7 @@ impl CombinedCleaner {
                                 trace!("Segment {} not archived (no backup storage configured)", segment.id);
                             }
                         }
-                        Err(e) => {
-                            debug!(
-                                "[COMBINE CRITICAL] Segment {} (chunk={}, seq_id={}) archive failed: {} - NOT putting in list",
-                                segment.id, segment.chunk_id, segment.seq_id, e
-                            );
-                            panic!(
-                                "Combine failed: segment {} archive error: {}",
-                                segment.id, e
-                            );
-                        }
+                        Err(_) => unreachable!("a failed archive undoes the whole round above"),
                     }
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);

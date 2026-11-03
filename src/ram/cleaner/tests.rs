@@ -319,6 +319,60 @@ pub fn combining_relocates_cells_it_cannot_migrate() {
     }
 }
 
+/// An archive that fails (an I/O error on the backup store) undoes the
+/// combine round: no panic, every cell still readable from its source, and a
+/// later round combines once the store works again. The combine used to
+/// panic here and take the server down.
+#[test]
+pub fn a_failed_archive_undoes_the_combine_round() {
+    let _ = env_logger::try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("backup");
+    let (gen0, _) = evolving_pair();
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.register_internal_schema(gen0);
+    let chunks = Chunks::new(
+        1,
+        MAX_SEGMENT_SIZE * 3,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup.to_string_lossy().into_owned()),
+        Some(dir.path().join("wal").to_string_lossy().into_owned()),
+        None,
+    );
+    let chunk = &chunks.list[0];
+    let survivors = provision_combinable_chunk(&chunks);
+    chunk.rotate_heads_for_scrub_test();
+    let sources = chunk.segments().len();
+    let failures = combine::COMBINE_ARCHIVE_FAILURES.load(Ordering::Relaxed);
+
+    crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup, true);
+    let combined = combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+    crate::ram::segs::power_loss_model::fail_wal_syncs_under(&backup, false);
+
+    assert_eq!(
+        combine::COMBINE_ARCHIVE_FAILURES.load(Ordering::Relaxed) - failures,
+        1,
+        "the combine never reached the archive, so this test proves nothing"
+    );
+    assert_eq!(combined, (0, 0), "an undone round reclaims nothing");
+    assert_eq!(chunk.segments().len(), sources, "the sources stay published");
+    for id in &survivors {
+        let cell = chunks.read_cell(id).expect("the source still holds the cell");
+        assert_eq!(cell.data["id"].i32(), Some(&(id.bits() as i32)));
+    }
+
+    combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+    assert!(
+        chunk.segments().len() < sources,
+        "with the store working again the round combines"
+    );
+    for id in &survivors {
+        let cell = chunks.read_cell(id).expect("combined cells stay readable");
+        assert_eq!(cell.data["id"].i32(), Some(&(id.bits() as i32)));
+    }
+}
+
 /// Generations that index differently are left alone: migrating those cells
 /// would mean adding and removing index entries, which this path cannot do.
 #[test]
