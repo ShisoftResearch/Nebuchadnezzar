@@ -138,6 +138,7 @@ service! {
     // an acknowledged delete is undone when the resolution installs T's cell.
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
+    rpc compare_version_and_remove_cell(key: Id, version: u64) -> Result<(), WriteError>;
     rpc count() -> u64;
     rpc post_schema_add(schema_id: u32) -> Result<(), String>;
     rpc post_schema_evolve(previous_id: u32, evolved_id: u32) -> Result<(), String>;
@@ -1100,6 +1101,30 @@ impl Service for NebRPCService {
                             .compare_version_and_set_field(&key, version, field, value)
                     })
                     .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+    fn compare_version_and_remove_cell(
+        &self,
+        key: Id,
+        version: u64,
+    ) -> BoxFuture<'_, Result<(), WriteError>> {
+        async move {
+            self.refuse_if_not_owner(&key)?;
+            let _fence = self.fence_for_cell_id(&key)?;
+            let remove = || {
+                self.database_runtime
+                    .chunks()
+                    .compare_version_and_remove_cell(&key, version)
+            };
+            match self.with_indices_ensured(remove).await {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(remove).await
                 }
                 other => other,
             }

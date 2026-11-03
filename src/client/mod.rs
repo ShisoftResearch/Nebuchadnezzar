@@ -696,6 +696,24 @@ impl AsyncClient {
     }
     /// Contract: a cell takes plain writes or transactions, not both. See
     /// [`crate::client::transaction`].
+    /// Remove `id` only while its version is still `version`; a write that
+    /// landed since answers `CellVersionMismatch` and keeps the cell.
+    pub async fn compare_version_and_remove_cell(
+        &self,
+        id: Id,
+        version: u64,
+    ) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        match client.compare_version_and_remove_cell(id, version).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.compare_version_and_remove_cell(id, version).await
+            }
+            other => Ok(other),
+        }
+    }
+
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client.remove_cell(id).await? {

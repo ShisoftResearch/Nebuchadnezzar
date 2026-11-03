@@ -610,6 +610,12 @@ impl HashIndexer {
     /// updating its predecessor, which races with a concurrent spill onto that
     /// same predecessor. An empty segment costs one small cell and one read on
     /// the walk, which is cheaper than getting that race wrong.
+    ///
+    /// An emptied HEAD with no chain behind it goes: it has no predecessor,
+    /// and keeping it left one cell behind for every value ever indexed and
+    /// removed (a unique key under churn grew the store without bound). The
+    /// delete is version-checked; an insert since keeps the head, and the
+    /// insert path recreates a missing head.
     pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
         let bucket = self.bucket(index_id);
         let mut inline = bucket
@@ -664,7 +670,7 @@ impl HashIndexer {
             // Locate the segment holding it.
             let mut cursor = Some(*index_id);
             let mut hops = 0usize;
-            let mut holder: Option<(Id, u64, Vec<Id>)> = None;
+            let mut holder: Option<(Id, u64, Vec<Id>, Option<Id>)> = None;
             loop {
                 let Some(cid) = cursor else { break };
                 match read_bucket(neb_client, cid).await {
@@ -678,7 +684,7 @@ impl HashIndexer {
                             ))));
                         }
                         if segment.ids.contains(cell_id) {
-                            holder = Some((cid, version, segment.ids.to_vec()));
+                            holder = Some((cid, version, segment.ids.to_vec(), segment.next));
                             break;
                         }
                         cursor = segment.next;
@@ -706,7 +712,7 @@ impl HashIndexer {
                 }
             }
 
-            let Some((seg_id, version, mut ids)) = holder else {
+            let Some((seg_id, version, mut ids, next)) = holder else {
                 debug!(
                     "Cell {:?} not in index {:?}, nothing to remove",
                     cell_id, index_id
@@ -714,6 +720,25 @@ impl HashIndexer {
                 return Ok(());
             };
             ids.retain(|id| id != cell_id);
+            if ids.is_empty() && next.is_none() && seg_id == *index_id {
+                match neb_client
+                    .compare_version_and_remove_cell(seg_id, version)
+                    .await
+                {
+                    Ok(Ok(())) | Ok(Err(WriteError::CellDoesNotExisted)) => return Ok(()),
+                    Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                        last_error = e;
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        last_error = WriteError::NetworkingError;
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+            }
 
             match neb_client
                 .compare_version_and_set_field(
@@ -1385,12 +1410,12 @@ mod tests {
                 failures.push(case);
             }
             if result.is_ok() && !ids.contains(&id) {
-                assert!(
-                    !bucket_segment(&client.read_cell(segment).await.unwrap().unwrap())
-                        .unwrap()
-                        .ids
-                        .contains(&id)
-                );
+                // An emptied head is removed; a kept one must not list `id`.
+                match client.read_cell(segment).await.unwrap() {
+                    Ok(cell) => assert!(!bucket_segment(&cell).unwrap().ids.contains(&id)),
+                    Err(ReadError::CellDoesNotExisted) => {}
+                    Err(e) => panic!("reading the bucket: {e:?}"),
+                }
             }
         }
         server.shutdown().await;
@@ -1445,6 +1470,14 @@ mod tests {
     }
 
     /// Helper function to create a test server
+    /// A bucket emptied by its last removal is gone: its head is removed.
+    async fn assert_bucket_gone(client: &AsyncClient, index_id: Id) {
+        match client.read_cell(index_id).await.unwrap() {
+            Err(ReadError::CellDoesNotExisted) => {}
+            other => panic!("an emptied bucket head must be removed, got {other:?}"),
+        }
+    }
+
     async fn create_test_server(name: &str) -> (Arc<NebServer>, Arc<AsyncClient>) {
         let _ = env_logger::try_init();
         let server_addr = crate::utils::test_port::unique_localhost_addr();
@@ -1568,23 +1601,47 @@ mod tests {
         let cell_id = Id::rand();
         let index_id = Id::rand();
 
-        // Add and then remove
+        // Add and then remove: the emptied head goes, it is not left behind.
         indexer.add_index(&cell_id, &index_id).await.unwrap();
         indexer.remove_index(&cell_id, &index_id).await.unwrap();
 
-        let result = client.read_cell(index_id).await;
-        match result {
+        match client.read_cell(index_id).await {
             Ok(Err(ReadError::CellDoesNotExisted)) => {}
-            Ok(Ok(cell)) => {
-                let ids = &cell[*HASH_INDEX_FIELD_ID];
-                if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids {
-                    assert!(ids.is_empty(), "Expected empty ids, got {:?}", ids);
-                } else {
-                    panic!("Expected Id array, got {:?}", ids);
-                }
-            }
-            other => panic!("Expected empty index, got {:?}", other),
+            other => panic!("an emptied bucket head must be removed, got {:?}", other),
         }
+
+        // The value can be indexed again, and is found.
+        let again = Id::rand();
+        indexer.add_index(&again, &index_id).await.unwrap();
+        let cell = client.read_cell(index_id).await.unwrap().unwrap();
+        match &cell[*HASH_INDEX_FIELD_ID] {
+            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => assert_eq!(ids, &vec![again]),
+            other => panic!("Expected Id array, got {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_checked_remove_keeps_a_cell_written_since() {
+        let (_server, client) = create_test_server("version_checked_remove").await;
+        let indexer = HashIndexer::new(&client);
+        let index_id = Id::rand();
+        indexer.add_index(&Id::rand(), &index_id).await.unwrap();
+        let stale = client.read_cell(index_id).await.unwrap().unwrap().header.version;
+        indexer.add_index(&Id::rand(), &index_id).await.unwrap();
+
+        let refused = client
+            .compare_version_and_remove_cell(index_id, stale)
+            .await
+            .unwrap();
+        assert!(matches!(refused, Err(WriteError::CellVersionMismatch)), "{refused:?}");
+        let current = client.read_cell(index_id).await.unwrap().unwrap().header.version;
+        client
+            .compare_version_and_remove_cell(index_id, current)
+            .await
+            .unwrap()
+            .unwrap();
+        let gone = client.compare_version_and_remove_cell(index_id, current).await.unwrap();
+        assert!(matches!(gone, Err(WriteError::CellDoesNotExisted)), "{gone:?}");
     }
 
     #[tokio::test]
@@ -1676,8 +1733,7 @@ mod tests {
         let bucket = indexer.bucket(&index_id);
         indexer.remove_index(&member, &index_id).await.unwrap();
         assert_eq!(bucket.removal_handoffs.load(Ordering::Relaxed), 0);
-        let stored = client.read_cell(index_id).await.unwrap().unwrap();
-        assert!(bucket_segment(&stored).unwrap().ids.is_empty());
+        assert_bucket_gone(&client, index_id).await;
         server.shutdown().await;
     }
 
@@ -1701,8 +1757,7 @@ mod tests {
             "removal unnecessarily waited for the bucket applier"
         );
         result.unwrap().unwrap();
-        let stored = client.read_cell(index_id).await.unwrap().unwrap();
-        assert!(bucket_segment(&stored).unwrap().ids.is_empty());
+        assert_bucket_gone(&client, index_id).await;
         server.shutdown().await;
     }
 
@@ -1742,11 +1797,7 @@ mod tests {
             "removal must await the cell word and let the runtime timer run"
         );
         removal.await.unwrap();
-        let stored = client.read_cell(index_id).await.unwrap().unwrap();
-        let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = &stored[*HASH_INDEX_FIELD_ID] else {
-            panic!("expected bucket IDs");
-        };
-        assert!(ids.is_empty());
+        assert_bucket_gone(&client, index_id).await;
         server.shutdown().await;
     }
 

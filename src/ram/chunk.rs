@@ -6944,6 +6944,23 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);
     }
+
+    /// Remove the cell only while its version is still `version`. A write
+    /// that landed since makes this `CellVersionMismatch` and keeps the cell.
+    pub fn compare_version_and_remove_cell(&self, key: &Id, version: u64) -> Result<(), WriteError> {
+        let found = std::cell::Cell::new(false);
+        let result = self.remove_cell_by(key, |cell| {
+            found.set(true);
+            cell.header.version == version
+        });
+        match result {
+            // `remove_cell_by` answers a refused predicate as absence.
+            Err(WriteError::CellDoesNotExisted) if found.get() => {
+                Err(WriteError::CellVersionMismatch)
+            }
+            other => other,
+        }
+    }
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return *chunk.location_for_read(hash).unwrap();
