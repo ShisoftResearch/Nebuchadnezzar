@@ -445,6 +445,7 @@ impl DurableFile {
                 sequence: self.sequence,
                 message: error.to_string(),
             });
+            stop_after_sync_failure();
         } else if p.failed.is_none() {
             // A rewind during the sync keeps the bytes before its length.
             if let Some(prefix) = p.stable_prefix(epoch) {
@@ -770,6 +771,26 @@ impl DurableFile {
     pub fn pending_waiters(&self) -> usize {
         self.progress.lock().waiters.len()
     }
+}
+
+/// Stop the process after a failed WAL sync, as Pebble and TiKV do.
+///
+/// After an fsync error the kernel can mark the dirty pages clean without
+/// writing them, so no later sync can make those bytes durable. A write of
+/// the default class is acknowledged before its sync; if the process went
+/// on, such a write would be lost at the next power cut, seconds or hours
+/// after its acknowledgement. A stop turns the failure into a crash at the
+/// moment of the error: recovery then reads the log as it is. The soak
+/// (F7) observed the loss, and also stalls and dangling edge bodies on the
+/// failed files that followed.
+///
+/// Unit tests keep the error path, which they inspect.
+fn stop_after_sync_failure() {
+    if cfg!(test) {
+        return;
+    }
+    log::logger().flush();
+    std::process::abort();
 }
 
 thread_local! {
