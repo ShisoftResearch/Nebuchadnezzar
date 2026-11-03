@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::compression;
 use crate::ram::entry;
+use crate::ram::fault;
 use crate::ram::entry::EntryMeta;
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::io::align_address;
@@ -2563,6 +2564,7 @@ image, not an empty segment; archiving it would persist the damage.",
                     if power_loss_model::wal_sync_fails(&Some(tmp_backup_file.clone())) {
                         return Err(io::Error::from_raw_os_error(libc::EIO));
                     }
+                    fault::fire(fault::Site::Archive)?;
                     file.sync_all()?;
                     drop(file);
 
@@ -2775,7 +2777,9 @@ image, not an empty segment; archiving it would persist the damage.",
                 crate::ram::wal_format::frame_record((addr - self.addr) as u64, data_block)
             };
             let mut sink = &**file;
-            if let Err(error) = sink.write_all(&framed) {
+            if let Err(error) =
+                fault::fire(fault::Site::WalWrite).and_then(|()| sink.write_all(&framed))
+            {
                 // Remove the refused frame before another append can follow it.
                 // A failed truncation closes this head instead.
                 if let Err(truncate_error) = file.set_len(original_len) {
@@ -2810,10 +2814,11 @@ image, not an empty segment; archiving it would persist the damage.",
                     let result = if durability.is_some_and(|d| d.test_fail_sync()) {
                         Err(io::Error::from_raw_os_error(libc::EIO))
                     } else {
-                        file.sync_data()
+                        fault::fire(fault::Site::WalSync).and_then(|()| file.sync_data())
                     };
                     #[cfg(not(test))]
-                    let result = file.sync_data();
+                    let result =
+                        fault::fire(fault::Site::WalSync).and_then(|()| file.sync_data());
                     WAL_SYNC_SERVICE_NS
                         .fetch_add(sync_started.elapsed().as_nanos() as u64, Relaxed);
                     if let Some(durability) = durability {
@@ -3069,10 +3074,10 @@ image, not an empty segment; archiving it would persist the damage.",
         {
             Err(io::Error::from_raw_os_error(libc::EIO))
         } else {
-            sync(&file)
+            fault::fire(fault::Site::WalSync).and_then(|()| sync(&file))
         };
         #[cfg(not(test))]
-        let result = sync(&file);
+        let result = fault::fire(fault::Site::WalSync).and_then(|()| sync(&file));
         let result = result.and_then(|()| {
             durability
                 .as_ref()

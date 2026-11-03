@@ -11,6 +11,7 @@ pub mod chunk;
 pub mod cleaner;
 pub mod compression;
 pub mod entry;
+pub mod fault;
 pub mod txn_status;
 pub mod fence;
 pub mod file_manager;

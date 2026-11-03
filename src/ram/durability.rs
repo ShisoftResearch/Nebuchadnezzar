@@ -695,10 +695,12 @@ impl DurableFile {
             {
                 Err(io::Error::from_raw_os_error(libc::EIO))
             } else {
-                file.sync_data()
+                crate::ram::fault::fire(crate::ram::fault::Site::WalSync)
+                    .and_then(|()| file.sync_data())
             };
             #[cfg(not(test))]
-            let result = file.sync_data();
+            let result = crate::ram::fault::fire(crate::ram::fault::Site::WalSync)
+                .and_then(|()| file.sync_data());
             let result = result.and_then(|()| self.publish_namespace());
             #[cfg(test)]
             if result.is_ok() {

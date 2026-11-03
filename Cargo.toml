@@ -70,6 +70,9 @@ mimalloc-allocator = ["dep:mimalloc"]
 #   MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof,lg_prof_interval:32
 # then read the dumps with jeprof.
 jemalloc-profiling = ["dep:tikv-jemallocator"]
+# Arm EIO faults at the WAL write, the WAL sync and the archive sync.
+# Only the corruption soak harness enables it; see ram::fault.
+fault-injection = []
 default = [
     "cleaner", "combine_cleaner",
     "tiered_memory", "compress_backups"
