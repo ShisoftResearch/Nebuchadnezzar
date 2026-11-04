@@ -137,13 +137,24 @@ fn crc32_checksum(data: &[u8]) -> u32 {
     digest.finalize() as u32
 }
 
+/// Checksum of a block image: its bytes and its declared live extent.
+///
+/// `used_len` decides how much of the image a reader interprets, so a flip in
+/// that field loses data as surely as a flip in the data does.
+fn image_checksum(image: &[u8], used_len: usize) -> u32 {
+    let mut digest = Digest::new(CrcAlgorithm::Crc32Iscsi);
+    digest.update(image);
+    digest.update(&(used_len as u32).to_le_bytes());
+    digest.finalize() as u32
+}
+
 /// Decompress a backup, or return the data unchanged if it carries no magic.
 ///
 /// Block-indexed backups are the only compressed form; a buffer without the
 /// magic is stored plain and passes through.
 ///
-/// The checksum verified here covers the WHOLE uncompressed image, and it is
-/// checked only on this full-read path. There are no per-block CRCs -- a
+/// The checksum verified here covers the WHOLE uncompressed image and its
+/// `used_len`, and it is checked only on this full-read path. There are no per-block CRCs -- a
 /// claim this comment used to make -- so a single block served directly to a
 /// cold read is not verified by anything in this module. That gap is covered
 /// one level up instead: every entry carries a checksum of its own content
@@ -162,7 +173,7 @@ pub fn decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>> {
 ///   index:  [uncompressed_start(u32), file_offset(u32), compressed_len(u32)] * block_count
 ///   blocks: lz4(block 0), lz4(block 1), ...
 ///
-/// The crc32 covers the whole uncompressed input, so a full read still verifies
+/// The crc32 covers the whole uncompressed input and `used_len`, so a full read still verifies
 /// end to end. Blocks carry their own length via `compress_prepend_size`, so a
 /// single block can be decompressed without consulting anything but its index
 /// entry.
@@ -192,7 +203,7 @@ pub fn compress_blocks_on_cells(
 }
 
 fn compress_spans(data: &[u8], spans: &[(usize, usize)], used_len: usize) -> io::Result<Vec<u8>> {
-    let checksum = crc32_checksum(data);
+    let checksum = image_checksum(data, used_len);
     let block_count = spans.len();
     let index_bytes = block_count * BLOCK_INDEX_ENTRY_SIZE;
 
@@ -529,7 +540,7 @@ pub fn decompress_all_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
     for i in 0..layout.block_count {
         out.extend_from_slice(&decompress_block(data, i)?);
     }
-    let computed = crc32_checksum(&out);
+    let computed = image_checksum(&out, layout.used_len);
     if computed != layout.checksum {
         // An ERROR, not a panic.
         //
@@ -553,6 +564,76 @@ pub fn decompress_all_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(out)
+}
+
+/// A segment image as the repair path read it.
+#[derive(Debug)]
+pub struct SalvagedSegment {
+    pub image: Vec<u8>,
+    /// The live extent the file declares, if it declares one.
+    pub used_len: Option<usize>,
+    /// Image ranges that could not be read. See [`SalvagedBlocks`].
+    pub unreadable: Vec<std::ops::Range<usize>>,
+}
+
+/// What could be read from a block image that failed its full read.
+#[derive(Debug)]
+pub struct SalvagedBlocks {
+    pub image: Vec<u8>,
+    pub used_len: usize,
+    /// Image ranges whose block could not be read. They hold zeros, which a
+    /// reader must not take for free space.
+    pub unreadable: Vec<std::ops::Range<usize>>,
+}
+
+/// Read every block that still decodes, and report the ones that do not.
+///
+/// This is the repair path, so the whole-image checksum is not checked: it
+/// already failed. The caller must judge each entry by its own checksum.
+///
+/// Block starts must ascend from 0. If they do not, the index is damaged and
+/// no block has a known place in the image, so this returns an error.
+pub fn salvage_blocks(data: &[u8], max_len: usize) -> io::Result<SalvagedBlocks> {
+    let layout = block_layout(data).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "not a block-compressed buffer")
+    })?;
+    let used_len = layout.used_len.min(max_len);
+    let mut image = Vec::with_capacity(max_len);
+    let mut unreadable = Vec::new();
+    let mut previous_start = None;
+    for block_idx in 0..layout.block_count {
+        let (start, _, _) = layout.entry(data, block_idx)?;
+        let in_order = match previous_start {
+            None => start == 0,
+            Some(previous) => start > previous,
+        };
+        if !in_order || start >= max_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("block index is damaged at block {block_idx}: start {start}"),
+            ));
+        }
+        previous_start = Some(start);
+        if start > image.len() {
+            unreadable.push(image.len()..start);
+        }
+        // A damaged block can decode to the wrong length, so the index, not
+        // the decoded length, places the next block.
+        image.resize(start, 0);
+        if let Ok(block) = decompress_block(data, block_idx) {
+            image.extend_from_slice(&block);
+        }
+    }
+    image.truncate(max_len);
+    if image.len() < used_len {
+        unreadable.push(image.len()..used_len);
+        image.resize(used_len, 0);
+    }
+    Ok(SalvagedBlocks {
+        image,
+        used_len,
+        unreadable,
+    })
 }
 
 /// Check if data appears to be compressed (has valid magic header)
@@ -599,6 +680,48 @@ pub fn decompress_field(compressed_data: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn two_block_image() -> (Vec<u8>, Vec<u8>, usize) {
+        let mut image = vec![0x11_u8; 4096];
+        image.extend_from_slice(&vec![0x22_u8; 4096]);
+        let blocks = compress_spans(&image, &[(0, 4096), (4096, 8192)], 8192).unwrap();
+        (image, blocks, 8192)
+    }
+
+    #[test]
+    fn salvage_returns_every_block_of_a_healthy_image() {
+        let (image, blocks, used_len) = two_block_image();
+        let salvaged = salvage_blocks(&blocks, 1 << 20).unwrap();
+        assert_eq!(salvaged.image, image);
+        assert_eq!(salvaged.used_len, used_len);
+        assert!(salvaged.unreadable.is_empty());
+    }
+
+    #[test]
+    fn salvage_reports_a_lost_block_and_keeps_the_others() {
+        for lost in 0..2 {
+            let (image, mut blocks, _) = two_block_image();
+            let layout = block_layout(&blocks).unwrap();
+            let (start, offset, len) = layout.entry(&blocks, lost).unwrap();
+            // Past the 4-byte size prefix, which LZ4 does not check.
+            blocks[offset + 4..offset + len].fill(0xFF);
+            assert!(decompress_block(&blocks, lost).is_err());
+            let salvaged = salvage_blocks(&blocks, 1 << 20).unwrap();
+            assert_eq!(salvaged.unreadable, vec![start..start + 4096]);
+            assert_eq!(salvaged.image.len(), 8192);
+            let kept = 4096 - start;
+            assert_eq!(salvaged.image[kept..kept + 4096], image[kept..kept + 4096]);
+            assert!(salvaged.image[start..start + 4096].iter().all(|b| *b == 0));
+        }
+    }
+
+    #[test]
+    fn salvage_refuses_a_block_index_out_of_order() {
+        let (_, mut blocks, _) = two_block_image();
+        let second_start = block_header_size() + block_index_entry_size();
+        blocks[second_start..second_start + 4].fill(0);
+        assert!(salvage_blocks(&blocks, 1 << 20).is_err());
+    }
 
     #[test]
     fn test_crc32c() {

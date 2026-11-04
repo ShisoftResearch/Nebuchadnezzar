@@ -137,9 +137,11 @@ pub struct RecoveryConfig {
 
 const DEFAULT_RECOVERY_THREADS: usize = 64;
 
-/// Set to `1` to start without the cells of segments that cannot be read
-/// (quarantine). Without it such a segment stops the start: a skipped
-/// segment is lost data, so only an operator who knows that may ask for it.
+/// Set to `1` to start without the data that recovery cannot read
+/// (quarantine). Recovery keeps every entry that verifies and drops the
+/// damaged ranges; a segment it cannot repair at all is skipped. Without this
+/// setting any such loss stops the start, so only an operator who knows the
+/// cost may ask for it. A dropped tombstone can bring a deleted cell back.
 pub const QUARANTINE_ENV: &str = "NEB_RECOVERY_QUARANTINE_UNREADABLE";
 
 fn quarantine_unreadable() -> bool {
@@ -1330,6 +1332,13 @@ fn apply_bracketed_group(
 pub static RECOVERY_DAMAGED_ENTRIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Segments whose file recovery repaired and installed again.
+pub static RECOVERY_REPAIRED_SEGMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Live bytes that repaired segments lost, after the operator accepted it.
+pub static RECOVERY_LOST_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Read a segment image's fixed tail link, if it has one.
 ///
 /// One read, no scanning: that is the point of putting the link at a FIXED
@@ -1409,6 +1418,272 @@ fn entry_stands_alone(addr: usize, bound: usize) -> bool {
         // check, is trusted as an anchor.
         None => header.entry_type == EntryType::PADDING,
     }
+}
+
+/// The bytes of an image that its declaration says are live.
+fn declared_extent(data: &[u8], declared_used_len: Option<usize>) -> usize {
+    declared_used_len
+        .map(|len| len.min(data.len()))
+        .unwrap_or(data.len())
+}
+
+/// Where an image's entries end: its declared extent, less any chain link.
+fn live_extent(data: &[u8], declared_used_len: Option<usize>) -> usize {
+    let declared = declared_extent(data, declared_used_len);
+    read_chain_link(data, declared).map_or(declared, |(tail, _, _)| tail)
+}
+
+/// Whether a resync may continue at `addr`, which `entry_stands_alone` accepts.
+///
+/// A 24-bit checksum alone is thin in a search over damaged bytes, so a found
+/// entry must also make sense here. A false result costs a good entry at most,
+/// which is reported as lost. A false entry would be applied as data.
+fn is_resync_anchor(chunk: &Chunk, chunk_count: usize, addr: usize) -> bool {
+    use super::cell::CELL_HEADER_SIZE;
+    let belongs_here = |id: &Id| id.locality() as usize % chunk_count == chunk.id;
+    let (header, _) = Entry::decode_from(addr, |_, _| {});
+    let content_addr = Entry::content_pos(addr);
+    let content = unsafe {
+        std::slice::from_raw_parts(content_addr as *const u8, header.content_length as usize)
+    };
+    match header.entry_type {
+        EntryType::CELL if content.len() >= CELL_HEADER_SIZE => {
+            let cell = cell_header_from_entry_content_addr(content_addr);
+            let known_schema = cell.schema == *crate::ram::txn_status::TXN_STATUS_SCHEMA_ID
+                || chunk.meta.schemas.get(&cell.schema).is_some();
+            known_schema && belongs_here(&cell.id)
+        }
+        EntryType::TOMBSTONE if content.len() == super::tombstone::TOMBSTONE_SIZE => {
+            belongs_here(&Tombstone::read(addr).id)
+        }
+        EntryType::BEGIN => crate::ram::bracket::decode_begin(content).is_ok(),
+        EntryType::COMMIT => crate::ram::bracket::decode_commit(content).is_some(),
+        // A bare stamp is 8 common bytes. Only a checksum makes one an anchor.
+        EntryType::PADDING => {
+            crate::ram::entry::verify_entry_at(addr, addr + 8 + content.len()) == Some(true)
+        }
+        _ => false,
+    }
+}
+
+/// What the repair walk found in one segment image.
+#[derive(Debug, Default, PartialEq)]
+struct ImageDamage {
+    /// Byte ranges of the live extent that hold no verified entry.
+    lost: Vec<std::ops::Range<usize>>,
+    /// The ranges to remove: `lost`, widened over each bracket it touches.
+    dropped: Vec<std::ops::Range<usize>>,
+    /// Entry offsets, for the block layout of the repaired file.
+    boundaries: Vec<usize>,
+    /// Where the walk ended.
+    end: usize,
+}
+
+/// Walk an image entry by entry and find what does not verify.
+///
+/// Unlike the recovery scan, this walk changes nothing, and it does not stop
+/// at damage: it searches forward, on the 8-byte grid, for the next entry that
+/// `is_anchor` accepts.
+///
+/// A transaction must apply whole or not at all, and damage breaks a bracket
+/// in two ways. Damage after a BEGIN removes part of the transaction, so the
+/// range widens back to the BEGIN. Damage that removed a BEGIN leaves entries
+/// that read as ordinary ones until a COMMIT with no BEGIN shows what they
+/// were, so the range from the damage to that COMMIT is removed too.
+fn find_image_damage(
+    data: &[u8],
+    declared_used_len: Option<usize>,
+    unreadable: &[std::ops::Range<usize>],
+    is_anchor: &dyn Fn(usize) -> bool,
+) -> ImageDamage {
+    let live_len = live_extent(data, declared_used_len);
+    let base = data.as_ptr() as usize;
+    let bound = base + live_len;
+    let entry_end = |addr: usize| {
+        let (header, _) = Entry::decode_from(addr, |_, _| {});
+        addr + ENTRY_HEAD_SIZE + header.content_length as usize
+    };
+    let mut damage = ImageDamage::default();
+    let mut open_bracket = None;
+    let mut unbracketed_from = None;
+    let mut cursor = base;
+    while cursor < bound {
+        let offset = cursor - base;
+        if entry_stands_alone(cursor, bound) {
+            let (header, _) = Entry::decode_from(cursor, |_, _| {});
+            let end = entry_end(cursor) - base;
+            match header.entry_type {
+                EntryType::BEGIN => {
+                    open_bracket = Some(offset);
+                    unbracketed_from = None;
+                }
+                EntryType::COMMIT if open_bracket.take().is_none() => {
+                    if let Some(from) = unbracketed_from.take() {
+                        damage.dropped.push(from..end);
+                    }
+                }
+                _ => {}
+            }
+            damage.boundaries.push(offset);
+            cursor = end + base;
+            continue;
+        }
+        // Zeros to the live end are the end of the entries, unless they stand
+        // where a block could not be read.
+        let lost_block = unreadable
+            .iter()
+            .any(|range| range.start < live_len && range.end > offset);
+        if !lost_block && has_only_zero_padding(&data[..live_len], offset) {
+            break;
+        }
+        let mut resume = (cursor + ENTRY_HEAD_SIZE..bound)
+            .step_by(ENTRY_HEAD_SIZE)
+            .find(|addr| entry_stands_alone(*addr, bound) && is_anchor(*addr))
+            .unwrap_or(bound);
+        // Padding needs content to step over: a scan stops at a zero-length
+        // entry. An 8-byte gap takes the next entry with it.
+        if resume - cursor == ENTRY_HEAD_SIZE && resume < bound {
+            resume = entry_end(resume);
+        }
+        damage.lost.push(offset..resume - base);
+        damage
+            .dropped
+            .push(open_bracket.take().unwrap_or(offset)..resume - base);
+        unbracketed_from.get_or_insert(resume - base);
+        damage.boundaries.push(offset);
+        cursor = resume;
+    }
+    damage.end = cursor - base;
+    damage.dropped.sort_by_key(|range| range.start);
+    damage.dropped = damage
+        .dropped
+        .drain(..)
+        .fold(Vec::new(), |mut merged, range| {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+            merged
+        });
+    damage
+}
+
+/// The live extent of an image whose declaration may be the damaged part.
+///
+/// The repair runs because a checksum failed, and that checksum covers
+/// `used_len`. A flip that shrinks `used_len` hides every entry after the new
+/// value, so an entry that verifies past the declared end proves the
+/// declaration wrong. Noise in free space does not pass as an entry.
+fn corrected_extent(data: &[u8], used_len: usize, is_anchor: &dyn Fn(usize) -> bool) -> usize {
+    let base = data.as_ptr() as usize;
+    let bound = base + data.len();
+    let mut extent = used_len.min(data.len());
+    let mut cursor = base + extent.next_multiple_of(ENTRY_HEAD_SIZE);
+    while cursor + ENTRY_HEAD_SIZE <= bound {
+        if entry_stands_alone(cursor, bound) && is_anchor(cursor) {
+            let (header, _) = Entry::decode_from(cursor, |_, _| {});
+            cursor += ENTRY_HEAD_SIZE + header.content_length as usize;
+            extent = cursor - base;
+        } else {
+            cursor += ENTRY_HEAD_SIZE;
+        }
+    }
+    extent
+}
+
+/// A repaired image, ready to install.
+struct SegmentRepair {
+    image: Vec<u8>,
+    used_len: usize,
+    boundaries: Vec<usize>,
+    lost: Vec<std::ops::Range<usize>>,
+}
+
+/// Build the repaired image of a file that recovery cannot read.
+///
+/// A damaged range becomes checksummed padding, so the repaired image passes
+/// the normal read and the normal scan: there is only one code path that
+/// applies a recovered entry.
+fn repair_segment_image(
+    chunk: &Chunk,
+    chunk_count: usize,
+    path: &Path,
+) -> io::Result<SegmentRepair> {
+    let salvaged = chunk.file_manager.read_file_for_repair(path)?;
+    let mut image = salvaged.image;
+    if image.len() > SEGMENT_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} bytes is larger than a segment", image.len()),
+        ));
+    }
+    let is_anchor = |addr: usize| is_resync_anchor(chunk, chunk_count, addr);
+    let declared = salvaged
+        .used_len
+        .map(|used_len| corrected_extent(&image, used_len, &is_anchor));
+    let live_len = live_extent(&image, declared);
+    let damage = find_image_damage(&image, declared, &salvaged.unreadable, &is_anchor);
+    for range in &damage.dropped {
+        if range.len() > ENTRY_HEAD_SIZE {
+            crate::ram::entry::stamp_padding(&mut image, range.start, range.len());
+        } else {
+            image[range.clone()].fill(0);
+        }
+    }
+    // A plain image declares no extent. The repaired file must: everything
+    // from the walk's end is free space, unless a chain link holds the tail.
+    let used_len = declared.unwrap_or(if live_len < image.len() {
+        image.len()
+    } else {
+        damage.end
+    });
+    image.resize(SEGMENT_SIZE, 0);
+    Ok(SegmentRepair {
+        image,
+        used_len,
+        boundaries: damage.boundaries,
+        lost: damage.lost,
+    })
+}
+
+/// Install a repaired image as the backup of its segment, and return the path.
+///
+/// A repaired backup replaces the file it came from: a second file at the same
+/// seq id could shadow the repair. A repaired WAL goes to the segment's backup
+/// path, because discovery prefers a backup over a WAL at the same seq id.
+///
+/// The damaged file stays beside it as `<backup>.damaged` when data was lost:
+/// that copy is the only record of the lost bytes. Recovery ignores the name.
+fn install_repaired_segment(
+    chunk: &Chunk,
+    file_info: &SegmentFileInfo,
+    repair: &SegmentRepair,
+) -> io::Result<String> {
+    let backup_path = if file_info.is_backup {
+        file_info.path.to_string_lossy().into_owned()
+    } else {
+        chunk
+            .file_manager
+            .backup_path(file_info.chunk_id, file_info.seg_id, file_info.seq_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "repair needs a backup directory for the repaired image",
+                )
+            })?
+    };
+    let bytes = crate::ram::compression::compress_blocks_on_cells(
+        &repair.image,
+        &repair.boundaries,
+        repair.used_len,
+    )?;
+    if !repair.lost.is_empty() {
+        fs::copy(&file_info.path, format!("{backup_path}.damaged"))?;
+    }
+    chunk
+        .file_manager
+        .install_backup_file(&backup_path, &bytes)?;
+    Ok(backup_path)
 }
 
 /// Whether everything from `start_offset` to the LIVE end is zero.
@@ -1694,9 +1969,7 @@ fn scan_segment_from_data(
     // so it is never parsed -- which is what makes "empty" and "damaged"
     // distinguishable at all. Without the cursor both look like "no entries",
     // and recovery used to fail the whole store rather than guess.
-    let live_len = declared_used_len
-        .map(|len| len.min(data.len()))
-        .unwrap_or(data.len());
+    let live_len = declared_extent(data, declared_used_len);
     // A chain part's live entries stop before its link. Read that first, so
     // the walk never meets the zeros between the last entry and the tail.
     let chain_link = read_chain_link(data, live_len);
@@ -2616,58 +2889,117 @@ pub fn recover_chunks(
                                 }
                                 match recovered_from_wal {
                                     Some(loaded) => loaded,
-                                    None if !quarantine => {
-                                        // The segment's cells exist and cannot be read.
-                                        // Skipping them is data loss, so the start stops
-                                        // unless the operator asked for the skip.
-                                        let reason = format!(
-                                            "segment {} (chunk {}, seq {}) in '{}' cannot be \
-                                             read: {}. Recovery stops; set {}=1 to start \
-                                             without the cells of this segment",
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            file_info.path.display(),
-                                            error,
-                                            QUARANTINE_ENV
-                                        );
-                                        error!("{reason}");
-                                        return Err(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            reason,
-                                        ));
-                                    }
                                     None => {
-                                        // The operator asked for the skip
-                                        // (`QUARANTINE_ENV`): quarantine the segment and
-                                        // keep the rest of the store.
-                                        //
-                                        // This used to be `?`, so one unreadable segment
-                                        // failed the whole recovery -- every chunk, and
-                                        // every segment not yet reached. On TB14 segment
-                                        // 2053 did exactly that at 174,900 of 350,902
-                                        // segments: the remaining 176,002 were never even
-                                        // read, the caller logged "Starting with fresh
-                                        // storage", and the ranged index then found an
-                                        // empty store and replaced 31 of its 40 trees with
-                                        // empty ones. One bad segment cost the database.
-                                        //
-                                        // Its files are left alone for forensics and for a
-                                        // later repair; what is lost is this segment's
-                                        // cells, which is the actual damage rather than
-                                        // the whole store.
-                                        error!(
-                                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
-                                             Recovery continues; the cells in this segment are missing \
-                                             from the recovered store.",
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            file_info.path.display(),
-                                            error
-                                        );
-                                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                                        continue;
+                                        let repaired =
+                                            repair_segment_image(chunk, chunks.len(), &file_info.path)
+                                                .and_then(|repair| {
+                                                    if !repair.lost.is_empty() && !quarantine {
+                                                        return Err(io::Error::new(
+                                                            io::ErrorKind::InvalidData,
+                                                            format!(
+                                                                "damaged byte ranges {:?} hold no \
+                                                                 verified entry",
+                                                                repair.lost
+                                                            ),
+                                                        ));
+                                                    }
+                                                    let path = install_repaired_segment(
+                                                        chunk, &file_info, &repair,
+                                                    )?;
+                                                    let loaded =
+                                                        attempt(Path::new(&path), &mut version_map)?;
+                                                    Ok((path, repair.lost, loaded))
+                                                });
+                                        match repaired {
+                                            Ok((path, lost, loaded)) => {
+                                                let lost_bytes: usize =
+                                                    lost.iter().map(|range| range.len()).sum();
+                                                RECOVERY_REPAIRED_SEGMENTS
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                RECOVERY_LOST_BYTES.fetch_add(
+                                                    lost_bytes as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                                error!(
+                                                    "REPAIRED segment {} (chunk {}, seq {}) from \
+                                                     '{}' into '{}': {}. Lost {} live byte(s) in \
+                                                     ranges {:?}.",
+                                                    file_info.seg_id,
+                                                    chunk_id,
+                                                    file_info.seq_id,
+                                                    file_info.path.display(),
+                                                    path,
+                                                    error,
+                                                    lost_bytes,
+                                                    lost
+                                                );
+                                                source_is_backup = true;
+                                                loaded
+                                            }
+                                            Err(repair_error)
+                                                if is_bracket_record_error(&repair_error) =>
+                                            {
+                                                return Err(repair_error);
+                                            }
+                                            Err(repair_error) if !quarantine => {
+                                                // The segment's cells exist and cannot all be
+                                                // read. A loss stops the start, unless the
+                                                // operator accepted it. The files stay as
+                                                // they were.
+                                                let reason = format!(
+                                                    "segment {} (chunk {}, seq {}) in '{}' cannot \
+                                                     be read: {}. Repair failed: {}. Recovery \
+                                                     stops; set {}=1 to start without the data \
+                                                     that cannot be read",
+                                                    file_info.seg_id,
+                                                    chunk_id,
+                                                    file_info.seq_id,
+                                                    file_info.path.display(),
+                                                    error,
+                                                    repair_error,
+                                                    QUARANTINE_ENV
+                                                );
+                                                error!("{reason}");
+                                                return Err(io::Error::new(
+                                                    io::ErrorKind::InvalidData,
+                                                    reason,
+                                                ));
+                                            }
+                                            Err(repair_error) => {
+                                                    // The operator asked for the skip
+                                                    // (`QUARANTINE_ENV`), and even a repair cannot
+                                                    // read this file: quarantine the segment and keep
+                                                    // the rest of the store.
+                                                    //
+                                                    // This used to be `?`, so one unreadable segment
+                                                    // failed the whole recovery -- every chunk, and
+                                                    // every segment not yet reached. On TB14 segment
+                                                    // 2053 did exactly that at 174,900 of 350,902
+                                                    // segments: the remaining 176,002 were never even
+                                                    // read, the caller logged "Starting with fresh
+                                                    // storage", and the ranged index then found an
+                                                    // empty store and replaced 31 of its 40 trees with
+                                                    // empty ones. One bad segment cost the database.
+                                                    //
+                                                    // Its files are left alone for forensics and for a
+                                                    // later repair; what is lost is this segment's
+                                                    // cells, which is the actual damage rather than
+                                                    // the whole store.
+                                                    error!(
+                                                        "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
+                                                         Repair failed: {}. Recovery continues; the cells in this \
+                                                         segment are missing from the recovered store.",
+                                                        file_info.seg_id,
+                                                        chunk_id,
+                                                        file_info.seq_id,
+                                                        file_info.path.display(),
+                                                        error,
+                                                        repair_error
+                                                    );
+                                                    quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                                                    continue;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2896,6 +3228,15 @@ pub fn recover_chunks(
 
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
+
+    let repaired = RECOVERY_REPAIRED_SEGMENTS.load(Ordering::Relaxed);
+    if repaired > 0 {
+        error!(
+            "=== Recovery REPAIRED {} damaged segment(s), with {} live byte(s) lost. Grep 'REPAIRED segment' for the files and ranges. ===",
+            repaired,
+            RECOVERY_LOST_BYTES.load(Ordering::Relaxed)
+        );
+    }
 
     let quarantined = quarantined_segments.load(Ordering::Relaxed);
     if quarantined > 0 {
@@ -4520,6 +4861,434 @@ mod tests {
             true,
             Some(raft_path),
         );
+    }
+
+    /// Three real entries and the schema that reads them.
+    struct RepairFixture {
+        schema: Schema,
+        ids: Vec<Id>,
+        entries: Vec<Vec<u8>>,
+    }
+
+    fn repair_fixture(schema_id: u32, name: &str) -> RepairFixture {
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let schema = schema_with_id(schema_id, name, false);
+        writer_chunks.list[0]
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let ids: Vec<Id> = (0..3).map(|i| Id::allocated(25, 0, i + 1)).collect();
+        let entries = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut cell = OwnedCell {
+                    header: CellHeader::new(schema.vid, id),
+                    data: data_map_value!(id: i as i32, data: vec![0x4D_u8; DATA_SIZE]),
+                };
+                writer_chunks.write_cell(&mut cell).unwrap();
+                entry_bytes_at(writer_chunks.address_of(id))
+            })
+            .collect();
+        RepairFixture {
+            schema,
+            ids,
+            entries,
+        }
+    }
+
+    /// Lay entries out as an image; return it with their ranges.
+    fn image_of(entries: &[&[u8]]) -> (Vec<u8>, Vec<std::ops::Range<usize>>) {
+        let mut image = empty_segment_bytes();
+        let mut ranges = Vec::new();
+        let mut at = 0;
+        for entry in entries {
+            image[at..at + entry.len()].copy_from_slice(entry);
+            ranges.push(at..at + entry.len());
+            at += entry.len();
+        }
+        (image, ranges)
+    }
+
+    fn flip_content(image: &mut [u8], range: &std::ops::Range<usize>) {
+        image[range.start + ENTRY_HEAD_SIZE + 3] ^= 0xFF;
+    }
+
+    /// A backup whose whole-image CRC fails, as damage at rest leaves one.
+    fn backup_bytes_failing_crc(image: &[u8], ranges: &[std::ops::Range<usize>]) -> Vec<u8> {
+        let boundaries: Vec<usize> = ranges.iter().map(|range| range.start).collect();
+        let used_len = ranges.last().map_or(0, |range| range.end);
+        let mut bytes =
+            crate::ram::compression::compress_blocks_on_cells(image, &boundaries, used_len)
+                .expect("compress");
+        bytes[4] ^= 0xFF;
+        bytes
+    }
+
+    fn recover_with_schema(
+        schema: &Schema,
+        backup_dir: &TempDir,
+        wal_dir: &TempDir,
+    ) -> Arc<Chunks> {
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let schemas = setup_test_schema();
+        schemas.debug_only_new_schema(schema.clone());
+        Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        )
+    }
+
+    /// A failed image CRC alone costs nothing when every entry verifies. The
+    /// start goes on, and the file passes a normal read again.
+    #[test]
+    fn a_failed_image_crc_over_intact_entries_repairs_without_loss() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(215, "repair_intact");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (image, ranges) = image_of(&refs);
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let bytes = backup_bytes_failing_crc(&image, &ranges);
+        write_backup_segment(&backup_dir, 0, 0, 1, &bytes);
+
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        for id in &fixture.ids {
+            assert!(chunks.read_cell(id).is_ok(), "{id:?} was lost");
+        }
+        let path = backup_dir.path().join("0-0-1.nbackup");
+        assert!(load_file_with_used_len(&path).is_ok());
+        assert!(!backup_dir.path().join("0-0-1.nbackup.damaged").exists());
+    }
+
+    /// Bytes past the declared extent hold no data, so a block that is lost
+    /// there is no reason to stop.
+    #[test]
+    fn a_lost_block_past_the_live_extent_repairs_without_loss() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(216, "repair_free_space");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (mut image, ranges) = image_of(&refs);
+        let used_len = ranges[2].end;
+        let free_space = 1 << 20;
+        image[free_space..free_space + 4096].fill(0x5A);
+        let mut bytes =
+            crate::ram::compression::compress_blocks_on_cells(&image, &[0, free_space], used_len)
+                .expect("compress");
+        let layout = crate::ram::compression::block_layout(&bytes).unwrap();
+        assert_eq!(layout.block_count, 2, "the fixture needs a second block");
+        let (_, offset, len) = layout.entry(&bytes, 1).unwrap();
+        bytes[offset + 4..offset + len].fill(0xFF);
+        assert!(
+            crate::ram::compression::decompress_if_compressed(&bytes).is_err(),
+            "the normal read must fail, or the repair never runs"
+        );
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        write_backup_segment(&backup_dir, 0, 0, 1, &bytes);
+
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        for id in &fixture.ids {
+            assert!(chunks.read_cell(id).is_ok(), "{id:?} was lost");
+        }
+    }
+
+    /// Damage to a live entry stops the start, at any position, and the stop
+    /// leaves the file as it was.
+    #[test]
+    fn damage_to_a_live_entry_stops_the_start_and_leaves_the_file() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(217, "repair_stop");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        for damaged in 0..fixture.entries.len() {
+            let (mut image, ranges) = image_of(&refs);
+            flip_content(&mut image, &ranges[damaged]);
+            let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            let bytes = backup_bytes_failing_crc(&image, &ranges);
+            write_backup_segment(&backup_dir, 0, 0, 1, &bytes);
+
+            let start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+            }));
+
+            assert!(start.is_err(), "entry {damaged}: the start went on");
+            let path = backup_dir.path().join("0-0-1.nbackup");
+            assert_eq!(fs::read(path).unwrap(), bytes, "entry {damaged}");
+            assert!(!backup_dir.path().join("0-0-1.nbackup.damaged").exists());
+        }
+    }
+
+    /// With the opt-in, only the damaged entry is lost, at any position. The
+    /// repair is on disk, so the next start needs no opt-in.
+    #[test]
+    fn the_opt_in_keeps_every_entry_that_verifies() {
+        let _ = env_logger::try_init();
+        let fixture = repair_fixture(218, "repair_opt_in");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        for damaged in 0..fixture.entries.len() {
+            let (mut image, ranges) = image_of(&refs);
+            flip_content(&mut image, &ranges[damaged]);
+            let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            let bytes = backup_bytes_failing_crc(&image, &ranges);
+            write_backup_segment(&backup_dir, 0, 0, 1, &bytes);
+
+            TEST_QUARANTINE.with(|c| c.set(Some(true)));
+            let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+            let survivors = |chunks: &Chunks| {
+                fixture
+                    .ids
+                    .iter()
+                    .map(|id| chunks.read_cell(id).is_ok())
+                    .collect::<Vec<bool>>()
+            };
+            let expected: Vec<bool> = (0..3).map(|i| i != damaged).collect();
+            assert_eq!(survivors(&chunks), expected, "entry {damaged}");
+            drop(chunks);
+
+            let evidence = backup_dir.path().join("0-0-1.nbackup.damaged");
+            assert_eq!(fs::read(evidence).unwrap(), bytes, "entry {damaged}");
+
+            TEST_QUARANTINE.with(|c| c.set(Some(false)));
+            let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+            assert_eq!(survivors(&chunks), expected, "restart, entry {damaged}");
+        }
+    }
+
+    /// The property the repair exists for, on a real archive: one flipped
+    /// bit, anywhere in the file, stops the start or costs nothing.
+    #[test]
+    fn a_flip_in_a_real_backup_stops_the_start_or_costs_nothing() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let store = TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Some(store.path().to_str().unwrap().to_string()),
+        );
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(225, "repair_real_archive", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+        let ids: Vec<Id> = (0..64).map(|i| Id::allocated(25, 0, i + 1)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            // Mixed bytes, so that LZ4 output is not one long match.
+            let payload: Vec<u8> = (0..DATA_SIZE)
+                .map(|at| (at.wrapping_mul(31) ^ i.wrapping_mul(97) ^ (at >> 3)) as u8)
+                .collect();
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.vid, id),
+                data: data_map_value!(id: i as i32, data: payload),
+            };
+            chunks.write_cell(&mut cell).expect("write a cell");
+        }
+        let segment = chunk
+            .segs
+            .get(&(chunk.get_head_seg_id() as usize))
+            .expect("head segment");
+        let backup_file = chunk
+            .file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+            .expect("backup path");
+        chunk.rotate_heads_for_scrub_test();
+        segment.archive().expect("archive");
+        let bytes = fs::read(&backup_file).unwrap();
+        let name = Path::new(&backup_file).file_name().unwrap().to_owned();
+
+        let header = 0..crate::ram::compression::block_header_size();
+        let stride = (bytes.len() / 48).max(1);
+        let mut silent_losses = Vec::new();
+        let mut stops = 0;
+        for position in header.chain((0..bytes.len()).step_by(stride)) {
+            let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            let mut flipped = bytes.clone();
+            flipped[position] ^= 0x01;
+            fs::write(backup_dir.path().join(&name), &flipped).unwrap();
+            let start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recover_with_schema(&schema, &backup_dir, &wal_dir)
+            }));
+            match start {
+                Err(_) => stops += 1,
+                Ok(recovered) => {
+                    let missing = ids
+                        .iter()
+                        .filter(|id| recovered.read_cell(id).is_err())
+                        .count();
+                    if missing > 0 {
+                        silent_losses.push((position, missing));
+                    }
+                }
+            }
+        }
+        assert!(stops > 0, "no flip was detected");
+        assert_eq!(silent_losses, vec![], "(file offset, cells lost)");
+    }
+
+    /// A WAL has no second chance at its own path, so its repair lands as the
+    /// segment's backup, which discovery prefers at the same seq id.
+    #[test]
+    fn a_repaired_wal_image_lands_as_the_backup_of_its_segment() {
+        let _ = env_logger::try_init();
+        let fixture = repair_fixture(220, "repair_wal");
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        // The first entry never reached the log, so the image starts with a
+        // hole that the scan cannot step over.
+        let hole = fixture.entries[0].len();
+        let mut bytes = crate::ram::wal_format::wal_file_header(1).to_vec();
+        bytes.extend_from_slice(&crate::ram::wal_format::frame_record(
+            hole as u64,
+            &fixture.entries[1],
+        ));
+        fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
+
+        TEST_QUARANTINE.with(|c| c.set(Some(true)));
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        assert!(chunks.read_cell(&fixture.ids[1]).is_ok());
+        let backup = chunks.list[0].file_manager.backup_path(0, 0, 1).unwrap();
+        assert!(load_file_with_used_len(Path::new(&backup)).is_ok());
+    }
+
+    /// Every position in a bracket loses the whole bracket, and entries
+    /// outside it stay.
+    #[test]
+    fn damage_in_a_bracket_drops_the_whole_bracket() {
+        let fixture = repair_fixture(221, "repair_bracket");
+        let txn = crate::server::transactions::test_hlc(4243, 7);
+        let begin = bracket_entry_bytes(
+            EntryType::BEGIN,
+            &crate::ram::bracket::encode_begin(&txn, &[]),
+        );
+        let commit = bracket_entry_bytes(
+            EntryType::COMMIT,
+            &crate::ram::bracket::encode_commit(&txn, &[]),
+        );
+        let e = &fixture.entries;
+        let parts: [&[u8]; 6] = [&e[0], &begin, &e[1], &e[2], &commit, &e[0]];
+        let (template, ranges) = image_of(&parts);
+        let bracket = ranges[1].start..ranges[4].end;
+
+        for damaged in 1..=4 {
+            let mut image = template.clone();
+            flip_content(&mut image, &ranges[damaged]);
+            let found = find_image_damage(&image, Some(ranges[5].end), &[], &|_| true);
+            assert_eq!(found.lost, vec![ranges[damaged].clone()], "part {damaged}");
+            assert_eq!(found.dropped, vec![bracket.clone()], "part {damaged}");
+        }
+        for damaged in [0, 5] {
+            let mut image = template.clone();
+            flip_content(&mut image, &ranges[damaged]);
+            let found = find_image_damage(&image, Some(ranges[5].end), &[], &|_| true);
+            assert_eq!(
+                found.dropped,
+                vec![ranges[damaged].clone()],
+                "part {damaged}"
+            );
+        }
+    }
+
+    /// Zeros are the end of the entries, unless a block was lost there.
+    #[test]
+    fn zeros_in_a_lost_block_count_as_damage() {
+        let fixture = repair_fixture(222, "repair_lost_tail");
+        let (image, ranges) = image_of(&[&fixture.entries[0]]);
+        let used_len = ranges[0].end + 4096;
+
+        let found = find_image_damage(&image, Some(used_len), &[], &|_| true);
+        assert!(found.lost.is_empty());
+
+        let lost_block = [ranges[0].end..used_len];
+        let found = find_image_damage(&image, Some(used_len), &lost_block, &|_| true);
+        assert_eq!(found.lost, lost_block.to_vec());
+    }
+
+    /// Entries past the declared end prove that the declaration is wrong, and
+    /// noise in free space does not.
+    #[test]
+    fn verified_entries_past_the_declared_end_correct_the_extent() {
+        let fixture = repair_fixture(226, "repair_extent");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (mut image, ranges) = image_of(&refs);
+        let used_len = ranges[2].end;
+        assert_eq!(corrected_extent(&image, ranges[1].end, &|_| true), used_len);
+        assert_eq!(corrected_extent(&image, 100, &|_| true), used_len);
+        assert_eq!(corrected_extent(&image, used_len, &|_| true), used_len);
+        assert_eq!(corrected_extent(&image, 1 << 16, &|_| true), 1 << 16);
+
+        image[1 << 20..(1 << 20) + 4096].fill(0x5A);
+        assert_eq!(corrected_extent(&image, used_len, &|_| true), used_len);
+    }
+
+    /// A flip that shrinks `used_len` to an entry boundary leaves nothing
+    /// damaged inside the declared extent, so only the extent check sees it.
+    #[test]
+    fn a_shrunken_used_len_on_an_entry_boundary_loses_nothing() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(227, "repair_used_len");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (image, ranges) = image_of(&refs);
+        let boundaries: Vec<usize> = ranges.iter().map(|range| range.start).collect();
+        let mut bytes =
+            crate::ram::compression::compress_blocks_on_cells(&image, &boundaries, ranges[2].end)
+                .expect("compress");
+        let shrunken = ranges[0].end as u32;
+        bytes[16..20].copy_from_slice(&shrunken.to_le_bytes());
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        write_backup_segment(&backup_dir, 0, 0, 1, &bytes);
+
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        for id in &fixture.ids {
+            assert!(chunks.read_cell(id).is_ok(), "{id:?} was lost");
+        }
+    }
+
+    /// A resync lands only on a candidate that the anchor check accepts.
+    #[test]
+    fn a_resync_ignores_a_candidate_that_fails_the_anchor_check() {
+        let fixture = repair_fixture(223, "repair_anchor");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (mut image, ranges) = image_of(&refs);
+        flip_content(&mut image, &ranges[0]);
+        let used_len = ranges[2].end;
+        let found = find_image_damage(&image, Some(used_len), &[], &|_| false);
+        assert_eq!(found.lost, vec![0..used_len]);
+    }
+
+    /// A verified entry is an anchor only for a schema this node knows, in
+    /// the chunk that owns its id.
+    #[test]
+    fn an_anchor_needs_a_known_schema_and_the_owning_chunk() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(224, "repair_owner", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+        let id = Id::allocated(25, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.vid, &id),
+            data: data_map_value!(id: 1_i32, data: vec![0x4D_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell).unwrap();
+        let addr = chunks.address_of(&id);
+
+        let count = id.locality() as usize + 2;
+        assert!(is_resync_anchor(chunk, 1, addr));
+        assert!(!is_resync_anchor(chunk, count, addr), "wrong chunk");
+
+        let other = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        assert!(!is_resync_anchor(&other.list[0], 1, addr), "unknown schema");
     }
 
     /// A WAL shorter than its file header holds no record: the header is

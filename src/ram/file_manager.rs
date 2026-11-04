@@ -387,6 +387,50 @@ impl SegmentFileManager {
         }
     }
 
+    /// Read what a segment file still holds, for the repair path.
+    ///
+    /// A block backup is salvaged block by block. Any other file is read
+    /// as usual: a WAL record is verified by its frame, and a plain backup
+    /// has nothing to verify at file level.
+    pub fn read_file_for_repair(&self, path: &Path) -> io::Result<compression::SalvagedSegment> {
+        let is_backup = path.extension().is_some_and(|ext| ext == "nbackup");
+        if is_backup {
+            let buffer = fs::read(path)?;
+            if compression::block_layout(&buffer).is_some() {
+                let salvaged =
+                    compression::salvage_blocks(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
+                return Ok(compression::SalvagedSegment {
+                    used_len: Some(salvaged.used_len),
+                    image: salvaged.image,
+                    unreadable: salvaged.unreadable,
+                });
+            }
+        }
+        let (image, used_len) = self.read_file_with_used_len(path)?;
+        Ok(compression::SalvagedSegment {
+            image,
+            used_len,
+            unreadable: Vec::new(),
+        })
+    }
+
+    /// Atomically install `bytes` as the backup at `backup_path`.
+    ///
+    /// A kill leaves the previous file or the complete new one. `.tmp` files
+    /// are invisible to recovery.
+    pub fn install_backup_file(&self, backup_path: &str, bytes: &[u8]) -> io::Result<()> {
+        let tmp_path = format!("{backup_path}.tmp");
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, backup_path)?;
+        if let Some(parent) = Path::new(backup_path).parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Get file size
     pub fn file_size(&self, path: &Path) -> io::Result<u64> {
         Ok(fs::metadata(path)?.len())

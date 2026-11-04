@@ -6267,7 +6267,8 @@ impl Chunks {
                     error!(
                         "RECOVERY FAILED for this database: {:?}. REFUSING TO START. The \
                          existing store is left untouched. Starting empty would hide it behind \
-                         new writes. For an unscannable segment, {}=1 starts without its cells.",
+                         new writes. For an unreadable segment, {}=1 starts without the data that \
+                         cannot be read.",
                         e,
                         crate::ram::recovery::QUARANTINE_ENV
                     );
