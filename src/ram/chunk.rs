@@ -6396,6 +6396,7 @@ impl Chunks {
                     break 'decision Err(error);
                 }
             }
+            crate::ram::fault::crash_point(crate::ram::fault::Point::CommitPlaced);
             #[cfg(test)]
             if take_injected_commit_refusal(self.base_addr, txn) {
                 break 'decision Err(WriteError::CannotAllocateSpace);

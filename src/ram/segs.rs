@@ -2582,6 +2582,7 @@ image, not an empty segment; archiving it would persist the damage.",
                     // replace whatever the final path held. rename(2) within
                     // one directory either fully installs the new image or
                     // leaves the previous state -- there is no torn middle.
+                    fault::crash_point(fault::Point::ArchiveSynced);
                     fs::rename(&tmp_backup_file, &backup_file)?;
                     // The rename must be DURABLE before the WAL that covers
                     // these bytes is unlinked below, and only the directory's

@@ -993,6 +993,7 @@ impl DataManager {
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
             }
+            crate::ram::fault::crash_point(crate::ram::fault::Point::RollbackMid);
         }
         failures
     }
@@ -2869,7 +2870,10 @@ impl DataManager {
         let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut write_error: Option<(Id, WriteError)> = None;
             {
-                for cell_op in cells {
+                for (index, cell_op) in cells.into_iter().enumerate() {
+                    if index == 1 {
+                        crate::ram::fault::crash_point(crate::ram::fault::Point::ApplyMid);
+                    }
                     match cell_op {
                         CommitOp::Read(_, _) => continue,
                         CommitOp::None => {
@@ -3091,6 +3095,7 @@ impl DataManager {
         };
         #[cfg(multisite_test)]
         crate::utils::multisite::point("before_p0", tid);
+        crate::ram::fault::crash_point(crate::ram::fault::Point::PrepareEntries);
         #[cfg(feature = "occ_phase_profile")]
         let sync_phase = super::phase_profile::guard(super::phase_profile::Phase::PrepareSync);
         // Through each file's group sync, all files at once: one at a time,
@@ -3136,6 +3141,7 @@ impl DataManager {
 
         #[cfg(multisite_test)]
         crate::utils::multisite::point("after_p0", tid);
+        crate::ram::fault::crash_point(crate::ram::fault::Point::PrepareSynced);
         // NO commit marker here, deliberately.
         //
         // Despite its name, this runs in the coordinator's PREPARE phase

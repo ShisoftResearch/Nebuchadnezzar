@@ -598,6 +598,7 @@ impl CombinedCleaner {
             }
             return None;
         }
+        crate::ram::fault::crash_point(crate::ram::fault::Point::CombineStaged);
         Some(COMBINE_ALLOC_POOL.install(|| {
             staged
                 .into_par_iter()
