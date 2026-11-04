@@ -1676,6 +1676,11 @@ fn install_repaired_segment(
         &repair.image,
         &repair.boundaries,
         repair.used_len,
+        crate::ram::compression::SegmentIdentity {
+            chunk_id: file_info.chunk_id as u64,
+            seg_id: file_info.seg_id,
+            seq_id: file_info.seq_id,
+        },
     )?;
     if !repair.lost.is_empty() {
         fs::copy(&file_info.path, format!("{backup_path}.damaged"))?;
@@ -3507,8 +3512,8 @@ mod tests {
     ) {
         let dir = wal_dir.path().join(format!("chunk-wal-{}", chunk_id));
         fs::create_dir_all(&dir).unwrap();
-        let mut bytes = crate::ram::wal_format::wal_file_header(seq_id).to_vec();
-        bytes.extend_from_slice(&crate::ram::wal_format::frame_record(0, entry));
+        let mut bytes = crate::ram::wal_format::wal_file_header(chunk_id, seg_id, seq_id).to_vec();
+        bytes.extend_from_slice(&crate::ram::wal_format::frame_record(0, entry, 0));
         fs::write(
             dir.join(format!("{}-{}-{}.nlog", chunk_id, seg_id, seq_id)),
             &bytes,
@@ -4020,6 +4025,7 @@ mod tests {
             &good_segment,
             &[0],
             good_entry.len(),
+            TEST_BACKUP_IDENTITY,
         )
         .expect("compress");
         let torn = &compressed[..compressed.len() / 2];
@@ -4863,6 +4869,14 @@ mod tests {
         );
     }
 
+    /// The file these fixtures write: `0-0-1.nbackup`.
+    const TEST_BACKUP_IDENTITY: crate::ram::compression::SegmentIdentity =
+        crate::ram::compression::SegmentIdentity {
+            chunk_id: 0,
+            seg_id: 0,
+            seq_id: 1,
+        };
+
     /// Three real entries and the schema that reads them.
     struct RepairFixture {
         schema: Schema,
@@ -4919,8 +4933,13 @@ mod tests {
         let boundaries: Vec<usize> = ranges.iter().map(|range| range.start).collect();
         let used_len = ranges.last().map_or(0, |range| range.end);
         let mut bytes =
-            crate::ram::compression::compress_blocks_on_cells(image, &boundaries, used_len)
-                .expect("compress");
+            crate::ram::compression::compress_blocks_on_cells(
+                image,
+                &boundaries,
+                used_len,
+                TEST_BACKUP_IDENTITY,
+            )
+            .expect("compress");
         bytes[4] ^= 0xFF;
         bytes
     }
@@ -4982,7 +5001,12 @@ mod tests {
         let free_space = 1 << 20;
         image[free_space..free_space + 4096].fill(0x5A);
         let mut bytes =
-            crate::ram::compression::compress_blocks_on_cells(&image, &[0, free_space], used_len)
+            crate::ram::compression::compress_blocks_on_cells(
+                &image,
+                &[0, free_space],
+                used_len,
+                TEST_BACKUP_IDENTITY,
+            )
                 .expect("compress");
         let layout = crate::ram::compression::block_layout(&bytes).unwrap();
         assert_eq!(layout.block_count, 2, "the fixture needs a second block");
@@ -5145,10 +5169,11 @@ mod tests {
         // The first entry never reached the log, so the image starts with a
         // hole that the scan cannot step over.
         let hole = fixture.entries[0].len();
-        let mut bytes = crate::ram::wal_format::wal_file_header(1).to_vec();
+        let mut bytes = crate::ram::wal_format::wal_file_header(0, 0, 1).to_vec();
         bytes.extend_from_slice(&crate::ram::wal_format::frame_record(
             hole as u64,
             &fixture.entries[1],
+            0,
         ));
         fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
 
@@ -5158,6 +5183,137 @@ mod tests {
         assert!(chunks.read_cell(&fixture.ids[1]).is_ok());
         let backup = chunks.list[0].file_manager.backup_path(0, 0, 1).unwrap();
         assert!(load_file_with_used_len(Path::new(&backup)).is_ok());
+    }
+
+    /// A WAL with its entries and watermarks, as the writer lays one out.
+    fn wal_bytes(fixture: &RepairFixture) -> (Vec<u8>, Vec<usize>) {
+        let header = crate::ram::wal_format::wal_file_header(0, 0, 1).to_vec();
+        let mut bytes = header;
+        let mut starts = Vec::new();
+        let mut at = 0;
+        for entry in &fixture.entries {
+            starts.push(bytes.len());
+            // Each record says that a sync covered all records before it.
+            bytes.extend_from_slice(&crate::ram::wal_format::frame_record(
+                at as u64,
+                entry,
+                bytes.len() as u64,
+            ));
+            at += entry.len();
+        }
+        (bytes, starts)
+    }
+
+    /// A synced record that changed at rest is not a torn tail, so the start
+    /// stops instead of dropping it and every record after it.
+    #[test]
+    #[should_panic(expected = "recovery failed")]
+    fn damage_to_a_synced_wal_record_stops_the_start() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(228, "wal_damage_stop");
+        let (mut bytes, starts) = wal_bytes(&fixture);
+        bytes[starts[1] + crate::ram::wal_format::RECORD_HEADER_SIZE + 12] ^= 0x01;
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
+        recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+    }
+
+    /// With the opt-in, the records around the damage come back.
+    #[test]
+    fn the_opt_in_keeps_the_wal_records_around_the_damage() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(true)));
+        let fixture = repair_fixture(229, "wal_damage_opt_in");
+        let (mut bytes, starts) = wal_bytes(&fixture);
+        bytes[starts[1] + crate::ram::wal_format::RECORD_HEADER_SIZE + 12] ^= 0x01;
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
+
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        assert!(chunks.read_cell(&fixture.ids[0]).is_ok());
+        assert!(chunks.read_cell(&fixture.ids[1]).is_err());
+        assert!(chunks.read_cell(&fixture.ids[2]).is_ok());
+    }
+
+    /// Every record of a swapped WAL verifies. Only the identity in its file
+    /// header shows that it holds another segment.
+    #[test]
+    #[should_panic(expected = "recovery failed")]
+    fn a_wal_of_another_segment_stops_the_start() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(230, "wal_swap");
+        let (bytes, _) = wal_bytes(&fixture);
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0-5-9.nlog"), &bytes).unwrap();
+        recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+    }
+
+    /// Every byte of a swapped backup verifies. Only its identity shows that
+    /// it holds another segment.
+    #[test]
+    #[should_panic(expected = "recovery failed")]
+    fn a_backup_of_another_segment_stops_the_start() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(231, "backup_swap");
+        let refs: Vec<&[u8]> = fixture.entries.iter().map(Vec::as_slice).collect();
+        let (image, ranges) = image_of(&refs);
+        let bytes = crate::ram::compression::compress_blocks_on_cells(
+            &image,
+            &[0],
+            ranges[2].end,
+            TEST_BACKUP_IDENTITY,
+        )
+        .expect("compress");
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        write_backup_segment(&backup_dir, 0, 7, 9, &bytes);
+        recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+    }
+
+    /// A flip in the last record has no later record to prove it, and its
+    /// shape shows that no crash left it.
+    #[test]
+    #[should_panic(expected = "recovery failed")]
+    fn a_flip_in_the_last_wal_record_stops_the_start() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(232, "wal_last_flip");
+        let (mut bytes, starts) = wal_bytes(&fixture);
+        bytes[starts[2] + crate::ram::wal_format::RECORD_HEADER_SIZE + 12] ^= 0x01;
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
+        recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+    }
+
+    /// A tear in the last record still recovers: this is what a crash leaves.
+    #[test]
+    fn a_torn_last_wal_record_keeps_the_records_before_it() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let fixture = repair_fixture(233, "wal_last_tear");
+        let (mut bytes, starts) = wal_bytes(&fixture);
+        bytes.truncate(starts[2] + crate::ram::wal_format::RECORD_HEADER_SIZE + 5);
+        let (backup_dir, wal_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0-0-1.nlog"), &bytes).unwrap();
+
+        let chunks = recover_with_schema(&fixture.schema, &backup_dir, &wal_dir);
+
+        assert!(chunks.read_cell(&fixture.ids[0]).is_ok());
+        assert!(chunks.read_cell(&fixture.ids[1]).is_ok());
+        assert!(chunks.read_cell(&fixture.ids[2]).is_err());
     }
 
     /// Every position in a bracket loses the whole bracket, and entries
@@ -5241,7 +5397,12 @@ mod tests {
         let (image, ranges) = image_of(&refs);
         let boundaries: Vec<usize> = ranges.iter().map(|range| range.start).collect();
         let mut bytes =
-            crate::ram::compression::compress_blocks_on_cells(&image, &boundaries, ranges[2].end)
+            crate::ram::compression::compress_blocks_on_cells(
+                &image,
+                &boundaries,
+                ranges[2].end,
+                TEST_BACKUP_IDENTITY,
+            )
                 .expect("compress");
         let shrunken = ranges[0].end as u32;
         bytes[16..20].copy_from_slice(&shrunken.to_le_bytes());
@@ -5321,7 +5482,7 @@ mod tests {
 
         let dir = wal_dir.path().join("chunk-wal-0");
         fs::create_dir_all(&dir).unwrap();
-        let header = crate::ram::wal_format::wal_file_header(2);
+        let header = crate::ram::wal_format::wal_file_header(0, 1, 2);
         fs::write(dir.join("0-1-2.nlog"), &header[..7]).unwrap();
         fs::write(dir.join("0-2-3.nlog"), b"").unwrap();
 
@@ -6967,6 +7128,9 @@ mod tests {
     #[test]
     fn a_scribbled_wal_record_is_refused_rather_than_served_as_data() {
         let _ = env_logger::try_init();
+        // Without the opt-in the start stops: see
+        // `a_flip_in_the_last_wal_record_stops_the_start`.
+        TEST_QUARANTINE.with(|c| c.set(Some(true)));
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
@@ -7117,12 +7281,13 @@ mod tests {
                 // assuming the segment starts with this cell.
                 let first_off = (chunks.address_of(&first_id) - blob_segment.addr) as u64;
                 let second_off = (chunks.address_of(&second_id) - blob_segment.addr) as u64;
-                let mut bytes = crate::ram::wal_format::wal_file_header(blob_seq_id).to_vec();
+                let mut bytes = crate::ram::wal_format::wal_file_header(0, blob_segment.id, blob_seq_id).to_vec();
                 bytes.extend_from_slice(&crate::ram::wal_format::frame_record(
                     first_off,
                     &first_entry,
+                    0,
                 ));
-                let torn = crate::ram::wal_format::frame_record(second_off, &second_entry);
+                let torn = crate::ram::wal_format::frame_record(second_off, &second_entry, 0);
                 bytes.extend_from_slice(&torn[..crate::ram::wal_format::RECORD_HEADER_SIZE + 4]);
                 bytes
             };
@@ -7344,7 +7509,10 @@ mod tests {
                 .file_manager
                 .backup_path(0, 0, recovered_seq_id)
                 .expect("backup storage should be configured for the recovered bootstrap segment");
-            std::fs::copy(&original_backup, &recovered_backup).expect(
+            // The file names its seq id too, so the copy must say the new one.
+            let mut image = std::fs::read(&original_backup).unwrap();
+            image[36..44].copy_from_slice(&recovered_seq_id.to_le_bytes());
+            std::fs::write(&recovered_backup, &image).expect(
                 "should be able to synthesize a recovered bootstrap segment with a higher seq_id",
             );
         }

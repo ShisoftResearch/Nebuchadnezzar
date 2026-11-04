@@ -102,10 +102,19 @@ impl SegmentFileManager {
             // A framed log opens with a file header naming the incarnation
             // it belongs to. Write it exactly once, when the file is new.
             let existing_len = file.metadata()?.len();
-            if existing_len == 0 {
+            // Appending to an old file would mix two sync histories: a new
+            // record's `synced_len` could cover a tail torn before the restart,
+            // and that tail would then read as damage at rest.
+            if existing_len != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("WAL {wal_path} already holds {existing_len} bytes"),
+                ));
+            }
+            {
                 use std::io::Write;
-                if let Err(error) = file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))
-                {
+                let header = crate::ram::wal_format::wal_file_header(chunk_id, seg_id, seq_id);
+                if let Err(error) = file.write_all(&header) {
                     // This new file has no accepted records.
                     std::fs::remove_file(&wal_path)?;
                     return Err(error);
@@ -117,27 +126,6 @@ impl SegmentFileManager {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 result?;
-            } else {
-                // Appending framed records to an unframed log would leave one
-                // file holding two formats, and recovery would have to guess
-                // where the second began. Refuse instead: the caller reports
-                // a journal failure, which is loud and recoverable, rather
-                // than writing something no reader can arbitrate.
-                let mut opening = [0u8; 4];
-                use std::io::Read;
-                let mut probe = File::open(&wal_path)?;
-                probe.read_exact(&mut opening)?;
-                if opening != crate::ram::wal_format::FILE_MAGIC {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "WAL {} is not a framed log, so it cannot be appended to. Its \
-                             segment must be archived (or recovered and left sealed) rather \
-                             than resumed.",
-                            wal_path
-                        ),
-                    ));
-                }
             }
             Ok(Some(file))
         } else {
@@ -311,6 +299,9 @@ impl SegmentFileManager {
         wal_file.read_to_end(&mut wal_data)?;
         let outcome =
             crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
+        if let crate::ram::wal_format::TailStop::Damaged { .. } = outcome.stop {
+            return Err(wal_damage_error(Path::new(&wal_path), &outcome.stop));
+        }
         let image = outcome.image;
         let wal_size = image.len();
 
@@ -353,6 +344,7 @@ impl SegmentFileManager {
         // Check if this is a backup file by extension
         if let Some(extension) = path.extension() {
             if extension == "nbackup" {
+                check_backup_identity(path, &buffer)?;
                 let used_len = compression::declared_used_len(&buffer);
                 // Decompress backup files (auto-detects compression)
                 return compression::decompress_if_compressed(&buffer).map(|data| (data, used_len));
@@ -365,26 +357,26 @@ impl SegmentFileManager {
         // that is not framed is not a WAL this build wrote, and reading it as
         // a raw segment image -- which is what the unframed path did -- means
         // replaying bytes nothing can verify.
-        {
-            let outcome =
-                crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
-            if let crate::ram::wal_format::TailStop::Torn {
+        let outcome = scan_wal(path, &buffer)?;
+        match &outcome.stop {
+            crate::ram::wal_format::TailStop::Clean => {}
+            crate::ram::wal_format::TailStop::Torn {
                 at_file_offset,
                 reason,
-            } = &outcome.stop
-            {
-                warn!(
-                    "WAL {} has a torn tail at byte {}: {}. Replaying the {} record(s) before \
-                     it and dropping the rest; those writes were never acknowledged as durable.",
-                    path.display(),
-                    at_file_offset,
-                    reason,
-                    outcome.records
-                );
+            } => warn!(
+                "WAL {} has a torn tail at byte {}: {}. Replaying the {} record(s) before \
+                 it and dropping the rest: no later record proves those bytes were synced.",
+                path.display(),
+                at_file_offset,
+                reason,
+                outcome.records
+            ),
+            crate::ram::wal_format::TailStop::Damaged { .. } => {
+                return Err(wal_damage_error(path, &outcome.stop));
             }
-            let used_len = outcome.used_len;
-            Ok((outcome.image, Some(used_len)))
         }
+        let used_len = outcome.used_len;
+        Ok((outcome.image, Some(used_len)))
     }
 
     /// Read what a segment file still holds, for the repair path.
@@ -396,6 +388,7 @@ impl SegmentFileManager {
         let is_backup = path.extension().is_some_and(|ext| ext == "nbackup");
         if is_backup {
             let buffer = fs::read(path)?;
+            check_backup_identity(path, &buffer)?;
             if compression::block_layout(&buffer).is_some() {
                 let salvaged =
                     compression::salvage_blocks(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
@@ -405,6 +398,15 @@ impl SegmentFileManager {
                     unreadable: salvaged.unreadable,
                 });
             }
+        }
+        if !is_backup {
+            let buffer = fs::read(path)?;
+            let outcome = scan_wal(path, &buffer)?;
+            return Ok(compression::SalvagedSegment {
+                used_len: Some(outcome.used_len),
+                image: outcome.image,
+                unreadable: outcome.unreadable,
+            });
         }
         let (image, used_len) = self.read_file_with_used_len(path)?;
         Ok(compression::SalvagedSegment {
@@ -648,6 +650,61 @@ impl SegmentFileManager {
     }
 }
 
+/// Scan a WAL and refuse one that belongs to another segment.
+///
+/// Every record in a swapped file verifies, so only the identity in the file
+/// header can show that the file holds the wrong segment.
+fn scan_wal(path: &Path, buffer: &[u8]) -> io::Result<crate::ram::wal_format::ScanOutcome> {
+    let outcome = crate::ram::wal_format::scan_framed(buffer, crate::ram::segs::SEGMENT_SIZE)?;
+    if let Some(name) = SegmentFileInfo::parse_filename(path) {
+        let written_for = (outcome.chunk_id, outcome.seg_id, outcome.seq_id);
+        if written_for != (name.chunk_id as u64, name.seg_id, name.seq_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL {} holds (chunk, segment, seq) {written_for:?}: it is another \
+                     segment's file",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(outcome)
+}
+
+/// Refuse a block backup that belongs to another segment.
+fn check_backup_identity(path: &Path, buffer: &[u8]) -> io::Result<()> {
+    let (Some(layout), Some(name)) = (
+        compression::block_layout(buffer),
+        SegmentFileInfo::parse_filename(path),
+    ) else {
+        return Ok(());
+    };
+    let expected = compression::SegmentIdentity {
+        chunk_id: name.chunk_id as u64,
+        seg_id: name.seg_id,
+        seq_id: name.seq_id,
+    };
+    if layout.identity == expected {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "backup {} holds {:?}: it is another segment's file",
+            path.display(),
+            layout.identity
+        ),
+    ))
+}
+
+fn wal_damage_error(path: &Path, stop: &crate::ram::wal_format::TailStop) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("WAL {} is damaged at rest: {stop:?}", path.display()),
+    )
+}
+
 /// Information about a segment file
 #[derive(Debug, Clone)]
 pub struct SegmentFileInfo {
@@ -706,6 +763,18 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::TempDir;
+
+    /// A WAL has one sync history, so no writer may append to an old file.
+    #[test]
+    fn creating_a_wal_over_an_existing_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let manager = SegmentFileManager::new(None, Some(root));
+        manager.init_directories().unwrap();
+        assert!(manager.create_wal_file(0, 1, 2).unwrap().is_some());
+        let error = manager.create_wal_file(0, 1, 2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
 
     #[test]
     fn archive_staging_pools_are_chunk_local_and_release_with_the_store() {
@@ -818,7 +887,7 @@ mod tests {
             .unwrap();
         File::create(wal_dir.join("0-3-3.nlog"))
             .unwrap()
-            .write_all(&crate::ram::wal_format::wal_file_header(3))
+            .write_all(&crate::ram::wal_format::wal_file_header(0, 3, 3))
             .unwrap();
 
         let mgr = SegmentFileManager::new(

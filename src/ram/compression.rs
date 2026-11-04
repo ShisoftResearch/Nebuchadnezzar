@@ -19,7 +19,7 @@ use std::io;
 /// Identifies a block-indexed image, so a reader can tell one from a plain
 /// buffer. Not a version: there is one format, and images that do not match it
 /// are not read.
-pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
+pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x04];
 
 /// Target uncompressed span for a block. A target, not a stride.
 ///
@@ -47,13 +47,14 @@ pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 
 /// magic(4) + crc32(4) + target_block_size(4) + block_count(4) + used_len(4)
+/// + chunk_id(8) + seg_id(8) + seq_id(8)
 ///
 /// `used_len` is the segment's append cursor when the image was taken. It is
 /// recorded rather than inferred because inference cannot tell an empty
 /// segment from a damaged one -- both yield no entries. A segment whose pages
 /// had been dropped was archived as "no entries", and recovery, finding
 /// non-zero bytes it could not parse, failed the entire store on it.
-const BLOCK_HEADER_SIZE: usize = 20;
+const BLOCK_HEADER_SIZE: usize = 44;
 /// Per-entry index: uncompressed_start(u32) + file_offset(u32) + compressed_len(u32)
 ///
 /// The uncompressed start is stored because block spans vary, so a reader
@@ -166,10 +167,20 @@ pub fn decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 
+/// The segment an image belongs to. Every byte of a swapped file verifies, so
+/// only this can show that a file holds the wrong segment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentIdentity {
+    pub chunk_id: u64,
+    pub seg_id: u64,
+    pub seq_id: u64,
+}
+
 /// Compress `data` as independently-decompressable blocks with an offset index.
 ///
 /// Layout:
 ///   magic(4) | crc32(4) | block_size(4) | block_count(4) | used_len(4)
+///   chunk_id(8) | seg_id(8) | seq_id(8)
 ///   index:  [uncompressed_start(u32), file_offset(u32), compressed_len(u32)] * block_count
 ///   blocks: lz4(block 0), lz4(block 1), ...
 ///
@@ -187,7 +198,7 @@ pub fn compress_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
         .map(|s| (s, (s + bs).min(data.len())))
         .collect();
     // No cursor known at this level; the whole buffer is the live extent.
-    compress_spans(data, &spans, data.len())
+    compress_spans(data, &spans, data.len(), SegmentIdentity::default())
 }
 
 /// Compress `data` into blocks that break only on the supplied cell boundaries.
@@ -197,12 +208,18 @@ pub fn compress_blocks_on_cells(
     data: &[u8],
     boundaries: &[usize],
     used_len: usize,
+    identity: SegmentIdentity,
 ) -> io::Result<Vec<u8>> {
     let spans = plan_blocks(boundaries, data.len(), block_size());
-    compress_spans(data, &spans, used_len)
+    compress_spans(data, &spans, used_len, identity)
 }
 
-fn compress_spans(data: &[u8], spans: &[(usize, usize)], used_len: usize) -> io::Result<Vec<u8>> {
+fn compress_spans(
+    data: &[u8],
+    spans: &[(usize, usize)],
+    used_len: usize,
+    identity: SegmentIdentity,
+) -> io::Result<Vec<u8>> {
     let checksum = image_checksum(data, used_len);
     let block_count = spans.len();
     let index_bytes = block_count * BLOCK_INDEX_ENTRY_SIZE;
@@ -240,6 +257,9 @@ fn compress_spans(data: &[u8], spans: &[(usize, usize)], used_len: usize) -> io:
     // The segment's append cursor when this image was taken, so a reader does
     // not have to guess how much of the image is live.
     out.extend_from_slice(&(used_len as u32).to_le_bytes());
+    out.extend_from_slice(&identity.chunk_id.to_le_bytes());
+    out.extend_from_slice(&identity.seg_id.to_le_bytes());
+    out.extend_from_slice(&identity.seq_id.to_le_bytes());
     out.extend_from_slice(&index);
     for b in &blocks {
         out.extend_from_slice(b);
@@ -268,6 +288,7 @@ pub struct BlockLayout {
     /// Blocks are stored uncompressed. Reading one is then a copy rather than
     /// a decompress, and writing skipped the compressor entirely.
     pub raw: bool,
+    pub identity: SegmentIdentity,
 }
 
 /// Marks a backup whose blocks are stored uncompressed, in the high bit of the
@@ -360,6 +381,11 @@ pub fn block_layout(data: &[u8]) -> Option<BlockLayout> {
         block_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize,
         raw: raw_field & RAW_BLOCKS_FLAG != 0,
         used_len: u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize,
+        identity: SegmentIdentity {
+            chunk_id: u64::from_le_bytes(data[20..28].try_into().unwrap()),
+            seg_id: u64::from_le_bytes(data[28..36].try_into().unwrap()),
+            seq_id: u64::from_le_bytes(data[36..44].try_into().unwrap()),
+        },
     })
 }
 
@@ -684,7 +710,8 @@ mod tests {
     fn two_block_image() -> (Vec<u8>, Vec<u8>, usize) {
         let mut image = vec![0x11_u8; 4096];
         image.extend_from_slice(&vec![0x22_u8; 4096]);
-        let blocks = compress_spans(&image, &[(0, 4096), (4096, 8192)], 8192).unwrap();
+        let spans = [(0, 4096), (4096, 8192)];
+        let blocks = compress_spans(&image, &spans, 8192, SegmentIdentity::default()).unwrap();
         (image, blocks, 8192)
     }
 
@@ -988,7 +1015,9 @@ mod tests {
     #[ignore]
     fn block_size_curve() {
         let data = segment_like(8 * 1024 * 1024);
-        let whole = compress_spans(&data, &[(0, data.len())], data.len()).unwrap().len();
+        let whole = compress_spans(&data, &[(0, data.len())], data.len(), SegmentIdentity::default())
+                .unwrap()
+                .len();
         println!(
             "\nwhole-segment (single span): {:.2}% of {} MiB\n",
             whole as f64 / data.len() as f64 * 100.0,
@@ -1102,7 +1131,7 @@ mod tests {
             data.extend(std::iter::repeat((i % 251) as u8).take(*s));
         }
 
-        let packed = compress_blocks_on_cells(&data, &bounds, data.len()).unwrap();
+        let packed = compress_blocks_on_cells(&data, &bounds, data.len(), SegmentIdentity::default()).unwrap();
         assert_eq!(decompress_all_blocks(&packed).unwrap(), data);
 
         // Each cell must be reachable by decompressing exactly its own block.

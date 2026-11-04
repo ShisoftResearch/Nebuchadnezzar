@@ -20,32 +20,51 @@
 //! Layout:
 //!
 //! ```text
-//! file header (16 bytes)
+//! file header (32 bytes)
 //!   magic       [u8; 4]  b"NEBW"
 //!   version     u8       FORMAT_VERSION
 //!   reserved    [u8; 3]
 //!   seq_id      u64      the segment incarnation this log belongs to
+//!   chunk_id    u64      the chunk this log belongs to
+//!   seg_id      u64      the segment this log belongs to
 //!
 //! record (20-byte header + payload), repeated
 //!   magic       u32      RECORD_MAGIC
-//!   seg_offset  u64      offset of the payload within the segment
+//!   seg_offset  u32      offset of the payload within the segment
+//!   synced_len  u32      file bytes covered by a completed sync at this write
 //!   len         u32      payload length
-//!   crc         u32      CRC32C over seg_offset, len and payload
+//!   crc         u32      CRC32C over seg_offset, synced_len, len and payload
 //!   payload     [u8; len]
 //! ```
+//!
+//! `synced_len` shares the 8 bytes that `seg_offset` alone needed: a segment
+//! offset fits in 23 bits, so a record pays nothing for it.
+//!
+//! Two proofs separate a torn tail from damage at rest, and neither costs a
+//! write. `docs/tla/WalDamage.tla` checks them.
+//!
+//! * A crash can tear only what no sync covered, so a bad record below the
+//!   `synced_len` of any valid later record was durable.
+//! * A tear leaves an absent sector, which reads as zeros in a fresh file, or
+//!   the end of the file. A whole record with a bad CRC has neither, so its
+//!   bytes changed after they were written. This rests on two facts of the
+//!   disk: a sector is written whole, and a new block reads as zeros. ext4
+//!   with `data=writeback` breaks the second fact, so a crash on it can stop
+//!   a healthy start. XFS and ext4 `data=ordered` keep it.
+//!
+//! A zeroed sector in the final sync window has neither proof. It is the same
+//! file that a crash leaves, so it still reads as a torn tail.
 //!
 
 use crc_fast::{CrcAlgorithm, Digest};
 use std::io;
 
 pub const FILE_MAGIC: [u8; 4] = *b"NEBW";
-/// Bumped past the short-lived 32-byte header that carried a decided
-/// watermark. That field is gone -- every bracket carries its own COMMIT, so
-/// nothing needed it -- and a file written with the old layout must be
-/// REFUSED rather than read with shifted offsets. There is no earlier format
-/// to stay compatible with, which is what makes bumping free.
-pub const FORMAT_VERSION: u8 = 3;
-pub const FILE_HEADER_SIZE: usize = 16;
+/// A file written with another layout must be REFUSED rather than read with
+/// shifted offsets. There is no earlier format to stay compatible with, which
+/// is what makes bumping free.
+pub const FORMAT_VERSION: u8 = 4;
+pub const FILE_HEADER_SIZE: usize = 32;
 
 pub const RECORD_MAGIC: u32 = 0x5741_4C52; // "WALR"
 pub const RECORD_HEADER_SIZE: usize = 20;
@@ -64,25 +83,33 @@ pub fn is_framed(data: &[u8]) -> bool {
     data.len() >= FILE_HEADER_SIZE && data[..4] == FILE_MAGIC
 }
 
-pub fn wal_file_header(seq_id: u64) -> [u8; FILE_HEADER_SIZE] {
+pub fn wal_file_header(chunk_id: usize, seg_id: u64, seq_id: u64) -> [u8; FILE_HEADER_SIZE] {
     let mut header = [0u8; FILE_HEADER_SIZE];
     header[..4].copy_from_slice(&FILE_MAGIC);
     header[4] = FORMAT_VERSION;
     header[8..16].copy_from_slice(&seq_id.to_le_bytes());
+    header[16..24].copy_from_slice(&(chunk_id as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&seg_id.to_le_bytes());
     header
 }
 
 /// Frame one record. The payload is copied in, so the caller's buffer (a
 /// live segment region) need not outlive the call.
-pub fn frame_record(seg_offset: u64, payload: &[u8]) -> Vec<u8> {
+///
+/// `synced_len` is the file length that a completed sync covers now. It may
+/// understate that length, which only loses a proof of damage. It must never
+/// overstate it, or a crash reads as damage.
+pub fn frame_record(seg_offset: u64, payload: &[u8], synced_len: u64) -> Vec<u8> {
     let len = payload.len() as u32;
-    let offset_bytes = seg_offset.to_le_bytes();
+    let offset_bytes = (seg_offset as u32).to_le_bytes();
     let len_bytes = len.to_le_bytes();
-    let crc = crc32c(&[&offset_bytes, &len_bytes, payload]);
+    let synced_bytes = (synced_len.min(u32::MAX as u64) as u32).to_le_bytes();
+    let crc = crc32c(&[&offset_bytes, &synced_bytes, &len_bytes, payload]);
 
     let mut framed = Vec::with_capacity(RECORD_HEADER_SIZE + payload.len());
     framed.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
     framed.extend_from_slice(&offset_bytes);
+    framed.extend_from_slice(&synced_bytes);
     framed.extend_from_slice(&len_bytes);
     framed.extend_from_slice(&crc.to_le_bytes());
     framed.extend_from_slice(payload);
@@ -96,6 +123,13 @@ pub enum TailStop {
     Clean,
     /// A partial or corrupt record was found; everything before it is good.
     Torn { at_file_offset: usize, reason: String },
+    /// A bad record lies below the length that a later valid record says a
+    /// sync covered. A crash cannot do this: the file changed at rest.
+    Damaged {
+        at_file_offset: usize,
+        synced_len: u64,
+        reason: String,
+    },
 }
 
 pub struct ScanOutcome {
@@ -110,6 +144,113 @@ pub struct ScanOutcome {
     pub stop: TailStop,
     /// Seq id recorded in the file header.
     pub seq_id: u64,
+    /// Chunk id recorded in the file header.
+    pub chunk_id: u64,
+    /// Segment id recorded in the file header.
+    pub seg_id: u64,
+    /// Image ranges that a damaged stretch of the file may have held. Only
+    /// a [`TailStop::Damaged`] scan has them, and they stay unfilled.
+    pub unreadable: Vec<std::ops::Range<usize>>,
+}
+
+/// A record that verifies, read from the bytes at `cursor`.
+struct Frame<'a> {
+    seg_offset: u64,
+    synced_len: u64,
+    payload: &'a [u8],
+}
+
+/// Read the record at `cursor`. An `Err` says why it is not a good record.
+fn read_frame(data: &[u8], cursor: usize) -> Result<Frame<'_>, String> {
+    if cursor + RECORD_HEADER_SIZE > data.len() {
+        return Err(format!(
+            "partial record header ({} of {RECORD_HEADER_SIZE} bytes)",
+            data.len() - cursor
+        ));
+    }
+    let magic = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+    if magic != RECORD_MAGIC {
+        return Err(format!("bad record magic 0x{magic:08x}"));
+    }
+    let offset_bytes: [u8; 4] = data[cursor + 4..cursor + 8].try_into().unwrap();
+    let synced_bytes: [u8; 4] = data[cursor + 8..cursor + 12].try_into().unwrap();
+    let len_bytes: [u8; 4] = data[cursor + 12..cursor + 16].try_into().unwrap();
+    let stored_crc = u32::from_le_bytes(data[cursor + 16..cursor + 20].try_into().unwrap());
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let payload_start = cursor + RECORD_HEADER_SIZE;
+    if len == 0 || payload_start + len > data.len() {
+        return Err(format!(
+            "record claims {len} payload bytes, {} remain",
+            data.len().saturating_sub(payload_start)
+        ));
+    }
+    let payload = &data[payload_start..payload_start + len];
+    let crc = crc32c(&[&offset_bytes, &synced_bytes, &len_bytes, payload]);
+    if crc != stored_crc {
+        return Err(format!(
+            "CRC mismatch (stored 0x{stored_crc:08x}, computed 0x{crc:08x})"
+        ));
+    }
+    Ok(Frame {
+        seg_offset: u32::from_le_bytes(offset_bytes) as u64,
+        synced_len: u32::from_le_bytes(synced_bytes) as u64,
+        payload,
+    })
+}
+
+/// Bytes a disk writes as one unit.
+const SECTOR_BYTES: usize = 512;
+
+/// Whether a sector's share of `range` is all zeros, as an absent sector is.
+fn holds_absent_sector(data: &[u8], range: std::ops::Range<usize>) -> bool {
+    let mut at = range.start;
+    while at < range.end {
+        let next = ((at / SECTOR_BYTES + 1) * SECTOR_BYTES).min(range.end);
+        if data[at..next].iter().all(|byte| *byte == 0) {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
+/// Whether the bad record at `at` can be what a crash leaves.
+///
+/// When in doubt this says yes: that loses a proof of damage, and it never
+/// stops a store that a crash alone left.
+fn can_be_a_tear(data: &[u8], at: usize) -> bool {
+    let header_end = at + RECORD_HEADER_SIZE;
+    if header_end > data.len() {
+        return true;
+    }
+    let magic = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+    if magic != RECORD_MAGIC {
+        return holds_absent_sector(data, at..header_end);
+    }
+    let len = u32::from_le_bytes(data[at + 12..at + 16].try_into().unwrap()) as usize;
+    let record_end = header_end.saturating_add(len);
+    len == 0 || record_end > data.len() || holds_absent_sector(data, at..record_end)
+}
+
+/// Search for valid records after a bad one at `from`.
+///
+/// Record boundaries are lost at a bad record, so this tries every byte. The
+/// magic and a CRC32C over the record must both match, so random bytes do not
+/// pass. Each record is returned with its file offset.
+fn later_frames(data: &[u8], from: usize) -> Vec<(usize, Frame<'_>)> {
+    let mut frames = Vec::new();
+    let mut cursor = from + 1;
+    while cursor + RECORD_HEADER_SIZE <= data.len() {
+        match read_frame(data, cursor) {
+            Ok(frame) => {
+                let next = cursor + RECORD_HEADER_SIZE + frame.payload.len();
+                frames.push((cursor, frame));
+                cursor = next;
+            }
+            Err(_) => cursor += 1,
+        }
+    }
+    frames
 }
 
 /// Rebuild a segment image from a framed log, verifying every record.
@@ -134,75 +275,90 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
         ));
     }
     let seq_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let chunk_id = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    let seg_id = u64::from_le_bytes(data[24..32].try_into().unwrap());
 
     let mut image = vec![0u8; segment_size];
     let mut used_len = 0usize;
     let mut records = 0usize;
     // Extent of every verified record, for the gap fill after the loop.
     let mut covered: Vec<(usize, usize)> = Vec::new();
-    let mut cursor = FILE_HEADER_SIZE;
-    let stop = loop {
-        if cursor == data.len() {
-            break TailStop::Clean;
-        }
-        if cursor + RECORD_HEADER_SIZE > data.len() {
-            break TailStop::Torn {
-                at_file_offset: cursor,
-                reason: format!(
-                    "partial record header ({} of {RECORD_HEADER_SIZE} bytes)",
-                    data.len() - cursor
-                ),
-            };
-        }
-        let magic = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
-        if magic != RECORD_MAGIC {
-            break TailStop::Torn {
-                at_file_offset: cursor,
-                reason: format!("bad record magic 0x{magic:08x}"),
-            };
-        }
-        let offset_bytes: [u8; 8] = data[cursor + 4..cursor + 12].try_into().unwrap();
-        let len_bytes: [u8; 4] = data[cursor + 12..cursor + 16].try_into().unwrap();
-        let stored_crc = u32::from_le_bytes(data[cursor + 16..cursor + 20].try_into().unwrap());
-        let seg_offset = u64::from_le_bytes(offset_bytes);
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        let payload_start = cursor + RECORD_HEADER_SIZE;
-        if len == 0 || payload_start + len > data.len() {
-            break TailStop::Torn {
-                at_file_offset: cursor,
-                reason: format!(
-                    "record claims {len} payload bytes, {} remain",
-                    data.len().saturating_sub(payload_start)
-                ),
-            };
-        }
-        let payload = &data[payload_start..payload_start + len];
-        let crc = crc32c(&[&offset_bytes, &len_bytes, payload]);
-        if crc != stored_crc {
-            break TailStop::Torn {
-                at_file_offset: cursor,
-                reason: format!("CRC mismatch (stored 0x{stored_crc:08x}, computed 0x{crc:08x})"),
-            };
-        }
+    let mut place = |seg_offset: u64, payload: &[u8]| -> Result<(), String> {
         // A record naming a span outside the segment is corruption that
         // happens to check out -- refuse it rather than growing the image
         // to fit whatever the bytes claim.
-        let end = seg_offset as usize + len;
-        if end > segment_size {
-            break TailStop::Torn {
-                at_file_offset: cursor,
-                reason: format!(
-                    "record spans [{seg_offset}, {end}) beyond the {segment_size}-byte segment"
-                ),
-            };
-        }
         let start = seg_offset as usize;
+        let end = start.saturating_add(payload.len());
+        if end > segment_size {
+            return Err(format!(
+                "record spans [{seg_offset}, {end}) beyond the {segment_size}-byte segment"
+            ));
+        }
         image[start..end].copy_from_slice(payload);
         covered.push((start, end));
         used_len = used_len.max(end);
         records += 1;
-        cursor = payload_start + len;
+        Ok(())
+    };
+    let mut cursor = FILE_HEADER_SIZE;
+    let mut stop = loop {
+        if cursor == data.len() {
+            break TailStop::Clean;
+        }
+        let frame = match read_frame(data, cursor) {
+            Ok(frame) => frame,
+            Err(reason) => {
+                break TailStop::Torn {
+                    at_file_offset: cursor,
+                    reason,
+                }
+            }
+        };
+        if let Err(reason) = place(frame.seg_offset, frame.payload) {
+            break TailStop::Torn {
+                at_file_offset: cursor,
+                reason,
+            };
+        }
+        cursor += RECORD_HEADER_SIZE + frame.payload.len();
+    };
+
+    // A bad record is a torn tail unless a later record proves it was synced.
+    let mut damaged = false;
+    if let TailStop::Torn {
+        at_file_offset,
+        reason,
+    } = &stop
+    {
+        let at_file_offset = *at_file_offset;
+        let frames = later_frames(data, at_file_offset);
+        let proof = frames
+            .iter()
+            .map(|(_, frame)| frame.synced_len)
+            .max()
+            .filter(|len| *len > at_file_offset as u64);
+        if proof.is_some() || !can_be_a_tear(data, at_file_offset) {
+            stop = TailStop::Damaged {
+                at_file_offset,
+                synced_len: proof.unwrap_or(0),
+                reason: reason.clone(),
+            };
+            damaged = true;
+            // Later records are verified, and the repair may keep them.
+            for (_, frame) in &frames {
+                let _ = place(frame.seg_offset, frame.payload);
+            }
+        }
+    }
+    // The bad record held the last bytes of the image if no later one covers
+    // them. Its own offset cannot be trusted, so one entry header past the end
+    // stands for it: without this the repair finds no gap and reports no loss.
+    let lost_tail = if damaged {
+        let tail = used_len..used_len + crate::ram::entry::ENTRY_HEAD_SIZE;
+        used_len = tail.end;
+        Some(tail)
+    } else {
+        None
     };
 
     // Fill the gaps abandoned reservations left, AFTER every record is
@@ -219,13 +375,19 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
     // is read, sized or trusted. Alignment makes every gap stampable:
     // entries are 8-byte aligned, so gaps are multiples of 8 and at least
     // ENTRY_HEAD_SIZE wide.
+    //
+    // After damage a gap can hide lost records, so it stays unfilled and is
+    // reported: padding here would turn lost data into free space.
     let mut gaps = 0usize;
+    let mut unreadable = Vec::new();
     covered.sort_unstable();
     let mut fill_from = 0usize;
     for &(start, end) in &covered {
         if start > fill_from {
             let span = start - fill_from;
-            if crate::ram::entry::stamp_padding(&mut image, fill_from, span) {
+            if damaged {
+                unreadable.push(fill_from..start);
+            } else if crate::ram::entry::stamp_padding(&mut image, fill_from, span) {
                 gaps += 1;
             } else {
                 warn!(
@@ -245,6 +407,7 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
         );
     }
 
+    unreadable.extend(lost_tail);
     Ok(ScanOutcome {
         image,
         used_len,
@@ -252,6 +415,9 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
         gaps,
         stop,
         seq_id,
+        chunk_id,
+        seg_id,
+        unreadable,
     })
 }
 
@@ -261,10 +427,71 @@ mod tests {
 
     const SEG: usize = 4096;
 
+    /// Records of 16 payload bytes each, with the `synced_len` given for each.
+    fn log_with_watermarks(synced: &[u64]) -> (Vec<u8>, Vec<usize>) {
+        let mut file = wal_file_header(0, 0, 7).to_vec();
+        let mut offsets = Vec::new();
+        for (index, synced_len) in synced.iter().enumerate() {
+            offsets.push(file.len());
+            let at = index as u64 * 16;
+            file.extend_from_slice(&frame_record(at, &[index as u8 + 1; 16], *synced_len));
+        }
+        (file, offsets)
+    }
+
+    #[test]
+    fn a_bad_record_below_a_later_watermark_is_damage() {
+        let (mut file, offsets) = log_with_watermarks(&[0, 0, 0, 0]);
+        let synced = offsets[2] as u64;
+        let (mut proved, _) = log_with_watermarks(&[0, 0, synced, synced]);
+        // Zeros carry no shape proof, so only the watermark can decide.
+        let bad = offsets[1]..offsets[2];
+        proved[bad.clone()].fill(0);
+        file[bad].fill(0);
+
+        let outcome = scan_framed(&proved, SEG).unwrap();
+        assert!(
+            matches!(outcome.stop, TailStop::Damaged { at_file_offset, .. } if at_file_offset == offsets[1]),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(outcome.records, 3, "the verified records after it stay");
+        assert_eq!(outcome.unreadable[0], 16..32, "the hole is not padded");
+
+        // The same bad record with no proof is a torn tail, as after a crash.
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert!(matches!(outcome.stop, TailStop::Torn { .. }), "{:?}", outcome.stop);
+        assert_eq!(outcome.records, 1);
+    }
+
+    #[test]
+    fn a_watermark_at_the_bad_record_proves_nothing() {
+        let offsets = log_with_watermarks(&[0, 0, 0]).1;
+        let (mut file, _) = log_with_watermarks(&[0, 0, offsets[1] as u64]);
+        file[offsets[1]..offsets[2]].fill(0);
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert!(matches!(outcome.stop, TailStop::Torn { .. }), "{:?}", outcome.stop);
+    }
+
+    #[test]
+    fn a_later_record_is_found_past_a_zeroed_header() {
+        let offsets = log_with_watermarks(&[0, 0, 0]).1;
+        let (mut file, _) = log_with_watermarks(&[0, 0, offsets[2] as u64]);
+        file[offsets[1]..offsets[1] + RECORD_HEADER_SIZE].fill(0);
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert!(matches!(outcome.stop, TailStop::Damaged { .. }), "{:?}", outcome.stop);
+    }
+
+    #[test]
+    fn the_watermark_adds_no_bytes_to_a_record() {
+        assert_eq!(RECORD_HEADER_SIZE, 20);
+        assert_eq!(frame_record(0, b"payload!", 9).len(), RECORD_HEADER_SIZE + 8);
+    }
+
     fn log_with(records: &[(u64, &[u8])]) -> Vec<u8> {
-        let mut file = wal_file_header(7).to_vec();
+        let mut file = wal_file_header(0, 0, 7).to_vec();
         for (offset, payload) in records {
-            file.extend_from_slice(&frame_record(*offset, payload));
+            file.extend_from_slice(&frame_record(*offset, payload, 0));
         }
         file
     }
@@ -335,11 +562,11 @@ mod tests {
     /// existed to prevent.
     #[test]
     fn out_of_order_journaling_still_leaves_a_walkable_image() {
-        let mut file = wal_file_header(9).to_vec();
-        file.extend_from_slice(&frame_record(0, b"aaaaaaaa")); // [0,16)
+        let mut file = wal_file_header(0, 0, 9).to_vec();
+        file.extend_from_slice(&frame_record(0, b"aaaaaaaa", 0)); // [0,16)
         // A reserved [16,208) and died un-journaled.
-        file.extend_from_slice(&frame_record(208, b"bbbbbbbb")); // B, journaled early
-        file.extend_from_slice(&frame_record(8, b"cccccccc")); // C, journaled LATE
+        file.extend_from_slice(&frame_record(208, b"bbbbbbbb", 0)); // B, journaled early
+        file.extend_from_slice(&frame_record(8, b"cccccccc", 0)); // C, journaled LATE
         let outcome = scan_framed(&file, SEG).unwrap();
 
         assert_eq!(outcome.stop, TailStop::Clean);
@@ -401,10 +628,10 @@ mod tests {
     /// A log without gaps must not grow phantom padding.
     #[test]
     fn contiguous_records_produce_no_padding() {
-        let mut file = wal_file_header(11).to_vec();
+        let mut file = wal_file_header(0, 0, 11).to_vec();
         // Two records that abut exactly.
-        file.extend_from_slice(&frame_record(0, b"aaaaaaaa"));
-        file.extend_from_slice(&frame_record(8, b"bbbbbbbb"));
+        file.extend_from_slice(&frame_record(0, b"aaaaaaaa", 0));
+        file.extend_from_slice(&frame_record(8, b"bbbbbbbb", 0));
         let outcome = scan_framed(&file, SEG).unwrap();
         assert_eq!(outcome.records, 2);
         assert_eq!(outcome.gaps, 0, "abutting records leave nothing to fill");
@@ -451,8 +678,42 @@ mod tests {
         file[last] ^= 0xFF;
         let outcome = scan_framed(&file, SEG).unwrap();
         assert_eq!(outcome.records, 1);
-        assert!(matches!(outcome.stop, TailStop::Torn { .. }));
+        // The whole record is there, so no crash left it.
+        assert!(matches!(outcome.stop, TailStop::Damaged { .. }));
         assert!(outcome.image[64..73].iter().all(|byte| *byte == 0));
+    }
+
+    /// The repair sees only the image, so a lost last record must show there.
+    #[test]
+    fn a_damaged_last_record_is_reported_as_unreadable() {
+        let mut file = log_with(&[(0, b"good"), (64, b"corrupted")]);
+        let last = file.len() - 1;
+        file[last] ^= 0xFF;
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert_eq!(outcome.unreadable.last(), Some(&(4..12)));
+        assert_eq!(outcome.used_len, 12);
+    }
+
+    /// A torn tail stays torn when the record is cut, or when one sector of
+    /// it is absent.
+    #[test]
+    fn the_shape_of_a_tear_is_not_damage() {
+        let mut file = log_with(&[(0, b"good")]);
+        let at = file.len();
+        file.extend_from_slice(&frame_record(64, &[0x7Au8; 2048], 0));
+        let whole = file.clone();
+
+        file.truncate(at + RECORD_HEADER_SIZE + 100);
+        assert!(matches!(scan_framed(&file, 8192).unwrap().stop, TailStop::Torn { .. }));
+
+        let mut file = whole.clone();
+        let sector = (at / SECTOR_BYTES + 2) * SECTOR_BYTES;
+        file[sector..sector + SECTOR_BYTES].fill(0);
+        assert!(matches!(scan_framed(&file, 8192).unwrap().stop, TailStop::Torn { .. }));
+
+        let mut file = whole;
+        file[sector + 7] ^= 0x01;
+        assert!(matches!(scan_framed(&file, 8192).unwrap().stop, TailStop::Damaged { .. }));
     }
 
     /// Zeros are the exact byte pattern a delayed-allocation tail reads
@@ -471,7 +732,8 @@ mod tests {
         let file = log_with(&[(SEG as u64 - 2, b"overrun")]);
         let outcome = scan_framed(&file, SEG).unwrap();
         assert_eq!(outcome.records, 0);
-        assert!(matches!(outcome.stop, TailStop::Torn { .. }));
+        // Its CRC passes, so this is no tear.
+        assert!(matches!(outcome.stop, TailStop::Damaged { .. }));
     }
 
     /// Legacy logs open with an EntryType discriminant (0, 1 or 2); the
@@ -489,7 +751,7 @@ mod tests {
 
     #[test]
     fn an_empty_log_is_clean_and_declares_nothing_live() {
-        let outcome = scan_framed(&wal_file_header(3), SEG).unwrap();
+        let outcome = scan_framed(&wal_file_header(0, 0, 3), SEG).unwrap();
         assert_eq!(outcome.stop, TailStop::Clean);
         assert_eq!(outcome.records, 0);
         assert_eq!(outcome.used_len, 0);

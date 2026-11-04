@@ -1101,6 +1101,11 @@ pub struct SegmentFileState {
     pub durability: Option<Arc<crate::ram::durability::DurableFile>>,
     /// Length through the last complete frame.
     wal_len: u64,
+    /// File bytes a completed sync covers, for syncs outside `durability`.
+    wal_synced_len: u64,
+    /// Counts tail truncations. A sync that raced one proves nothing about
+    /// the bytes written after it.
+    wal_rewinds: u64,
 }
 
 /// Reopens a segment's journal gate unless the archive actually sealed it.
@@ -1185,6 +1190,8 @@ impl Segment {
                 manager: file_manager,
                 wal: wal_file_opt,
                 wal_len: 0,
+                wal_synced_len: 0,
+                wal_rewinds: 0,
                 durability: None,
             }),
             dropped: AtomicBool::new(false),
@@ -2537,6 +2544,11 @@ image, not an empty segment; archiving it would persist the damage.",
                                 &padded_data,
                                 &boundaries,
                                 used_len_at_snapshot,
+                                compression::SegmentIdentity {
+                                    chunk_id: self.chunk_id as u64,
+                                    seg_id: self.id,
+                                    seq_id: self.seq_id,
+                                },
                             )?;
                             ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
                             file.write_all(&compressed_data)?;
@@ -2773,17 +2785,29 @@ image, not an empty segment; archiving it would persist the damage.",
             // a CRC over both. One write_all keeps the frame and its payload
             // in a single syscall, so a torn record can only ever be torn at
             // the tail -- never interleaved with another writer's.
+            let synced_len = durability
+                .map_or(0, |d| d.durable_len())
+                .max(state.wal_synced_len);
             let framed = unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
-                crate::ram::wal_format::frame_record((addr - self.addr) as u64, data_block)
+                crate::ram::wal_format::frame_record(
+                    (addr - self.addr) as u64,
+                    data_block,
+                    synced_len,
+                )
             };
             let mut sink = &**file;
             if let Err(error) =
                 fault::fire(fault::Site::WalWrite).and_then(|()| sink.write_all(&framed))
             {
                 // Remove the refused frame before another append can follow it.
-                // A failed truncation closes this head instead.
-                if let Err(truncate_error) = file.set_len(original_len) {
+                // The truncation must be durable: a crash can undo an unsynced
+                // one and leave the end of the refused frame behind the next
+                // record, which then reads as damage at rest. A failed
+                // truncation closes this head instead.
+                if let Err(truncate_error) =
+                    file.set_len(original_len).and_then(|()| file.sync_data())
+                {
                     self.retire_tail();
                     error!("WAL tail truncation failed after {error}: {truncate_error}");
                 }
@@ -2850,6 +2874,7 @@ image, not an empty segment; archiving it would persist the damage.",
                             .unwrap_or(error));
                     }
                     self.wal_bytes_synced.fetch_max(written, Release);
+                    state.wal_synced_len = state.wal_synced_len.max(new_len);
                     #[cfg(test)]
                     power_loss_model::record_synced_len(
                         &state.manager.wal_path(self.chunk_id, self.id, self.seq_id),
@@ -2962,6 +2987,8 @@ image, not an empty segment; archiving it would persist the damage.",
             );
         }
         state.wal_len = position;
+        state.wal_synced_len = state.wal_synced_len.min(position);
+        state.wal_rewinds += 1;
         if let Some(d) = &state.durability {
             d.truncate(position);
         }
@@ -3004,7 +3031,7 @@ image, not an empty segment; archiving it would persist the damage.",
         #[cfg(feature = "abort_profile")]
         let _timer = crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::ForceSync);
         let needs_transaction_proof = force && self.protection.transaction_pending();
-        let (file, written, end, durability, epoch) = {
+        let (file, written, end, durability, epoch, rewinds) = {
             let mut state = self.file_state.lock();
             if needs_transaction_proof && state.wal.is_some() && state.durability.is_none() {
                 self.init_durability(&mut state)?;
@@ -3055,6 +3082,7 @@ image, not an empty segment; archiving it would persist the damage.",
                 state.wal_len,
                 state.durability.clone(),
                 epoch,
+                state.wal_rewinds,
             )
         };
         #[cfg(test)]
@@ -3097,6 +3125,12 @@ image, not an empty segment; archiving it would persist the damage.",
         }
         result?;
         self.wal_bytes_synced.fetch_max(written, Release);
+        {
+            let mut state = self.file_state.lock();
+            if state.wal_rewinds == rewinds {
+                state.wal_synced_len = state.wal_synced_len.max(end);
+            }
+        }
         #[cfg(test)]
         power_loss_model::record_synced_len(&model_path, model_len);
         FORCED_WAL_SYNCS.fetch_add(1, Relaxed);

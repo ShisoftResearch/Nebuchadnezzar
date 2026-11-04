@@ -220,6 +220,8 @@ pub struct DurableFile {
     sequence: u64,
     // Highest complete prefix observed by a durable call or a sync.
     end: AtomicU64,
+    /// `Progress::durable`, readable with no lock.
+    durable_len: AtomicU64,
     epoch: AtomicU64,
     failed: AtomicBool,
     progress: Mutex<Progress>,
@@ -261,6 +263,7 @@ impl DurableFile {
             segment,
             sequence,
             end: AtomicU64::new(0),
+            durable_len: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             progress: Mutex::new(Progress {
@@ -294,6 +297,7 @@ impl DurableFile {
             p.directory = Some(std::path::PathBuf::from(directory));
             self.end.store(header_end, Release);
             p.durable = (crate::ram::wal_format::FILE_HEADER_SIZE as u64).min(header_end);
+            self.durable_len.store(p.durable, Release);
         }
         Ok(())
     }
@@ -391,6 +395,7 @@ impl DurableFile {
         }
         self.end.store(end, Release);
         p.durable = p.durable.min(end);
+        self.durable_len.store(p.durable, Release);
     }
     pub fn snapshot(&self) -> (u64, u64) {
         let p = self.progress.lock();
@@ -408,6 +413,11 @@ impl DurableFile {
 
     pub fn watermark(&self) -> u64 {
         self.progress.lock().durable
+    }
+
+    /// The durable length, with no lock: this is read on every WAL append.
+    pub fn durable_len(&self) -> u64 {
+        self.durable_len.load(Acquire)
     }
     pub fn end(&self) -> u64 {
         self.end.load(Acquire)
@@ -452,6 +462,7 @@ impl DurableFile {
                 let synced = end.min(prefix);
                 self.end.fetch_max(synced, Release);
                 p.durable = p.durable.max(synced);
+                self.durable_len.store(p.durable, Release);
             }
         }
         let failed = p.failed.clone();
