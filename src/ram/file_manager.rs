@@ -422,6 +422,21 @@ impl SegmentFileManager {
             // rename-installed, so this should be unreachable -- it is kept
             // as a guard against a torn archive from any cause, not as a
             // reader for some older format.
+            // A WAL shorter than its file header holds no record: the header
+            // is synced before the first append, so a crash between the
+            // create and that sync is the only way to leave one.
+            if !file.is_backup && file.size < crate::ram::wal_format::FILE_HEADER_SIZE as u64 {
+                warn!(
+                    "Ignoring WAL '{}' of {} bytes (chunk {} seg {} seq {}): shorter than its \
+                     header, so it holds no record",
+                    file.path.display(),
+                    file.size,
+                    file.chunk_id,
+                    file.seg_id,
+                    file.seq_id
+                );
+                continue;
+            }
             if file.is_backup && file.size == 0 {
                 warn!(
                     "Ignoring zero-byte backup '{}' (chunk {} seg {} seq {}): torn archive; \
@@ -744,9 +759,10 @@ mod tests {
         create_dir_all(&backup_dir).unwrap();
         create_dir_all(&wal_dir).unwrap();
 
-        // Create some test files. Backups carry content on purpose: a
-        // zero-byte backup is a torn archive and discovery now ignores it,
-        // so an empty fixture would be testing the guard, not discovery.
+        // Create some test files. They carry content on purpose: discovery
+        // ignores a zero-byte backup (a torn archive) and a WAL shorter than
+        // its header (no record), so an empty fixture would test the guards,
+        // not discovery.
         use std::io::Write as _;
         File::create(backup_dir.join("0-1-1.nbackup"))
             .unwrap()
@@ -756,7 +772,10 @@ mod tests {
             .unwrap()
             .write_all(b"x")
             .unwrap();
-        File::create(wal_dir.join("0-3-3.nlog")).unwrap();
+        File::create(wal_dir.join("0-3-3.nlog"))
+            .unwrap()
+            .write_all(&crate::ram::wal_format::wal_file_header(3))
+            .unwrap();
 
         let mgr = SegmentFileManager::new(
             Some(backup_dir.to_str().unwrap().to_string()),

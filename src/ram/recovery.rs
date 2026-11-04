@@ -137,6 +137,26 @@ pub struct RecoveryConfig {
 
 const DEFAULT_RECOVERY_THREADS: usize = 64;
 
+/// Set to `1` to start without the cells of segments that cannot be read
+/// (quarantine). Without it such a segment stops the start: a skipped
+/// segment is lost data, so only an operator who knows that may ask for it.
+pub const QUARANTINE_ENV: &str = "NEB_RECOVERY_QUARANTINE_UNREADABLE";
+
+fn quarantine_unreadable() -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = TEST_QUARANTINE.with(|c| c.get()) {
+        return allowed;
+    }
+    std::env::var(QUARANTINE_ENV).is_ok_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer to `quarantine_unreadable`, on the thread that recovers.
+    pub(crate) static TEST_QUARANTINE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Autopsy tracing for ranged-index page cells during recovery, gated by
 /// NEB_RECOVERY_TRACE_PAGES=1. Names every page image the scan judges --
 /// winner or loser -- so a corrupted tree can be traced back to the exact
@@ -2422,6 +2442,7 @@ pub fn recover_chunks(
     /// Segments recovery could not scan. They are skipped rather than fatal,
     /// so the count has to reach the operator: the store came up incomplete.
     let quarantined_segments = std::sync::atomic::AtomicUsize::new(0);
+    let quarantine = quarantine_unreadable();
 
     // Built from the discovered files, so a manifest member's presence is a
     // lookup rather than a search. Taken before grouping consumes the list.
@@ -2595,8 +2616,31 @@ pub fn recover_chunks(
                                 }
                                 match recovered_from_wal {
                                     Some(loaded) => loaded,
+                                    None if !quarantine => {
+                                        // The segment's cells exist and cannot be read.
+                                        // Skipping them is data loss, so the start stops
+                                        // unless the operator asked for the skip.
+                                        let reason = format!(
+                                            "segment {} (chunk {}, seq {}) in '{}' cannot be \
+                                             read: {}. Recovery stops; set {}=1 to start \
+                                             without the cells of this segment",
+                                            file_info.seg_id,
+                                            chunk_id,
+                                            file_info.seq_id,
+                                            file_info.path.display(),
+                                            error,
+                                            QUARANTINE_ENV
+                                        );
+                                        error!("{reason}");
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            reason,
+                                        ));
+                                    }
                                     None => {
-                                        // Quarantine the segment; do not abandon the store.
+                                        // The operator asked for the skip
+                                        // (`QUARANTINE_ENV`): quarantine the segment and
+                                        // keep the rest of the store.
                                         //
                                         // This used to be `?`, so one unreadable segment
                                         // failed the whole recovery -- every chunk, and
@@ -3607,6 +3651,7 @@ mod tests {
     #[test]
     fn test_recovery_quarantines_a_torn_backup_and_keeps_the_rest() {
         let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(true)));
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
@@ -4393,6 +4438,7 @@ mod tests {
     #[test]
     fn test_recovery_quarantines_an_unscannable_segment_and_keeps_the_rest() {
         let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(true)));
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
@@ -4446,6 +4492,84 @@ mod tests {
             "an unscannable segment abandoned the entire store: {} cells recovered",
             recovered
         );
+    }
+
+    /// Without the operator's opt-in, an unscannable segment stops the start
+    /// instead of costing its cells in silence.
+    #[test]
+    #[should_panic(expected = "recovery failed")]
+    fn an_unscannable_segment_stops_recovery_without_the_quarantine_opt_in() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        let mut bad_segment = empty_segment_bytes();
+        bad_segment[ENTRY_HEAD_SIZE + 4] = 0xAA;
+        write_backup_segment(&backup_dir, 0, 0, 1, &bad_segment);
+        Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+    }
+
+    /// A WAL shorter than its file header holds no record: the header is
+    /// synced before the first append. A crash between the create and that
+    /// sync leaves one, and it must not stop the start.
+    #[test]
+    fn a_wal_shorter_than_its_header_holds_nothing_and_recovers() {
+        let _ = env_logger::try_init();
+        TEST_QUARANTINE.with(|c| c.set(Some(false)));
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let schema = schema_with_id(214, "recovery_short_wal", false);
+        writer_chunks.list[0]
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let good_id = Id::allocated(24, 0, 1);
+        let mut good_cell = OwnedCell {
+            header: CellHeader::new(schema.vid, &good_id),
+            data: data_map_value!(id: 13_i32, data: vec![0x3C_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut good_cell).unwrap();
+        let mut good_segment = empty_segment_bytes();
+        let good_entry = entry_bytes_at(writer_chunks.address_of(&good_id));
+        good_segment[..good_entry.len()].copy_from_slice(&good_entry);
+        write_backup_segment(&backup_dir, 0, 0, 1, &good_segment);
+
+        let dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&dir).unwrap();
+        let header = crate::ram::wal_format::wal_file_header(2);
+        fs::write(dir.join("0-1-2.nlog"), &header[..7]).unwrap();
+        fs::write(dir.join("0-2-3.nlog"), b"").unwrap();
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        assert!(count_recovered_cells(&chunks.list) > 0);
     }
 
     #[test]

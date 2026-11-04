@@ -6259,18 +6259,17 @@ impl Chunks {
                     // empty store it found.
                     //
                     // A store that cannot be recovered is a situation for a
-                    // human. Unscannable segments no longer reach here -- they
-                    // are quarantined individually -- so this is now reserved
-                    // for whole-store failures: unreadable directories, I/O
-                    // errors, a file larger than a segment. Every one of those
-                    // is worth stopping for, and none is improved by writing
-                    // more data on top.
+                    // human: an unscannable segment (unless the operator set
+                    // `recovery::QUARANTINE_ENV`), an unreadable directory, an
+                    // I/O error, a file larger than a segment. Every one of
+                    // those is worth stopping for, and none is improved by
+                    // writing more data on top.
                     error!(
                         "RECOVERY FAILED for this database: {:?}. REFUSING TO START. The \
                          existing store is left untouched. Starting empty would hide it behind \
-                         new writes; individual unscannable segments are quarantined and do not \
-                         reach this path, so this is a whole-store failure that needs looking at.",
-                        e
+                         new writes. For an unscannable segment, {}=1 starts without its cells.",
+                        e,
+                        crate::ram::recovery::QUARANTINE_ENV
                     );
                     panic!("recovery failed, refusing to start over an existing store: {e:?}");
                 }
