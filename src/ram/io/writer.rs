@@ -162,6 +162,11 @@ pub fn plan_write_field<'a>(
             let len = array.len();
             let mut sub_field = field.clone();
             sub_field.is_array = false;
+            // `nullable` is about the array. The reader takes an array of primitives as a
+            // packed block, so its elements must carry no null flags.
+            if sub_field.sub_fields.is_none() {
+                sub_field.nullable = false;
+            }
             trace!("Pushing array len inst with {} at {}", len, *offset);
             plan_write_array_len(len, offset, &sub_field, value, &mut ins)?;
             for val in array {

@@ -536,4 +536,64 @@ mod tests {
             "second entry shifted -- a null in the first entry desynced the cursor"
         );
     }
+
+    /// JSON gives an array as a list of values. Its elements must land in the packed
+    /// form that the reader takes for an array of primitives, on a nullable field too.
+    #[test]
+    fn a_nullable_array_of_values_reads_back_as_written() {
+        use crate::ram::io::writer::{execute_plan, plan_write_field, WriteInstructions};
+        use crate::ram::schema::Schema;
+        use crate::ram::types::OwnedValue;
+        use dovahkiin::types::OwnedMap;
+
+        let schema = Schema::new(
+            "nullable_values",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed_array_nullable("nums", Type::U64),
+                Field::new_unindexed_array_nullable("names", Type::String),
+            ]),
+            false,
+            false,
+        );
+        let mut root = OwnedMap::new();
+        root.insert_key_id(
+            types::key_hash("nums"),
+            OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(9)]),
+        );
+        root.insert_key_id(
+            types::key_hash("names"),
+            OwnedValue::Array(vec![
+                OwnedValue::String("NVIDIA Corporation".to_string()),
+                OwnedValue::String("NVIDIA".to_string()),
+                OwnedValue::String("Nvidia".to_string()),
+            ]),
+        );
+        let value = OwnedValue::Map(root);
+
+        let mut tail = schema.static_bound;
+        let mut ins = WriteInstructions::new();
+        plan_write_field(
+            &mut tail,
+            &schema.fields,
+            &value,
+            &mut ins,
+            false,
+            &schema.transform,
+        )
+        .unwrap();
+        let mut buf = vec![0u8; tail + 64];
+        execute_plan(buf.as_mut_ptr() as usize, &ins);
+
+        let read = read_by_schema(buf.as_ptr() as usize, &schema);
+        let SharedValue::Map(map) = &read else {
+            panic!("root not a map: {read:?}");
+        };
+        let nums = format!("{:?}", map.get_by_key_id(types::key_hash("nums")));
+        assert!(nums.contains("[7, 9]"), "{nums}");
+        let names = format!("{:?}", map.get_by_key_id(types::key_hash("names")));
+        for name in ["\"NVIDIA Corporation\"", "\"NVIDIA\"", "\"Nvidia\""] {
+            assert!(names.contains(name), "{name} in {names}");
+        }
+    }
 }
