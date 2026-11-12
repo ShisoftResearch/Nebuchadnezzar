@@ -443,3 +443,108 @@ fn benchmark_port_plan_panics_on_slot_overflow() {
     let plan = fixture::PortPlan::new(u16::MAX - 5);
     let _ = plan.single(1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zz_experiment_stale_coordinator_after_migration() {
+    let _ = env_logger::try_init();
+    std::env::set_var("NEB_JOIN_FILL_DELAY_MS", "3600000");
+    let plan = fixture::PortPlan::new(54_520);
+    let fixture = Arc::new(fixture::OccFixture::cluster(plan.cluster(0), "occ_bench_stale_exp").await);
+    let sids: Vec<u64> = fixture.servers.iter().map(|s| s.server_id).collect();
+    let mut ids = Vec::new();
+    for (index, sid) in sids.iter().enumerate() {
+        ids.extend(fixture.ids_placed_on_server(*sid, 1, 4_000_000 + index as u64 * 10_000).await);
+    }
+    for id in &ids {
+        fixture.seed_counter(*id, 0).await;
+    }
+    let ids = Arc::new(ids);
+    let slots: Vec<u32> = ids.iter().map(neb::slots::slot_of).collect();
+    let group = fixture.client.group_name().to_string();
+    let db = fixture.client.database_name().to_string();
+    let pos = |o: Option<u64>| o.and_then(|o| sids.iter().position(|x| *x == o));
+    let other = Arc::new(
+        neb::client::AsyncClient::new(
+            &fixture.servers[1].rpc,
+            &fixture.servers[1].membership,
+            &fixture.addresses,
+            &group,
+        )
+        .await
+        .unwrap(),
+    );
+    let tables = |label: &str| {
+        let mut v = format!("EXP {label}:");
+        for (k, server) in fixture.servers.iter().enumerate() {
+            v.push_str(&format!(" s{k}={:?}", slots.iter().map(|s| pos(server.consh.slot_override(*s as u64))).collect::<Vec<_>>()));
+        }
+        v.push_str(&format!(" fixture_client={:?}", slots.iter().map(|s| pos(fixture.client.conshash.slot_override(*s as u64))).collect::<Vec<_>>()));
+        v.push_str(&format!(" migrating_client={:?}", slots.iter().map(|s| pos(other.conshash.slot_override(*s as u64))).collect::<Vec<_>>()));
+        eprintln!("{v}");
+    };
+    let direct = |label: &'static str| {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        let sids = sids.clone();
+        let group = group.clone();
+        let db = db.clone();
+        async move {
+            let mut v = format!("EXP {label} direct id2 score per server:");
+            for (k, sid) in sids.iter().enumerate() {
+                let c = neb::client::client_by_server_id_for_database(&fixture.client.conshash, *sid, &group, &db).await.unwrap();
+                let r = match c.read_cell(ids[2]).await {
+                    Ok(Ok(cell)) => format!("{:?}", cell.data["score"].u64()),
+                    Ok(Err(e)) => format!("{e:?}"),
+                    Err(e) => format!("rpc {e:?}"),
+                };
+                v.push_str(&format!(" s{k}={r}"));
+            }
+            eprintln!("{v}");
+        }
+    };
+    let batch = |n: u64| {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        async move {
+            let b = run_fixed_success_rmw(fixture, ids, BatchSpec { successes: n, concurrency: 1, cells_per_txn: 3, window_stride: 3 }).await;
+            (b.metrics.committed, b.metrics.unexpected)
+        }
+    };
+    tables("after placement");
+    let (c0, u0) = batch(10).await;
+    eprintln!("EXP batch0 committed={c0} unexpected={u0:?}");
+    direct("before migration").await;
+
+    let mplan = neb::migration::MigrationPlan::default();
+    let h = neb::migration::migrate_slot(&other, slots[2], sids[2], sids[1], &mplan).await;
+    eprintln!("EXP migrate slot {} s2->s1: {:?}", slots[2], h.as_ref().map(|h| h.cells_transferred));
+    tables("after handover");
+    let (c1, u1) = batch(10).await;
+    eprintln!("EXP batch1 (after handover, before reclaim) committed={c1} unexpected={u1:?}");
+    direct("after batch1").await;
+
+    let r = neb::migration::reclaim_donor_copy(&other, slots[2], sids[2], sids[1], &mplan).await;
+    eprintln!("EXP reclaim: {:?}", r.as_ref().map(|r| (r.dropped, r.carried_over, r.retained)));
+    tables("after reclaim");
+    direct("after reclaim").await;
+    let (c2, u2) = batch(10).await;
+    eprintln!("EXP batch2 (after reclaim) committed={c2} unexpected={u2:?}");
+    direct("after batch2").await;
+
+    for server in &fixture.servers {
+        server.refresh_slot_placement().await;
+    }
+    fixture.client.reload_slot_owners().await;
+    tables("after explicit refresh");
+    direct("after refresh").await;
+    let mut finals = Vec::new();
+    for id in ids.iter() {
+        finals.push(fixture.score(*id).await);
+    }
+    eprintln!("EXP total committed={} final scores={:?}", c0 + c1 + c2, finals);
+    let (c3, u3) = batch(10).await;
+    eprintln!("EXP batch3 (after refresh) committed={c3} unexpected={u3:?}");
+    drop(other);
+    let fixture = match Arc::try_unwrap(fixture) { Ok(f) => f, Err(_) => panic!("shared") };
+    fixture.shutdown().await;
+}
