@@ -165,6 +165,17 @@ pub enum DMPrepareResult {
     /// write a cell the dump is copying (or one whose family cannot be told).
     /// Nothing was prepared; retryable once the fence is released.
     DatabaseFenced,
+    /// This member does not own the slot of a cell of the transaction; the
+    /// named member does. Nothing was prepared. The coordinator records the
+    /// owner, and the transaction is retryable.
+    NotSlotOwner {
+        slot: u32,
+        owner: u64,
+        applied_index: u64,
+    },
+    /// The slot of a cell of the transaction is in the last step of a
+    /// handover to another member. Nothing was prepared; retryable.
+    SlotMoving,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]

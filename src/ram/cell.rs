@@ -199,6 +199,10 @@ pub enum ReadError {
     /// with itself, and every caller that can afford to should treat it as an
     /// error rather than an empty result.
     StaleCellPointer,
+    /// A transaction read reached a member whose copy of the slot is in the
+    /// last step of a handover. The member cannot tell if the handover
+    /// committed, so its copy can be behind. Retryable.
+    SlotMoving,
 }
 
 impl CellHeader {

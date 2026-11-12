@@ -772,9 +772,6 @@ async fn shut_down(fixture: Arc<fixture::OccFixture>) {
 /// owner, and it must not fail with `CellDoesNotExisted` for a cell that
 /// exists.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: a coordinator that took no part in a slot migration routes \
-            transactions to the former owner (writes land on the donor, and fail with \
-            CellDoesNotExisted after the reclaim)"]
 async fn stale_coordinator_commits_to_the_current_slot_owner() {
     let _ = env_logger::try_init();
     let (fixture, sids, migrator) =
@@ -858,9 +855,6 @@ async fn stale_coordinator_commits_to_the_current_slot_owner() {
 /// full refresh, the final score must equal the number of acknowledged
 /// commits. Each round uses a new cell in a new slot.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: a stale and a current coordinator write two copies of a slot \
-            after a migration, and the reclaim keeps one copy, so acknowledged commits \
-            are lost"]
 async fn stale_and_current_coordinators_lose_no_acknowledged_commit() {
     let _ = env_logger::try_init();
     let (fixture, sids, migrator) =
@@ -980,9 +974,6 @@ async fn stale_and_current_coordinators_lose_no_acknowledged_commit() {
 /// the handover: no member is stale here. After the reclaim and a full
 /// refresh, the final score must equal the number of acknowledged commits.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: a slot handover does not stop the donor before the recipient \
-            serves, so the recipient serves a stale copy, and the reclaim drops the \
-            commits made on it"]
 async fn writes_during_a_handover_lose_no_acknowledged_commit() {
     let _ = env_logger::try_init();
     let (fixture, sids, migrator) =

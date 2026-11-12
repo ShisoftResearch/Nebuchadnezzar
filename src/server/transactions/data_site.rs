@@ -781,6 +781,60 @@ impl DataManager {
             .count()
     }
 
+    /// Prepared transactions that write a cell of one of `slots`. A slot seal
+    /// waits for these before the donor reports the slots sealed, because
+    /// each can still commit on this member.
+    pub fn prepared_writers_in_slots(&self, slots: &[u32]) -> usize {
+        let tids: Vec<TxnId> = self.transaction_ids();
+        tids.iter()
+            .filter(|tid| {
+                self.find_transaction(tid).is_some_and(|txn| {
+                    let txn = txn.lock();
+                    txn.state == TxnState::Prepared
+                        && txn.certified.values().any(|op| {
+                            op.intent == PrepareIntent::Write
+                                && slots.contains(&(crate::slots::slot_of(&op.id) as u32))
+                        })
+                })
+            })
+            .count()
+    }
+
+    /// The owner of the slot of `id` in the stored table, when it is another
+    /// member. `None` when this member owns the slot or cannot tell (no table,
+    /// or no entry for the slot).
+    fn other_slot_owner(&self, id: &Id) -> Option<(u64, u64)> {
+        let conshash = &self.database_runtime.consh;
+        if !conshash.has_slot_overrides() {
+            return None;
+        }
+        conshash
+            .slot_override_with_index(crate::slots::slot_of(id) as u64)
+            .filter(|(owner, _)| *owner != self.database_runtime.rpc.server_id)
+    }
+
+    /// Why a transaction read of `id` must not be served here, if it must not.
+    ///
+    /// A plain read of a cell that a former owner still holds is served. A
+    /// transaction read is not: the transaction validates and writes on the
+    /// member that it read from, and after a flip that member is not the one
+    /// that takes the writes. A sealed slot is refused too, because this
+    /// member cannot tell if the handover committed.
+    fn slot_read_refusal(&self, id: &Id) -> Option<ReadError> {
+        if self
+            .database_runtime
+            .slot_seal()
+            .is_sealed(crate::slots::slot_of(id) as u32)
+        {
+            return Some(ReadError::SlotMoving);
+        }
+        self.other_slot_owner(id)
+            .map(|(owner, applied_index)| ReadError::NotSlotOwner {
+                owner,
+                applied_index,
+            })
+    }
+
     /// Whether preparing `ops` would write a cell the engaged fence protects.
     ///
     /// A prepare names cells by id and carries no schema, so the family is read
@@ -8685,6 +8739,10 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+        if let Some(refusal) = self.slot_read_refusal(&id) {
+            self.update_clock(clock);
+            return self.response_with(TxnExecResult::Error(refusal));
+        }
         // Instrumentation: this is the whole-cell transfer path. Coordinator
         // tests assert header/projection-only reads never reach here.
         FULL_READ_RPC_COUNT.fetch_add(1, Relaxed);
@@ -8720,6 +8778,10 @@ impl Service for DataManager {
         id: Id,
         fields: Vec<u64>,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+        if let Some(refusal) = self.slot_read_refusal(&id) {
+            self.update_clock(clock);
+            return self.response_with(TxnExecResult::Error(refusal));
+        }
         // Serve an already-pinned cell from its immutable snapshot without
         // `prepare_read` (see `read` for why re-checking could only spuriously
         // reject or delay it; the clock merge happens exactly once per path).
@@ -8753,6 +8815,10 @@ impl Service for DataManager {
         id: Id,
         pin: bool,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
+        if let Some(refusal) = self.slot_read_refusal(&id) {
+            self.update_clock(clock);
+            return self.response_with(TxnExecResult::Error(refusal));
+        }
         // A partial read (pin=true) snapshots the read version so the same
         // transaction repeats it. The blind version-observation path (pin=false,
         // e.g. `observe_head_from_site`) must NOT pin or create a transaction; it
@@ -8830,6 +8896,10 @@ impl Service for DataManager {
         offset: usize,
         len: usize,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
+        if let Some(refusal) = self.slot_read_refusal(&id) {
+            self.update_clock(clock);
+            return self.response_with(TxnExecResult::Error(refusal));
+        }
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
@@ -8867,6 +8937,36 @@ impl Service for DataManager {
             if fence.is_engaged() && self.prepare_writes_fenced_cell(&prepared_ops) {
                 return self.response_with(DMPrepareResult::DatabaseFenced).await;
             }
+            // The slot seal and the slot owner, for every cell of the
+            // transaction: a read is validated here, and that is sound only
+            // on the member that takes the writes of the slot. The guards
+            // are held for the whole prepare, so a seal that drains sees this
+            // transaction either not started (and it is refused here) or
+            // `Prepared` (and waits for it through
+            // `prepared_writers_in_slots`).
+            let seal = self.database_runtime.slot_seal();
+            let mut slot_guards = Vec::new();
+            let mut guarded_slots: Vec<u32> = Vec::new();
+            for op in &prepared_ops {
+                let slot = crate::slots::slot_of(&op.id) as u32;
+                if !guarded_slots.contains(&slot) {
+                    match seal.enter(slot) {
+                        Some(guard) => slot_guards.push(guard),
+                        None => return self.response_with(DMPrepareResult::SlotMoving).await,
+                    }
+                    guarded_slots.push(slot);
+                }
+                if let Some((owner, applied_index)) = self.other_slot_owner(&op.id) {
+                    return self
+                        .response_with(DMPrepareResult::NotSlotOwner {
+                            slot,
+                            owner,
+                            applied_index,
+                        })
+                        .await;
+                }
+            }
+            let _slot_guards = slot_guards;
             #[cfg(test)]
             if let Some(state) = Self::take_matching_prepare_delay(&tid, &prepared_ops) {
                 Self::await_prepare_delay(&state).await;

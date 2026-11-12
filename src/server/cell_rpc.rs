@@ -1132,6 +1132,28 @@ impl Service for NebRPCService {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            // A transaction that prepared before the seal can still commit
+            // here, and a commit is a write. `prepare` is sealed, so the set
+            // of such transactions only gets smaller from here.
+            if let Some(site) = self.database_runtime.data_site() {
+                let started = std::time::Instant::now();
+                loop {
+                    let prepared_writers = site.prepared_writers_in_slots(&slots);
+                    if prepared_writers == 0 {
+                        break;
+                    }
+                    if started.elapsed() >= std::time::Duration::from_millis(drain_ms) {
+                        self.database_runtime
+                            .slot_seal()
+                            .unseal_token(&slots, token);
+                        return Err(format!(
+                            "{prepared_writers} prepared transaction(s) still hold cells of \
+                             the slots after {drain_ms} ms; slots unsealed"
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
             // The seal must not outlive a caller that stopped. When the lease
             // ends and the seal is still there, this member asks the placement
             // table to abort and acts on the answer.

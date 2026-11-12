@@ -1216,6 +1216,9 @@ impl TransactionManager {
             match read_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
+                    if self.read_refused_by_slot(id, &dsr.payload) {
+                        return Ok(TxnExecResult::Rejected);
+                    }
                     let payload = dsr.payload;
                     match payload {
                         TxnExecResult::Accepted(cell) => {
@@ -1323,6 +1326,9 @@ impl TransactionManager {
             match head_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
+                    if self.read_refused_by_slot(id, &dsr.payload) {
+                        return Ok(TxnExecResult::Rejected);
+                    }
                     match dsr.payload {
                         TxnExecResult::Accepted(header) => {
                             let version = header.version;
@@ -1439,6 +1445,9 @@ impl TransactionManager {
             match read_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
+                    if self.read_refused_by_slot(id, &dsr.payload) {
+                        return Ok(TxnExecResult::Rejected);
+                    }
                     match dsr.payload {
                         TxnExecResult::Accepted(projection) => {
                             let version = projection.header.version;
@@ -1550,6 +1559,9 @@ impl TransactionManager {
             match head_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
+                    if self.read_refused_by_slot(id, &dsr.payload) {
+                        return Ok(TxnExecResult::Rejected);
+                    }
                     let payload = &dsr.payload;
                     match &payload {
                         &TxnExecResult::Wait => {
@@ -1668,6 +1680,28 @@ impl TransactionManager {
                             Self::backoff_wait(attempt, config).await?;
                             attempt += 1;
                             continue;
+                        }
+                        // The participant does not own a slot of this
+                        // transaction any more, or the slot is in the last
+                        // step of a handover. Nothing was prepared. Record
+                        // the owner that it named, so the next transaction
+                        // goes to the right member, and let the client start
+                        // a new transaction.
+                        DMPrepareResult::NotSlotOwner {
+                            slot,
+                            owner,
+                            applied_index,
+                        } => {
+                            deps.consh.note_slot_owner(
+                                slot as u64,
+                                owner,
+                                crate::slots::SLOT_COUNT,
+                                applied_index,
+                            );
+                            return Ok(DMPrepareResult::NotRealizable);
+                        }
+                        DMPrepareResult::SlotMoving => {
+                            return Ok(DMPrepareResult::NotRealizable)
                         }
                         _ => return Ok(payload),
                     }
@@ -2112,6 +2146,34 @@ impl TransactionManager {
             });
         }
     }
+    /// Tells if a participant refused a transaction read because of the slot
+    /// of the cell: it is not the owner, or the slot is in the last step of a
+    /// handover. For "not the owner" this records the owner that the
+    /// participant named, so the next transaction goes to the right member.
+    /// The caller rejects the read, and the client starts a new transaction.
+    fn read_refused_by_slot<A: Send + Clone>(
+        &self,
+        id: &Id,
+        payload: &TxnExecResult<A, ReadError>,
+    ) -> bool {
+        match payload {
+            TxnExecResult::Error(ReadError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                self.deps.consh.note_slot_owner(
+                    crate::slots::slot_of(id) as u64,
+                    *owner,
+                    crate::slots::SLOT_COUNT,
+                    *applied_index,
+                );
+                true
+            }
+            TxnExecResult::Error(ReadError::SlotMoving) => true,
+            _ => false,
+        }
+    }
+
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
             return Ok(());
