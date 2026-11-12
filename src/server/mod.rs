@@ -34,6 +34,7 @@ pub mod cell_rpc;
 pub mod database;
 pub mod status;
 mod storage_lock;
+pub mod slot_seal;
 pub mod write_fence;
 #[cfg(test)]
 mod tests;
@@ -1166,6 +1167,9 @@ pub struct DatabaseRuntime {
     id_alloc_sm: tokio::sync::OnceCell<Arc<crate::ram::id_alloc_sm::client::SMClient>>,
     /// Holds writers off for a logical dump; see `write_fence`.
     write_fence: Arc<write_fence::WriteFence>,
+    /// Holds writers off the slots in the last step of a handover; see
+    /// `slot_seal`.
+    slot_seal: Arc<slot_seal::SlotSeal>,
     /// This database's participant side, once its service is registered.
     ///
     /// WEAK on purpose: the data site holds the runtime, so a strong link
@@ -1212,6 +1216,7 @@ impl DatabaseRuntime {
             id_allocator: tokio::sync::OnceCell::new(),
             id_alloc_sm: tokio::sync::OnceCell::new(),
             write_fence: Arc::new(write_fence::WriteFence::new()),
+            slot_seal: Arc::new(slot_seal::SlotSeal::new()),
             data_site: std::sync::OnceLock::new(),
         }
     }
@@ -1319,6 +1324,10 @@ impl DatabaseRuntime {
 
     pub fn write_fence(&self) -> &Arc<write_fence::WriteFence> {
         &self.write_fence
+    }
+
+    pub fn slot_seal(&self) -> &Arc<slot_seal::SlotSeal> {
+        &self.slot_seal
     }
 
     /// Fence the families in `protected` against writes, wait for the ones in
