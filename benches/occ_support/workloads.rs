@@ -10,6 +10,7 @@ use std::{
 
 use dovahkiin::types::{Map as _, Value as _};
 use neb::{
+    client::transaction::TxnError,
     ram::{
         cell::{OwnedCell, ReadError},
         types::{Id, OwnedValue},
@@ -1084,6 +1085,124 @@ pub async fn run_fixed_success_rmw(
             metrics.record_unexpected(format!(
                 "fixed-success RMW score invariant underflow: before {}, after {}, expected {}",
                 score_before, score_after, expected_delta
+            ));
+        }
+    }
+
+    TimedBatch { metrics, elapsed }
+}
+
+/// Runs the fixed-success RMW workload through `Client::transaction`, so
+/// the retry loop and the retry backoff of the client are part of the
+/// measurement. `run_fixed_success_rmw` retries at once and does not use
+/// them.
+pub async fn run_client_transaction_rmw(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    spec: BatchSpec,
+) -> TimedBatch {
+    let expected_delta = validate_batch_spec(&ids, spec);
+
+    let score_before = fixture.sum_scores(ids.as_ref()).await;
+    let next = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+
+    let mut workers = Vec::with_capacity(spec.concurrency);
+    for _ in 0..spec.concurrency {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        let next = next.clone();
+        workers.push(tokio::spawn(async move {
+            let mut metrics = BatchMetrics::default();
+            loop {
+                let logical_index = next.fetch_add(1, Ordering::Relaxed);
+                if logical_index >= spec.successes {
+                    break;
+                }
+
+                let logical_ids = Arc::new(ids_for_logical_operation(
+                    ids.as_ref(),
+                    logical_index,
+                    spec.cells_per_txn,
+                    spec.window_stride,
+                ));
+                let attempts = Arc::new(AtomicU64::new(0));
+                let logical_started = Instant::now();
+                let result = fixture
+                    .client
+                    .transaction(|txn| {
+                        let logical_ids = logical_ids.clone();
+                        let attempts = attempts.clone();
+                        async move {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                            for id in logical_ids.iter() {
+                                let mut cell =
+                                    txn.read(*id).await?.ok_or(TxnError::InternalError)?;
+                                let score = *cell.data["score"]
+                                    .u64()
+                                    .ok_or(TxnError::InternalError)?;
+                                let next_score =
+                                    score.checked_add(1).ok_or(TxnError::InternalError)?;
+                                let mut map = match &cell.data {
+                                    OwnedValue::Map(map) => map.owned(),
+                                    _ => return Err(TxnError::InternalError),
+                                };
+                                replace_score_value(&mut map, next_score);
+                                cell.data = OwnedValue::Map(map);
+                                txn.update(cell).await?;
+                            }
+                            Ok(())
+                        }
+                    })
+                    .await;
+
+                let attempts = attempts.load(Ordering::Relaxed);
+                let retries = attempts.saturating_sub(1);
+                for _ in 0..retries {
+                    metrics.record_retryable();
+                }
+                match result {
+                    Ok(()) => {
+                        metrics.record_success(logical_started.elapsed(), attempts, retries);
+                    }
+                    Err(error) => {
+                        metrics.attempts += attempts;
+                        metrics.logical_retries += retries;
+                        metrics.record_unexpected(format!(
+                            "client transaction for logical operation {logical_index} failed: {error:?}"
+                        ));
+                        return metrics;
+                    }
+                }
+            }
+
+            metrics
+        }));
+    }
+
+    let mut metrics = BatchMetrics::default();
+    for worker in workers {
+        match worker.await {
+            Ok(worker_metrics) => metrics.merge(worker_metrics),
+            Err(err) => metrics.record_unexpected(format!("worker join failed: {:?}", err)),
+        }
+    }
+
+    let elapsed = started.elapsed();
+    if metrics.committed != spec.successes {
+        metrics.record_unexpected(format!(
+            "client transaction RMW committed {} logical operations, expected {}",
+            metrics.committed, spec.successes
+        ));
+    }
+
+    let score_after = fixture.sum_scores(ids.as_ref()).await;
+    match score_after.checked_sub(score_before) {
+        Some(actual_delta) if actual_delta == expected_delta => {}
+        other => {
+            metrics.record_unexpected(format!(
+                "client transaction RMW score invariant failed: actual delta {:?}, expected {}",
+                other, expected_delta
             ));
         }
     }

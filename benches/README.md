@@ -164,3 +164,7 @@ two consecutive operations.
 - `occ/multi_cell_adjacent` uses a stride of 1. Adjacent windows share
   `cells_per_txn - 1` cells. This is the contention case for retry and backoff
   work.
+- `occ/client_txn_adjacent` runs the same contention workload through
+  `Client::transaction`. The other RMW cases call the transaction manager
+  directly and retry at once, so only this case measures the retry backoff of
+  the client.

@@ -18,7 +18,8 @@ use occ_support::{
     metrics::RunReport,
     workloads::{
         run_blind_remove_batch, run_blind_update_batch, run_fixed_success_rmw,
-        run_projected_read_batch, BatchSpec, ProjectionMode, TimedBatch,
+        run_client_transaction_rmw, run_projected_read_batch, BatchSpec, ProjectionMode,
+        TimedBatch,
     },
 };
 
@@ -257,6 +258,54 @@ fn multi_cell_adjacent(criterion: &mut Criterion) {
     );
 }
 
+// The contention case of `multi_cell_adjacent`, run through
+// `Client::transaction`. It measures the retry backoff of the client.
+fn client_txn_adjacent(criterion: &mut Criterion) {
+    let runtime = Runtime::new().expect("create OCC benchmark runtime");
+    let plan = PortPlan::new(occ_support::base_port());
+    let fixture = Arc::new(runtime.block_on(OccFixture::single(
+        plan.single(7),
+        "occ_client_txn_adjacent",
+    )));
+    let server_id = fixture.servers[0].server_id;
+    let ids = Arc::new(fixture.ids_for_server(server_id, 4_096, 9_000_000));
+    seed(&runtime, &fixture, ids.as_ref(), 0);
+
+    let mut group = occ_group(criterion, "occ/client_txn_adjacent");
+    for concurrency in [8usize, 32] {
+        let scenario = format!("occ/client_txn_adjacent/{concurrency}");
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        let runtime = &runtime;
+        group.bench_with_input(
+            BenchmarkId::from_parameter(concurrency),
+            &concurrency,
+            |bench, &concurrency| {
+                let fixture = fixture.clone();
+                let ids = ids.clone();
+                let scenario = scenario.clone();
+                bench.iter_custom(move |iterations| {
+                    reset_phase_profile();
+                    let batch = runtime.block_on(run_client_transaction_rmw(
+                        fixture.clone(),
+                        ids.clone(),
+                        BatchSpec {
+                            successes: iterations.max(1),
+                            concurrency,
+                            cells_per_txn: 8,
+                            window_stride: 1,
+                        },
+                    ));
+                    publish(&scenario, batch)
+                });
+            },
+        );
+    }
+    group.finish();
+
+    finish_fixture(runtime, fixture);
+}
+
 fn multi_participant(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("create OCC benchmark runtime");
     let plan = PortPlan::new(occ_support::base_port());
@@ -389,6 +438,7 @@ criterion_group!(
     hot_rmw,
     multi_cell,
     multi_cell_adjacent,
+    client_txn_adjacent,
     multi_participant,
     projected_reads,
     blind_mutations

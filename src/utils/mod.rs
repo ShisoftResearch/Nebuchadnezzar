@@ -1,5 +1,6 @@
 use std::thread;
 
+pub mod backoff;
 pub mod persisted;
 pub mod raii_mutex_table;
 pub mod test_port;

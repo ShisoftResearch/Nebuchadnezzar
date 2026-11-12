@@ -37,6 +37,10 @@ use self::transaction::*;
 pub static TRANSACTION_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static TRANSACTION_MAX_RETRY: u32 = 1000;
+/// Window of the first retry delay. Each later retry doubles the window.
+const TRANSACTION_RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(1);
+/// Largest window of a retry delay.
+const TRANSACTION_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(5_120);
 
 pub mod embedding;
 pub mod fulltext;
@@ -1411,17 +1415,21 @@ impl AsyncClient {
             client: txn_client,
         };
         while retried < TRANSACTION_MAX_RETRY {
-            // Exponential backoff before retry (skip on first attempt)
+            // Exponential backoff with full jitter before a retry (skip on first attempt)
             if retried > 0 {
                 TRANSACTION_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let backoff_ms = 2u64.pow(retried.min(10)) * 5; // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms, cap at 5120ms
+                let backoff = crate::utils::backoff::full_jitter_backoff(
+                    retried - 1,
+                    TRANSACTION_RETRY_BACKOFF_BASE,
+                    TRANSACTION_RETRY_BACKOFF_CAP,
+                );
                 debug!(
-                    "Client retrying transaction after {}ms backoff (attempt {}/{})",
-                    backoff_ms,
+                    "Client retrying transaction after {:?} backoff (attempt {}/{})",
+                    backoff,
                     retried + 1,
                     TRANSACTION_MAX_RETRY
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                tokio::time::sleep(backoff).await;
             }
 
             txn.state = StdCell::new(txn_server::TxnState::Started);
