@@ -1085,9 +1085,6 @@ async fn writes_during_a_handover_lose_no_acknowledged_commit() {
 /// owner at the handover. The final score must equal the number of
 /// acknowledged updates.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: a slot handover does not stop the donor before the recipient \
-            serves, so the recipient serves a stale copy, and the reclaim drops the \
-            updates made on it"]
 async fn plain_writes_during_a_handover_lose_no_acknowledged_update() {
     use dovahkiin::types::Map as _;
     let _ = env_logger::try_init();

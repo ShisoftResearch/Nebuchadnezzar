@@ -785,6 +785,42 @@ impl Service for NebRPCService {
             // existing write path; `migration_preserves_cell_versions` pins the
             // property so a future change to the increment rule fails loudly
             // here rather than silently downstream.
+            //
+            // The pre-decrement gives the donor's version only to a cell that
+            // is new here: an upsert over a stored cell continues from the
+            // stored version. A cell is sent again when the donor changed it
+            // after its first transfer, so the copy that is already here is
+            // removed first. This member does not own the slot yet, and a
+            // read that misses in between is sent to the owner, so the gap
+            // is not visible. The index entries stay: there is one entry for
+            // each id in the cluster, and the donor keeps it current.
+            let mut stale_copy_error = None;
+            for cell in &cells {
+                let id = cell.header.id;
+                match self.database_runtime.chunks().head_cell(&id) {
+                    Ok(stored) if stored.version != cell.header.version => {
+                        let removal = self
+                            .with_indices_ensured(|| {
+                                self.database_runtime
+                                    .chunks()
+                                    .remove_cell_keeping_indices(&id)
+                            })
+                            .await;
+                        if let Err(error) = removal {
+                            if !matches!(error, WriteError::CellDoesNotExisted) {
+                                stale_copy_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(error) = stale_copy_error {
+                let mut results = vec![Err(error)];
+                results.resize(cells.len(), Err(WriteError::BatchAborted));
+                return results;
+            }
             let prepared: Vec<OwnedCell> = cells
                 .into_iter()
                 .map(|mut cell| {

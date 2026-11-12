@@ -126,7 +126,21 @@ pub struct MigrationPlan {
     /// `concurrent_slots x batch_cells`, so raising this raises the recipient's
     /// peak memory proportionally. Defaults to [`default_concurrent_slots`].
     pub concurrent_slots: usize,
+    /// How long the donor waits for writes in flight when it seals the slots,
+    /// in ms. A seal that cannot drain in this time fails, and the migration
+    /// is aborted.
+    pub seal_drain_ms: u64,
+    /// How long the donor keeps a seal with no flip and no abort, in ms.
+    /// After it, the donor aborts the handover by itself. The last copy and
+    /// the flip must fit in this time, or the migration fails and the slots
+    /// stay with the donor.
+    pub seal_lease_ms: u64,
 }
+
+/// Default of [`MigrationPlan::seal_drain_ms`].
+pub const DEFAULT_SEAL_DRAIN_MS: u64 = 5_000;
+/// Default of [`MigrationPlan::seal_lease_ms`].
+pub const DEFAULT_SEAL_LEASE_MS: u64 = 60_000;
 
 /// Slot concurrency scaled to the machine, clamped at both ends.
 ///
@@ -148,6 +162,8 @@ impl Default for MigrationPlan {
             delta_rounds: DEFAULT_DELTA_ROUNDS,
             settle_recipient_per_batch: true,
             concurrent_slots: default_concurrent_slots(),
+            seal_drain_ms: DEFAULT_SEAL_DRAIN_MS,
+            seal_lease_ms: DEFAULT_SEAL_LEASE_MS,
         }
     }
 }
@@ -472,6 +488,167 @@ fn accumulate(into: &mut SlotHandover, extra: SlotHandover) {
     into.recipient_evicted_segments += extra.recipient_evicted_segments;
 }
 
+/// What the sealed last copy of a handover did.
+#[derive(Debug, Clone, Copy, Default)]
+struct FinalCopy {
+    /// Cells that the recipient did not have, or had at another version.
+    sent: usize,
+    /// Cells on the recipient that the donor no longer had: the donor removed
+    /// them after their transfer.
+    removed: usize,
+}
+
+/// A token that names one handover on the donor, so that the lease of this
+/// handover cannot end the seal of a later one.
+fn seal_token() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    hasher.finish()
+}
+
+/// Seal `slots` and make the copy on the recipient equal to the copy on the
+/// donor.
+///
+/// This is the step that lets the flip lose no write. Until here the donor
+/// took writes, so a cell that was already transferred can be newer on the
+/// donor, and a transferred cell can be gone from the donor.
+///
+/// 1. Record the seal in the placement table. A donor that restarts reads it.
+/// 2. Tell the donor. It refuses new writes to the slots and answers when no
+///    write that it admitted is in flight. Its copy does not change from then.
+/// 3. Compare the 2 copies by cell version and send each difference. Remove
+///    from the recipient each cell that the donor no longer has.
+///
+/// On `Ok` the caller must flip the slots or abort. On `Err` the slots can
+/// still be sealed: the caller aborts through [`abort_sealed_slots`].
+async fn seal_and_copy_differences(
+    placement: &SlotsSMClient,
+    group: u64,
+    donor: &Arc<CellServiceClient>,
+    recipient: &Arc<CellServiceClient>,
+    slots: &[u32],
+    to: u64,
+    token: u64,
+    plan: &MigrationPlan,
+) -> Result<FinalCopy, MigrationError> {
+    let slot_list = slots.to_vec();
+    let (sealed, _) = placement
+        .seal_slot_migrations_with_index(&group, &slot_list)
+        .await
+        .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
+    if sealed.len() != slots.len() {
+        return Err(MigrationError::Placement(format!(
+            "{} of {} slots are not migrating and could not be sealed",
+            slots.len() - sealed.len(),
+            slots.len()
+        )));
+    }
+    donor
+        .seal_slots(&slot_list, token, plan.seal_drain_ms, plan.seal_lease_ms)
+        .await?
+        .map_err(|reason| MigrationError::Transfer(format!("donor could not seal: {reason}")))?;
+
+    let on_donor = donor
+        .cell_ids_in_slots(&slot_list)
+        .await?
+        .map_err(MigrationError::SlotInDoubt)?;
+    let on_recipient = recipient
+        .cell_ids_in_slots(&slot_list)
+        .await?
+        .map_err(MigrationError::SlotInDoubt)?;
+
+    let mut copy = FinalCopy::default();
+    let donor_ids: std::collections::HashSet<Id> = on_donor.iter().copied().collect();
+    for batch in range_batches(on_donor, plan.batch_cells) {
+        let donor_heads = donor.head_all_cells(&batch).await?;
+        let recipient_heads = recipient.head_all_cells(&batch).await?;
+        let differs: Vec<Id> = batch
+            .iter()
+            .zip(donor_heads.iter().zip(recipient_heads.iter()))
+            .filter_map(|(id, (donor_head, recipient_head))| match (donor_head, recipient_head) {
+                (Ok(donor_head), Ok(recipient_head))
+                    if donor_head.version == recipient_head.version =>
+                {
+                    None
+                }
+                // The donor is sealed, so a cell that it listed is there. A
+                // cell that it cannot head is a store fault, not an absence.
+                (Err(error), _) => Some(Err(MigrationError::Transfer(format!(
+                    "sealed donor could not head {id:?}: {error:?}"
+                )))),
+                _ => Some(Ok(*id)),
+            })
+            .collect::<Result<_, _>>()?;
+        if differs.is_empty() {
+            continue;
+        }
+        let outcome = transfer_batch(donor, to, &differs).await?;
+        if outcome.transferred.len() != differs.len() {
+            return Err(MigrationError::Transfer(format!(
+                "{} of {} changed cells did not reach recipient {to} under the seal",
+                differs.len() - outcome.transferred.len(),
+                differs.len()
+            )));
+        }
+        copy.sent += differs.len();
+    }
+
+    let removed_on_donor: Vec<Id> = on_recipient
+        .into_iter()
+        .filter(|id| !donor_ids.contains(id))
+        .collect();
+    for batch in range_batches(removed_on_donor, plan.batch_cells) {
+        for (id, removal) in batch
+            .iter()
+            .zip(recipient.drop_migrated_cells(&batch).await?)
+        {
+            match removal {
+                Ok(()) | Err(WriteError::CellDoesNotExisted) => copy.removed += 1,
+                Err(error) => {
+                    return Err(MigrationError::Transfer(format!(
+                        "recipient {to} could not remove {id:?}, which the donor removed: \
+                         {error:?}"
+                    )))
+                }
+            }
+        }
+    }
+    Ok(copy)
+}
+
+/// Give slots back to their donor after a seal attempt: abort them in the
+/// placement table, then end the seal on the donor.
+///
+/// The table comes first. If the donor served writes while the table still
+/// read `Sealed`, a flip from another caller could commit behind them.
+async fn abort_sealed_slots(
+    placement: &SlotsSMClient,
+    group: u64,
+    donor: &Arc<CellServiceClient>,
+    slots: &[u32],
+    from: u64,
+    token: u64,
+) {
+    for slot in slots {
+        if let Err(error) = placement.abort_slot_migration(&group, slot).await {
+            warn!(
+                "slot {slot} could not be aborted ({error:?}); donor {from} ends its seal \
+                 through the table when its lease runs out"
+            );
+            return;
+        }
+    }
+    if let Err(error) = donor.unseal_slots(&slots.to_vec(), token).await {
+        warn!(
+            "donor {from} could not be told to unseal {} slot(s) ({error:?}); it ends the \
+             seal when its lease runs out",
+            slots.len()
+        );
+    }
+}
+
 /// Move one slot's cells and flip its owner.
 ///
 /// The donor keeps its copy: call [`reclaim_donor_copy`] to drop it, once the
@@ -613,15 +790,30 @@ async fn migrate_slot_prepared(
     }
     .await;
 
+    // The donor took writes during the rounds above. Seal it and send what
+    // changed, so the flip below sees equal copies.
+    let token = seal_token();
+    let outcome = match outcome {
+        Ok(()) => seal_and_copy_differences(
+            &placement,
+            group,
+            &donor,
+            &recipient,
+            &[slot],
+            to,
+            token,
+            plan,
+        )
+        .await
+        .map(|copy| {
+            handover.cells_transferred += copy.sent;
+        }),
+        Err(error) => Err(error),
+    };
+
     if let Err(error) = outcome {
         // Give the slot back to its donor.
-        if let Err(abort_error) = placement.abort_slot_migration(&group, &slot).await {
-            warn!(
-                "slot {slot} transfer failed ({error}) and the migration could not be aborted \
-                 ({abort_error:?}); the slot stays with donor {from} but its table entry still \
-                 reads as migrating"
-            );
-        }
+        abort_sealed_slots(&placement, group, &donor, &[slot], from, token).await;
         // And take back what already landed on the recipient. Routing-wise
         // those copies are harmless -- nothing points at them -- but they are
         // NOT free: they sit in the recipient's storage and its live-byte
@@ -1170,7 +1362,30 @@ pub async fn reshard_slots(
             warn!("slot {slot} transfer failed and could not be aborted: {error:?}");
         }
     }
-    let handovers: Vec<SlotHandover> = handovers.into_values().collect();
+    let mut handovers: Vec<SlotHandover> = handovers.into_values().collect();
+
+    // The donor took writes during the rounds above. Seal every slot that is
+    // ready and send what changed, in one pass over the whole set, so the
+    // commit below sees equal copies. If this fails, no slot of the set
+    // commits: all go back to the donor.
+    let token = seal_token();
+    let ready: Vec<u32> = handovers.iter().map(|handover| handover.slot).collect();
+    if !ready.is_empty() {
+        if let Err(error) = seal_and_copy_differences(
+            &placement, group, &donor, &recipient, &ready, to, token, plan,
+        )
+        .await
+        {
+            abort_sealed_slots(&placement, group, &donor, &ready, from, token).await;
+            for slot in &ready {
+                reshard
+                    .failed
+                    .push((*slot, format!("sealed copy failed: {error}")));
+            }
+            aborted.extend(ready.iter().copied());
+            handovers.clear();
+        }
+    }
 
     // ONE raft command to commit them all. Its return value is produced by its own
     // apply, so it is authoritative about what committed -- no follow-up query,
