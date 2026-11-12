@@ -407,6 +407,36 @@ async fn fixed_success_hot_cell_batch_smoke_test() {
     assert_eq!(final_score, 4);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_fixture_places_one_id_on_every_member() {
+    let _ = env_logger::try_init();
+    let plan = fixture::PortPlan::new(54_510);
+    let fixture = fixture::OccFixture::cluster(plan.cluster(0), "occ_bench_cluster_ids").await;
+    for (index, server) in fixture.servers.iter().enumerate() {
+        let start = 4_000_000 + index as u64 * 10_000;
+        let ids = fixture
+            .ids_placed_on_server(server.server_id, 1, start)
+            .await;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            fixture.client.locate_server_id(&ids[0]).unwrap(),
+            server.server_id
+        );
+        // Every member must route the id to its owner, not only the members
+        // that took part in the move.
+        let slot = neb::slots::slot_of(&ids[0]) as u64;
+        for member in &fixture.servers {
+            assert_eq!(
+                member.consh.get_server_id_for_slot(slot),
+                Some(server.server_id)
+            );
+        }
+        fixture.seed_counter(ids[0], index as u64).await;
+        assert_eq!(fixture.score(ids[0]).await, index as u64);
+    }
+    fixture.shutdown().await;
+}
+
 #[test]
 #[should_panic(expected = "Port plan overflow")]
 fn benchmark_port_plan_panics_on_slot_overflow() {

@@ -319,7 +319,11 @@ fn multi_participant(criterion: &mut Criterion) {
             .iter()
             .enumerate()
             .flat_map(|(index, server)| {
-                fixture.ids_for_server(server.server_id, 1, 4_000_000 + index as u64 * 10_000)
+                runtime.block_on(fixture.ids_placed_on_server(
+                    server.server_id,
+                    1,
+                    4_000_000 + index as u64 * 10_000,
+                ))
             })
             .collect::<Vec<_>>(),
     );

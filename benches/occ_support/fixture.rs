@@ -4,6 +4,7 @@ use std::sync::Arc;
 use dovahkiin::types::{Map as _, Type};
 use neb::{
     client::AsyncClient,
+    migration::{migrate_slot, MigrationPlan},
     ram::{
         cell::OwnedCell,
         schema::{Field, Schema},
@@ -237,7 +238,7 @@ impl OccFixture {
                     self.group, server_id, count, start, max_probes
                 )
             });
-            let id = Id::from_parts(candidate, candidate.rotate_left(17));
+            let id = probe_id(candidate);
             if self
                 .client
                 .locate_server_id(&id)
@@ -257,11 +258,98 @@ impl OccFixture {
         );
     }
 
+    /// `count` ids from `start` on, with their slots moved to `server_id`.
+    ///
+    /// A cluster that starts empty does not spread its slots. The first member
+    /// to start seeds the stored slot table from a ring that holds only
+    /// itself, so it owns every slot, and the join fill moves nothing while
+    /// the members hold 0 bytes. Probing (`ids_for_server`) then never finds
+    /// an id on the other members. This places the slots explicitly, as the
+    /// cross-site transaction tests do.
+    ///
+    /// Callers must use disjoint slot ranges for different servers: a later
+    /// call moves a slot away from the server that an earlier call gave it.
+    ///
+    /// The automatic join fill can still move these slots later, while a
+    /// workload runs. That case is a product problem and this does not hide it.
+    pub async fn ids_placed_on_server(&self, server_id: u64, count: usize, start: u64) -> Vec<Id> {
+        assert!(
+            self.servers
+                .iter()
+                .any(|server| server.server_id == server_id),
+            "OCC fixture group={} does not contain server_id={}",
+            self.group,
+            server_id
+        );
+        let ids: Vec<Id> = (0..count as u64)
+            .map(|offset| {
+                probe_id(start.checked_add(offset).unwrap_or_else(|| {
+                    panic!(
+                        "OCC fixture id overflow for group={} start={} count={}",
+                        self.group, start, count
+                    )
+                }))
+            })
+            .collect();
+        let mut slots: Vec<u32> = ids.iter().map(neb::slots::slot_of).collect();
+        slots.sort_unstable();
+        slots.dedup();
+
+        let plan = MigrationPlan::default();
+        for slot in slots {
+            let owner = self
+                .client
+                .locate_server_id(&Id::from_parts(slot as u64, 1))
+                .expect("route OCC benchmark slot");
+            if owner == server_id {
+                continue;
+            }
+            migrate_slot(&self.client, slot, owner, server_id, &plan)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "move OCC benchmark slot {} from {} to {} in group={}: {:?}",
+                        slot, owner, server_id, self.group, err
+                    )
+                });
+        }
+        // A migration updates only the tables of its donor, its recipient and
+        // the client that ran it. Refresh every member, so that a coordinator
+        // on any member routes these ids to their new owner.
+        for server in &self.servers {
+            assert!(
+                server.refresh_slot_placement().await,
+                "refresh slot placement on server_id={} in group={}",
+                server.server_id,
+                self.group
+            );
+        }
+        self.client.reload_slot_owners().await;
+
+        for id in &ids {
+            assert_eq!(
+                self.client
+                    .locate_server_id(id)
+                    .expect("route OCC benchmark id"),
+                server_id,
+                "OCC fixture group={} placed {:?} but it does not route to server_id={}",
+                self.group,
+                id,
+                server_id
+            );
+        }
+        ids
+    }
+
     pub async fn shutdown(self) {
         for server in self.servers {
             server.shutdown().await;
         }
     }
+}
+
+fn probe_id(candidate: u64) -> Id {
+    Id::from_parts(candidate, candidate.rotate_left(17))
 }
 
 pub(crate) fn ids_probe_budget(count: usize) -> usize {
