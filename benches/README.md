@@ -151,3 +151,16 @@ The controlled profiling portfolio is exactly `independent_rmw/1`,
 binding.
 
 Generated profiling artifacts stay under `target/` and are not committed.
+
+## Cell windows of the RMW cases
+
+Each RMW case gives a window of `cells_per_txn` cells to each logical
+operation. `BatchSpec::window_stride` sets the distance between the windows of
+two consecutive operations.
+
+- `occ/multi_cell` uses disjoint windows (stride = `cells_per_txn`). Concurrent
+  workers share no cells, so the case measures the cost of a multi-cell
+  transaction without added conflicts.
+- `occ/multi_cell_adjacent` uses a stride of 1. Adjacent windows share
+  `cells_per_txn - 1` cells. This is the contention case for retry and backoff
+  work.

@@ -120,10 +120,15 @@ fn register_rmw(
     fixture: Arc<OccFixture>,
     ids: Arc<Vec<Id>>,
     cases: &[(usize, usize)],
+    window_stride: WindowStride,
 ) {
     let mut group = occ_group(criterion, group_name);
 
     for &(concurrency, cells_per_txn) in cases {
+        let window_stride = match window_stride {
+            WindowStride::Disjoint => cells_per_txn,
+            WindowStride::Adjacent => 1,
+        };
         let fixture = fixture.clone();
         let ids = ids.clone();
         let scenario = format!("{group_name}/{concurrency}");
@@ -143,6 +148,7 @@ fn register_rmw(
                             successes: iterations.max(1),
                             concurrency,
                             cells_per_txn,
+                            window_stride,
                         },
                     ));
                     publish(&scenario, batch)
@@ -154,6 +160,18 @@ fn register_rmw(
     group.finish();
 }
 
+/// How the cell windows of consecutive logical operations relate.
+#[derive(Clone, Copy)]
+enum WindowStride {
+    /// Each operation takes the next `cells_per_txn` cells. Concurrent
+    /// workers do not share cells, unless the id set is smaller than the
+    /// windows that are in flight.
+    Disjoint,
+    /// Each window starts 1 cell after the window before it, so adjacent
+    /// windows share `cells_per_txn - 1` cells. This is a contention case.
+    Adjacent,
+}
+
 fn run_single_server_rmw(
     criterion: &mut Criterion,
     group_name: &str,
@@ -163,6 +181,7 @@ fn run_single_server_rmw(
     id_count: usize,
     payload_bytes: usize,
     cases: &[(usize, usize)],
+    window_stride: WindowStride,
 ) {
     let runtime = Runtime::new().expect("create OCC benchmark runtime");
     let plan = PortPlan::new(occ_support::base_port());
@@ -170,7 +189,15 @@ fn run_single_server_rmw(
     let server_id = fixture.servers[0].server_id;
     let ids = Arc::new(fixture.ids_for_server(server_id, id_count, id_start));
     seed(&runtime, &fixture, ids.as_ref(), payload_bytes);
-    register_rmw(criterion, &runtime, group_name, fixture.clone(), ids, cases);
+    register_rmw(
+        criterion,
+        &runtime,
+        group_name,
+        fixture.clone(),
+        ids,
+        cases,
+        window_stride,
+    );
     finish_fixture(runtime, fixture);
 }
 
@@ -184,6 +211,7 @@ fn independent_rmw(criterion: &mut Criterion) {
         4_096,
         0,
         &[(1, 1), (8, 1), (32, 1)],
+        WindowStride::Disjoint,
     );
 }
 
@@ -197,6 +225,7 @@ fn hot_rmw(criterion: &mut Criterion) {
         1,
         0,
         &[(8, 1), (32, 1)],
+        WindowStride::Disjoint,
     );
 }
 
@@ -210,6 +239,21 @@ fn multi_cell(criterion: &mut Criterion) {
         4_096,
         0,
         &[(1, 8), (8, 8)],
+        WindowStride::Disjoint,
+    );
+}
+
+fn multi_cell_adjacent(criterion: &mut Criterion) {
+    run_single_server_rmw(
+        criterion,
+        "occ/multi_cell_adjacent",
+        6,
+        "occ_multi_cell_adjacent",
+        8_000_000,
+        4_096,
+        0,
+        &[(8, 8)],
+        WindowStride::Adjacent,
     );
 }
 
@@ -238,6 +282,7 @@ fn multi_participant(criterion: &mut Criterion) {
         fixture.clone(),
         ids,
         &[(1, 3), (4, 3)],
+        WindowStride::Disjoint,
     );
     finish_fixture(runtime, fixture);
 }
@@ -343,6 +388,7 @@ criterion_group!(
     independent_rmw,
     hot_rmw,
     multi_cell,
+    multi_cell_adjacent,
     multi_participant,
     projected_reads,
     blind_mutations

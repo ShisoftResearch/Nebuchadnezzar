@@ -57,6 +57,7 @@ async fn main() {
             successes,
             concurrency,
             cells_per_txn: 1,
+            window_stride: 1,
         },
     )
     .await;

@@ -68,6 +68,12 @@ pub struct BatchSpec {
     pub successes: u64,
     pub concurrency: usize,
     pub cells_per_txn: usize,
+    /// Distance in cells between the windows of two consecutive logical
+    /// operations. A stride of `cells_per_txn` gives disjoint windows, so
+    /// concurrent workers conflict only if the workload itself has shared
+    /// cells. A stride of 1 makes adjacent windows share
+    /// `cells_per_txn - 1` cells.
+    pub window_stride: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1002,8 +1008,12 @@ pub async fn run_fixed_success_rmw(
                     break;
                 }
 
-                let logical_ids =
-                    ids_for_logical_operation(ids.as_ref(), logical_index, spec.cells_per_txn);
+                let logical_ids = ids_for_logical_operation(
+                    ids.as_ref(),
+                    logical_index,
+                    spec.cells_per_txn,
+                    spec.window_stride,
+                );
                 let logical_started = Instant::now();
                 let mut attempts = 0u64;
                 let mut retries = 0u64;
@@ -1300,8 +1310,14 @@ fn validate_batch_spec(ids: &[Id], spec: BatchSpec) -> u64 {
         })
 }
 
-fn ids_for_logical_operation(ids: &[Id], logical_index: u64, cells_per_txn: usize) -> Vec<Id> {
-    let start = usize::try_from(logical_index % ids.len() as u64)
+fn ids_for_logical_operation(
+    ids: &[Id],
+    logical_index: u64,
+    cells_per_txn: usize,
+    window_stride: usize,
+) -> Vec<Id> {
+    let stride = u64::try_from(window_stride).expect("window_stride must fit in u64");
+    let start = usize::try_from(logical_index.wrapping_mul(stride) % ids.len() as u64)
         .expect("logical operation index modulo ids length must fit in usize");
     (0..cells_per_txn)
         .map(|offset| ids[(start + offset) % ids.len()])
@@ -1314,6 +1330,29 @@ mod tests {
     use dovahkiin::types::OwnedMap;
 
     #[test]
+    fn window_stride_sets_the_overlap_of_consecutive_operations() {
+        let ids: Vec<Id> = (0..64).map(|index| Id::from_parts(1, index)).collect();
+        let shared = |first: &[Id], second: &[Id]| {
+            first.iter().filter(|id| second.contains(id)).count()
+        };
+
+        let disjoint: Vec<Vec<Id>> = (0..8)
+            .map(|index| ids_for_logical_operation(&ids, index, 8, 8))
+            .collect();
+        for pair in disjoint.windows(2) {
+            assert_eq!(shared(&pair[0], &pair[1]), 0);
+        }
+        let mut all: Vec<Id> = disjoint.concat();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 64);
+
+        let first = ids_for_logical_operation(&ids, 0, 8, 1);
+        let second = ids_for_logical_operation(&ids, 1, 8, 1);
+        assert_eq!(shared(&first, &second), 7);
+    }
+
+    #[test]
     #[should_panic(expected = "globally unique ids")]
     fn duplicate_input_ids_are_rejected_before_timing() {
         let id = Id::from_parts(1, 1);
@@ -1321,6 +1360,7 @@ mod tests {
             successes: 1,
             concurrency: 1,
             cells_per_txn: 1,
+            window_stride: 1,
         };
 
         let _ = validate_batch_spec(&[id, id], spec);
@@ -1333,6 +1373,7 @@ mod tests {
             successes: u64::MAX,
             concurrency: 1,
             cells_per_txn: 2,
+            window_stride: 2,
         };
 
         let _ = validate_batch_spec(&[Id::from_parts(1, 1), Id::from_parts(2, 2)], spec);

@@ -388,6 +388,7 @@ async fn fixed_success_hot_cell_batch_smoke_test() {
             successes: 4,
             concurrency: 2,
             cells_per_txn: 1,
+            window_stride: 1,
         },
     )
     .await;
