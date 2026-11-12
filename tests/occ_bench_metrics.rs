@@ -74,8 +74,8 @@ fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
     );
     assert_eq!(
         compact_driver.matches("occ_group(").count(),
-        4,
-        "all four OCC group construction sites must call the shared helper"
+        5,
+        "all five OCC group construction sites must call the shared helper"
     );
 }
 
