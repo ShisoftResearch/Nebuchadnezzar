@@ -570,7 +570,7 @@ async fn zz_experiment_stale_coordinator_after_migration() {
     let r = neb::migration::reclaim_donor_copy(&other, slots[2], sids[2], sids[1], &mplan).await;
     eprintln!(
         "EXP reclaim: {:?}",
-        r.as_ref().map(|r| (r.dropped, r.carried_over, r.retained))
+        r.as_ref().map(|r| (r.dropped, r.absent_on_owner, r.retained))
     );
     tables("after reclaim");
     direct("after reclaim").await;
@@ -825,8 +825,8 @@ async fn stale_coordinator_commits_to_the_current_slot_owner() {
         .await
         .expect("reclaim");
     eprintln!(
-        "reclaim: dropped={} carried_over={} retained={}",
-        reclaim.dropped, reclaim.carried_over, reclaim.retained
+        "reclaim: dropped={} absent_on_owner={} retained={}",
+        reclaim.dropped, reclaim.absent_on_owner, reclaim.retained
     );
 
     // After the reclaim the donor no longer holds the cell.
@@ -954,8 +954,8 @@ async fn stale_and_current_coordinators_lose_no_acknowledged_commit() {
         eprintln!(
             "EXP round {round} slot {slot}: acked stale={stale_acked} current={current_acked} \
              before reclaim donor={donor_copy:?} owner={owner_copy:?} reclaim \
-             dropped={} carried_over={} retained={} final={final_score} lost={lost}",
-            reclaim.dropped, reclaim.carried_over, reclaim.retained
+             dropped={} absent_on_owner={} retained={} final={final_score} lost={lost}",
+            reclaim.dropped, reclaim.absent_on_owner, reclaim.retained
         );
     }
     eprintln!(
@@ -1058,9 +1058,9 @@ async fn writes_during_a_handover_lose_no_acknowledged_commit() {
         }
         eprintln!(
             "EXP handover round {round} slot {slot}: acked={acked} before reclaim \
-             donor={donor_copy:?} owner={owner_copy:?} reclaim dropped={} carried_over={} \
+             donor={donor_copy:?} owner={owner_copy:?} reclaim dropped={} absent_on_owner={} \
              retained={} final={final_score} lost={lost}",
-            reclaim.dropped, reclaim.carried_over, reclaim.retained
+            reclaim.dropped, reclaim.absent_on_owner, reclaim.retained
         );
     }
     eprintln!(
@@ -1168,9 +1168,9 @@ async fn plain_writes_during_a_handover_lose_no_acknowledged_update() {
         }
         eprintln!(
             "EXP plain round {round} slot {slot}: acked={acked} before reclaim \
-             donor={donor_copy:?} owner={owner_copy:?} reclaim dropped={} carried_over={} \
+             donor={donor_copy:?} owner={owner_copy:?} reclaim dropped={} absent_on_owner={} \
              retained={} final={final_score} lost={lost}",
-            reclaim.dropped, reclaim.carried_over, reclaim.retained
+            reclaim.dropped, reclaim.absent_on_owner, reclaim.retained
         );
     }
     eprintln!(

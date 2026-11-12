@@ -58,22 +58,31 @@
 //! [`SlotHandover::recipient_peak_hot_bytes`] carries the peak — so the driver
 //! measures the thing that could blow up instead of assuming it cannot.
 //!
-//! ## What this guarantees, and what it does not
+//! ## What this guarantees
 //!
-//! A slot with no concurrent writes moves exactly and losslessly. Under
-//! concurrent writes:
+//! A handover loses no acknowledged write, with or without concurrent writes
+//! to the slot.
 //!
-//! - **New cells** written to the donor mid-transfer are caught: each delta
-//!   round re-enumerates the donor, and the reclaim carries over anything the
-//!   recipient turns out to be missing rather than dropping it.
-//! - **Updates to already-transferred cells** are not. A writer holding a
-//!   stale table can also write to a former owner after the flip. Both need
-//!   the same fix — a member must refuse writes for a slot the table no longer
-//!   assigns to it, so a stale client is told to refresh instead of silently
-//!   writing somewhere that will be discarded. That is deliberately not done
-//!   here: it puts a check on the write path, and the cluster tests are not yet
-//!   trustworthy enough to attribute a regression there. It is the next step,
-//!   with the racing-write failure model that proves it.
+//! - **New cells** that the donor takes during the transfer: each delta round
+//!   enumerates the donor again and sends them.
+//! - **Updates and removes** of cells that were already transferred: the
+//!   delta rounds do not see them. Before the flip the driver seals the slot
+//!   (`SlotState::Sealed` in the table, then `seal_slots` on the donor), the
+//!   donor stops writes and waits for the writes in flight, and the driver
+//!   compares the 2 copies by version and sends each difference. Only a
+//!   sealed slot can flip.
+//! - **A writer with a stale table** after the flip: a member refuses a write
+//!   for a slot that the table no longer gives to it, and names the owner.
+//! - **A driver that stops** between the seal and the flip: the donor ends
+//!   the seal by itself when its lease runs out. It aborts the handover in
+//!   the table and acts on the answer of that command.
+//!
+//! While a slot is sealed, a write to it waits on the donor. The wait ends
+//! with the write on the donor (abort) or with a redirect to the new owner
+//! (flip).
+//!
+//! The reclaim sends nothing. After the flip the new owner is the authority,
+//! so a cell that only the donor holds is one that the owner removed.
 
 use crate::client::AsyncClient;
 use crate::ram::cell::{ReadError, WriteError};
@@ -98,10 +107,9 @@ pub const DEFAULT_BATCH_CELLS: usize = 1024;
 /// after the previous pass read the slot.
 ///
 /// Bounded on purpose: under sustained writes to the slot being moved the delta
-/// never empties, and looping until it does would never commit. Committing with
-/// a non-empty delta is the better answer — after the flip new writes go to the
-/// recipient, so the delta stops growing, and the reclaim carries over whatever
-/// is left.
+/// never empties, and looping until it does would never commit. The rounds only
+/// reduce the work that is left for the sealed last copy, which sends every
+/// remaining difference while the donor takes no writes.
 pub const DEFAULT_DELTA_ROUNDS: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
@@ -200,10 +208,10 @@ pub struct Reclaim {
     pub from: u64,
     pub to: u64,
     pub dropped: usize,
-    /// Cells the new owner turned out not to have, so they were transferred
-    /// before being dropped. Non-zero means writes reached the donor after the
-    /// last delta pass.
-    pub carried_over: usize,
+    /// Cells that the donor still held and the new owner did not. The new
+    /// owner removed them after the flip, so the donor copy was dropped and
+    /// not sent. Included in `dropped`.
+    pub absent_on_owner: usize,
     /// Cells left on the donor because they could not be safely dropped. Always
     /// the safe outcome, and always worth investigating.
     pub retained: usize,
@@ -1023,26 +1031,22 @@ async fn reclaim_slot_confirmed(
         from,
         to,
         dropped: 0,
-        carried_over: 0,
+        absent_on_owner: 0,
         retained: 0,
     };
 
     for batch in range_batches(known, plan.batch_cells) {
-        // Freshness at the new owner, without moving any bodies to find out.
+        // The new owner is the authority for this slot since the flip, and the
+        // handover made the 2 copies equal before the flip. So the reclaim only
+        // checks, and never sends a donor copy:
         //
-        // Existence alone is not enough, and that gap was data loss: the donor
-        // stays the serving owner for the whole transfer, so it legitimately
-        // accepts writes *after* the transfer has read a cell. Those updates are
-        // invisible to the delta rounds, which look for new ids rather than new
-        // versions, and a carry-over that only asks "does the recipient have it?"
-        // then drops the newer copy. Demonstrated by
-        // `an_update_during_transfer_is_lost`.
-        //
-        // Comparing versions is sound *because* migration preserves them: a
-        // transferred cell lands on the version it had, so the two sides agree
-        // unless one of them has since taken a write. Before that fix the
-        // recipient was always one ahead and this comparison would have been
-        // meaningless -- which is why an earlier version of this code did not try.
+        // * the new owner has the cell at the same or a higher version: the
+        //   donor copy is the old one, drop it;
+        // * the new owner does not have the cell: it removed the cell after
+        //   the flip. To send the donor copy would bring a removed cell back;
+        // * the donor copy is NEWER: this cannot come from a sealed handover.
+        //   The donor copy is kept and reported, not written over the copy of
+        //   the owner, which can hold writes that the donor never saw.
         let t_verify = std::time::Instant::now();
         let heads = recipient.head_all_cells(&batch).await?;
         let donor_heads = donor.head_all_cells(&batch).await?;
@@ -1056,24 +1060,28 @@ async fn reclaim_slot_confirmed(
             .filter_map(|(id, head)| head.ok().map(|header| (*id, header.version)))
             .collect();
         let mut droppable: Vec<Id> = Vec::with_capacity(batch.len());
-        let mut missing: Vec<Id> = Vec::new();
         for (id, head) in batch.iter().zip(heads.into_iter()) {
             match head {
-                // The recipient has it, but the donor's copy is NEWER: a write
-                // landed after the transfer read this cell. Carry it over rather
-                // than destroy it. `missing` is really "needs sending", and a
-                // stale copy needs sending exactly as much as an absent one does.
                 Ok(header)
                     if donor_versions
                         .get(id)
                         .is_some_and(|donor_version| *donor_version > header.version) =>
                 {
-                    missing.push(*id)
+                    warn!(
+                        "slot {slot}: donor {from} holds {id:?} at a higher version than new \
+                         owner {to} ({:?} against {}); keeping the donor's copy",
+                        donor_versions.get(id),
+                        header.version
+                    );
+                    reclaim.retained += 1;
                 }
                 Ok(_) => droppable.push(*id),
-                Err(ReadError::CellDoesNotExisted) => missing.push(*id),
+                Err(ReadError::CellDoesNotExisted) => {
+                    reclaim.absent_on_owner += 1;
+                    droppable.push(*id);
+                }
                 Err(error) => {
-                    // We cannot establish that the new owner has it, so we do
+                    // We cannot establish what the new owner has, so we do
                     // not destroy the only copy we know about.
                     warn!(
                         "slot {slot}: could not check {id:?} on new owner {to} ({error:?}); \
@@ -1082,21 +1090,6 @@ async fn reclaim_slot_confirmed(
                     reclaim.retained += 1;
                 }
             }
-        }
-
-        if !missing.is_empty() {
-            // The new owner is authoritative for this slot now, so this is a
-            // plain repair rather than a migration step: send what it is
-            // missing, then it is safe to drop.
-            let outcome = transfer_batch(&donor, to, &missing).await?;
-            reclaim.carried_over += outcome.transferred.len();
-            // Vanished ids are already gone from the donor; counting them as
-            // dropped keeps the totals honest against the enumeration.
-            reclaim.dropped += outcome.vanished;
-            let unaccounted = missing.len() - outcome.transferred.len() - outcome.vanished;
-            reclaim.retained += unaccounted;
-            // Only what demonstrably reached the new owner may be destroyed.
-            droppable.extend(outcome.transferred);
         }
 
         if droppable.is_empty() {
@@ -1134,14 +1127,14 @@ async fn reclaim_slot_confirmed(
         // slots on a cluster that cannot verify its transfers).
         warn!(
             "slot {} reclaim on {} RETAINED {} cell(s) it could not verify on {}: \
-             {} dropped, {} carried over. The donor keeps the unverified copies; \
+             {} dropped, {} absent on the owner. The donor keeps the unverified copies; \
              re-run the reclaim to converge. An automatic balancer must stop here.",
-            slot, from, reclaim.retained, to, reclaim.dropped, reclaim.carried_over
+            slot, from, reclaim.retained, to, reclaim.dropped, reclaim.absent_on_owner
         );
     } else {
         info!(
-            "slot {} donor copy reclaimed on {}: {} dropped, {} carried over to {}, {} retained",
-            slot, from, reclaim.dropped, reclaim.carried_over, to, reclaim.retained
+            "slot {} donor copy reclaimed on {}: {} dropped, {} absent on owner {}, {} retained",
+            slot, from, reclaim.dropped, reclaim.absent_on_owner, to, reclaim.retained
         );
     }
     Ok(reclaim)
@@ -1251,7 +1244,7 @@ pub async fn reshard_slots(
                 )
             }
             // A later round failing is not fatal: the earlier rounds transferred,
-            // and the reclaim's carry-over is the backstop for anything missed.
+            // and the sealed last copy sends anything that they missed.
             Err(error) => {
                 warn!("delta round {round} enumeration failed ({error:?}); committing what moved");
                 break;
@@ -1953,7 +1946,7 @@ mod cluster_tests {
             .await
             .expect("reclaim should be allowed once the slot is stable on the recipient");
         assert_eq!(reclaim.dropped, PER_SLOT as usize);
-        assert_eq!(reclaim.carried_over, 0);
+        assert_eq!(reclaim.absent_on_owner, 0);
         assert_eq!(reclaim.retained, 0);
 
         assert!(
@@ -2040,65 +2033,48 @@ mod cluster_tests {
         client.read_cell(id).await.unwrap().unwrap();
     }
 
-    /// A cell that reaches the donor after the flip is carried over, not
-    /// destroyed. This is the reason the reclaim asks the new owner what it has
-    /// instead of trusting the transfer's own record.
+    /// A cell that only the donor holds after the flip is dropped, not sent.
+    /// The handover seals the donor and makes the 2 copies equal before the
+    /// flip, so such a cell is one that the new owner removed after it. The
+    /// reclaim must not bring it back.
     #[tokio::test(flavor = "multi_thread")]
-    async fn reclaim_carries_over_a_cell_the_new_owner_never_received() {
+    async fn reclaim_does_not_bring_back_a_cell_that_the_new_owner_removed() {
         let (servers, client) = start_pair("migration_carryover_test").await;
         let donor_id = servers[0].server_id;
         let recipient_id = servers[1].server_id;
 
         const SLOT: u16 = 64;
-        let (moved_id, cell) = cell_in_slot(SLOT, 1, "moved");
+        let (kept_id, cell) = cell_in_slot(SLOT, 1, "kept");
+        client.write_cell(cell).await.unwrap().unwrap();
+        let (removed_id, cell) = cell_in_slot(SLOT, 2, "removed after the flip");
         client.write_cell(cell).await.unwrap().unwrap();
 
         let plan = MigrationPlan::default();
         migrate_slot(&client, SLOT as u32, donor_id, recipient_id, &plan)
             .await
             .expect("slot should migrate");
-
-        // Stands in for a write that the donor accepted microseconds *before* the
-        // flip committed: the ownership guard checks at request time, so a
-        // request that passed the check and was still writing when the table
-        // changed lands anyway. That is the window the carry-over exists for,
-        // and it is why the reclaim asks the new owner what it holds instead of
-        // trusting the transfer's own record.
-        //
-        // Placed through the migration-exempt receive path because an ordinary
-        // write to the donor is now (correctly) refused -- the guard closes the
-        // *stale client* case, not this one.
-        let (late_id, late_cell) = cell_in_slot(SLOT, 2, "late");
-        let donor = client.client_by_server_id(donor_id).await.unwrap();
-        donor
-            .receive_migrated_cells(vec![late_cell])
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert!(
-            !held_in_slot(&servers[1], SLOT).contains(&late_id),
-            "the premise is that the new owner has never seen this cell"
+        assert_eq!(
+            held_in_slot(&servers[1], SLOT),
+            HashSet::from([kept_id, removed_id])
         );
+
+        // The new owner takes a remove. The donor still holds its old copy.
+        client.remove_cell(removed_id).await.unwrap().unwrap();
+        assert!(held_in_slot(&servers[0], SLOT).contains(&removed_id));
 
         let reclaim = reclaim_donor_copy(&client, SLOT as u32, donor_id, recipient_id, &plan)
             .await
             .expect("reclaim should be allowed");
-        assert_eq!(
-            reclaim.carried_over, 1,
-            "the late cell must be carried to the new owner, not dropped"
-        );
+        assert_eq!(reclaim.absent_on_owner, 1);
         assert_eq!(reclaim.dropped, 2);
         assert_eq!(reclaim.retained, 0);
 
-        assert_eq!(
-            held_in_slot(&servers[1], SLOT),
-            HashSet::from([moved_id, late_id])
-        );
+        assert_eq!(held_in_slot(&servers[1], SLOT), HashSet::from([kept_id]));
         assert!(held_in_slot(&servers[0], SLOT).is_empty());
-        client.read_cell(late_id).await.unwrap().unwrap();
+        assert!(matches!(
+            client.read_cell(removed_id).await.unwrap(),
+            Err(ReadError::CellDoesNotExisted)
+        ));
     }
 
     /// A member refuses writes for a slot it no longer owns, and names the owner.
@@ -3031,24 +3007,19 @@ mod cluster_tests {
         );
     }
 
-    /// THE BUG, in isolation: an update to an already-transferred cell is lost.
+    /// An update that the donor takes after the transfer read the cell reaches
+    /// the new owner before the flip.
     ///
-    /// The migration doc has always said delta rounds catch *new* cells and not
-    /// updates to ones already copied. This shows what that costs, without a graph
-    /// or a transaction anywhere near it: transfer a cell, update it on the donor
-    /// while the slot is still `Migrating` (so the donor is the serving owner and
-    /// the write is legitimately accepted), then commit.
-    ///
-    /// The recipient ends up with the pre-update value, and because the reclaim
-    /// only carries over cells the recipient is *missing* — never ones whose donor
-    /// copy is newer — dropping the donor's copy destroys the newer version.
+    /// The delta rounds look for new ids, not new versions, so they do not see
+    /// such an update. The sealed last copy compares versions and sends it. A
+    /// flip without the seal is refused by the placement table.
     ///
     /// This is the shape behind the Morpheus id-list failure: the cell that gets
     /// updated there is a type list, and the pointer it gains names a segment that
     /// the recipient never receives, so a read that resolves the pointer reports
     /// "root segment cell does not exist".
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_update_during_transfer_is_lost() {
+    async fn an_update_during_transfer_reaches_the_new_owner_before_the_flip() {
         let (servers, client) = start_pair("migration_lost_update_test").await;
         let donor_id = servers[0].server_id;
         let recipient_id = servers[1].server_id;
@@ -3061,9 +3032,10 @@ mod cluster_tests {
         let group = slot_group_id(client.group_name());
         let donor = client.client_by_server_id(donor_id).await.unwrap();
         let recipient = client.client_by_server_id(recipient_id).await.unwrap();
+        let plan = MigrationPlan::default();
 
-        // Drive the sequence by hand so the update lands in the window the driver
-        // cannot see: after the transfer has read the cell, before the flip.
+        // Drive the sequence by hand so the update lands in the window that the
+        // delta rounds cannot see: after the transfer read the cell.
         placement
             .begin_slot_migration(&group, &(SLOT as u32), &donor_id, &recipient_id)
             .await
@@ -3084,39 +3056,83 @@ mod cluster_tests {
         let (_, updated) = cell_in_slot(SLOT, 1, "UPDATED-mid-transfer");
         donor.upsert_cell(updated).await.unwrap().unwrap();
 
+        assert!(
+            placement
+                .complete_slot_migration(&group, &(SLOT as u32))
+                .await
+                .unwrap()
+                .is_err(),
+            "a slot whose donor still takes writes must not flip"
+        );
+
+        let token = seal_token();
+        let copy = seal_and_copy_differences(
+            &placement,
+            group,
+            &donor,
+            &recipient,
+            &[SLOT as u32],
+            recipient_id,
+            token,
+            &plan,
+        )
+        .await
+        .expect("sealed copy");
+        assert_eq!(copy.sent, 1, "the sealed copy must send the updated cell");
+        assert_eq!(copy.removed, 0);
+        assert!(
+            matches!(
+                donor
+                    .seal_slots(&vec![SLOT as u32], token, 10, 60_000)
+                    .await
+                    .unwrap(),
+                Ok(())
+            ),
+            "a repeated seal of a sealed slot must succeed"
+        );
+
+        let donor_head = donor.head_all_cells(&vec![id]).await.unwrap().remove(0).unwrap();
+        let landed_head = recipient
+            .head_all_cells(&vec![id])
+            .await
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        assert_eq!(
+            landed_head.version, donor_head.version,
+            "a cell that is sent again must land on the donor's version"
+        );
+
         let (owner, applied_index) = placement
             .complete_slot_migration_with_index(&group, &(SLOT as u32))
             .await
             .unwrap();
         assert_eq!(owner.unwrap(), recipient_id);
         client.note_slot_owner(SLOT as u32, recipient_id, applied_index);
+        for member in [&donor, &recipient] {
+            member
+                .note_slot_owner(SLOT as u32, recipient_id, applied_index)
+                .await
+                .unwrap();
+        }
 
-        // What the new owner holds is the value from before the update.
         let landed = recipient.read_cell(id).await.unwrap().unwrap();
-        let landed_name = landed.data["name"].string().cloned().unwrap_or_default();
-
-        // And the reclaim will not rescue it: the recipient HAS the cell, so the
-        // carry-over sees nothing missing and the donor's newer copy is dropped.
-        let reclaim = reclaim_donor_copy(
-            &client,
-            SLOT as u32,
-            donor_id,
-            recipient_id,
-            &MigrationPlan::default(),
-        )
-        .await
-        .expect("reclaim should run");
         assert_eq!(
-            reclaim.carried_over, 1,
-            "the carry-over must notice the donor holds a newer version and send it"
+            landed.data["name"].string().cloned().unwrap_or_default(),
+            "UPDATED-mid-transfer"
         );
 
+        let reclaim = reclaim_donor_copy(&client, SLOT as u32, donor_id, recipient_id, &plan)
+            .await
+            .expect("reclaim should run");
+        assert_eq!(reclaim.dropped, 1);
+        assert_eq!(reclaim.absent_on_owner, 0);
+        assert_eq!(reclaim.retained, 0);
+
         let after = client.read_cell(id).await.unwrap().unwrap();
-        let after_name = after.data["name"].string().cloned().unwrap_or_default();
         assert_eq!(
-            after_name, "UPDATED-mid-transfer",
-            "an update accepted by the donor mid-transfer was lost: the cluster now \
-             serves {after_name:?} (transferred value was {landed_name:?})"
+            after.data["name"].string().cloned().unwrap_or_default(),
+            "UPDATED-mid-transfer"
         );
     }
 
