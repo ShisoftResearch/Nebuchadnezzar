@@ -135,6 +135,10 @@ pub enum WriteError {
     /// would make that entry survive a crash the rest of the transaction does
     /// not.
     TransactionHeadUnavailable,
+    /// The slot of this cell is in the last step of a handover to another
+    /// member, and the handover did not end in the time that a write waits.
+    /// Nothing was written; the write is retryable.
+    SlotMoving,
 }
 
 impl WriteError {

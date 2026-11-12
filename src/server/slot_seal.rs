@@ -32,7 +32,7 @@
 //! cost for a write is 2 uncontended atomic read-modify-writes, 2 loads of the
 //! generation and 1 load of the sealed set.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,12 +85,15 @@ pub struct SlotSeal {
     /// Its lowest bit names the bank that new writers enter.
     generation: AtomicU64,
     banks: [Bank; 2],
-    /// The sealed slots. Published before the generation moves and read only
-    /// after a writer is counted, so the generation orders it.
-    sealed: arc_swap::ArcSwap<HashSet<u32>>,
+    /// The sealed slots, each with the token of the handover that sealed it.
+    /// Published before the generation moves and read only after a writer is
+    /// counted, so the generation orders it.
+    sealed: arc_swap::ArcSwap<HashMap<u32, u64>>,
     /// Held by the one sealer that moves the generation and drains.
     sealing: AtomicBool,
     refused: AtomicU64,
+    /// Wakes the writers that wait for a seal to end.
+    unsealed: tokio::sync::Notify,
 }
 
 impl Default for SlotSeal {
@@ -145,9 +148,10 @@ impl SlotSeal {
         Self {
             generation: AtomicU64::new(0),
             banks: [new_bank(), new_bank()],
-            sealed: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            sealed: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             sealing: AtomicBool::new(false),
             refused: AtomicU64::new(0),
+            unsealed: tokio::sync::Notify::new(),
         }
     }
 
@@ -166,7 +170,7 @@ impl SlotSeal {
             self.banks[bank][shard].0.fetch_sub(1, Ordering::SeqCst);
         };
         let sealed = self.sealed.load();
-        if !sealed.is_empty() && sealed.contains(&slot) {
+        if !sealed.is_empty() && sealed.contains_key(&slot) {
             self.banks[bank][shard].0.fetch_sub(1, Ordering::SeqCst);
             self.refused.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -180,14 +184,29 @@ impl SlotSeal {
     /// without a guard.
     pub fn is_sealed(&self, slot: u32) -> bool {
         let sealed = self.sealed.load();
-        !sealed.is_empty() && sealed.contains(&slot)
+        !sealed.is_empty() && sealed.contains_key(&slot)
+    }
+
+    /// Tells if any slot is sealed now.
+    pub fn any_sealed(&self) -> bool {
+        !self.sealed.load().is_empty()
     }
 
     /// The sealed slots, in ascending order.
     pub fn sealed_slots(&self) -> Vec<u32> {
-        let mut slots: Vec<u32> = self.sealed.load().iter().copied().collect();
+        let mut slots: Vec<u32> = self.sealed.load().keys().copied().collect();
         slots.sort_unstable();
         slots
+    }
+
+    /// The slots of `slots` that the handover `token` still seals.
+    pub fn sealed_by(&self, slots: &[u32], token: u64) -> Vec<u32> {
+        let sealed = self.sealed.load();
+        slots
+            .iter()
+            .copied()
+            .filter(|slot| sealed.get(slot) == Some(&token))
+            .collect()
     }
 
     /// Writes refused by a seal since this value was created.
@@ -207,15 +226,24 @@ impl SlotSeal {
     ///
     /// When this returns `Ok`, no write to these slots is in flight and none
     /// starts until [`Self::unseal`]. On an error the slots of this call are
-    /// not sealed. A slot that an earlier call sealed stays sealed.
-    pub async fn seal(&self, slots: &[u32], drain_timeout: Duration) -> Result<(), SealError> {
+    /// not sealed. A slot that an earlier call sealed stays sealed, and keeps
+    /// the token of that call.
+    ///
+    /// `token` names the handover. The donor uses it to end only its own seal
+    /// when a lease runs out, and not a later seal of the same slot.
+    pub async fn seal(
+        &self,
+        slots: &[u32],
+        token: u64,
+        drain_timeout: Duration,
+    ) -> Result<(), SealError> {
         let started = Instant::now();
         let newly_sealed: Vec<u32> = {
             let current = self.sealed.load();
             slots
                 .iter()
                 .copied()
-                .filter(|slot| !current.contains(slot))
+                .filter(|slot| !current.contains_key(slot))
                 .collect()
         };
 
@@ -252,8 +280,10 @@ impl SlotSeal {
         }
 
         self.sealed.rcu(|current| {
-            let mut next = HashSet::clone(current);
-            next.extend(slots.iter().copied());
+            let mut next = HashMap::clone(current);
+            for slot in slots {
+                next.entry(*slot).or_insert(token);
+            }
             next
         });
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -264,7 +294,7 @@ impl SlotSeal {
                 return Ok(());
             }
             if started.elapsed() >= drain_timeout {
-                self.unseal(&newly_sealed);
+                self.unseal_token(&newly_sealed, token);
                 return Err(SealError::DrainTimeout {
                     in_flight_writes: in_flight,
                     waited: started.elapsed(),
@@ -281,12 +311,47 @@ impl SlotSeal {
             return;
         }
         self.sealed.rcu(|current| {
-            let mut next = HashSet::clone(current);
+            let mut next = HashMap::clone(current);
             for slot in slots {
                 next.remove(slot);
             }
             next
         });
+        self.unsealed.notify_waiters();
+    }
+
+    /// Let writes through again for the slots of `slots` that the handover
+    /// `token` sealed. A slot that another handover sealed stays sealed.
+    pub fn unseal_token(&self, slots: &[u32], token: u64) {
+        if slots.is_empty() {
+            return;
+        }
+        self.sealed.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            for slot in slots {
+                if next.get(slot) == Some(&token) {
+                    next.remove(slot);
+                }
+            }
+            next
+        });
+        self.unsealed.notify_waiters();
+    }
+
+    /// Wait until `slot` is not sealed or `deadline` passes.
+    ///
+    /// A wake-up can be missed between the check and the wait, so the wait
+    /// also ends after `UNSEAL_POLL`. The caller checks the slot again.
+    pub async fn unsealed(&self, slot: u32, deadline: tokio::time::Instant) {
+        const UNSEAL_POLL: Duration = Duration::from_millis(5);
+        if !self.is_sealed(slot) {
+            return;
+        }
+        let poll = tokio::time::Instant::now() + UNSEAL_POLL;
+        tokio::select! {
+            _ = self.unsealed.notified() => {}
+            _ = tokio::time::sleep_until(poll.min(deadline)) => {}
+        }
     }
 }
 
@@ -301,7 +366,7 @@ mod tests {
     async fn a_sealed_slot_refuses_writes_and_other_slots_do_not() {
         let seal = SlotSeal::new();
         assert!(seal.enter(7).is_some());
-        seal.seal(&[7], DRAIN).await.expect("seal");
+        seal.seal(&[7], 1, DRAIN).await.expect("seal");
 
         assert!(seal.enter(7).is_none());
         assert!(seal.enter(8).is_some());
@@ -324,7 +389,7 @@ mod tests {
             let seal = seal.clone();
             let sealed = sealed.clone();
             tokio::spawn(async move {
-                seal.seal(&[7], DRAIN).await.expect("seal");
+                seal.seal(&[7], 1, DRAIN).await.expect("seal");
                 sealed.store(true, Ordering::SeqCst);
             })
         };
@@ -348,7 +413,7 @@ mod tests {
         let straggler = seal.enter(7).expect("admitted");
 
         let error = seal
-            .seal(&[7], Duration::from_millis(20))
+            .seal(&[7], 1, Duration::from_millis(20))
             .await
             .expect_err("the straggler keeps the drain from ending");
         assert!(matches!(error, SealError::DrainTimeout { in_flight_writes: 1, .. }));
@@ -358,23 +423,27 @@ mod tests {
         // The straggler is still in flight and saw no seal. The next seal of
         // the same slot must wait for it too.
         let error = seal
-            .seal(&[7], Duration::from_millis(20))
+            .seal(&[7], 1, Duration::from_millis(20))
             .await
             .expect_err("the straggler is still in flight");
         assert!(matches!(error, SealError::DrainTimeout { .. }));
         drop(straggler);
-        seal.seal(&[7], DRAIN).await.expect("seal after the straggler left");
+        seal.seal(&[7], 1, DRAIN).await.expect("seal after the straggler left");
         assert!(seal.enter(7).is_none());
     }
 
     #[tokio::test]
     async fn seals_overlap_and_end_independently() {
         let seal = SlotSeal::new();
-        seal.seal(&[1, 2], DRAIN).await.expect("first seal");
-        seal.seal(&[3], DRAIN).await.expect("second seal");
+        seal.seal(&[1, 2], 1, DRAIN).await.expect("first seal");
+        seal.seal(&[3], 1, DRAIN).await.expect("second seal");
         assert_eq!(seal.sealed_slots(), vec![1, 2, 3]);
 
-        seal.unseal(&[2]);
+        // A lease of another handover must not end this seal.
+        seal.unseal_token(&[1, 2, 3], 99);
+        assert_eq!(seal.sealed_slots(), vec![1, 2, 3]);
+        assert_eq!(seal.sealed_by(&[1, 2, 3, 4], 1), vec![1, 2, 3]);
+        seal.unseal_token(&[2], 1);
         assert!(seal.enter(1).is_none());
         assert!(seal.enter(2).is_some());
         assert!(seal.enter(3).is_none());
@@ -383,7 +452,7 @@ mod tests {
         // the same call cannot drain.
         let straggler = seal.enter(9).expect("admitted");
         let error = seal
-            .seal(&[1, 9], Duration::from_millis(20))
+            .seal(&[1, 9], 1, Duration::from_millis(20))
             .await
             .expect_err("slot 9 cannot drain");
         assert!(matches!(error, SealError::DrainTimeout { .. }));
@@ -414,7 +483,7 @@ mod tests {
                 }));
             }
             tokio::time::sleep(Duration::from_micros(200)).await;
-            seal.seal(&[7], DRAIN).await.expect("seal");
+            seal.seal(&[7], 1, DRAIN).await.expect("seal");
             let at_seal = landed.load(Ordering::SeqCst);
             tokio::time::sleep(Duration::from_micros(200)).await;
             let later = landed.load(Ordering::SeqCst);
