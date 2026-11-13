@@ -3007,6 +3007,87 @@ mod cluster_tests {
         );
     }
 
+    /// A donor keeps its seal in memory. After a restart the table still shows
+    /// the slot sealed and still serves it from the donor. The start of the
+    /// donor must end that handover, or a write that the donor accepts would
+    /// miss the last copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_donor_ends_the_handovers_that_it_sealed() {
+        let (servers, client) = start_pair("migration_restart_seal_test").await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+        const SLOT: u32 = 293;
+        const OTHER_SLOT: u32 = 294;
+
+        let placement = placement_client(&client);
+        let group = slot_group_id(client.group_name());
+        for slot in [SLOT, OTHER_SLOT] {
+            placement
+                .begin_slot_migration(&group, &slot, &donor_id, &recipient_id)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Only the table holds this seal, as after a restart of the donor.
+        assert_eq!(
+            placement
+                .seal_slot_migrations(&group, &vec![SLOT])
+                .await
+                .unwrap(),
+            vec![SLOT]
+        );
+
+        let raft_client = &servers[0].raft_client;
+        // The recipient sealed nothing, thus its start changes nothing.
+        let ended = crate::slots::end_seals_of_restarted_member(
+            client.group_name(),
+            raft_client,
+            crate::server::SLOTS_SM_ID,
+            recipient_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, 0);
+        let ended = crate::slots::end_seals_of_restarted_member(
+            client.group_name(),
+            raft_client,
+            crate::server::SLOTS_SM_ID,
+            donor_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, 1);
+
+        let (table, _) =
+            crate::slots::load_table(client.group_name(), raft_client, crate::server::SLOTS_SM_ID)
+                .await
+                .unwrap();
+        let table = table.unwrap();
+        assert!(!table[&SLOT].is_migrating(), "{:?}", table[&SLOT]);
+        assert_eq!(table[&SLOT].serving_owner(), donor_id);
+        assert!(
+            table[&OTHER_SLOT].is_migrating() && !table[&OTHER_SLOT].is_sealed(),
+            "a handover without a seal must continue: {:?}",
+            table[&OTHER_SLOT]
+        );
+        assert!(
+            placement
+                .complete_slot_migration(&group, &SLOT)
+                .await
+                .unwrap()
+                .is_err(),
+            "the flip must fail after the donor ended the handover"
+        );
+        placement
+            .abort_slot_migration(&group, &OTHER_SLOT)
+            .await
+            .unwrap()
+            .unwrap();
+        for server in servers {
+            server.shutdown().await;
+        }
+    }
+
     /// An update that the donor takes after the transfer read the cell reaches
     /// the new owner before the flip.
     ///

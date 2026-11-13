@@ -175,6 +175,42 @@ pub async fn load_owner_vec(
     ))
 }
 
+/// End the handovers that this member sealed before it stopped.
+///
+/// The seal of a donor lives in memory, so a restart loses it while the table
+/// still shows the slot `Sealed`. The table still serves that slot from this
+/// member. A write accepted now would miss the last copy and be lost at the
+/// flip. Thus the member aborts those handovers before it serves a write. A
+/// flip that arrives later fails, because only a sealed slot commits.
+///
+/// Returns the count of slots that went back to this member.
+pub async fn end_seals_of_restarted_member(
+    group_name: &str,
+    raft_client: &Arc<RaftClient>,
+    slots_sm_id: u64,
+    member: u64,
+) -> Result<usize, String> {
+    let (table, _) = load_table(group_name, raft_client, slots_sm_id).await?;
+    let sealed: Vec<u32> = table
+        .into_iter()
+        .flatten()
+        .filter(|(_, state)| state.is_sealed() && state.serving_owner() == member)
+        .map(|(slot, _)| slot)
+        .collect();
+    if sealed.is_empty() {
+        return Ok(0);
+    }
+    let client = SlotsSMClient::new(slots_sm_id, raft_client);
+    let states = client
+        .abort_slot_migrations_from(&slot_group_id(group_name), &sealed, &member)
+        .await
+        .map_err(|error| format!("abort of sealed slot handovers failed: {error:?}"))?;
+    Ok(states
+        .into_iter()
+        .filter(|(_, state)| matches!(state, Some(state) if state.serving_owner() == member))
+        .count())
+}
+
 /// Read the whole table through an ordered Raft command, returning that command's
 /// applied log index, or `None` when the group has never been seeded.
 ///

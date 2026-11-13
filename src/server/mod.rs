@@ -1023,6 +1023,9 @@ pub enum ServerError {
     CannotInitConsistentHashTable(String),
     /// The explicit restore of a store under a new address failed.
     CannotRestoreStore(String),
+    /// The member could not end the slot handovers that it sealed before a
+    /// restart. To serve those slots now could lose acknowledged writes.
+    CannotEndSealedHandovers(String),
     CannotLoadMetaClient,
     CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
@@ -1060,6 +1063,9 @@ impl std::fmt::Display for ServerError {
             ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
             ServerError::CannotInitConsistentHashTable(error) => {
                 write!(f, "cannot initialize consistent hash table: {error}")
+            }
+            ServerError::CannotEndSealedHandovers(error) => {
+                write!(f, "cannot end the sealed slot handovers: {error}")
             }
             ServerError::CannotRestoreStore(error) => {
                 write!(f, "cannot restore the store under a new address: {error}")
@@ -2684,6 +2690,22 @@ impl NebServer {
             "Creating key-value server instance, group name {}",
             group_name
         );
+        // No cell service is registered yet, thus no write can arrive before
+        // the handovers that a previous run of this member sealed are ended.
+        let unsealed = crate::slots::end_seals_of_restarted_member(
+            group_name,
+            raft_client,
+            SLOTS_SM_ID,
+            rpc_server.server_id,
+        )
+        .await
+        .map_err(ServerError::CannotEndSealedHandovers)?;
+        if unsealed > 0 {
+            warn!(
+                "member {} restarted during a slot handover: {} sealed slot(s) stay here",
+                rpc_server.server_id, unsealed
+            );
+        }
         let conshasing = init_conshash(
             group_name,
             server_addr,
