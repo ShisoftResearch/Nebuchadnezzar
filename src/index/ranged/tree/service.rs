@@ -419,7 +419,20 @@ impl Service for TreeService {
             if self.trees.contains_key(&id) {
                 return;
             }
-            let tree = RangedTree::create(&self.client, &id).await;
+            let tree = match RangedTree::create(&self.client, &id).await {
+                Ok(tree) => tree,
+                Err(error) => {
+                    // The same rule as `load_tree`: a stored tree that does
+                    // not load stays absent, and the next operation on its
+                    // range tries again.
+                    error!(
+                        "Not creating ranged tree {:?}: a tree is stored for it and does not \
+                         load: {}. The range it covers will report errors until it can be read.",
+                        id, error
+                    );
+                    return;
+                }
+            };
             self.trees
                 .insert(id, Arc::new(DistTree::new(id, tree, boundary, None, epoch)));
         }

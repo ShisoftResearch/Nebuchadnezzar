@@ -171,8 +171,15 @@ impl std::fmt::Display for TreeRecoverError {
 }
 
 impl RangedTree {
-    /// Create a new ranged tree
-    pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
+    /// Create a new ranged tree, or load the tree that is stored for `id`.
+    ///
+    /// A stored tree that does not load is an error. An empty tree in its
+    /// place would answer each range scan with "no rows", which looks the
+    /// same as a correct answer.
+    pub async fn create(
+        neb_client: &Arc<AsyncClient>,
+        id: &Id,
+    ) -> Result<Self, TreeRecoverError> {
         let deletion_set = Arc::new(DeletionSet::with_capacity(0));
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
@@ -181,39 +188,13 @@ impl RangedTree {
         match neb_client.write_cell(tree_cell).await {
             Ok(Ok(_)) => {
                 info!("Created new ranged tree {:?}", id);
-                Self { tree }
+                Ok(Self { tree })
             }
-            Ok(Err(e)) => {
-                use crate::ram::cell::WriteError;
-                match e {
-                    WriteError::CellAlreadyExisted => {
-                        info!("Ranged tree already exists for {:?}, recovering", id);
-                        match Self::recover(neb_client, id).await {
-                            Ok(tree) => tree,
-                            Err(error) => {
-                                // The tree exists on disk but cannot be read
-                                // right now. Returning a fresh in-memory tree
-                                // is safe only because this path does not
-                                // persist it: the metadata cell still points
-                                // at the real chain, so a later load recovers
-                                // it once the store can answer.
-                                error!(
-                                    "Ranged tree {:?} exists but could not be loaded: {}. \
-                                     Serving an unpersisted empty tree; the stored chain is \
-                                     untouched.",
-                                    id, error
-                                );
-                                let deletion_set =
-                                    Arc::new(DeletionSet::with_capacity(0));
-                                Self {
-                                    tree: DiskTree::new(&deletion_set),
-                                }
-                            }
-                        }
-                    }
-                    _ => panic!("Failed to create ranged tree cell: {:?}", e),
-                }
+            Ok(Err(crate::ram::cell::WriteError::CellAlreadyExisted)) => {
+                info!("Ranged tree already exists for {:?}, recovering", id);
+                Self::recover(neb_client, id).await
             }
+            Ok(Err(e)) => panic!("Failed to create ranged tree cell: {:?}", e),
             Err(e) => panic!("RPC error creating ranged tree cell: {:?}", e),
         }
     }
@@ -1041,7 +1022,7 @@ mod tests {
         let tree_id = Id::from_parts(901, 901);
         let schema_id = 1;
         let field = 777;
-        let tree = RangedTree::create(&client, &tree_id).await;
+        let tree = RangedTree::create(&client, &tree_id).await.unwrap();
 
         for value in 10..=12 {
             assert!(tree.insert(&make_field_key(
@@ -1149,7 +1130,7 @@ mod tests {
 
         let tree_id = Id::from_parts(905, 905);
         let field = 781;
-        let tree = RangedTree::create(&client, &tree_id).await;
+        let tree = RangedTree::create(&client, &tree_id).await.unwrap();
         for value in 0..300u64 {
             assert!(tree.insert(&make_field_key(
                 SchemaUid(1),
@@ -1259,7 +1240,7 @@ mod tests {
         storage::start_external_nodes_write_back(&client);
 
         let tree_id = Id::from_parts(902, 902);
-        let tree = RangedTree::create(&client, &tree_id).await;
+        let tree = RangedTree::create(&client, &tree_id).await.unwrap();
         for value in 20..=22 {
             assert!(tree.insert(&make_field_key(
                 SchemaUid(1),
@@ -1365,7 +1346,7 @@ mod tests {
         let tree_id = Id::from_parts(903, 903);
         let schema_id = 1;
         let field = 779;
-        let tree = RangedTree::create(&client, &tree_id).await;
+        let tree = RangedTree::create(&client, &tree_id).await.unwrap();
         // Three pages at BTREE_NODE_SIZE=128 for monotone inserts.
         let n = 300u64;
         for value in 0..n {
@@ -1478,7 +1459,7 @@ mod tests {
         storage::start_external_nodes_write_back(&client);
 
         let tree_id = Id::from_parts(902, 902);
-        let tree = RangedTree::create(&client, &tree_id).await;
+        let tree = RangedTree::create(&client, &tree_id).await.unwrap();
         let head_id = tree.head_id();
 
         client.remove_cell(tree_id).await.unwrap().unwrap();

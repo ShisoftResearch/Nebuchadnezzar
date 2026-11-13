@@ -140,7 +140,7 @@ async fn publish_head_recreates_missing_metadata_cell() {
     storage::start_external_nodes_write_back(&client);
 
     let tree_id = Id::from_parts(902, 902);
-    let tree = RangedTree::create(&client, &tree_id).await;
+    let tree = RangedTree::create(&client, &tree_id).await.unwrap();
     let head_id = tree.head_id();
 
     client.remove_cell(tree_id).await.unwrap().unwrap();
@@ -150,6 +150,83 @@ async fn publish_head_recreates_missing_metadata_cell() {
 
     let restored = client.read_cell(tree_id).await.unwrap().unwrap();
     assert_eq!(restored.data[*RANGED_TREE_HEAD_HASH].id(), Some(&head_id));
+
+    server.shutdown().await;
+}
+
+/// `create` over a stored tree loads that tree. If the tree does not load,
+/// the caller must get an error: an empty tree in its place would answer each
+/// range scan with "no rows".
+#[tokio::test(flavor = "multi_thread")]
+async fn create_reports_a_stored_tree_that_does_not_load() {
+    let _ = env_logger::try_init();
+
+    let server_addr = String::from("127.0.0.1:6833");
+    let server_group = "ranged_recovery_fix_create";
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![NebService::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
+
+    client
+        .new_schema_with_id(page_schema())
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+        .await
+        .unwrap()
+        .unwrap();
+
+    storage::start_external_nodes_write_back(&client);
+
+    let tree_id = Id::from_parts(903, 903);
+    let tree = RangedTree::create(&client, &tree_id).await.unwrap();
+    let head_id = tree.head_id();
+    drop(tree);
+
+    // The metadata cell stays. The page that it names goes away, so the
+    // stored tree does not load.
+    client.remove_cell(head_id).await.unwrap().unwrap();
+
+    let again = RangedTree::create(&client, &tree_id).await;
+    assert!(
+        again.is_err(),
+        "a stored tree that does not load must be an error, not an empty tree"
+    );
+    let metadata = client.read_cell(tree_id).await.unwrap().unwrap();
+    assert_eq!(
+        metadata.data[*RANGED_TREE_HEAD_HASH].id(),
+        Some(&head_id),
+        "the metadata cell must still name the stored chain"
+    );
 
     server.shutdown().await;
 }

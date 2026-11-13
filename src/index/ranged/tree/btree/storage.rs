@@ -1032,7 +1032,7 @@ mod tests {
         start_external_nodes_write_back(&client);
         let tree_id = crate::ram::types::Id::from_parts(909, 909);
         let key = super::super::EntryKey::from_id(&crate::ram::types::Id::from_parts(9, 1));
-        let tree = Arc::new(RangedTree::create(&client, &tree_id).await);
+        let tree = Arc::new(RangedTree::create(&client, &tree_id).await.unwrap());
         assert!(tree.insert(&key));
         let hub = hub_for(&client);
         assert!(hub.wait_for_locality(tree.tree.head_id().locality()).await);

@@ -569,7 +569,7 @@ mod test {
         let field = 200;
 
         // Create LSM tree and insert test data
-        let tree = RangedTree::create(&client, &lsm_tree_id).await;
+        let tree = RangedTree::create(&client, &lsm_tree_id).await.unwrap();
 
         // Insert keys with feature values 10..=100
         for i in 10..=100 {
@@ -832,7 +832,7 @@ mod test {
         let field = 300;
 
         // Create LSM tree and insert test data
-        let tree = RangedTree::create(&client, &lsm_tree_id).await;
+        let tree = RangedTree::create(&client, &lsm_tree_id).await.unwrap();
 
         // Insert keys with feature values 10..=100 (91 items to ensure oversized mem tree)
         for i in 10..=100 {
@@ -1362,8 +1362,8 @@ mod test {
         let target_tree_id = Id::from_parts(778, 778);
         let schema_id = 1;
         let field = 400;
-        let source_tree = RangedTree::create(&client, &source_tree_id).await;
-        let target_tree = RangedTree::create(&client, &target_tree_id).await;
+        let source_tree = RangedTree::create(&client, &source_tree_id).await.unwrap();
+        let target_tree = RangedTree::create(&client, &target_tree_id).await.unwrap();
 
         for i in 10..=100 {
             let key = create_entry_key(schema_id, field, i, Id::from_parts(4, i));
