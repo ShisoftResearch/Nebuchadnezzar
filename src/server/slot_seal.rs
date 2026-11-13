@@ -8,45 +8,31 @@
 //!
 //! # Why it cannot be raced
 //!
-//! This is the store-then-load handshake of [`super::write_fence`], with one
-//! change. A write fence admits one fencer at a time, so one counter set is
-//! enough. Seals overlap: a reshard seals a slot while another slot is still
-//! sealed, and writes to all other slots must keep their full protection.
-//! Thus the seal keeps 2 counter banks and a generation:
+//! The seal has no writer count of its own. Each write is already counted by
+//! the write fence of the database ([`super::write_fence`]), in one of 2
+//! counter banks. The seal uses that count:
 //!
-//! * a writer reads the generation, adds itself to the bank of that
-//!   generation, and reads the generation again. If it changed, the writer
-//!   removes itself and repeats. **Then** it reads the sealed set;
-//! * a sealer publishes the new sealed set, **then** moves the generation to
-//!   the other bank, and waits for the old bank to become empty.
+//! * a writer adds itself to the current bank of the fence, **then** reads
+//!   the sealed set;
+//! * a sealer publishes the new sealed set, **then** rotates the banks, and
+//!   waits for the old bank to become empty.
 //!
 //! A writer that stays in the old bank is one that the sealer waits for. A
-//! writer in the new bank read the generation after the sealer moved it, and
+//! writer in the new bank read the rotation after the sealer moved it, and
 //! the sealer published the set before that, so the writer sees the seal and
 //! is refused. No write is in neither group.
 //!
 //! Sealers take turns through a claim flag, because the bank that a sealer
 //! makes current must be empty first. The claim is not on the write path.
 //!
-//! The banks are split into shards on separate cache lines. With no seal the
-//! cost for a write is 2 uncontended atomic read-modify-writes, 2 loads of the
-//! generation and 1 load of the sealed set.
+//! With no seal, the cost for a write above the cost of the fence is 2 loads
+//! of the rotation and 1 load of the sealed set.
 
+use super::write_fence::{WriteFence, WriteGuard};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-const SHARDS: usize = 32;
-
-#[repr(align(128))]
-struct Shard(AtomicI64);
-
-type Bank = Box<[Shard; SHARDS]>;
-
-fn new_bank() -> Bank {
-    Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0))))
-}
 
 /// Why a seal could not be engaged. In each case no slot of the request stays
 /// sealed.
@@ -82,45 +68,17 @@ impl std::fmt::Display for SealError {
 impl std::error::Error for SealError {}
 
 pub struct SlotSeal {
-    /// Its lowest bit names the bank that new writers enter.
-    generation: AtomicU64,
-    banks: [Bank; 2],
+    /// The write fence of the same database. It counts the writes.
+    fence: Arc<WriteFence>,
     /// The sealed slots, each with the token of the handover that sealed it.
-    /// Published before the generation moves and read only after a writer is
-    /// counted, so the generation orders it.
+    /// Published before the banks rotate and read only after a writer is
+    /// counted, so the rotation orders it.
     sealed: arc_swap::ArcSwap<HashMap<u32, u64>>,
     /// Held by the one sealer that moves the generation and drains.
     sealing: AtomicBool,
     refused: AtomicU64,
     /// Wakes the writers that wait for a seal to end.
     unsealed: tokio::sync::Notify,
-}
-
-impl Default for SlotSeal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Held for the duration of one write. A seal that engages while this guard
-/// lives waits for it.
-pub struct SlotWriteGuard<'a> {
-    counted: Option<(&'a SlotSeal, usize, usize)>,
-}
-
-impl SlotWriteGuard<'_> {
-    /// A guard for a write that no seal can apply to.
-    pub fn uncounted() -> Self {
-        Self { counted: None }
-    }
-}
-
-impl Drop for SlotWriteGuard<'_> {
-    fn drop(&mut self) {
-        if let Some((seal, bank, shard)) = self.counted.take() {
-            seal.banks[bank][shard].0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
 }
 
 struct SealingClaim<'a>(&'a SlotSeal);
@@ -131,23 +89,10 @@ impl Drop for SealingClaim<'_> {
     }
 }
 
-fn shard_of_current_thread() -> usize {
-    thread_local! {
-        static SHARD: usize = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::thread::current().id().hash(&mut hasher);
-            (hasher.finish() as usize) % SHARDS
-        };
-    }
-    SHARD.with(|shard| *shard)
-}
-
 impl SlotSeal {
-    pub fn new() -> Self {
+    pub fn new(fence: Arc<WriteFence>) -> Self {
         Self {
-            generation: AtomicU64::new(0),
-            banks: [new_bank(), new_bank()],
+            fence,
             sealed: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             sealing: AtomicBool::new(false),
             refused: AtomicU64::new(0),
@@ -157,27 +102,26 @@ impl SlotSeal {
 
     /// Admit one write to `slot`, or refuse it because the slot is sealed.
     ///
-    /// The caller keeps the guard until the write is complete.
-    pub fn enter(&self, slot: u32) -> Option<SlotWriteGuard<'_>> {
-        let shard = shard_of_current_thread();
-        let bank = loop {
-            let generation = self.generation.load(Ordering::SeqCst);
-            let bank = (generation & 1) as usize;
-            self.banks[bank][shard].0.fetch_add(1, Ordering::SeqCst);
-            if self.generation.load(Ordering::SeqCst) == generation {
-                break bank;
-            }
-            self.banks[bank][shard].0.fetch_sub(1, Ordering::SeqCst);
-        };
+    /// For a caller that holds no guard of the write fence. The caller keeps
+    /// the guard until the write is complete.
+    pub fn enter(&self, slot: u32) -> Option<WriteGuard<'_>> {
+        let guard = self
+            .fence
+            .count_if_open()
+            .unwrap_or_else(|| self.fence.count_passed());
+        self.admits(slot).then_some(guard)
+    }
+
+    /// Tells if a write to `slot` can proceed. The caller must hold a counted
+    /// guard of the write fence from before this call until the write is
+    /// complete. Without the guard the answer protects nothing.
+    pub fn admits(&self, slot: u32) -> bool {
         let sealed = self.sealed.load();
         if !sealed.is_empty() && sealed.contains_key(&slot) {
-            self.banks[bank][shard].0.fetch_sub(1, Ordering::SeqCst);
             self.refused.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return false;
         }
-        Some(SlotWriteGuard {
-            counted: Some((self, bank, shard)),
-        })
+        true
     }
 
     /// Tells if `slot` is sealed now. For a caller that needs the answer
@@ -212,13 +156,6 @@ impl SlotSeal {
     /// Writes refused by a seal since this value was created.
     pub fn refused_writes(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
-    }
-
-    fn bank_in_flight(&self, bank: usize) -> i64 {
-        self.banks[bank]
-            .iter()
-            .map(|shard| shard.0.load(Ordering::SeqCst))
-            .sum()
     }
 
     /// Seal `slots` and wait until each write that was admitted before the
@@ -263,10 +200,10 @@ impl SlotSeal {
 
         // The bank that becomes current must be empty. It holds writers only
         // if an earlier seal gave up its drain.
-        let old_bank = (self.generation.load(Ordering::SeqCst) & 1) as usize;
+        let old_bank = self.fence.current_bank();
         let new_bank = old_bank ^ 1;
         loop {
-            let in_flight = self.bank_in_flight(new_bank);
+            let in_flight = self.fence.bank_in_flight(new_bank);
             if in_flight <= 0 {
                 break;
             }
@@ -286,10 +223,10 @@ impl SlotSeal {
             }
             next
         });
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.fence.rotate();
 
         loop {
-            let in_flight = self.bank_in_flight(old_bank);
+            let in_flight = self.fence.bank_in_flight(old_bank);
             if in_flight <= 0 {
                 return Ok(());
             }
@@ -364,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sealed_slot_refuses_writes_and_other_slots_do_not() {
-        let seal = SlotSeal::new();
+        let seal = SlotSeal::new(Arc::new(WriteFence::new()));
         assert!(seal.enter(7).is_some());
         seal.seal(&[7], 1, DRAIN).await.expect("seal");
 
@@ -381,7 +318,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_seal_waits_for_a_write_that_was_admitted_before_it() {
-        let seal = Arc::new(SlotSeal::new());
+        let seal = Arc::new(SlotSeal::new(Arc::new(WriteFence::new())));
         let guard = seal.enter(7).expect("admitted before the seal");
 
         let sealed = Arc::new(AtomicBool::new(false));
@@ -409,14 +346,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_drain_timeout_leaves_the_slot_open_and_the_next_seal_correct() {
-        let seal = SlotSeal::new();
+        let seal = SlotSeal::new(Arc::new(WriteFence::new()));
         let straggler = seal.enter(7).expect("admitted");
 
         let error = seal
             .seal(&[7], 1, Duration::from_millis(20))
             .await
             .expect_err("the straggler keeps the drain from ending");
-        assert!(matches!(error, SealError::DrainTimeout { in_flight_writes: 1, .. }));
+        assert!(matches!(
+            error,
+            SealError::DrainTimeout {
+                in_flight_writes: 1,
+                ..
+            }
+        ));
         assert!(!seal.is_sealed(7), "a failed seal must not stay engaged");
         assert!(seal.enter(7).is_some());
 
@@ -428,13 +371,15 @@ mod tests {
             .expect_err("the straggler is still in flight");
         assert!(matches!(error, SealError::DrainTimeout { .. }));
         drop(straggler);
-        seal.seal(&[7], 1, DRAIN).await.expect("seal after the straggler left");
+        seal.seal(&[7], 1, DRAIN)
+            .await
+            .expect("seal after the straggler left");
         assert!(seal.enter(7).is_none());
     }
 
     #[tokio::test]
     async fn seals_overlap_and_end_independently() {
-        let seal = SlotSeal::new();
+        let seal = SlotSeal::new(Arc::new(WriteFence::new()));
         seal.seal(&[1, 2], 1, DRAIN).await.expect("first seal");
         seal.seal(&[3], 1, DRAIN).await.expect("second seal");
         assert_eq!(seal.sealed_slots(), vec![1, 2, 3]);
@@ -467,7 +412,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn no_write_lands_after_the_seal_returns() {
         for _ in 0..200 {
-            let seal = Arc::new(SlotSeal::new());
+            let seal = Arc::new(SlotSeal::new(Arc::new(WriteFence::new())));
             let stop = Arc::new(AtomicBool::new(false));
             let landed = Arc::new(AtomicUsize::new(0));
             let mut writers = Vec::new();

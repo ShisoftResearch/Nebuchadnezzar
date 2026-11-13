@@ -692,8 +692,8 @@ impl Service for NebRPCService {
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;
@@ -714,8 +714,8 @@ impl Service for NebRPCService {
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
                 .await;
@@ -735,16 +735,16 @@ impl Service for NebRPCService {
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             self.remove_cell_unchecked(key).await
         }
         .boxed()
     }
     fn upsert_cell(&self, cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             self.upsert_cell_unchecked(cell).await
         }
         .boxed()
@@ -1264,8 +1264,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_indices_ensured(|| {
                     self.database_runtime
@@ -1297,8 +1297,8 @@ impl Service for NebRPCService {
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let first_value = value.clone();
             let result = self
                 .with_indices_ensured(|| {
@@ -1329,8 +1329,8 @@ impl Service for NebRPCService {
         version: u64,
     ) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let remove = || {
                 self.database_runtime
                     .chunks()
@@ -1654,8 +1654,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_durable_indices(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;
@@ -1679,8 +1679,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_durable_indices(|| self.database_runtime.chunks().update_cell(&mut cell))
                 .await;
@@ -1704,8 +1704,8 @@ impl Service for NebRPCService {
         cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             self.upsert_cell_durable_unchecked(cell).await
         }
         .boxed()
@@ -1713,8 +1713,8 @@ impl Service for NebRPCService {
 
     fn remove_cell_durable(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             self.remove_cell_durable_unchecked(key).await
         }
         .boxed()
@@ -1729,8 +1729,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
         self.with_captured_indices(async move {
-            let _slot = self.admit_slot_write(&cell.header.id).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_captured_op(|| {
                     self.capture_for_rpc(|| self.database_runtime.chunks().write_cell(&mut cell))
@@ -1755,8 +1755,8 @@ impl Service for NebRPCService {
 
     fn remove_cell_captured(&self, key: Id) -> BoxFuture<'_, (Result<(), WriteError>, Vec<Id>)> {
         self.with_captured_indices(async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let result = self
                 .with_captured_op(|| {
                     self.capture_for_rpc(|| self.database_runtime.chunks().remove_cell(&key))
@@ -1783,8 +1783,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
         self.with_captured_indices(async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_captured_op(|| {
                     self.capture_for_rpc(|| {
@@ -1821,8 +1821,8 @@ impl Service for NebRPCService {
         value: OwnedValue,
     ) -> BoxFuture<'_, (Result<CellHeader, WriteError>, Vec<Id>)> {
         self.with_captured_indices(async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let first_value = value.clone();
             let result = self
                 .with_captured_op(|| {
@@ -1902,8 +1902,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_body(&cell)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_durable_indices(|| {
                     self.database_runtime
@@ -1936,8 +1936,8 @@ impl Service for NebRPCService {
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let _slot = self.admit_slot_write(&key).await?;
-            let _fence = self.fence_for_cell_id(&key)?;
+            let _fence =
+                self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let first_value = value.clone();
             let result = self
                 .with_durable_indices(|| {
@@ -2462,40 +2462,44 @@ impl NebRPCService {
         }
     }
 
-    /// Admit a write to the slot of `id`, or refuse it at once.
+    /// Admit a write to the cell `id`, or refuse it at once.
     ///
-    /// The guard keeps a slot seal from completing its drain, so the caller
-    /// holds it until the write is complete. The owner check comes after the
-    /// seal check: a handover installs the new owner before it removes the
-    /// seal, so a write that passes the seal sees the owner of that moment.
-    fn admit_slot_write_now(
-        &self,
+    /// `fence` takes the guard of the write fence for this write. That guard
+    /// also counts the write for a slot seal, so the seal check comes after
+    /// it and the caller holds the guard until the write is complete. The
+    /// owner check comes after the seal check: a handover installs the new
+    /// owner before it removes the seal, so a write that passes the seal sees
+    /// the owner of that moment.
+    fn admit_write_now<'a>(
+        &'a self,
         id: &Id,
-    ) -> Result<crate::server::slot_seal::SlotWriteGuard<'_>, WriteError> {
+        fence: impl FnOnce() -> Result<crate::server::write_fence::WriteGuard<'a>, WriteError>,
+    ) -> Result<crate::server::write_fence::WriteGuard<'a>, WriteError> {
+        let guard = fence()?;
         let slot = crate::slots::slot_of(id) as u32;
-        let guard = self
-            .database_runtime
-            .slot_seal()
-            .enter(slot)
-            .ok_or(WriteError::SlotMoving)?;
+        if !self.database_runtime.slot_seal().admits(slot) {
+            return Err(WriteError::SlotMoving);
+        }
         self.refuse_if_not_owner(id)?;
         Ok(guard)
     }
 
-    /// Admit a write to the slot of `id`. If the slot is sealed for a
-    /// handover, wait for the handover to end.
+    /// Admit a write to the cell `id`. If the slot is sealed for a handover,
+    /// wait for the handover to end.
     ///
     /// The sealed window of a handover is short: one last copy of the changed
     /// cells and one placement command. To wait here costs the writer less
     /// than a refusal and a retry. After the wait the write either proceeds
     /// (the handover was aborted) or gets `NotSlotOwner` with the new owner
     /// (the handover committed). A wait above `SLOT_SEAL_WRITE_WAIT` ends
-    /// with the retryable `SlotMoving`.
-    async fn admit_slot_write(
-        &self,
+    /// with the retryable `SlotMoving`. The write holds no guard while it
+    /// waits.
+    async fn admit_write<'a>(
+        &'a self,
         id: &Id,
-    ) -> Result<crate::server::slot_seal::SlotWriteGuard<'_>, WriteError> {
-        match self.admit_slot_write_now(id) {
+        fence: impl Fn() -> Result<crate::server::write_fence::WriteGuard<'a>, WriteError>,
+    ) -> Result<crate::server::write_fence::WriteGuard<'a>, WriteError> {
+        match self.admit_write_now(id, &fence) {
             Err(WriteError::SlotMoving) => {}
             other => return other,
         }
@@ -2504,7 +2508,7 @@ impl NebRPCService {
         let deadline = tokio::time::Instant::now() + SLOT_SEAL_WRITE_WAIT;
         loop {
             seal.unsealed(slot, deadline).await;
-            match self.admit_slot_write_now(id) {
+            match self.admit_write_now(id, &fence) {
                 Err(WriteError::SlotMoving) if tokio::time::Instant::now() < deadline => {}
                 other => return other,
             }
@@ -2590,8 +2594,7 @@ impl NebRPCService {
         cell: &mut OwnedCell,
         insert: bool,
     ) -> Result<CellHeader, WriteError> {
-        let _slot = self.admit_slot_write_now(&cell.header.id)?;
-        let _fence = self.fence_for_cell_body(cell)?;
+        let _fence = self.admit_write_now(&cell.header.id, || self.fence_for_cell_body(cell))?;
         if insert {
             self.database_runtime.chunks().write_cell(cell)
         } else {
@@ -2604,8 +2607,8 @@ impl NebRPCService {
         cell: &mut OwnedCell,
         insert: bool,
     ) -> Result<CellHeader, WriteError> {
-        let _slot = self.admit_slot_write(&cell.header.id).await?;
-        let _fence = self.fence_for_cell_body(cell)?;
+        let _fence =
+            self.admit_write(&cell.header.id, || self.fence_for_cell_body(cell)).await?;
         let (result, tasks) = IndexBuilder::with_request_index_scope(|| {
             crate::ram::durability::capture(|| {
                 if insert {

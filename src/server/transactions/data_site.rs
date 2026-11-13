@@ -8944,17 +8944,22 @@ impl Service for DataManager {
             // transaction either not started (and it is refused here) or
             // `Prepared` (and waits for it through
             // `prepared_writers_in_slots`).
+            //
+            // The guard of the fence counts this prepare for a seal. A fence
+            // that is engaged gives no guard, so the prepare is counted here.
             let seal = self.database_runtime.slot_seal();
-            let mut slot_guards = Vec::new();
-            let mut guarded_slots: Vec<u32> = Vec::new();
+            let _seal_guard = match &_fence_guard {
+                Some(_) => None,
+                None => Some(fence.count_passed()),
+            };
+            let mut checked_slots: Vec<u32> = Vec::new();
             for op in &prepared_ops {
                 let slot = crate::slots::slot_of(&op.id) as u32;
-                if !guarded_slots.contains(&slot) {
-                    match seal.enter(slot) {
-                        Some(guard) => slot_guards.push(guard),
-                        None => return self.response_with(DMPrepareResult::SlotMoving).await,
+                if !checked_slots.contains(&slot) {
+                    if !seal.admits(slot) {
+                        return self.response_with(DMPrepareResult::SlotMoving).await;
                     }
-                    guarded_slots.push(slot);
+                    checked_slots.push(slot);
                 }
                 if let Some((owner, applied_index)) = self.other_slot_owner(&op.id) {
                     return self
@@ -8966,7 +8971,6 @@ impl Service for DataManager {
                         .await;
                 }
             }
-            let _slot_guards = slot_guards;
             #[cfg(test)]
             if let Some(state) = Self::take_matching_prepare_delay(&tid, &prepared_ops) {
                 Self::await_prepare_delay(&state).await;

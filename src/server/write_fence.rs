@@ -37,6 +37,29 @@
 //! the shared gate (read-mostly, so it stays in every core's cache), and one
 //! `fetch_sub` when the write leaves: two uncontended atomic read-modify-writes and
 //! one load. Measured end to end in `benches/write_path.rs`.
+//!
+//! # Banks
+//!
+//! A slot seal ([`super::slot_seal`]) also must wait for the writes in flight.
+//! A second count for each write cost 6 % to 13 % of the write throughput at
+//! 64 writers, so the seal uses this count. A fence admits one fencer and
+//! waits for all writers. Seals overlap, and the writes to all other slots
+//! continue, so a seal cannot wait for "all writers". Thus the counters are
+//! in 2 banks, and a rotation value names the bank that new writers enter:
+//!
+//! * a writer reads the rotation, adds itself to that bank, and reads the
+//!   rotation again. If it changed, the writer removes itself and repeats.
+//!   **Then** it reads the gate, and after that the sealed slots;
+//! * a sealer publishes its slots, **then** rotates, and waits for the old
+//!   bank to become empty.
+//!
+//! A writer that stays in the old bank is one that the sealer waits for. A
+//! writer in the new bank read the rotation after the sealer moved it, so it
+//! sees the published slots. The fencer waits for both banks.
+//!
+//! A write that an engaged fence lets through (its family is not protected)
+//! is not in the count of the fencer, but a seal must wait for it too. It is
+//! counted in a separate pair of banks that only a seal reads.
 
 use crate::ram::cell::WriteError;
 use crate::ram::schema::SchemaUid;
@@ -49,6 +72,12 @@ const SHARDS: usize = 32;
 
 #[repr(align(128))]
 struct Shard(AtomicI64);
+
+type Bank = Box<[Shard; SHARDS]>;
+
+fn new_banks() -> [Bank; 2] {
+    std::array::from_fn(|_| Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0)))))
+}
 
 /// Why a fence could not be engaged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +155,13 @@ pub struct WriteFence {
     /// between a write's decision and a fence's publication checkable after the
     /// fact (see the trace under `cfg(test)`).
     gate: AtomicU64,
-    shards: Box<[Shard; SHARDS]>,
+    /// Its lowest bit names the bank that new writers enter.
+    rotation: AtomicU64,
+    /// The writes admitted with no fence engaged. The fencer waits for these.
+    open: [Bank; 2],
+    /// The writes that an engaged fence let through. Only a seal waits for
+    /// these.
+    passed: [Bank; 2],
     /// The families being protected. Written before `gate` turns odd and read
     /// only after it is seen odd, so the gate's ordering publishes it.
     protected: arc_swap::ArcSwap<PublishedProtection>,
@@ -192,7 +227,9 @@ impl Default for WriteFence {
 /// Held for the duration of one write. Dropping it ends the write's claim on
 /// the fence's drain.
 pub struct WriteGuard<'a> {
-    counted: Option<(&'a WriteFence, usize)>,
+    /// The fence, the counter that holds this write, and whether the count
+    /// is one that the fencer waits for.
+    counted: Option<(&'a WriteFence, &'a Shard, bool)>,
     #[cfg(test)]
     note: u64,
     #[cfg(test)]
@@ -201,9 +238,11 @@ pub struct WriteGuard<'a> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        if let Some((fence, shard)) = self.counted.take() {
+        if let Some((fence, shard, open)) = self.counted.take() {
+            #[cfg(not(test))]
+            let _ = (fence, open);
             #[cfg(test)]
-            {
+            if open {
                 // Before the decrement: if the drain returned while this write
                 // was still running, its Done tick would be after the drain's.
                 let tick = fence.trace.tick();
@@ -213,7 +252,7 @@ impl Drop for WriteGuard<'_> {
                     tick,
                 });
             }
-            fence.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+            shard.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -266,7 +305,9 @@ impl WriteFence {
     pub fn new() -> Self {
         Self {
             gate: AtomicU64::new(0),
-            shards: Box::new(std::array::from_fn(|_| Shard(AtomicI64::new(0)))),
+            rotation: AtomicU64::new(0),
+            open: new_banks(),
+            passed: new_banks(),
             protected: arc_swap::ArcSwap::from_pointee(PublishedProtection {
                 protection: Arc::new(Protection::Only(HashSet::new())),
                 engaged: false,
@@ -300,7 +341,57 @@ impl WriteFence {
 
     /// Writes currently inside a guard.
     pub fn in_flight(&self) -> i64 {
-        self.shards.iter().map(|s| s.0.load(Ordering::SeqCst)).sum()
+        self.open
+            .iter()
+            .flat_map(|bank| bank.iter())
+            .map(|s| s.0.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// Add one write to the current bank of `banks`.
+    fn count<'a>(&self, banks: &'a [Bank; 2]) -> &'a Shard {
+        let shard = shard_of_current_thread();
+        loop {
+            let rotation = self.rotation.load(Ordering::SeqCst);
+            let counter = &banks[(rotation & 1) as usize][shard];
+            counter.0.fetch_add(1, Ordering::SeqCst);
+            if self.rotation.load(Ordering::SeqCst) == rotation {
+                return counter;
+            }
+            counter.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Count a write that the caller admits by its own rule while a fence is
+    /// engaged. The fencer does not wait for it. A slot seal does.
+    pub fn count_passed(&self) -> WriteGuard<'_> {
+        WriteGuard {
+            counted: Some((self, self.count(&self.passed), false)),
+            #[cfg(test)]
+            note: 0,
+            #[cfg(test)]
+            seen: 0,
+        }
+    }
+
+    /// The bank that new writers enter now.
+    pub(crate) fn current_bank(&self) -> usize {
+        (self.rotation.load(Ordering::SeqCst) & 1) as usize
+    }
+
+    /// Make the other bank current. The caller must be the only one that
+    /// rotates, and must know that the other bank is empty.
+    pub(crate) fn rotate(&self) {
+        self.rotation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The writes of all kinds that are in `bank`.
+    pub(crate) fn bank_in_flight(&self, bank: usize) -> i64 {
+        self.open[bank]
+            .iter()
+            .chain(self.passed[bank].iter())
+            .map(|s| s.0.load(Ordering::SeqCst))
+            .sum()
     }
 
     /// Admit one write, or refuse it with [`WriteError::DatabaseFenced`].
@@ -325,8 +416,7 @@ impl WriteFence {
     ) -> Result<WriteGuard<'_>, WriteError> {
         #[cfg(not(test))]
         let _ = note;
-        let shard = shard_of_current_thread();
-        self.shards[shard].0.fetch_add(1, Ordering::SeqCst);
+        let shard = self.count(&self.open);
         // THE decision: one SeqCst load of the gate. What it returns is what
         // this write saw of the fence, and everything below follows from it.
         let seen = self.gate.load(Ordering::SeqCst);
@@ -343,15 +433,16 @@ impl WriteFence {
                 });
             }
             return Ok(WriteGuard {
-                counted: Some((self, shard)),
+                counted: Some((self, shard, true)),
                 #[cfg(test)]
                 note,
                 #[cfg(test)]
                 seen,
             });
         }
-        // Fenced: this write is not going to count, whatever the verdict.
-        self.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+        // Fenced: the fencer does not wait for this write, whatever the
+        // verdict.
+        shard.0.fetch_sub(1, Ordering::SeqCst);
         // A family that cannot be determined is refused, not admitted. For a
         // write that carries its cell the only way to get here is a schema this
         // server's cache does not know yet -- and the write path refreshes the
@@ -377,7 +468,7 @@ impl WriteFence {
             Err(WriteError::DatabaseFenced)
         } else {
             Ok(WriteGuard {
-                counted: None,
+                counted: Some((self, self.count(&self.passed), false)),
                 #[cfg(test)]
                 note,
                 #[cfg(test)]
@@ -391,8 +482,7 @@ impl WriteFence {
     /// engaged, so a fencer that engages afterwards waits for it; `None` if one
     /// is, in which case the caller applies its own rule. Never a refusal.
     pub fn count_if_open(&self) -> Option<WriteGuard<'_>> {
-        let shard = shard_of_current_thread();
-        self.shards[shard].0.fetch_add(1, Ordering::SeqCst);
+        let shard = self.count(&self.open);
         let seen = self.gate.load(Ordering::SeqCst);
         if seen & 1 == 0 {
             #[cfg(test)]
@@ -407,14 +497,14 @@ impl WriteFence {
                 });
             }
             return Some(WriteGuard {
-                counted: Some((self, shard)),
+                counted: Some((self, shard, true)),
                 #[cfg(test)]
                 note: 0,
                 #[cfg(test)]
                 seen,
             });
         }
-        self.shards[shard].0.fetch_sub(1, Ordering::SeqCst);
+        shard.0.fetch_sub(1, Ordering::SeqCst);
         None
     }
 

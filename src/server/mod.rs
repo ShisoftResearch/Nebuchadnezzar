@@ -1205,6 +1205,7 @@ impl DatabaseRuntime {
         raft_client: Arc<RaftClient>,
         neb_client: Arc<AsyncClient>,
     ) -> Self {
+        let write_fence = Arc::new(write_fence::WriteFence::new());
         Self {
             group_name: group_name.to_string(),
             database_name: database_name.to_string(),
@@ -1221,8 +1222,8 @@ impl DatabaseRuntime {
             neb_client,
             id_allocator: tokio::sync::OnceCell::new(),
             id_alloc_sm: tokio::sync::OnceCell::new(),
-            write_fence: Arc::new(write_fence::WriteFence::new()),
-            slot_seal: Arc::new(slot_seal::SlotSeal::new()),
+            slot_seal: Arc::new(slot_seal::SlotSeal::new(write_fence.clone())),
+            write_fence,
             data_site: std::sync::OnceLock::new(),
         }
     }
