@@ -3223,8 +3223,13 @@ mod tests {
         assert_eq!(report.entries_pruned, 0, "{}", report);
         assert_eq!(report.prune_incomplete, 1, "{}", report);
         assert!(servers[1].chunks().read_cell(&id).is_ok());
-        // A stable owner is not proof that carry-over has finished. Model
-        // a late cell still on the donor after the ownership commit.
+        // A stable owner is not proof that the donor copy is removed. Model
+        // a cell still on the donor after the ownership commit.
+        let sealed = placement
+            .seal_slot_migrations(&slot_group, &vec![3])
+            .await
+            .unwrap();
+        assert_eq!(sealed, vec![3]);
         placement
             .complete_slot_migration(&slot_group, &3)
             .await
@@ -3234,7 +3239,7 @@ mod tests {
             prune_ranged_index(servers[0].chunks(), indexers, ScrubMode::Repair).await;
         assert!(
             indexers.ranged_client.contains(&key).await.unwrap(),
-            "a stable handover pruned a cell awaiting carry-over"
+            "a stable handover pruned a cell that waits for the reclaim"
         );
         assert_eq!(after_commit.entries_pruned, 0);
         assert_eq!(after_commit.prune_incomplete, 1);
@@ -3243,7 +3248,7 @@ mod tests {
         assert_eq!(hash_handover.hash_prune_incomplete, 1);
         assert!(
             bucket_ids(&client, hash_head).await.contains(&id),
-            "stable carry-over deleted a hash member"
+            "a stable handover deleted a hash member"
         );
 
         assert!(servers[1].chunks().read_cell(&id).is_ok());
