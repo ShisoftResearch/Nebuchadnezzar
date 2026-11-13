@@ -3226,12 +3226,12 @@ mod tests {
         // A stable owner is not proof that the donor copy is removed. Model
         // a cell still on the donor after the ownership commit.
         let sealed = placement
-            .seal_slot_migrations(&slot_group, &vec![3])
+            .seal_slot_migrations(&slot_group, &vec![3], &1)
             .await
             .unwrap();
         assert_eq!(sealed, vec![3]);
         placement
-            .complete_slot_migration(&slot_group, &3)
+            .complete_slot_migration(&slot_group, &3, &1)
             .await
             .unwrap()
             .unwrap();

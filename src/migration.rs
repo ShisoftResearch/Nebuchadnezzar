@@ -543,7 +543,7 @@ async fn seal_and_copy_differences(
 ) -> Result<FinalCopy, MigrationError> {
     let slot_list = slots.to_vec();
     let (sealed, _) = placement
-        .seal_slot_migrations_with_index(&group, &slot_list)
+        .seal_slot_migrations_with_index(&group, &slot_list, &token)
         .await
         .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
     if sealed.len() != slots.len() {
@@ -570,6 +570,9 @@ async fn seal_and_copy_differences(
     let mut copy = FinalCopy::default();
     let donor_ids: std::collections::HashSet<Id> = on_donor.iter().copied().collect();
     for batch in range_batches(on_donor, plan.batch_cells) {
+        // Equal versions are equal cells. The versions of a cell only go up
+        // on a member, except when a transaction rolls back, and the donor
+        // sends no write that can still roll back (`push_cells_to`).
         let donor_heads = donor.head_all_cells(&batch).await?;
         let recipient_heads = recipient.head_all_cells(&batch).await?;
         let differs: Vec<Id> = batch
@@ -869,7 +872,7 @@ async fn migrate_slot_prepared(
 
     // The commit point.
     let (owner, applied_index) = placement
-        .complete_slot_migration_with_index(&group, &slot)
+        .complete_slot_migration_with_index(&group, &slot, &token)
         .await
         .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
     let owner = owner.map_err(MigrationError::NotCommitted)?;
@@ -1385,7 +1388,7 @@ pub async fn reshard_slots(
     // which also sidesteps a query being served the pre-commit state.
     let ready: Vec<u32> = handovers.iter().map(|handover| handover.slot).collect();
     let (committed, applied_index) = match placement
-        .complete_slot_migrations_with_index(&group, &ready)
+        .complete_slot_migrations_with_index(&group, &ready, &token)
         .await
     {
         Ok(committed) => committed,
@@ -3031,7 +3034,7 @@ mod cluster_tests {
         // Only the table holds this seal, as after a restart of the donor.
         assert_eq!(
             placement
-                .seal_slot_migrations(&group, &vec![SLOT])
+                .seal_slot_migrations(&group, &vec![SLOT], &7)
                 .await
                 .unwrap(),
             vec![SLOT]
@@ -3072,7 +3075,7 @@ mod cluster_tests {
         );
         assert!(
             placement
-                .complete_slot_migration(&group, &SLOT)
+                .complete_slot_migration(&group, &SLOT, &7)
                 .await
                 .unwrap()
                 .is_err(),
@@ -3108,6 +3111,10 @@ mod cluster_tests {
         const SLOT: u16 = 291;
         let (id, cell) = cell_in_slot(SLOT, 1, "original");
         client.write_cell(cell).await.unwrap().unwrap();
+        let (unchanged_id, unchanged) = cell_in_slot(SLOT, 2, "unchanged");
+        client.write_cell(unchanged).await.unwrap().unwrap();
+        let (reused_id, reused) = cell_in_slot(SLOT, 3, "sent-twice");
+        client.write_cell(reused).await.unwrap().unwrap();
 
         let placement = placement_client(&client);
         let group = slot_group_id(client.group_name());
@@ -3137,9 +3144,31 @@ mod cluster_tests {
         let (_, updated) = cell_in_slot(SLOT, 1, "UPDATED-mid-transfer");
         donor.upsert_cell(updated).await.unwrap().unwrap();
 
+        // A cell that is sent again with the version that the recipient has
+        // is not written again, so its version stays the version of the donor.
+        let versions = |member: Arc<CellServiceClient>, id: Id| async move {
+            member
+                .head_all_cells(&vec![id])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap()
+                .version
+        };
+        donor
+            .push_cells_to(&vec![reused_id], recipient_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            versions(donor.clone(), reused_id).await,
+            versions(recipient.clone(), reused_id).await,
+            "a repeated transfer must not change the version on the recipient"
+        );
+
         assert!(
             placement
-                .complete_slot_migration(&group, &(SLOT as u32))
+                .complete_slot_migration(&group, &(SLOT as u32), &7)
                 .await
                 .unwrap()
                 .is_err(),
@@ -3159,7 +3188,17 @@ mod cluster_tests {
         )
         .await
         .expect("sealed copy");
-        assert_eq!(copy.sent, 1, "the sealed copy must send the updated cell");
+        assert_eq!(
+            copy.sent, 1,
+            "the sealed copy must send the updated cell and no unchanged cell"
+        );
+        for id in [id, unchanged_id, reused_id] {
+            assert_eq!(
+                versions(donor.clone(), id).await,
+                versions(recipient.clone(), id).await,
+                "the 2 copies of {id:?} must have the same version under the seal"
+            );
+        }
         assert_eq!(copy.removed, 0);
         assert!(
             matches!(
@@ -3185,7 +3224,7 @@ mod cluster_tests {
         );
 
         let (owner, applied_index) = placement
-            .complete_slot_migration_with_index(&group, &(SLOT as u32))
+            .complete_slot_migration_with_index(&group, &(SLOT as u32), &token)
             .await
             .unwrap();
         assert_eq!(owner.unwrap(), recipient_id);
@@ -3206,7 +3245,7 @@ mod cluster_tests {
         let reclaim = reclaim_donor_copy(&client, SLOT as u32, donor_id, recipient_id, &plan)
             .await
             .expect("reclaim should run");
-        assert_eq!(reclaim.dropped, 1);
+        assert_eq!(reclaim.dropped, 3);
         assert_eq!(reclaim.absent_on_owner, 0);
         assert_eq!(reclaim.retained, 0);
 

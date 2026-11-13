@@ -790,7 +790,10 @@ impl Service for NebRPCService {
             // is new here: an upsert over a stored cell continues from the
             // stored version. A cell is sent again when the donor changed it
             // after its first transfer, so the copy that is already here is
-            // removed first. This member does not own the slot yet, and a
+            // removed first. A cell that is here with the version of the
+            // donor is the same cell (the donor sends decided writes only),
+            // and it is not written again: a write over it would give it the
+            // next version. This member does not own the slot yet, and a
             // read that misses in between is sent to the owner, so the gap
             // is not visible. The index entries stay: there is one entry for
             // each id in the cluster, and the donor keeps it current.
@@ -821,13 +824,20 @@ impl Service for NebRPCService {
                 results.resize(cells.len(), Err(WriteError::BatchAborted));
                 return results;
             }
-            let prepared: Vec<OwnedCell> = cells
-                .into_iter()
-                .map(|mut cell| {
-                    cell.header.version = cell.header.version.saturating_sub(1);
-                    cell
-                })
-                .collect();
+            let mut present: Vec<Option<CellHeader>> = Vec::with_capacity(cells.len());
+            let mut prepared: Vec<OwnedCell> = Vec::with_capacity(cells.len());
+            for mut cell in cells {
+                match self.database_runtime.chunks().head_cell(&cell.header.id) {
+                    Ok(stored) if stored.version == cell.header.version => {
+                        present.push(Some(stored));
+                    }
+                    _ => {
+                        present.push(None);
+                        cell.header.version = cell.header.version.saturating_sub(1);
+                        prepared.push(cell);
+                    }
+                }
+            }
 
             // Written as ONE run. Every cell of a batch shares a slot, a slot
             // is a locality, and a locality picks the chunk -- so they all
@@ -849,12 +859,17 @@ impl Service for NebRPCService {
             // A migration aborts the whole slot on any failure, so keep the
             // stop-at-first-failure reporting the driver expects.
             let mut aborted = false;
-            results
+            let mut written = results.into_iter();
+            present
                 .into_iter()
-                .map(|result| {
+                .map(|present| {
                     if aborted {
                         return Err(WriteError::BatchAborted);
                     }
+                    let result = match present {
+                        Some(header) => Ok(header),
+                        None => written.next().unwrap_or(Err(WriteError::BatchAborted)),
+                    };
                     if result.is_err() {
                         aborted = true;
                     }
@@ -1133,13 +1148,13 @@ impl Service for NebRPCService {
                 .await
                 .map_err(|error| error.to_string())?;
             // A transaction that prepared before the seal can still commit
-            // here, and a commit is a write. `prepare` is sealed, so the set
-            // of such transactions only gets smaller from here.
+            // or roll back here, and each is a write. `prepare` is sealed, so
+            // the set of such transactions only gets smaller from here.
             if let Some(site) = self.database_runtime.data_site() {
                 let started = std::time::Instant::now();
                 loop {
-                    let prepared_writers = site.prepared_writers_in_slots(&slots);
-                    if prepared_writers == 0 {
+                    let undecided_writers = site.undecided_writers_in_slots(&slots);
+                    if undecided_writers == 0 {
                         break;
                     }
                     if started.elapsed() >= std::time::Duration::from_millis(drain_ms) {
@@ -1147,8 +1162,8 @@ impl Service for NebRPCService {
                             .slot_seal()
                             .unseal_token(&slots, token);
                         return Err(format!(
-                            "{prepared_writers} prepared transaction(s) still hold cells of \
-                             the slots after {drain_ms} ms; slots unsealed"
+                            "{undecided_writers} transaction(s) without a decision still hold \
+                             cells of the slots after {drain_ms} ms; slots unsealed"
                         ));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1198,15 +1213,47 @@ impl Service for NebRPCService {
                 .await
                 .map_err(|error| format!("cannot reach recipient {target}: {error:?}"))?;
 
+            // Send decided writes only. A transaction applies its writes
+            // before its decision, and a rollback puts the old version back.
+            // The recipient cannot take that step back: a store keeps the
+            // highest version of a cell. So a cell with a write that has no
+            // decision is not sent now. A later round sends it, or the last
+            // copy under the seal, when no such transaction is left.
+            //
+            // A sealed slot has no such transaction (the seal waited for
+            // them), so its cells need no check.
+            let site = self.database_runtime.data_site();
+            let seal = self.database_runtime.slot_seal();
+            let sealed = |id: &Id| seal.is_sealed(crate::slots::slot_of(id) as u32);
+            const DECIDED_READ_ATTEMPTS: usize = 4;
             let mut cells = Vec::with_capacity(keys.len());
             let t_read = std::time::Instant::now();
-            for key in &keys {
-                match self.database_runtime.chunks().read_cell(key) {
-                    Ok(cell) => cells.push(cell.to_owned()),
-                    // Enumerated a moment ago and gone now: nothing to move, and
-                    // nothing wrong.
-                    Err(crate::ram::cell::ReadError::CellDoesNotExisted) => {}
-                    Err(error) => return Err(format!("donor could not read {key:?}: {error:?}")),
+            for attempt in 1..=DECIDED_READ_ATTEMPTS {
+                cells.clear();
+                let before = site.as_ref().map(|site| site.restore_activity());
+                for key in &keys {
+                    match self.database_runtime.chunks().read_cell(key) {
+                        Ok(cell) => cells.push(cell.to_owned()),
+                        // Enumerated a moment ago and gone now: nothing to
+                        // move, and nothing wrong.
+                        Err(crate::ram::cell::ReadError::CellDoesNotExisted) => {}
+                        Err(error) => {
+                            return Err(format!("donor could not read {key:?}: {error:?}"))
+                        }
+                    }
+                }
+                let Some(site) = &site else { break };
+                let undecided = site.undecided_write_ids();
+                let quiet = before.flatten().is_some()
+                    && before.flatten() == site.restore_activity();
+                if quiet {
+                    cells.retain(|cell| sealed(&cell.header.id) || !undecided.contains(&cell.header.id));
+                    break;
+                }
+                if attempt == DECIDED_READ_ATTEMPTS {
+                    // Restores did not stop. Keep only the cells that no
+                    // restore can touch.
+                    cells.retain(|cell| sealed(&cell.header.id));
                 }
             }
             crate::migration::MIGRATION_DONOR_READ_NANOS.fetch_add(

@@ -559,6 +559,12 @@ pub struct DataManager {
     /// restoration, and it releases the locks of one whose `end` never came.
     /// It does not depend on leases, which an abort gives back at once.
     aborted: SkipSet<TxnId>,
+    /// Counts of the restores of a cell to its state before a transaction, at
+    /// their start and at their end. A reader that must not keep a write
+    /// which was rolled back compares them around its read
+    /// (`restore_activity`).
+    restores_started: std::sync::atomic::AtomicU64,
+    restores_finished: std::sync::atomic::AtomicU64,
 }
 
 /// How often a site asks the participants that did not report their COMMIT
@@ -669,6 +675,8 @@ impl DataManager {
             txns_sorted: SkipSet::new(),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
+            restores_started: std::sync::atomic::AtomicU64::new(0),
+            restores_finished: std::sync::atomic::AtomicU64::new(0),
             decided: LFMap::with_capacity(128),
             decision_order: SkipSet::new(),
             aborted: SkipSet::new(),
@@ -781,16 +789,59 @@ impl DataManager {
             .count()
     }
 
-    /// Prepared transactions that write a cell of one of `slots`. A slot seal
-    /// waits for these before the donor reports the slots sealed, because
-    /// each can still commit on this member.
-    pub fn prepared_writers_in_slots(&self, slots: &[u32]) -> usize {
+    /// Put a cell back to its state before a transaction, and count it.
+    fn restore_cell(&self, id: &Id, previous: usize, version: u64) -> Result<(), WriteError> {
+        self.restores_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = self.chunks().restore_transaction_cell(id, previous, version);
+        self.restores_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    /// The count of the restores so far, or `None` while one is in progress.
+    ///
+    /// A reader takes this value before it reads cells and again after. If
+    /// both are `Some` and equal, no restore overlapped the read. Together
+    /// with [`Self::undecided_write_ids`], taken after the read, this tells
+    /// which cells that it read hold only decided writes.
+    pub fn restore_activity(&self) -> Option<u64> {
+        let finished = self.restores_finished.load(std::sync::atomic::Ordering::SeqCst);
+        let started = self.restores_started.load(std::sync::atomic::Ordering::SeqCst);
+        (started == finished).then_some(started)
+    }
+
+    /// The cells that a transaction without a decision writes.
+    pub fn undecided_write_ids(&self) -> std::collections::HashSet<Id> {
+        let mut ids = std::collections::HashSet::new();
+        for tid in self.transaction_ids() {
+            if let Some(txn) = self.find_transaction(&tid) {
+                let txn = txn.lock();
+                if matches!(txn.state, TxnState::Prepared | TxnState::Committed) {
+                    ids.extend(
+                        txn.certified
+                            .values()
+                            .filter(|op| op.intent == PrepareIntent::Write)
+                            .map(|op| op.id),
+                    );
+                }
+            }
+        }
+        ids
+    }
+
+    /// Transactions without a decision that write a cell of one of `slots`.
+    /// A slot seal waits for these before the donor reports the slots sealed.
+    ///
+    /// A `Prepared` transaction can still commit on this member. A
+    /// `Committed` transaction has its writes applied but can still roll
+    /// back: that state starts when the entries are durable, which is before
+    /// the decision. The last copy of a handover must see neither.
+    pub fn undecided_writers_in_slots(&self, slots: &[u32]) -> usize {
         let tids: Vec<TxnId> = self.transaction_ids();
         tids.iter()
             .filter(|tid| {
                 self.find_transaction(tid).is_some_and(|txn| {
                     let txn = txn.lock();
-                    txn.state == TxnState::Prepared
+                    matches!(txn.state, TxnState::Prepared | TxnState::Committed)
                         && txn.certified.values().any(|op| {
                             op.intent == PrepareIntent::Write
                                 && slots.contains(&(crate::slots::slot_of(&op.id) as u32))
@@ -1041,8 +1092,7 @@ impl DataManager {
         for (id, history) in history.iter() {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
             let error = self
-                .chunks()
-                .restore_transaction_cell(id, history.previous_location, history.current_version)
+                .restore_cell(id, history.previous_location, history.current_version)
                 .err();
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
@@ -1666,7 +1716,7 @@ impl DataManager {
             };
             let meta_lock = self.cell_meta_mutex(&id);
             let mut meta = meta_lock.lock();
-            match self.chunks().restore_transaction_cell(&id, location, version) {
+            match self.restore_cell(&id, location, version) {
                 Ok(()) => {
                     meta.write = previous_write;
                     drop(meta);
