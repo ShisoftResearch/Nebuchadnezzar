@@ -202,3 +202,50 @@ The model does not cover the gate reopen; the Rust control `gate_reopen` covers 
 | `ctl_none` | `NoLostLateWrite` violated, on purpose: no rule and no gate close (`441c1ff7`). |
 | `ctl_no_gate`, `ctl_no_gate_wait` | `NoLostWrite` violated, on purpose: without a rule and without other cleaner checks, the cleaner copies the segment before its in-flight write lands. |
 | `ctl_unbounded_wait` | `SealEnds` violated, on purpose: without the bound, a seal job waits forever for a cleaner that never reclaims. |
+
+## `PublicationOrder.tla` — what a reader outside a transaction sees
+
+Covers `DataManager::apply_commit_ops` (`publication_order`) and
+`DataManager::rollback` in `src/server/transactions/data_site.rs`. A site
+publishes the cells of a transaction one at a time, at prepare, and a reader
+that takes no part in the transaction reads one cell at a time. The model is
+general: each cell may refer to one other cell, and the store holds no
+dangling reference before and after the transaction.
+
+Written for the 2026-11-14 FlyWire v783 import: 1 to 3 edge groups failed per
+run, and a reader of the same list logged `Cannot find next key` and returned
+the list before the gap. The apply published cells in id order, so a list
+head could name its new segment before the segment existed; the rollback
+walked the same order.
+
+| config | orders | result |
+|---|---|---|
+| `PublicationOrderFixed.cfg` | new, changed, removed; undo removed, changed, new | **No error.** 741,046 distinct states (3 cells). |
+| `PublicationOrderFixedN4.cfg` | the same, 4 cells | **No error.** 2,608,105 distinct states. |
+| `PublicationOrderReaderCommit.cfg` | the same, a walking reader, a commit with no removal | **No error.** 141,901 distinct states. |
+| `PublicationOrderIdOrder.cfg` | any order (the code before) | `ReachableIntact` violated in 2 states. |
+| `PublicationOrderIdOrderNoRemove.cfg` | any apply order, no removal, no abort | `ReaderNeverMissing` violated: the order alone breaks readers. |
+| `PublicationOrderUndoExistingFirst.cfg` | undo changed and removed cells in id order, then new | `ReachableIntact` violated: a changed cell gets its reference to a removed cell back before that cell. The first draft of the fix did this. |
+| `PublicationOrderTwoSites.cfg` | the fixed orders, cells on 2 sites | `ReachableIntact` violated, by design: each site publishes on its own. |
+| `PublicationOrderReaderAbort.cfg` | the fixed orders, a reader, an abort | `ReaderNeverMissing` violated, by design: a reader already past the changed cell meets a created cell that the rollback removed. |
+| `PublicationOrderReaderWithRemove.cfg` | the fixed orders, a reader, removals | `ReaderNeverMissing` violated, by design: the same for a cell the commit removes. |
+| `PublicationOrderSanity.cfg` | fixed | `Sanity` violated **on purpose**: a partly published transaction is reachable, so the passes above are not vacuous. |
+
+What the fix gives, then: on one site, no cell that a reader can reach refers
+to a missing cell at any step of the apply or the rollback. What it does not
+give: a reader already in flight can meet a removed cell, and a transaction
+over two sites is published on each site on its own. A reader that walks a
+structure outside a transaction must report a missing cell (Morpheus:
+`IdListError::MissingSegment`), never a shorter answer.
+
+Not modelled, and not covered by the guarantee:
+
+- A restore that fails. `rollback` records the cell in `unrestored` and goes on
+  with the next class, and `retry_restoration` later restores the `unrestored`
+  cells in id order. A failed restore of a removed cell can thus leave a
+  restored cell that refers to it until the retry succeeds.
+- The Thomas write rule skip in `apply_commit_ops`: a skipped write of a new
+  cell together with an applied update that names it would leave a dangling
+  reference. Hypothesis (not verified): this cannot happen, because the cell
+  locks are held from prepare and the commit timestamp follows the prepare
+  reply.

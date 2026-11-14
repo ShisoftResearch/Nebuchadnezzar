@@ -259,6 +259,79 @@ fn take_apply_panic_hook(tid: &TxnId, id: &Id) -> bool {
         .is_some_and(|hooks| hooks.lock().remove(&(tid.clone(), *id)))
 }
 
+/// The order in which one site applies a transaction's cells: the cells the
+/// transaction creates, then the cells it changes, then the cells it removes.
+/// Within each class the order of `ops` stays.
+///
+/// The apply publishes each cell on its own, so a reader outside the
+/// transaction can see some of the cells and not the others. In this order a
+/// changed cell that refers to a new cell is visible only when the new cell
+/// is, and a removed cell goes only after the changes that stop referring to
+/// it. Linked structures that a reader walks one cell at a time (a list whose
+/// head points to a new segment) stay whole. [`DataManager::rollback`] undoes
+/// in the reverse order.
+///
+/// Model: docs/tla/PublicationOrder.tla. What it does NOT give: a reader
+/// already past a changed cell can still meet a cell that a commit removes or
+/// a rollback takes back (a rollback removes the created cells), and a
+/// transaction over two sites publishes on each site on its own. Such a
+/// reader must check its walk; a single transaction's view needs a
+/// transactional read.
+fn publication_order(mut ops: Vec<CommitOp>) -> Vec<CommitOp> {
+    ops.sort_by_key(|op| match op {
+        CommitOp::Write(_) => 0,
+        CommitOp::Update(_) | CommitOp::Read(..) | CommitOp::None => 1,
+        CommitOp::Remove(_) => 2,
+    });
+    ops
+}
+
+/// Test hook: a callback after each cell that the apply or the rollback of a
+/// transaction has published, to read the store between two cells.
+#[cfg(test)]
+type TransactionStepObserver = Arc<dyn Fn(&Id) + Send + Sync>;
+
+#[cfg(test)]
+static TRANSACTION_STEP_OBSERVERS: OnceLock<Mutex<HashMap<TxnId, TransactionStepObserver>>> =
+    OnceLock::new();
+
+/// Removes its observer when dropped, so no later test with the same
+/// transaction id meets it.
+#[cfg(test)]
+pub(crate) struct TransactionStepWatch(TxnId);
+
+#[cfg(test)]
+impl Drop for TransactionStepWatch {
+    fn drop(&mut self) {
+        if let Some(observers) = TRANSACTION_STEP_OBSERVERS.get() {
+            observers.lock().remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn observe_transaction_steps(
+    tid: TxnId,
+    observer: TransactionStepObserver,
+) -> TransactionStepWatch {
+    TRANSACTION_STEP_OBSERVERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .insert(tid.clone(), observer);
+    TransactionStepWatch(tid)
+}
+
+#[cfg(test)]
+fn observe_transaction_step(tid: &TxnId, id: &Id) {
+    let observer = TRANSACTION_STEP_OBSERVERS
+        .get()
+        .and_then(|observers| observers.lock().get(tid).cloned());
+    if let Some(observer) = observer {
+        observer(id);
+    }
+}
+
 /// Test hook: the apply burst fails right after this cell is written or
 /// updated, as a later write that finds no space.
 #[cfg(test)]
@@ -1087,9 +1160,30 @@ impl DataManager {
         Ok((addr, guard))
     }
 
-    fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
+    /// Undo the applied writes in the reverse of [`publication_order`]: give
+    /// the removed cells back, then give the changed cells their old versions
+    /// (which may refer to those removed cells again), then remove the cells
+    /// this transaction created (nothing refers to them any more). At each
+    /// step no cell a reader can reach refers to a missing cell. Model:
+    /// docs/tla/PublicationOrder.tla; undoing the changed cells before the
+    /// removed ones (`PublicationOrderUndoExistingFirst.cfg`) breaks this.
+    fn rollback(&self, _tid: &TxnId, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
-        for (id, history) in history.iter() {
+        // A history entry records how the apply changed the cell:
+        // a created cell has no previous location, a removed cell has no
+        // current version, a changed cell has both.
+        let undo_class = |history: &CellHistory| {
+            if history.previous_location == 0 {
+                2
+            } else if history.current_version == 0 {
+                0
+            } else {
+                1
+            }
+        };
+        let mut entries: Vec<_> = history.iter().collect();
+        entries.sort_by_key(|(_, history)| undo_class(history));
+        for (id, history) in entries {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
             let error = self
                 .restore_cell(id, history.previous_location, history.current_version)
@@ -1097,6 +1191,8 @@ impl DataManager {
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
             }
+            #[cfg(test)]
+            observe_transaction_step(_tid, id);
             crate::ram::fault::crash_point(crate::ram::fault::Point::RollbackMid);
         }
         failures
@@ -1177,7 +1273,7 @@ impl DataManager {
         #[cfg(feature = "abort_profile")]
         let rollback_timer =
             crate::ram::abort_profile::guard(crate::ram::abort_profile::Phase::Rollback);
-        let failures = self.rollback(&txn.history);
+        let failures = self.rollback(tid, &txn.history);
         for (id, history) in &txn.history {
             if failures.iter().all(|failure| failure.id != *id) {
                 let position = guarded_cell_ids
@@ -2971,6 +3067,7 @@ impl DataManager {
         // rewound, heads released -- before the panic continues. Left to
         // unwind on its own it held the heads with their BEGINs open until a
         // sweeper came, while the index served cells recovery would discard.
+        let cells = publication_order(cells);
         let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut write_error: Option<(Id, WriteError)> = None;
             {
@@ -3007,6 +3104,8 @@ impl DataManager {
                                         CellHistory::new(0, header.version, write_ts),
                                     );
                                     meta.write = effective_ts.clone();
+                                    #[cfg(test)]
+                                    observe_transaction_step(tid, &cell_id);
                                     #[cfg(test)]
                                     if take_apply_panic_hook(tid, &cell_id) {
                                         panic!("test hook: apply panics after writing {cell_id:?}");
@@ -3059,6 +3158,8 @@ impl DataManager {
                                         .insert(*cell_id, CellHistory::new(cell_addr, 0, write_ts));
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
+                                    #[cfg(test)]
+                                    observe_transaction_step(tid, cell_id);
                                 }
                                 Err(error) => {
                                     write_error = Some((*cell_id, error));
@@ -3117,6 +3218,8 @@ impl DataManager {
                                     );
                                     meta.write = effective_ts.clone();
                                     txn.segment_guards.push(guard);
+                                    #[cfg(test)]
+                                    observe_transaction_step(tid, &cell_id);
                                     #[cfg(test)]
                                     if take_apply_error_hook(tid, &cell_id) {
                                         write_error =
@@ -4270,6 +4373,221 @@ mod tests {
             EndResult::Success
         );
         assert_eq!(score_of(&runtime, &first), Some(3));
+        server.shutdown().await;
+    }
+
+    /// What a reader outside a transaction sees between two cells of the
+    /// apply or the rollback of a transaction that updates `named_by` to
+    /// refer to the new cell `created`: an error string for each step at
+    /// which `named_by` has its new score while `created` does not exist.
+    fn watch_naming_pair(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        tid: &TxnId,
+        named_by: Id,
+        new_score: u64,
+        created: Id,
+    ) -> (Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>, TransactionStepWatch) {
+        let violations = Arc::new(Mutex::new(Vec::new()));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let (runtime, seen, count) = (runtime.clone(), violations.clone(), steps.clone());
+        let watch = observe_transaction_steps(
+            tid.clone(),
+            Arc::new(move |step| {
+                count.fetch_add(1, Relaxed);
+                let names_new = score_of(&runtime, &named_by) == Some(new_score);
+                let target_exists = runtime.chunks().read_cell(&created).is_ok();
+                if names_new && !target_exists {
+                    seen.lock().push(format!(
+                        "after {step:?}: {named_by:?} refers to {created:?}, which does not exist"
+                    ));
+                }
+            }),
+        );
+        (violations, steps, watch)
+    }
+
+    /// A transaction that creates a cell and changes another cell to refer
+    /// to it publishes the new cell first, whatever the id order: a reader
+    /// that walks from the changed cell never meets a missing cell. Found by
+    /// a bulk edge import, where a list head pointed to a new segment that
+    /// did not exist yet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_apply_publishes_a_new_cell_before_the_cell_that_names_it() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_publication_order";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        // The id order applies the changed cell first: the order this fixes.
+        let named_by = Id::allocated(0, 0, 9871);
+        let created = Id::allocated(0, 0, 9872);
+        assert!(named_by < created);
+        let version = seed_cell_version(&runtime, schema.vid.get(), named_by, 1, 0);
+        let tid = test_hlc(1, 9871);
+        let (violations, steps, _watch) = watch_naming_pair(&runtime, &tid, named_by, 2, created);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9871,
+                &tid,
+                vec![
+                    PrepareOp {
+                        id: named_by,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    },
+                    PrepareOp {
+                        id: created,
+                        expectation: CellExpectation::Absent,
+                        intent: PrepareIntent::Write,
+                    },
+                ],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Update(counter_cell(schema.vid.get(), named_by, 2, "head")),
+                    CommitOp::Write(counter_cell(schema.vid.get(), created, 7, "segment")),
+                ],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(steps.load(Relaxed), 2, "the observer must see both cells");
+        assert_eq!(*violations.lock(), Vec::<String>::new());
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        server.shutdown().await;
+    }
+
+    /// The rollback of the same shape gives the changed cell its old version
+    /// back before it removes the new cell, whatever the id order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_rollback_restores_the_naming_cell_before_it_removes_the_new_cell() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_rollback_order";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        // The id order removes the new cell first: the order this fixes.
+        let created = Id::allocated(0, 0, 9881);
+        let named_by = Id::allocated(0, 0, 9882);
+        assert!(created < named_by);
+        let version = seed_cell_version(&runtime, schema.vid.get(), named_by, 1, 0);
+        let tid = test_hlc(1, 9881);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9881,
+                &tid,
+                vec![
+                    PrepareOp {
+                        id: created,
+                        expectation: CellExpectation::Absent,
+                        intent: PrepareIntent::Write,
+                    },
+                    PrepareOp {
+                        id: named_by,
+                        expectation: CellExpectation::Present(version),
+                        intent: PrepareIntent::Write,
+                    },
+                ],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Write(counter_cell(schema.vid.get(), created, 7, "segment")),
+                    CommitOp::Update(counter_cell(schema.vid.get(), named_by, 2, "head")),
+                ],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert_eq!(score_of(&runtime, &named_by), Some(2));
+        // Watch the rollback only.
+        let (violations, steps, _watch) = watch_naming_pair(&runtime, &tid, named_by, 2, created);
+        abort_and_end_local(&manager, &tid).await;
+        assert_eq!(steps.load(Relaxed), 2, "the observer must see both restores");
+        assert_eq!(*violations.lock(), Vec::<String>::new());
+        assert_eq!(score_of(&runtime, &named_by), Some(1), "the old version is back");
+        assert!(runtime.chunks().read_cell(&created).is_err(), "the new cell is gone");
+        server.shutdown().await;
+    }
+
+    /// The rollback gives a removed cell back before it gives the old version
+    /// back to a changed cell that referred to it, whatever the id order.
+    /// The draft of the order fix restored the changed and the removed cells
+    /// in id order; `PublicationOrderUndoExistingFirst.cfg` found it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_rollback_gives_a_removed_cell_back_before_the_cell_that_names_it() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_data_site_rollback_remove_order";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        // Score 1 on `named_by` stands for "refers to `removed`". The id order
+        // restores `named_by` first: the order this fixes.
+        let named_by = Id::allocated(0, 0, 9891);
+        let removed = Id::allocated(0, 0, 9892);
+        assert!(named_by < removed);
+        let named_version = seed_cell_version(&runtime, schema.vid.get(), named_by, 1, 0);
+        let removed_version = seed_cell_version(&runtime, schema.vid.get(), removed, 5, 0);
+        let tid = test_hlc(1, 9891);
+        let present = |id, version| PrepareOp {
+            id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9891,
+                &tid,
+                vec![present(named_by, named_version), present(removed, removed_version)],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Update(counter_cell(schema.vid.get(), named_by, 2, "unlinked")),
+                    CommitOp::Remove(removed),
+                ],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        assert!(runtime.chunks().read_cell(&removed).is_err());
+        // Watch the rollback only.
+        let (violations, steps, _watch) = watch_naming_pair(&runtime, &tid, named_by, 1, removed);
+        abort_and_end_local(&manager, &tid).await;
+        assert_eq!(steps.load(Relaxed), 2, "the observer must see both restores");
+        assert_eq!(*violations.lock(), Vec::<String>::new());
+        assert_eq!(score_of(&runtime, &named_by), Some(1));
+        assert_eq!(score_of(&runtime, &removed), Some(5));
         server.shutdown().await;
     }
 
