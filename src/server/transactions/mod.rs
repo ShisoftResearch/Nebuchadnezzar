@@ -222,8 +222,11 @@ pub enum EndResult {
     },
     Success,
     /// A multi-site transaction is decided COMMIT, but every site refused
-    /// to close its brackets for now. Each site keeps it decided and
-    /// finishes the close later. The client must not retry it.
+    /// to close its brackets for now. Each site keeps it decided in memory
+    /// and finishes the close later. No COMMIT is durable yet: a crash of
+    /// such a site before its close can still abort the transaction, so the
+    /// client reports `OutcomeUnknown` (TLA+ OccCommit F5). The client must
+    /// not retry it blindly.
     DecidedPending,
 }
 

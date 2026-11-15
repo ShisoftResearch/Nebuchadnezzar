@@ -269,13 +269,15 @@ impl Transaction {
                 Ok(())
             }
             Ok(Ok(EndResult::DecidedPending)) => {
-                // Decided COMMIT: every site keeps it and finishes its close
-                // later. A retry would apply it twice.
+                // Decided in the memory of each site, durable nowhere: a crash
+                // before a site closes its brackets can still abort it (TLA+
+                // OccCommit F5). A blind retry could apply it twice.
                 warn!(
-                    "Transaction {:?} is committed; its sites finish closing it later",
+                    "Transaction {:?} is decided, but no site has closed it yet; the outcome \
+                     is unknown until a site closes it",
                     self.tid
                 );
-                Ok(())
+                Err(TxnError::OutcomeUnknown)
             }
             // One site can refuse after another site accepts COMMIT.
             Ok(Ok(_)) => Err(TxnError::OutcomeUnknown),
@@ -399,6 +401,8 @@ mod commit_outcome_tests {
                 EndResult::StoreFull(WriteError::CannotAllocateSpace),
                 EndResult::WriteError(WriteError::TransactionHeadUnavailable),
                 EndResult::CheckFailed(CheckError::CannotEnd),
+                EndResult::CheckFailed(CheckError::AlreadyAborted),
+                EndResult::DecidedPending,
             ] {
                 let result = commit_response(Some(Ok(refusal)), durable).await;
                 assert!(
@@ -479,7 +483,6 @@ mod commit_outcome_tests {
     async fn commit_outcome_known_commit_controls() {
         for response in [
             EndResult::Success,
-            EndResult::DecidedPending,
             EndResult::SomeLocksNotReleased {
                 released: 0,
                 total: 1,
