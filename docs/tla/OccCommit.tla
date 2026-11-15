@@ -100,6 +100,13 @@ CONSTANTS
     PlainAtomic,  \* TRUE: the check of fix G and the write are one step
                   \* (the write holds the cell lock from its check to its
                   \* end). FALSE: control, the write checks, then writes.
+    PlainPrepareWindow, \* TRUE: fix G as the word-lock check. The plain write
+                  \* checks the lock flag of the cell under the cell word lock,
+                  \* in the step of the write. A write of a cell that is
+                  \* absent has no word to order it with the prepare that
+                  \* expects it absent, so it can also be admitted while that
+                  \* prepare is not applied yet. Modelled wider: a plain write
+                  \* is admitted while the owner of `x` is Prepared here.
     FixApplyFenced, \* Candidate fix for F3: `commit` (the apply) refuses a
                   \* transaction that a participant fenced on this site.
     FixROValidate \* Candidate fix for F4: a read-only transaction that read
@@ -941,7 +948,10 @@ SiteCrash(s) ==
 PlainWrite ==
     /\ PlainWrites
     /\ plain = "no"
-    /\ FixPlainRespectsLocks => owner["x"] = NoTxn
+    /\ FixPlainRespectsLocks =>
+           \/ owner["x"] = NoTxn
+           \/ PlainPrepareWindow /\ owner["x"] \in Tids
+              /\ obj[SiteOf("x")][owner["x"]].st = "Prepared"
     /\ IF PlainAtomic
        THEN /\ plain' = "done"
             /\ val' = [val EXCEPT !["x"] = PlainTid]

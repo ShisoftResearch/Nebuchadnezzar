@@ -290,7 +290,12 @@ Fix toggles: A `FixEndAborted`, B `FixStaleSweep`, C `FixReadReclaim`, D
 `FixPlainRespectsLocks`, F3 `FixApplyFenced`, F4 `FixROValidate`.
 `PlainAtomic` (TRUE in the code) makes the check of fix G and the plain
 write one step; FALSE is a control in which the write checks and then
-writes. A, B, D, F, G, F3 and F4 are in the code (`fix/neb-txn`); C and E
+writes. `PlainPrepareWindow` (TRUE in the code since the word-lock check)
+also admits a plain write while the owner of the cell is Prepared and not
+applied: the code reads the lock flag under the cell word lock, and a write
+of an absent cell has no word that orders it with a prepare that expects
+the cell absent. The apply checks the version again, so such a write makes
+the transaction fail, not leave anything. A, B, D, F, G, F3 and F4 are in the code (`fix/neb-txn`); C and E
 are rejected candidates.
 
 Two invariants were added with the fixes: `NoApplyAfterFence` (F3: no apply
@@ -320,6 +325,8 @@ Controls and sanity for the new fixes (each is violated on purpose):
 
 | config | what it shows | result | distinct states | depth |
 |---|---|---|---|---|
+| `OccShippedM1PlainWord.cfg` | `OccShippedM1Plain` with fix G as the word-lock check (`PlainPrepareWindow`): a plain write is also admitted while the owner of `x` is Prepared and not applied | no error | 210,861 | 28 |
+| `OccShippedPlainSplitWord.cfg` | the same with a plain write that checks, then writes | `NoLeftoverLocks` violated | 25,099 | 15 |
 | `OccShippedNoFenceCheck.cfg` | shipped without F3: a delayed apply runs on a fenced site | `NoApplyAfterFence` violated | 2,535 | 13 |
 | `OccShippedPlainSplit.cfg` | shipped with a plain write that checks, then writes | `NoLeftoverLocks` violated | 26,423 | 15 |
 | `OccShippedNoROValidate.cfg` | shipped without F4 | `SerialAll` violated | 22,004 | 14 |
