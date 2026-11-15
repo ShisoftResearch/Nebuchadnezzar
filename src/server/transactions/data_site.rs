@@ -375,7 +375,91 @@ pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCann
 }
 
 type CommitHistory = BTreeMap<Id, CellHistory>;
-type CellMetaMutex = Arc<Mutex<CellMeta>>;
+type CellMetaMutex = Arc<CellMetaLock>;
+
+/// The metadata of a cell and its lock, with a flag that a plain write reads
+/// without the lock: `held` is true while a transaction owns the cell
+/// (`CellMeta::owner`), and also while a prepare checks the cell before it
+/// takes it.
+///
+/// A plain write reads the flag under the cell word lock of the chunk, in the
+/// step of its write (`chunk::PlainWriteGate`). It cannot take the metadata
+/// lock there: a prepare and an apply hold the metadata lock and then take the
+/// word lock. Each guard stores the flag from `owner` when it is dropped, so
+/// the flag follows every change of the owner.
+pub(crate) struct CellMetaLock {
+    held: std::sync::atomic::AtomicBool,
+    meta: Mutex<CellMeta>,
+}
+
+impl CellMetaLock {
+    fn new(meta: CellMeta) -> Self {
+        Self {
+            held: std::sync::atomic::AtomicBool::new(meta.owner.is_some()),
+            meta: Mutex::new(meta),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> CellMetaGuard<'_> {
+        CellMetaGuard {
+            lock: self,
+            guard: self.meta.lock(),
+        }
+    }
+
+    /// Mark the cell held before a prepare checks it. The guard puts the flag
+    /// back to the owner when it is dropped.
+    fn claim(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+pub(crate) struct CellMetaGuard<'a> {
+    lock: &'a CellMetaLock,
+    guard: parking_lot::MutexGuard<'a, CellMeta>,
+}
+
+impl std::ops::Deref for CellMetaGuard<'_> {
+    type Target = CellMeta;
+    fn deref(&self) -> &CellMeta {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for CellMetaGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CellMeta {
+        &mut self.guard
+    }
+}
+
+impl Drop for CellMetaGuard<'_> {
+    fn drop(&mut self) {
+        // Before the lock is released (the field drops after this).
+        self.lock
+            .held
+            .store(self.guard.owner.is_some(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The plain-write gate of a database (fix G, TLA+ OccCommit
+/// `OccShippedM1PlainWord`): it tells a plain write of a cell, under the cell
+/// word lock, whether a transaction holds the cell. A cell without metadata
+/// costs one probe of the lock-free map and allocates nothing.
+pub(crate) struct TxnCellGate {
+    cells: Arc<crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>>,
+}
+
+impl crate::ram::chunk::PlainWriteGate for TxnCellGate {
+    fn refuses(&self, id: u64) -> bool {
+        self.cells
+            .get(&Id::from_bits(id))
+            .is_some_and(|entry| entry.as_ref().is_some_and(|meta| meta.held()))
+    }
+}
 type TxnMutex = Arc<Mutex<Transaction>>;
 
 /// Per-cell metadata for concurrency control
@@ -601,7 +685,7 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>,
+    cells: Arc<crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: SkipSet<Id>,
     txns_sorted: SkipSet<TxnId>,
@@ -748,7 +832,7 @@ impl DataManager {
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: Default::default(),
+            cells: Arc::new(Default::default()),
             txns: LFMap::with_capacity(128),
             cell_list: SkipSet::new(),
             txns_sorted: SkipSet::new(),
@@ -761,6 +845,12 @@ impl DataManager {
             aborted: SkipSet::new(),
             hlc,
         });
+        // The first data site of a database gates its plain writes (fix G).
+        manager
+            .database_runtime
+            .set_plain_write_gate(Arc::new(TxnCellGate {
+                cells: manager.cells.clone(),
+            }));
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
@@ -1014,48 +1104,6 @@ impl DataManager {
         })
     }
 
-    /// Run the plain (non-transactional) write `write` of the cell `id`,
-    /// unless a transaction holds the cell (TLA+ OccCommit F6, fix G).
-    ///
-    /// A transaction holds a cell from the lock of its prepare to its end,
-    /// and a cell of a bracket in doubt after a restart until the resolution.
-    /// A plain write in between would break it: an abort could not restore
-    /// the cell (a leftover lock and object), and a resolution would install
-    /// the transaction's cell over the acknowledged write. Such a write is
-    /// refused with the retryable `WriteError::CellInTransaction`.
-    ///
-    /// The check and the write are one step for the transactions (the model
-    /// config `OccShippedPlainSplit` shows that a check before the write is
-    /// not enough). With cell metadata, the write runs under its lock, which
-    /// every prepare, apply and abort takes. Without metadata, the write runs
-    /// under the entry guard of the metadata map, so a prepare cannot create
-    /// the metadata and lock the cell until the write ends. The guard and the
-    /// lock are per cell, and the write holds no other lock of this site.
-    pub(crate) fn admit_plain_write<R>(
-        &self,
-        id: &Id,
-        write: impl FnOnce() -> Result<R, WriteError>,
-    ) -> Result<R, WriteError> {
-        // A cell leaves the in-doubt set only after its resolution installed
-        // or discarded the bracket, so a write that passes here is after it.
-        if self.chunks().txn_status().is_in_doubt_cell(id.bits()) {
-            return Err(WriteError::CellInTransaction);
-        }
-        let entry = crate::profile_lock!(H07, self.cells.entry(id));
-        let Some(meta) = entry.as_ref().cloned() else {
-            return write();
-        };
-        // The metadata lock is taken after the entry guard is released, as
-        // in `cell_meta_mutex`: `cell_meta_cleanup` takes them in the other
-        // order. The clone keeps the cleanup from unmapping this metadata.
-        drop(entry);
-        let meta = meta.lock();
-        if meta.owner.is_some() {
-            return Err(WriteError::CellInTransaction);
-        }
-        write()
-    }
-
     /// Validate the reads of a read-only transaction at its end (TLA+
     /// OccCommit F4, `FixROValidate`).
     ///
@@ -1121,7 +1169,7 @@ impl DataManager {
         let mut entry = crate::profile_lock!(H07, self.cells.entry(id));
         entry.get_or_insert_with(|| {
             self.cell_list.insert(*id);
-            Arc::new(Mutex::new(CellMeta {
+            Arc::new(CellMetaLock::new(CellMeta {
                 read: TxnId::default(),
                 write: TxnId::default(),
                 owner: None,
@@ -1353,7 +1401,7 @@ impl DataManager {
         tid: &TxnId,
         txn: &mut Transaction,
         guarded_cell_ids: &[Id],
-        cell_guards: &mut [parking_lot::MutexGuard<'_, CellMeta>],
+        cell_guards: &mut [CellMetaGuard<'_>],
     ) -> Result<Option<Vec<RollbackFailure>>, WriteError> {
         debug!(
             ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
@@ -9510,6 +9558,53 @@ mod tests {
         assert_eq!(score, Some(80));
     }
 
+    /// Fix G as the word-lock check: a prepare marks its cells held before
+    /// it checks them. A prepare that is refused gives the mark back, so a
+    /// plain write of the cell is admitted again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_prepare_leaves_the_cell_free_for_plain_writes() {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_refused_prepare_plain_write";
+        let server = start_lease_test_server(&address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("the server runs a data site");
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![address.clone()],
+                group,
+            )
+            .await
+            .unwrap(),
+        );
+        let id = Id::allocated(0, 0, 9531);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9531);
+        let prepare = prepare_ops_local(
+            &manager,
+            9531,
+            &tid,
+            vec![PrepareOp {
+                id,
+                expectation: CellExpectation::Present(version + 7),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        let held = manager.cell_meta_for_test(&id).held();
+        let upsert = client
+            .upsert_cell(counter_cell(schema.vid.get(), id, 77, "plain"))
+            .await
+            .unwrap();
+        server.shutdown().await;
+        assert_eq!(prepare, DMPrepareResult::NotRealizable);
+        assert!(!held, "a refused prepare left the cell marked held");
+        assert!(upsert.is_ok(), "{upsert:?}");
+    }
+
     /// MODEL CHECK F7 (OccLUCrashAll.cfg; fix F). A transaction decided
     /// COMMIT whose close was refused keeps its applied write without a
     /// durable COMMIT: a crash still discards it. Its lock must not be
@@ -10005,6 +10100,13 @@ impl Service for DataManager {
                     cell_guards.push(meta);
                 }
 
+                // A plain write that comes after this point is refused
+                // (`CellMetaLock`); one that came before is seen by the check
+                // below. A guard puts the flag back to its owner when the
+                // prepare refuses.
+                for cell_mutex in &cell_mutices {
+                    cell_mutex.claim();
+                }
                 for op in &prepared_ops {
                     if !self.prepare_expectation_matches(op) {
                         debug!(

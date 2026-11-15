@@ -2618,17 +2618,27 @@ impl NebRPCService {
     /// Run the plain write `write` of the cell `id`, unless a transaction of
     /// this database holds the cell (`WriteError::CellInTransaction`).
     ///
-    /// Called inside the synchronous part of the write, so the check and the
-    /// write are one step for the transactions: see
-    /// `DataManager::admit_plain_write`. A database without a transaction
-    /// service has no transaction that could hold the cell.
+    /// The chunk write asks the gate under the cell word lock, in the step of
+    /// the write (`chunk::with_plain_write_gate`), so the check and the write
+    /// are one step for the transactions. A database without a transaction
+    /// service has no gate and no transaction that could hold the cell.
     fn plain_write<R>(
         &self,
         id: Id,
         write: impl FnOnce() -> Result<R, WriteError>,
     ) -> Result<R, WriteError> {
-        match self.database_runtime.data_site() {
-            Some(site) => site.admit_plain_write(&id, write),
+        // A cell leaves the in-doubt set only after its resolution installed
+        // or discarded the bracket, so a write that passes here is after it.
+        if self
+            .database_runtime
+            .chunks()
+            .txn_status()
+            .is_in_doubt_cell(id.bits())
+        {
+            return Err(WriteError::CellInTransaction);
+        }
+        match self.database_runtime.plain_write_gate() {
+            Some(gate) => crate::ram::chunk::with_plain_write_gate(&**gate, write),
             None => write(),
         }
     }
