@@ -285,9 +285,53 @@ committed transaction is complete on every participant, and no lock and no
 participant object is left. `PlainKept`: an acknowledged plain write is not
 lost. `NoLeftoverLocks`: the lock and object part of `NoLeftovers`.
 
-Fix toggles (candidate designs, no product code): A `FixEndAborted`, B
-`FixStaleSweep`, C `FixReadReclaim`, D `FixPendingUnknown`, E
-`FixDurableDecision`, F `FixNoReclaimDecided`, G `FixPlainRespectsLocks`.
+Fix toggles: A `FixEndAborted`, B `FixStaleSweep`, C `FixReadReclaim`, D
+`FixPendingUnknown`, E `FixDurableDecision`, F `FixNoReclaimDecided`, G
+`FixPlainRespectsLocks`, F3 `FixApplyFenced`, F4 `FixROValidate`.
+`PlainAtomic` (TRUE in the code) makes the check of fix G and the plain
+write one step; FALSE is a control in which the write checks and then
+writes. A, B, D, F, G, F3 and F4 are in the code (`fix/neb-txn`); C and E
+are rejected candidates.
+
+Two invariants were added with the fixes: `NoApplyAfterFence` (F3: no apply
+runs on an object that a participant fenced; a ghost field `lf` of the
+object marks it) and `NoLeftoversPlain` (with a plain write: at the end no
+cell holds a write of a transaction that is not committed, and each
+committed transaction is complete on every participant).
+
+### The shipped configs
+
+Every `OccShipped*` config has the fixes that are in the code on, and every
+fault on: lost RPCs, coordinator stop, site crash and recovery, restore and
+apply failure, refused close, stale reclaim, timeouts.
+
+| config | workload | invariants | result | distinct states | depth |
+|---|---|---|---|---|---|
+| `OccShippedM1.cfg` | M1 | Atomic, ToldCommittedTrue, ToldFailedTrue, OneCommitPerClient, SerialRW, NoLeftovers, NoApplyAfterFence, QuiescentNoStuckLock | no error | 90,198 | 27 |
+| `OccShippedM1Crash2.cfg` | M1, 2 crashes | the same | no error | 154,059 | 28 |
+| `OccShippedM1Plain.cfg` | M1 + plain write | Atomic, ToldCommittedTrue, ToldFailedTrue, PlainKept, NoLeftoverLocks, NoLeftoversPlain, NoApplyAfterFence | no error | 199,887 | 28 |
+| `OccShippedR1.cfg` | R1 | as M1 | no error | 2,658 | 17 |
+| `OccShippedLU.cfg` | LU + retry | as M1 | no error | 153,830 | 30 |
+| `OccShippedRO.cfg` | RO | as M1 + SerialAll | no error | 2,107,014 | 33 |
+| `OccShippedWS.cfg` | WS | as M1 | no error | 9,769,496 | 33 |
+| `OccShippedMS.cfg` | MS | as M1 | incomplete: no error in 30,737,605 distinct states at BFS level 23; the 12 GB scope stopped TLC with 11,411,626 states on the queue | 30,737,605 (partial) | – |
+
+Controls and sanity for the new fixes (each is violated on purpose):
+
+| config | what it shows | result | distinct states | depth |
+|---|---|---|---|---|
+| `OccShippedNoFenceCheck.cfg` | shipped without F3: a delayed apply runs on a fenced site | `NoApplyAfterFence` violated | 2,535 | 13 |
+| `OccShippedPlainSplit.cfg` | shipped with a plain write that checks, then writes | `NoLeftoverLocks` violated | 26,423 | 15 |
+| `OccShippedNoROValidate.cfg` | shipped without F4 | `SerialAll` violated | 22,004 | 14 |
+| `OccROSkewFix.cfg` | `OccROSkew` with F4 only | no error | 10,809 | 30 |
+| `OccSanityRO.cfg` | a validated read-only transaction commits and the system settles | `SanityNoROCommit` violated | 647,931 | 21 |
+
+The configs of the table above this section were checked again with the new
+constants (`PlainAtomic = TRUE`, `FixApplyFenced = FALSE`, `FixROValidate =
+FALSE`), so they still model the code before the fixes. Their state counts
+change by the ghost field `lf` (for example `OccSanity` 4,924, `OccROSkew`
+387, `OccM1Faults` 15,171, `OccM1PlainFixGAll` 293,829); each result is the
+same.
 
 | config | expected | result | distinct states | depth |
 |---|---|---|---|---|
@@ -344,3 +388,32 @@ taken as causal. With causal clocks the Thomas write rule skip in
 previous writer applied before this transaction's prepare took the lock, the
 site observed that writer's clock, and the coordinator observed the site's
 clock in the prepare reply before it stamped the commit (Read, not checked).
+
+## `IndexRepair.tla` — the repair of a failed index task
+
+A Neb copy of the `WriteIndex` model of Morpheus (agent D, Morpheus
+`docs/tla/WriteIndex.tla` at `424ac459`), with the repair that is in the
+code (`src/index/repair.rs`, finding D-F11). One cell, transactional and
+plain writes, index tasks that can fail, a crash with the recovery
+reconcile, the repair worker as 4 separate steps (take the generation, read
+the cell, re-assert its entries, remove the record if the generation did
+not change), and C3: a query of a schema with a pending repair answers
+`IndexRepairPending`. `NoSilentMiss`: at a quiet moment a query for the
+cell's value finds the cell or answers an error. `RepairEnds` (liveness,
+`FairSpec`): every repair record is worked off.
+
+| config | expected | result | distinct states | depth |
+|---|---|---|---|---|
+| `IndexRepairShipped.cfg` | pass | no error | 26,236 | 22 |
+| `IndexRepairLive.cfg` | pass (`RepairEnds`) | no error | 26,236 | 22 |
+| `IndexRepairNoRefusal.cfg` | the repair without C3: a query misses the row while the repair is pending | `NoSilentMiss` violated | 158 | 4 |
+| `IndexRepairCode.cfg` | the code before the fix | `NoSilentMiss` violated | 99 | 4 |
+| `IndexRepairNoGen.cfg` | the worker removes a record without the generation check | `NoSilentMiss` violated | 10,210 | 11 |
+| `IndexRepairNoReconcile.cfg` | a crash loses the records and the reconcile is off | `NoSilentMiss` violated | 73 | 3 |
+| `IndexRepairSanity.cfg` | `SanityRepaired` violated on purpose | violated | 2,687 | 8 |
+
+The records are memory, not a WAL record: with the recovery reconcile on (the
+default), a crash needs no record (`IndexRepairShipped` has the crash on).
+The worker only inserts; a stale entry stays until the full scrub prunes it,
+and a query drops it when it reads the candidate cell. Not modelled:
+concurrent plain writes of one cell, which can reorder their index tasks.

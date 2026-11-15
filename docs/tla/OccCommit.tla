@@ -95,8 +95,17 @@ CONSTANTS
     FixDurableDecision, \* Candidate fix for F5: `decided_commit` of a
                   \* multi-site part is made durable before `end` answers;
                   \* recovery commits from it.
-    PlainWrites   \* One plain (non-transactional) write to `x`, which
+    PlainWrites,  \* One plain (non-transactional) write to `x`, which
                   \* ignores transaction locks (cell_rpc.rs admit_write).
+    PlainAtomic,  \* TRUE: the check of fix G and the write are one step
+                  \* (the write holds the cell lock from its check to its
+                  \* end). FALSE: control, the write checks, then writes.
+    FixApplyFenced, \* Candidate fix for F3: `commit` (the apply) refuses a
+                  \* transaction that a participant fenced on this site.
+    FixROValidate \* Candidate fix for F4: a read-only transaction that read
+                  \* 2 or more cells validates each read at its end: the cell
+                  \* has no lock owner (else wait) and still holds the version
+                  \* that was read (else retry).
 
 ASSUME Workload \in {"LU", "WS", "MS", "M1", "R1", "RO"}
 
@@ -137,7 +146,10 @@ MultiPart(t, s) == s \in Part(t) /\ Cardinality(Part(t)) >= 2
 
 NoObj == [st |-> "none", hist |-> FALSE, dc |-> FALSE, cd |-> FALSE,
           fenced |-> FALSE, unrest |-> FALSE, restored |-> FALSE,
-          rec |-> FALSE]
+          rec |-> FALSE, lf |-> FALSE]
+\* `lf` is a ghost: the apply ran on an object that a participant had
+\* fenced (F3). The plain readers of the site then see the writes of a
+\* transaction that the fence decides to abort.
 PlainTid == 9       \* the writer id of the plain write
 
 VARIABLES
@@ -157,7 +169,9 @@ VARIABLES
     sw,       \* site -> tid -> step of the participant fence
     gdec,     \* ghost: site -> tid -> every decision the site ever recorded
     crashes,  \* how many site crashes happened
-    plain     \* the plain write happened
+    plain     \* the plain write: "no", "checked" (fix G passed, the write is
+              \* not done yet; PlainAtomic = FALSE only), "done", or "lost"
+              \* (its site crashed before the write)
 
 vars == <<val, owner, obj, undo, dec, status, pc, cache, pend, res, why,
           told, sw, gdec, crashes, plain>>
@@ -178,7 +192,7 @@ Init ==
     /\ sw = [s \in Sites |-> [t \in Tids |-> "idle"]]
     /\ gdec = [s \in Sites |-> [t \in Tids |-> {}]]
     /\ crashes = 0
-    /\ plain = FALSE
+    /\ plain = "no"
 
 -----------------------------------------------------------------------------
 (* Helpers on the participant side.                                        *)
@@ -271,6 +285,8 @@ DoApply(t, s, r, fail) ==
          THEN r = "error" /\ UNCHANGED <<val, owner, obj, undo, dec, status>>
     ELSE IF Certify /\ \E c \in WritesAt(t, s) : val[c] # cache[t][c] \* D:3053
          THEN r = "changed" /\ UNCHANGED <<val, owner, obj, undo, dec, status>>
+    ELSE IF FixApplyFenced /\ o.fenced
+         THEN r = "error" /\ UNCHANGED <<val, owner, obj, undo, dec, status>>
     ELSE IF fail /\ WritesAt(t, s) # {}
          THEN /\ r = "error"
               /\ obj' = [obj EXCEPT ![s][t].st = "Aborted",
@@ -282,7 +298,8 @@ DoApply(t, s, r, fail) ==
                         IF c \in WritesAt(t, s) THEN val[c] ELSE @[c]]]
          /\ val' = [c \in Cells |-> IF c \in WritesAt(t, s) THEN t ELSE val[c]]
          /\ obj' = [obj EXCEPT ![s][t].st = "Committed",
-                               ![s][t].hist = (WritesAt(t, s) # {})]
+                               ![s][t].hist = (WritesAt(t, s) # {}),
+                               ![s][t].lf = (o.fenced /\ WritesAt(t, s) # {})]
          /\ UNCHANGED <<owner, dec, status>>
 
 \* `finish_aborted` (D:1726) after `mark_restored` (D:1017), on `o2`, the
@@ -467,10 +484,14 @@ ReadTimeout(t) ==
 BodyDone(t) ==
     /\ pc[t] = "body"
     /\ \A c \in RS(t) : cache[t][c] # Unread
-    /\ IF WS(t) = {}
+    /\ IF WS(t) = {} /\ ~(FixROValidate /\ Cardinality(RS(t)) >= 2)
        THEN /\ pc' = [pc EXCEPT ![t] = "done"]
             /\ told' = [told EXCEPT ![t] = "committed"]
             /\ UNCHANGED <<pend, why>>
+       ELSE IF WS(t) = {}
+       THEN /\ pc' = [pc EXCEPT ![t] = "validate"]
+            /\ pend' = [pend EXCEPT ![t] = SitesOf(t)]
+            /\ UNCHANGED <<why, told>>
        ELSE /\ pc' = [pc EXCEPT ![t] = "prep"]
             /\ pend' = [pend EXCEPT ![t] = SitesOf(t)]
             /\ UNCHANGED <<why, told>>
@@ -552,6 +573,48 @@ ApplyDone(t) ==
                              ELSE IF \E s \in SitesOf(t) : res[t][s] = "changed"
                                   THEN "retry" ELSE "error")
     /\ UNCHANGED <<cache, told>>
+    /\ SiteUnchanged
+
+\* Candidate fix for F4: the end of a read-only transaction validates its
+\* reads on each site (one cell per site here, so one step per cell). A cell
+\* with a lock owner (also an in-doubt cell after a restart) makes the
+\* validation wait. A changed version is a NotRealizable retry. A lost RPC
+\* is an error to the client (nothing was written).
+ROValidate(t, s) ==
+    /\ pc[t] = "validate"
+    /\ s \in pend[t]
+    /\ \A c \in CellsAt(t, s) : owner[c] = NoTxn
+    /\ \E delivery \in (IF Lossy THEN {"ok", "lost"} ELSE {"ok"}) :
+        IF delivery = "lost"
+        THEN /\ why' = [why EXCEPT ![t] = "error"]
+             /\ FinishAbortWith(t, "error")
+             /\ UNCHANGED pend
+        ELSE IF \A c \in CellsAt(t, s) : val[c] = cache[t][c]
+        THEN /\ pend' = [pend EXCEPT ![t] = @ \ {s}]
+             /\ UNCHANGED <<pc, why, told>>
+        ELSE /\ why' = [why EXCEPT ![t] = "retry"]
+             /\ FinishAbortWith(t, "retry")
+             /\ UNCHANGED pend
+    /\ UNCHANGED <<cache, res>>
+    /\ SiteUnchanged
+
+\* The validation waits up to `max_total_wait_ms` on a held lock.
+ROValidateTimeout(t, s) ==
+    /\ Timeouts
+    /\ pc[t] = "validate"
+    /\ s \in pend[t]
+    /\ \E c \in CellsAt(t, s) : owner[c] # NoTxn
+    /\ why' = [why EXCEPT ![t] = "retry"]
+    /\ FinishAbortWith(t, "retry")
+    /\ UNCHANGED <<cache, pend, res>>
+    /\ SiteUnchanged
+
+ROValidateDone(t) ==
+    /\ pc[t] = "validate"
+    /\ pend[t] = {}
+    /\ pc' = [pc EXCEPT ![t] = "done"]
+    /\ told' = [told EXCEPT ![t] = "committed"]
+    /\ UNCHANGED <<cache, pend, res, why>>
     /\ SiteUnchanged
 
 \* The prepare reply to the client is lost, or the commit request is not
@@ -647,7 +710,7 @@ AbortDone(t) ==
 \* OutcomeUnknown (CT:300); any earlier step gives it an RPC error.
 Crash(t) ==
     /\ CoordCrash
-    /\ pc[t] \in {"prep", "apply", "end", "abort"}
+    /\ pc[t] \in {"prep", "apply", "end", "abort", "validate"}
     /\ pc' = [pc EXCEPT ![t] = "done"]
     /\ told' = [told EXCEPT ![t] = IF pc[t] = "end" THEN "unknown" ELSE "error"]
     /\ UNCHANGED <<cache, pend, res, why>>
@@ -866,7 +929,10 @@ SiteCrash(s) ==
                  IF dec[s][t] = "Committed" \/ DurableSingle(s, t) THEN "Committed"
                  ELSE IF Discarded(s, t) THEN "Aborted" ELSE "none"]]
     /\ sw' = [sw EXCEPT ![s] = [t \in Tids |-> "idle"]]
-    /\ UNCHANGED <<undo, status, plain>>
+    \* A plain write in flight on the crashed site is never done and never
+    \* acknowledged.
+    /\ plain' = IF plain = "checked" /\ s = SiteOf("x") THEN "lost" ELSE plain
+    /\ UNCHANGED <<undo, status>>
     /\ CoordUnchanged
 
 \* A plain write of `x` (src/server/cell_rpc.rs:693, `admit_write` checks
@@ -874,9 +940,20 @@ SiteCrash(s) ==
 \* lock).
 PlainWrite ==
     /\ PlainWrites
-    /\ ~plain
+    /\ plain = "no"
     /\ FixPlainRespectsLocks => owner["x"] = NoTxn
-    /\ plain' = TRUE
+    /\ IF PlainAtomic
+       THEN /\ plain' = "done"
+            /\ val' = [val EXCEPT !["x"] = PlainTid]
+       ELSE /\ plain' = "checked"
+            /\ UNCHANGED val
+    /\ UNCHANGED <<owner, obj, undo, dec, status, sw, crashes>>
+    /\ CoordUnchanged
+
+\* The write of a plain write that checked first (PlainAtomic = FALSE).
+PlainApply ==
+    /\ plain = "checked"
+    /\ plain' = "done"
     /\ val' = [val EXCEPT !["x"] = PlainTid]
     /\ UNCHANGED <<owner, obj, undo, dec, status, sw, crashes>>
     /\ CoordUnchanged
@@ -888,7 +965,7 @@ NextCore ==
         \/ \E c \in Cells : Read(t, c)
         \/ ReadTimeout(t) \/ BodyDone(t)
         \/ PrepareDone(t) \/ ApplyDone(t) \/ EndDone(t) \/ AbortDone(t)
-        \/ ClientGivesUp(t) \/ Crash(t)
+        \/ ClientGivesUp(t) \/ Crash(t) \/ ROValidateDone(t)
         \/ \E s \in Sites :
             \/ SitePrepare(t, s) \/ PrepareTimeout(t, s) \/ SiteApply(t, s)
             \/ SiteEnd(t, s) \/ SiteAbort(t, s) \/ SiteAbortEnd(t, s)
@@ -897,12 +974,13 @@ NextCore ==
             \/ SweepAbort(s, t)
             \/ RetryRestore(s, t) \/ FinishAborted(s, t) \/ Sync(s, t)
             \/ StaleObjSweep(s, t)
+            \/ ROValidate(t, s) \/ ROValidateTimeout(t, s)
     \/ \E c \in Cells : Reclaim(c)
 
 Next ==
     /\ \/ NextCore /\ UNCHANGED <<crashes, plain>>
        \/ \E s \in Sites : SiteCrash(s)
-       \/ PlainWrite
+       \/ PlainWrite \/ PlainApply
     /\ gdec' = [s \in Sites |-> [t \in Tids |->
                   gdec[s][t] \cup (IF dec'[s][t] = "none" THEN {}
                                    ELSE {dec'[s][t]})]]
@@ -967,6 +1045,7 @@ Quiescent ==
         /\ ~ENABLED StaleObjSweep(s, t)
         /\ status[s][t] # "committing"
         /\ sw[s][t] = "idle"
+    /\ plain # "checked"
 
 \* At the end the store holds exactly a serial history of the committed
 \* transactions: no lost write, no write of an aborted transaction.
@@ -998,13 +1077,29 @@ NoLeftovers == Quiescent =>
     /\ \A s \in Sites, t \in Tids : obj[s][t].st = "none"
 \* With one plain write of `x`: the acknowledged plain write is not lost. It
 \* is the value of `x`, or a committed transaction read it before it wrote.
-PlainKept == (Quiescent /\ plain) =>
+PlainKept == (Quiescent /\ plain = "done") =>
     \/ val["x"] = PlainTid
     \/ \E t \in CommittedRW : "x" \in WS(t) /\ cache[t]["x"] = PlainTid
+\* With a plain write: at the end no cell holds a write of a transaction
+\* that is not committed, and each committed transaction is complete on
+\* every participant. (`NoLeftovers` with the plain write as a committed
+\* writer; the serial-order part does not apply to a plain write.)
+NoLeftoversPlain == Quiescent =>
+    /\ \A c \in Cells : val[c] \in {0, PlainTid} \cup CommittedRW
+    /\ CompleteCommit
 \* With a plain write: no lock and no object is left.
 NoLeftoverLocks == Quiescent =>
     /\ \A c \in Cells : owner[c] = NoTxn
     /\ \A s \in Sites, t \in Tids : obj[s][t].st = "none"
+
+\* F3: no apply runs on an object that a participant fenced.
+NoApplyAfterFence == \A s \in Sites, t \in Tids : ~obj[s][t].lf
+
+\* Sanity, violated on purpose: a read-only transaction that read 2 cells
+\* commits after its validation, and the system settles.
+SanityNoROCommit ==
+    ~\E t \in Tids : WS(t) = {} /\ told[t] = "committed" /\ Quiescent
+                    /\ \E w \in Tids : RealCommitted(w) /\ WS(w) # {}
 
 \* Sanity, violated on purpose: a multi-site transaction commits and the
 \* system settles.
