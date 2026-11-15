@@ -9093,6 +9093,132 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    /// MODEL CHECK F1 (docs/tla/OccCommit.tla, OccR1F1.cfg). A presumed
+    /// abort that cannot restore a cell keeps the object Aborted. A late
+    /// coordinator `end` for the COMMIT then answers Success, and the
+    /// coordinator tells the client that the transaction committed
+    /// (M:2061 `end_sites`). The retry of the restoration then removes the
+    /// write. Expected to FAIL on the current code. Do not commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f1_late_end_after_failed_presumed_abort_is_not_success() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f1";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9471);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9471);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9471,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "new"))]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // The lease sweep presumes abort; the restore of the cell fails.
+        manager
+            .txns
+            .get(&tid)
+            .unwrap()
+            .lock()
+            .history
+            .get_mut(&id)
+            .unwrap()
+            .current_version += 1;
+        assert!(manager.presume_abort(&tid, true).await);
+        assert!(manager.has_transaction_for_test(&tid));
+        // The coordinator was slow, not dead: its COMMIT `end` comes now.
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+            .await
+            .payload;
+        // Repair the injection; the sweep retries the restore.
+        if let Some(txn) = manager.txns.get(&tid) {
+            if let Some(history) = txn.lock().history.get_mut(&id) {
+                history.current_version -= 1;
+            }
+        }
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        let score = score_of(&runtime, &id);
+        server.shutdown().await;
+        assert_ne!(
+            end,
+            EndResult::Success,
+            "the COMMIT `end` of a transaction this site aborted answered Success; \
+             the cell is now back at {score:?}, so the client was told a commit that \
+             did not happen"
+        );
+    }
+
+    /// MODEL CHECK F2 (docs/tla/OccCommit.tla, OccR1Lock.cfg). A participant
+    /// prepared a transaction and its coordinator went away before the
+    /// apply. The object holds no write lease, so no sweep ends it, and a
+    /// transactional read waits on its lock for good (D:2755 waits on any
+    /// owner and never reclaims). Expected to FAIL on the current code. Do
+    /// not commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f2_prepared_object_without_coordinator_blocks_reads_for_good() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f2";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9481);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9481);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9481,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        // The coordinator is gone. Age the lock past every timeout and run
+        // every background pass of the participant.
+        manager.cell_meta_for_test(&id).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        manager.finish_aborted_transactions(Duration::ZERO).await;
+        let reader = test_hlc(tid.ts + 10, 9489);
+        let read = <DataManager as Service>::read(&manager, 0, reader.clone(), reader, id)
+            .await
+            .payload;
+        let still_there = manager.has_transaction_for_test(&tid);
+        server.shutdown().await;
+        assert!(
+            !matches!(read, TxnExecResult::Wait),
+            "a transactional read still waits on the lock of a prepared transaction \
+             whose coordinator is gone (object present: {still_there})"
+        );
+    }
 }
 
 impl Service for DataManager {

@@ -249,3 +249,98 @@ Not modelled, and not covered by the guarantee:
   reference. Hypothesis (not verified): this cannot happen, because the cell
   locks are held from prepare and the commit timestamp follows the prepare
   reply.
+
+## `OccCommit.tla` — the OCC transaction, the commit, the fence and recovery
+
+Covers the client retry loop (`src/client/mod.rs` `transaction`), the
+coordinator (`src/server/transactions/manager.rs`: `do_prepare`,
+`sites_commit`, `sites_end`, `end_sites`, `abort_sites`), the participant
+(`src/server/transactions/data_site.rs`: `prepare`, `prepare_read`,
+`apply_commit_ops`, `end_transaction_locked`, `close_committed_brackets`,
+`abort_locked`, `presume_abort`, `finish_aborted`, the lease sweep and the
+participant fence `terminate_in_doubt` / `decide_in_doubt` / `fence_here`),
+a site crash with the recovery of `src/server/mod.rs`
+(`resolve_in_doubt_after_recovery`, `discard_in_doubt`,
+`apply_resolved_commit`), and one plain write (`src/server/cell_rpc.rs`
+`write_cell`). Each action names its source line. Time is abstract: every
+timeout can fire when its guard in the code holds. RPCs are lost before or
+after the target. The coordinator can stop at any step. A site crash is a
+process crash: appended records survive, memory is lost.
+
+Workloads (2 cells, `x` on site 1, `y` on site 2): `LU` two read-modify-write
+transactions on `x`; `WS` write skew; `MS` two transactions that read and
+write both cells; `M1` and `R1` one transaction over two sites (`R1` writes
+only `x`, so site 2 is a read-only part); `RO` a writer and a read-only
+transaction. `Retry` adds a second attempt of client 1.
+
+Invariants: `Atomic` (no participant commits while another aborts, over every
+decision a site ever recorded), `ToldCommittedTrue` and `ToldFailedTrue` (the
+outcome told to the client is the real one; `unknown` is always allowed),
+`OneCommitPerClient` (a retried closure takes effect once), `SerialRW` (the
+committed read-write transactions read as in a serial order), `FinalSerial`,
+`QuiescentNoStuckLock`, `QuiescentNoLock`, `QuiescentNoObject`, and
+`NoLeftovers`: when nothing more happens, the store is a serial history of
+the committed transactions (no cell of an uncommitted transaction), every
+committed transaction is complete on every participant, and no lock and no
+participant object is left. `PlainKept`: an acknowledged plain write is not
+lost. `NoLeftoverLocks`: the lock and object part of `NoLeftovers`.
+
+Fix toggles (candidate designs, no product code): A `FixEndAborted`, B
+`FixStaleSweep`, C `FixReadReclaim`, D `FixPendingUnknown`, E
+`FixDurableDecision`, F `FixNoReclaimDecided`, G `FixPlainRespectsLocks`.
+
+| config | expected | result | distinct states | depth |
+|---|---|---|---|---|
+| `OccSanity.cfg` | `SanityNoMultiCommit` violated on purpose | violated | 4,752 | 15 |
+| `OccSanityFence.cfg` | `SanityNoFenceAbort` violated on purpose | violated | 65 | 13 |
+| `OccSanityRetry.cfg` | `SanityNoRetryCommit` violated on purpose | violated | 573 | 17 |
+| `OccControlNoFence.cfg` | control: presumed abort without the fence (before D29) | `Atomic` violated | 55 | 13 |
+| `OccControlLU.cfg` | control: no version check | `SerialRW` violated (lost update) | 255 | 17 |
+| `OccLU.cfg` | the code, lost-update workload, retry, stale reclaim, timeouts | no error | 801 | 27 |
+| `OccWS.cfg` | the code, write skew | no error | 11,167 | 31 |
+| `OccMS.cfg` | the code, two 2-site transactions | no error | 556,859 | 47 |
+| `OccRO.cfg` | the code, a read-only transaction | no error | 6,649 | 27 |
+| `OccROSkew.cfg` | read-only transactions have no snapshot (by design) | `SerialAll` violated | 428 | 15 |
+| `OccLUFaultsCode.cfg` | the code, every fault, no crash: failure, once, atomic, serial | no error | 55,205 | 29 |
+| `OccM1Faults.cfg` | the code, every fault | F1: `ToldCommittedTrue` violated | 13,447 | 18 |
+| `OccR1F1.cfg` | the same, 1 writing site | F1 | 719 | 15 |
+| `OccLUFaults.cfg` | the same, 2 transactions and a retry | F1 | 1,296 | 10 |
+| `OccM1Leak.cfg` | coordinator stops | F2: `QuiescentNoLock` violated | 10 | 6 |
+| `OccR1Lock.cfg` | lost RPCs only | F2 | 101 | 10 |
+| `OccR1Faults.cfg` | A, every fault | F2 | 24 | 7 |
+| `OccM1CrashCode.cfg` | A, crash, refused close | F5: `ToldCommittedTrue` violated | 23,456 | 19 |
+| `OccM1Crash2Code.cfg` | A, 2 crashes, refused close | F5 | 7,768 | 19 |
+| `OccLUCrashAll.cfg` | A, B, D, every fault, crash | F7: `SerialRW` violated | 138,315 | 23 |
+| `OccM1Plain.cfg` | A, B, D, plain write | F6: `NoLeftoverLocks` violated | 862 | 15 |
+| `OccM1PlainCrash.cfg` | the same, crash | F6 | 2,668 | 15 |
+| `OccPlainKept.cfg` | plain write while in doubt after a restart | F6: `PlainKept` violated | 9,500 | 18 |
+| `OccM1FaultsFixA.cfg` | A | no error | 33,983 | 26 |
+| `OccR1F1FixA.cfg` | A | no error | 732 | 16 |
+| `OccLUFaultsFixA.cfg` | A | no error | 53,137 | 29 |
+| `OccWSFaults.cfg` | A, every fault | no error | 1,954,335 | 32 |
+| `OccR1FaultsFixB.cfg` | A, B | no error | 1,087 | 16 |
+| `OccM1LeakFixB.cfg` | A, B, every fault | no error | 34,135 | 26 |
+| `OccWSFaultsFixB.cfg` | A, B, every fault, quiescence set | no error | 3,765,680 | 32 |
+| `OccR1FaultsFixC.cfg` | A, C, safety set | no error | 732 | 16 |
+| `OccM1Crash.cfg` | A, B, D, crash, `NoLeftovers` | no error | 30,984 | 26 |
+| `OccM1CrashAll.cfg` | A, B, D, every fault, crash, `NoLeftovers` | no error | 90,998 | 27 |
+| `OccR1CrashAll.cfg` | the same, 1 writing site | no error | 2,658 | 17 |
+| `OccWSCrash.cfg` | A, B, D, write skew, crash, `NoLeftovers` | no error | 3,571,950 | 30 |
+| `OccM1CrashFixD.cfg` | A, B, D, 2 crashes, refused close, `NoLeftovers` | no error | 67,368 | 27 |
+| `OccM1CrashFixE.cfg` | A, B, E, the same | no error | 64,169 | 27 |
+| `OccLUCrashFixF.cfg` | A, B, D, F, every fault, crash, `NoLeftovers` | no error | 153,830 | 30 |
+| `OccM1PlainFixG.cfg` | A, B, D, G, plain write, crash | no error | 12,982 | 26 |
+| `OccM1PlainFixGAll.cfg` | A, B, D, F, G, every fault, crash, plain write | no error | 202,151 | 28 |
+
+The findings F1 to F7 and the fix designs are in the model-check findings
+file of agent A (`/mnt/ext/morpheus-fixes/model-check/findings/A_neb_occ.md`).
+
+Not modelled: power loss (unsynced records lost), the status-cell release
+and the eviction of the decision map, creation and removal of cells, index
+entries (a cell value stands for the cell and its entries), more than one
+cell per site, the read pins, the slot seal and the write fence. Clocks are
+taken as causal. With causal clocks the Thomas write rule skip in
+`apply_commit_ops` cannot fire for a transaction that holds the lock: the
+previous writer applied before this transaction's prepare took the lock, the
+site observed that writer's clock, and the coordinator observed the site's
+clock in the prepare reply before it stamped the commit (Read, not checked).
