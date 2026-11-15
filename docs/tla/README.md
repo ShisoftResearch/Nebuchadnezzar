@@ -249,3 +249,195 @@ Not modelled, and not covered by the guarantee:
   reference. Hypothesis (not verified): this cannot happen, because the cell
   locks are held from prepare and the commit timestamp follows the prepare
   reply.
+
+## `OccCommit.tla` — the OCC transaction, the commit, the fence and recovery
+
+Covers the client retry loop (`src/client/mod.rs` `transaction`), the
+coordinator (`src/server/transactions/manager.rs`: `do_prepare`,
+`sites_commit`, `sites_end`, `end_sites`, `abort_sites`), the participant
+(`src/server/transactions/data_site.rs`: `prepare`, `prepare_read`,
+`apply_commit_ops`, `end_transaction_locked`, `close_committed_brackets`,
+`abort_locked`, `presume_abort`, `finish_aborted`, the lease sweep and the
+participant fence `terminate_in_doubt` / `decide_in_doubt` / `fence_here`),
+a site crash with the recovery of `src/server/mod.rs`
+(`resolve_in_doubt_after_recovery`, `discard_in_doubt`,
+`apply_resolved_commit`), and one plain write (`src/server/cell_rpc.rs`
+`write_cell`). Each action names its source line. Time is abstract: every
+timeout can fire when its guard in the code holds. RPCs are lost before or
+after the target. The coordinator can stop at any step. A site crash is a
+process crash: appended records survive, memory is lost.
+
+Workloads (2 cells, `x` on site 1, `y` on site 2): `LU` two read-modify-write
+transactions on `x`; `WS` write skew; `MS` two transactions that read and
+write both cells; `M1` and `R1` one transaction over two sites (`R1` writes
+only `x`, so site 2 is a read-only part); `RO` a writer and a read-only
+transaction. `Retry` adds a second attempt of client 1.
+
+Invariants: `Atomic` (no participant commits while another aborts, over every
+decision a site ever recorded), `ToldCommittedTrue` and `ToldFailedTrue` (the
+outcome told to the client is the real one; `unknown` is always allowed),
+`OneCommitPerClient` (a retried closure takes effect once), `SerialRW` (the
+committed read-write transactions read as in a serial order), `FinalSerial`,
+`QuiescentNoStuckLock`, `QuiescentNoLock`, `QuiescentNoObject`, and
+`NoLeftovers`: when nothing more happens, the store is a serial history of
+the committed transactions (no cell of an uncommitted transaction), every
+committed transaction is complete on every participant, and no lock and no
+participant object is left. `PlainKept`: an acknowledged plain write is not
+lost. `NoLeftoverLocks`: the lock and object part of `NoLeftovers`.
+
+Fix toggles: A `FixEndAborted`, B `FixStaleSweep`, C `FixReadReclaim`, D
+`FixPendingUnknown`, E `FixDurableDecision`, F `FixNoReclaimDecided`, G
+`FixPlainRespectsLocks`, F3 `FixApplyFenced`, F4 `FixROValidate`.
+`PlainAtomic` (TRUE in the code) makes the check of fix G and the plain
+write one step; FALSE is a control in which the write checks and then
+writes. `PlainPrepareWindow` (TRUE in the code since the word-lock check)
+also admits a plain write while the owner of the cell is Prepared and not
+applied: the code reads the lock flag under the cell word lock, and a write
+of an absent cell has no word that orders it with a prepare that expects
+the cell absent. The apply checks the version again, so such a write makes
+the transaction fail, not leave anything. A, B, D, F, G, F3 and F4 are in the code (`fix/neb-txn`); C and E
+are rejected candidates.
+
+Two invariants were added with the fixes: `NoApplyAfterFence` (F3: no apply
+runs on an object that a participant fenced; a ghost field `lf` of the
+object marks it) and `NoLeftoversPlain` (with a plain write: at the end no
+cell holds a write of a transaction that is not committed, and each
+committed transaction is complete on every participant).
+
+### The shipped configs
+
+Every `OccShipped*` config has the fixes that are in the code on, and every
+fault on: lost RPCs, coordinator stop, site crash and recovery, restore and
+apply failure, refused close, stale reclaim, timeouts.
+
+| config | workload | invariants | result | distinct states | depth |
+|---|---|---|---|---|---|
+| `OccShippedM1.cfg` | M1 | Atomic, ToldCommittedTrue, ToldFailedTrue, OneCommitPerClient, SerialRW, NoLeftovers, NoApplyAfterFence, QuiescentNoStuckLock | no error | 90,198 | 27 |
+| `OccShippedM1Crash2.cfg` | M1, 2 crashes | the same | no error | 154,059 | 28 |
+| `OccShippedM1Plain.cfg` | M1 + plain write | Atomic, ToldCommittedTrue, ToldFailedTrue, PlainKept, NoLeftoverLocks, NoLeftoversPlain, NoApplyAfterFence | no error | 199,887 | 28 |
+| `OccShippedR1.cfg` | R1 | as M1 | no error | 2,658 | 17 |
+| `OccShippedLU.cfg` | LU + retry | as M1 | no error | 153,830 | 30 |
+| `OccShippedRO.cfg` | RO | as M1 + SerialAll | no error | 2,107,014 | 33 |
+| `OccShippedWS.cfg` | WS | as M1 | no error | 9,769,496 | 33 |
+| `OccShippedMS.cfg` | MS | as M1 | incomplete: no error in 30,737,605 distinct states at BFS level 23; the 12 GB scope stopped TLC with 11,411,626 states on the queue | 30,737,605 (partial) | – |
+
+Controls and sanity for the new fixes (each is violated on purpose):
+
+| config | what it shows | result | distinct states | depth |
+|---|---|---|---|---|
+| `OccShippedM1PlainWord.cfg` | `OccShippedM1Plain` with fix G as the word-lock check (`PlainPrepareWindow`): a plain write is also admitted while the owner of `x` is Prepared and not applied | no error | 210,861 | 28 |
+| `OccShippedPlainSplitWord.cfg` | the same with a plain write that checks, then writes | `NoLeftoverLocks` violated | 25,099 | 15 |
+| `OccShippedNoFenceCheck.cfg` | shipped without F3: a delayed apply runs on a fenced site | `NoApplyAfterFence` violated | 2,535 | 13 |
+| `OccShippedPlainSplit.cfg` | shipped with a plain write that checks, then writes | `NoLeftoverLocks` violated | 26,423 | 15 |
+| `OccShippedNoROValidate.cfg` | shipped without F4 | `SerialAll` violated | 22,004 | 14 |
+| `OccROSkewFix.cfg` | `OccROSkew` with F4 only | no error | 10,809 | 30 |
+| `OccSanityRO.cfg` | a validated read-only transaction commits and the system settles | `SanityNoROCommit` violated | 647,931 | 21 |
+| `OccSanityStaleEnd.cfg` | fix B ends a Prepared write participant (no lease: it did not apply) while the slow coordinator has not sent it the apply | `SanityStaleEndBeforeApply` violated | 198 | 8 |
+
+Fix B and a slow coordinator: a participant becomes `Prepared` at its
+prepare and gets its writes and its leases only at the apply (`commit` RPC),
+so every `Prepared` write participant holds no lease. Its yes vote is the
+apply, not the prepare: the coordinator sends `end` (the decision) only
+after every apply answered Success (`sites_commit`). After fix B ended the
+object, a late apply finds it Aborted or gone and is refused, so the
+coordinator can never decide COMMIT for it. `OccSanityStaleEnd` shows that
+the model reaches this case; the `OccShipped*` configs, in which time is
+abstract (a coordinator can be slow beyond any bound), pass `Atomic` and
+`NoLeftovers` with it.
+
+The configs of the table above this section were checked again with the new
+constants (`PlainAtomic = TRUE`, `FixApplyFenced = FALSE`, `FixROValidate =
+FALSE`), so they still model the code before the fixes. Their state counts
+change by the ghost field `lf` (for example `OccSanity` 4,924, `OccROSkew`
+387, `OccM1Faults` 15,171, `OccM1PlainFixGAll` 293,829); each result is the
+same.
+
+| config | expected | result | distinct states | depth |
+|---|---|---|---|---|
+| `OccSanity.cfg` | `SanityNoMultiCommit` violated on purpose | violated | 4,752 | 15 |
+| `OccSanityFence.cfg` | `SanityNoFenceAbort` violated on purpose | violated | 65 | 13 |
+| `OccSanityRetry.cfg` | `SanityNoRetryCommit` violated on purpose | violated | 573 | 17 |
+| `OccControlNoFence.cfg` | control: presumed abort without the fence (before D29) | `Atomic` violated | 55 | 13 |
+| `OccControlLU.cfg` | control: no version check | `SerialRW` violated (lost update) | 255 | 17 |
+| `OccLU.cfg` | the code, lost-update workload, retry, stale reclaim, timeouts | no error | 801 | 27 |
+| `OccWS.cfg` | the code, write skew | no error | 11,167 | 31 |
+| `OccMS.cfg` | the code, two 2-site transactions | no error | 556,859 | 47 |
+| `OccRO.cfg` | the code, a read-only transaction | no error | 6,649 | 27 |
+| `OccROSkew.cfg` | read-only transactions have no snapshot (by design) | `SerialAll` violated | 428 | 15 |
+| `OccLUFaultsCode.cfg` | the code, every fault, no crash: failure, once, atomic, serial | no error | 55,205 | 29 |
+| `OccM1Faults.cfg` | the code, every fault | F1: `ToldCommittedTrue` violated | 13,447 | 18 |
+| `OccR1F1.cfg` | the same, 1 writing site | F1 | 719 | 15 |
+| `OccLUFaults.cfg` | the same, 2 transactions and a retry | F1 | 1,296 | 10 |
+| `OccM1Leak.cfg` | coordinator stops | F2: `QuiescentNoLock` violated | 10 | 6 |
+| `OccR1Lock.cfg` | lost RPCs only | F2 | 101 | 10 |
+| `OccR1Faults.cfg` | A, every fault | F2 | 24 | 7 |
+| `OccM1CrashCode.cfg` | A, crash, refused close | F5: `ToldCommittedTrue` violated | 23,456 | 19 |
+| `OccM1Crash2Code.cfg` | A, 2 crashes, refused close | F5 | 7,768 | 19 |
+| `OccLUCrashAll.cfg` | A, B, D, every fault, crash | F7: `SerialRW` violated | 138,315 | 23 |
+| `OccM1Plain.cfg` | A, B, D, plain write | F6: `NoLeftoverLocks` violated | 862 | 15 |
+| `OccM1PlainCrash.cfg` | the same, crash | F6 | 2,668 | 15 |
+| `OccPlainKept.cfg` | plain write while in doubt after a restart | F6: `PlainKept` violated | 9,500 | 18 |
+| `OccM1FaultsFixA.cfg` | A | no error | 33,983 | 26 |
+| `OccR1F1FixA.cfg` | A | no error | 732 | 16 |
+| `OccLUFaultsFixA.cfg` | A | no error | 53,137 | 29 |
+| `OccWSFaults.cfg` | A, every fault | no error | 1,954,335 | 32 |
+| `OccR1FaultsFixB.cfg` | A, B | no error | 1,087 | 16 |
+| `OccM1LeakFixB.cfg` | A, B, every fault | no error | 34,135 | 26 |
+| `OccWSFaultsFixB.cfg` | A, B, every fault, quiescence set | no error | 3,765,680 | 32 |
+| `OccR1FaultsFixC.cfg` | A, C, safety set | no error | 732 | 16 |
+| `OccM1Crash.cfg` | A, B, D, crash, `NoLeftovers` | no error | 30,984 | 26 |
+| `OccM1CrashAll.cfg` | A, B, D, every fault, crash, `NoLeftovers` | no error | 90,998 | 27 |
+| `OccR1CrashAll.cfg` | the same, 1 writing site | no error | 2,658 | 17 |
+| `OccWSCrash.cfg` | A, B, D, write skew, crash, `NoLeftovers` | no error | 3,571,950 | 30 |
+| `OccM1CrashFixD.cfg` | A, B, D, 2 crashes, refused close, `NoLeftovers` | no error | 67,368 | 27 |
+| `OccM1CrashFixE.cfg` | A, B, E, the same | no error | 64,169 | 27 |
+| `OccLUCrashFixF.cfg` | A, B, D, F, every fault, crash, `NoLeftovers` | no error | 153,830 | 30 |
+| `OccM1PlainFixG.cfg` | A, B, D, G, plain write, crash | no error | 12,982 | 26 |
+| `OccM1PlainFixGAll.cfg` | A, B, D, F, G, every fault, crash, plain write | no error | 202,151 | 28 |
+
+The findings F1 to F7 and the fix designs are in the model-check findings
+file of agent A (`/mnt/ext/morpheus-fixes/model-check/findings/A_neb_occ.md`).
+
+Not modelled: power loss (unsynced records lost), the status-cell release
+and the eviction of the decision map, creation and removal of cells, index
+entries (a cell value stands for the cell and its entries), more than one
+cell per site, the read pins, the slot seal and the write fence. Clocks are
+taken as causal. With causal clocks the Thomas write rule skip in
+`apply_commit_ops` cannot fire for a transaction that holds the lock: the
+previous writer applied before this transaction's prepare took the lock, the
+site observed that writer's clock, and the coordinator observed the site's
+clock in the prepare reply before it stamped the commit (Read, not checked).
+
+## `IndexRepair.tla` — the repair of a failed index task
+
+A Neb copy of the `WriteIndex` model of Morpheus (agent D, Morpheus
+`docs/tla/WriteIndex.tla` at `424ac459`), with the repair that is in the
+code (`src/index/repair.rs`, finding D-F11). One cell, transactional and
+plain writes, index tasks that can fail, a crash with the recovery
+reconcile, the repair worker as 4 separate steps (take the generation, read
+the cell, re-assert its entries, remove the record if the generation did
+not change), and C3: a query of a schema with a pending repair answers
+`IndexRepairPending`. `NoSilentMiss`: at a quiet moment a query for the
+cell's value finds the cell or answers an error. `RepairEnds` (liveness,
+`FairSpec`): every repair record is worked off.
+
+| config | expected | result | distinct states | depth |
+|---|---|---|---|---|
+| `IndexRepairShipped.cfg` | pass | no error | 26,236 | 22 |
+| `IndexRepairLive.cfg` | pass (`RepairEnds`) | no error | 26,236 | 22 |
+| `IndexRepairNoRefusal.cfg` | the repair without C3: a query misses the row while the repair is pending | `NoSilentMiss` violated | 158 | 4 |
+| `IndexRepairCode.cfg` | the code before the fix | `NoSilentMiss` violated | 99 | 4 |
+| `IndexRepairNoGen.cfg` | the worker removes a record without the generation check | `NoSilentMiss` violated | 10,210 | 11 |
+| `IndexRepairNoReconcile.cfg` | a crash loses the records and the reconcile is off | `NoSilentMiss` violated | 73 | 3 |
+| `IndexRepairSanity.cfg` | `SanityRepaired` violated on purpose | violated | 2,687 | 8 |
+
+C3 is checked by every index reader of the process: `IndexedDataClient` and
+every ranged seek (`RangedIndexerClient::seek`, so also `client::ranged`).
+The records are per process and per database; a reader in another process
+does not see them, and the model has one process.
+
+The records are memory, not a WAL record: with the recovery reconcile on (the
+default), a crash needs no record (`IndexRepairShipped` has the crash on).
+The worker only inserts; a stale entry stays until the full scrub prunes it,
+and a query drops it when it reads the candidate cell. Not modelled:
+concurrent plain writes of one cell, which can reorder their index tasks.

@@ -8,6 +8,7 @@ pub mod entry;
 pub mod full_text;
 pub mod hash;
 pub mod ranged;
+pub mod repair;
 pub mod scrub;
 pub mod vector;
 pub mod verification;
@@ -56,6 +57,8 @@ pub struct IndexerClients {
     fulltext_indexer: OnceLock<Arc<InvertedIndexer>>,
     scannable_admission: admission::ScannableAdmission,
     pending_tasks: Arc<builder::PendingIndexTasks>,
+    /// Repairs owed by failed index tasks of this process (D-F11).
+    pub repairs: Arc<repair::IndexRepairs>,
     // Store initialization parameters for lazy initialization
     server_id: u64,
     pub(crate) neb_client: Arc<AsyncClient>,
@@ -84,6 +87,10 @@ impl IndexerClients {
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
             pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
+            repairs: repair::IndexRepairs::for_database(
+                neb_client.group_name(),
+                neb_client.database_name(),
+            ),
             scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(),
             server_id,
@@ -142,6 +149,10 @@ impl IndexerClients {
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
             pending_tasks: Arc::new(builder::PendingIndexTasks::default()),
+            repairs: repair::IndexRepairs::for_database(
+                neb_client.group_name(),
+                neb_client.database_name(),
+            ),
             scannable_admission: admission::ScannableAdmission::default(),
             fulltext_indexer: OnceLock::new(), // Empty, won't be initialized
             server_id,

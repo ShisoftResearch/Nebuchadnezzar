@@ -1,11 +1,12 @@
 //! The client side of a transaction.
 //!
-//! Contract: a cell takes plain (non-transactional) writes or transactions,
-//! not both. If a caller mixes them on one cell, Neb does not guarantee that
-//! an acknowledged plain write or delete survives the resolution of an
-//! in-doubt transaction: after a restart with a transaction T in doubt, the
-//! plain write and T's write can get the same version, and only one is kept;
-//! an acknowledged delete is undone when the resolution installs T's cell.
+//! Contract for plain (non-transactional) writes of a cell that transactions
+//! also write: a plain write or delete is refused with the retryable
+//! `WriteError::CellInTransaction` while a transaction holds the cell (from
+//! the lock of its prepare to its end) or the cell is in doubt after a
+//! restart. A plain write that is admitted is ordered with the transactions
+//! of the cell, and an in-doubt resolution cannot undo it. The caller retries
+//! a refused write.
 
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::types::Id;
@@ -269,13 +270,15 @@ impl Transaction {
                 Ok(())
             }
             Ok(Ok(EndResult::DecidedPending)) => {
-                // Decided COMMIT: every site keeps it and finishes its close
-                // later. A retry would apply it twice.
+                // Decided in the memory of each site, durable nowhere: a crash
+                // before a site closes its brackets can still abort it (TLA+
+                // OccCommit F5). A blind retry could apply it twice.
                 warn!(
-                    "Transaction {:?} is committed; its sites finish closing it later",
+                    "Transaction {:?} is decided, but no site has closed it yet; the outcome \
+                     is unknown until a site closes it",
                     self.tid
                 );
-                Ok(())
+                Err(TxnError::OutcomeUnknown)
             }
             // One site can refuse after another site accepts COMMIT.
             Ok(Ok(_)) => Err(TxnError::OutcomeUnknown),
@@ -399,6 +402,8 @@ mod commit_outcome_tests {
                 EndResult::StoreFull(WriteError::CannotAllocateSpace),
                 EndResult::WriteError(WriteError::TransactionHeadUnavailable),
                 EndResult::CheckFailed(CheckError::CannotEnd),
+                EndResult::CheckFailed(CheckError::AlreadyAborted),
+                EndResult::DecidedPending,
             ] {
                 let result = commit_response(Some(Ok(refusal)), durable).await;
                 assert!(
@@ -479,7 +484,6 @@ mod commit_outcome_tests {
     async fn commit_outcome_known_commit_controls() {
         for response in [
             EndResult::Success,
-            EndResult::DecidedPending,
             EndResult::SomeLocksNotReleased {
                 released: 0,
                 total: 1,

@@ -436,8 +436,57 @@ fn blind_mutations(criterion: &mut Criterion) {
     finish_fixture(runtime, fixture);
 }
 
+/// Read-only transactions through the coordinator, one at a time: begin,
+/// read `cells` cells, prepare, commit. A read-only transaction of 2 or more
+/// cells validates its reads at its end (TLA+ OccCommit F4); 1 cell is the
+/// control without the validation.
+fn read_only(criterion: &mut Criterion) {
+    use neb::server::transactions::TxnExecResult;
+    let runtime = Runtime::new().expect("create OCC benchmark runtime");
+    let plan = PortPlan::new(occ_support::base_port());
+    let fixture = Arc::new(runtime.block_on(OccFixture::single(plan.single(8), "occ_read_only")));
+    let server_id = fixture.servers[0].server_id;
+    let ids = Arc::new(fixture.ids_for_server(server_id, 64, 9_500_000));
+    seed(&runtime, &fixture, ids.as_ref(), 0);
+    let runtime_ref = &runtime;
+    let mut group = occ_group(criterion, "occ/read_only");
+    for cells in [1usize, 4] {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        group.bench_with_input(BenchmarkId::from_parameter(cells), &cells, |bench, &cells| {
+            let fixture = fixture.clone();
+            let ids = ids.clone();
+            bench.iter_custom(move |iterations| {
+                runtime_ref.block_on(async {
+                    let started = std::time::Instant::now();
+                    for n in 0..iterations {
+                        let tid = fixture.txn.begin().await.unwrap().unwrap();
+                        for k in 0..cells {
+                            let id = ids[(n as usize * cells + k) % ids.len()];
+                            match fixture.txn.read(tid.clone(), id).await.unwrap().unwrap() {
+                                TxnExecResult::Accepted(_) => {}
+                                other => panic!("read-only read answered {other:?}"),
+                            }
+                        }
+                        assert!(matches!(
+                            fixture.txn.prepare(tid.clone()).await.unwrap(),
+                            Ok(neb::server::transactions::TMPrepareResult::Success)
+                        ));
+                        fixture.txn.commit(tid).await.unwrap().unwrap();
+                    }
+                    started.elapsed()
+                })
+            });
+        });
+    }
+    group.finish();
+    drop(ids);
+    finish_fixture(runtime, fixture);
+}
+
 criterion_group!(
     occ_transactions,
+    read_only,
     independent_rmw,
     hot_rmw,
     multi_cell,

@@ -1891,7 +1891,10 @@ impl TransactionManager {
                 Ok(response) => {
                     self.merge_clock(response.clock);
                     match response.payload {
-                        EndResult::Success | EndResult::CheckFailed(CheckError::NotExisted) => {}
+                        // `end` of an aborted participant answers AlreadyAborted.
+                        EndResult::Success
+                        | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::AlreadyAborted) => {}
                         other => {
                             error!(
                                 "Abort cleanup could not end participant {} for {:?}: {:?}",
@@ -2274,8 +2277,15 @@ impl TransactionManager {
         let conclusion = {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
-            let result = {
+            let result = 'result: {
                 self.ensure_rw_state(&txn)?;
+                let read_only = !txn.data.values().any(|data_obj| data_obj.changed);
+                if read_only && txn.data.len() >= 2 {
+                    let validated = self.validate_read_only(&tid, &txn.data).await?;
+                    if validated != DMPrepareResult::Success {
+                        break 'result TMPrepareResult::DMPrepareError(validated);
+                    }
+                }
                 {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard = super::phase_profile::guard(
@@ -2321,6 +2331,56 @@ impl TransactionManager {
             result
         };
         Ok(conclusion)
+    }
+
+    /// The end of a read-only transaction that read 2 or more cells: every
+    /// site validates its reads (`DataManager::validate_reads_now`, TLA+
+    /// OccCommit F4). A site that answers `Wait` is asked again with backoff
+    /// until `max_total_wait_ms`, as a prepare is; then the transaction is
+    /// `NotRealizable`, and the client retries it.
+    async fn validate_read_only(
+        &self,
+        tid: &TxnId,
+        data: &HashMap<Id, DataObject>,
+    ) -> Result<DMPrepareResult, TMError> {
+        let mut by_site: BTreeMap<u64, Vec<PrepareOp>> = BTreeMap::new();
+        for (id, data_obj) in data {
+            by_site.entry(data_obj.server).or_default().push(PrepareOp {
+                id: *id,
+                expectation: data_obj.expectation.clone(),
+                intent: PrepareIntent::Read,
+            });
+        }
+        let validations: FuturesUnordered<_> = by_site
+            .into_iter()
+            .map(|(server_id, ops)| async move {
+                let site = self
+                    .get_data_site(server_id)
+                    .await
+                    .map_err(|_| TMError::CannotLocateCellServer)?;
+                let started = std::time::Instant::now();
+                let mut attempt = 0u32;
+                loop {
+                    if started.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                        return Ok(DMPrepareResult::NotRealizable);
+                    }
+                    let response = site
+                        .validate_reads(self.get_clock(), tid.clone(), ops.clone())
+                        .await
+                        .map_err(|_| TMError::RPCErrorFromCellServer)?;
+                    self.merge_clock(response.clock);
+                    match response.payload {
+                        DMPrepareResult::Wait => {
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
+                        }
+                        other => return Ok(other),
+                    }
+                }
+            })
+            .collect();
+        let results: Vec<Result<DMPrepareResult, TMError>> = validations.collect().await;
+        Self::reduce_prepare_results(results)
     }
 
     async fn run_prepare_lifecycle(

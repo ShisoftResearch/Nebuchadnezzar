@@ -2008,3 +2008,101 @@ async fn storage_chunk_count_uses_database_layout() {
         .unwrap();
     assert_eq!(owner.storage_chunk_count().await.unwrap(), 8);
 }
+
+/// MODEL CHECK F4 (docs/tla/OccCommit.tla: OccROSkew.cfg fails, OccROSkewFix.cfg
+/// passes). A read-only transaction reads `cell_1`, a writer then commits
+/// both cells, and the reader reads `cell_2`. Without the validation at its
+/// end the reader returns `cell_1` from before the writer and `cell_2` from
+/// after it. With it, the reader's first attempt is `NotRealizable` and the
+/// retry reads both cells after the writer.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn read_only_transaction_does_not_see_half_of_a_commit() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    let _ = env_logger::try_init();
+    let server_group = "read_only_validation_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 32 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
+    let schema_id = schema.vid;
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+    let cell_with_score = |id: &Id, score: u64| {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(1));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        data.insert(&String::from("name"), OwnedValue::String(String::from("x")));
+        OwnedCell::new_with_id(schema_id, id, OwnedValue::Map(data))
+    };
+    let cell_1 = Id::rand();
+    let cell_2 = Id::rand();
+    client.write_cell(cell_with_score(&cell_1, 0)).await.unwrap().unwrap();
+    client.write_cell(cell_with_score(&cell_2, 0)).await.unwrap().unwrap();
+    let written = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let score = |cell: Option<OwnedCell>| *cell.unwrap().data["score"].u64().unwrap();
+    let (first, second) = client
+        .transaction(|txn| {
+            let client = client.clone();
+            let written = written.clone();
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let first = score(txn.read(cell_1).await?);
+                if !written.swap(true, Ordering::SeqCst) {
+                    client
+                        .transaction(|writer| async move {
+                            writer.update(cell_with_score(&cell_1, 1)).await?;
+                            writer.update(cell_with_score(&cell_2, 1)).await?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
+                let second = score(txn.read(cell_2).await?);
+                Ok((first, second))
+            }
+        })
+        .await
+        .unwrap();
+    server.shutdown().await;
+    assert_eq!(
+        (first, second),
+        (1, 1),
+        "a read-only transaction returned a state that no serial order gives"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}

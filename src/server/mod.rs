@@ -1186,6 +1186,11 @@ pub struct DatabaseRuntime {
     data_site: std::sync::OnceLock<
         std::sync::Weak<transactions::data_site::DataManager>,
     >,
+    /// What a plain write of a cell asks, under the cell word lock, before it
+    /// writes: does a transaction hold the cell (fix G). Set by the first data
+    /// site of the database. It holds the cell metadata map only, not the
+    /// data site, so it makes no reference cycle.
+    plain_write_gate: std::sync::OnceLock<Arc<dyn crate::ram::chunk::PlainWriteGate>>,
 }
 
 impl DatabaseRuntime {
@@ -1225,6 +1230,7 @@ impl DatabaseRuntime {
             slot_seal: Arc::new(slot_seal::SlotSeal::new(write_fence.clone())),
             write_fence,
             data_site: std::sync::OnceLock::new(),
+            plain_write_gate: std::sync::OnceLock::new(),
         }
     }
 
@@ -1419,6 +1425,16 @@ impl DatabaseRuntime {
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
+    }
+
+    /// Install the plain-write gate of this database; the first one stays.
+    pub(crate) fn set_plain_write_gate(&self, gate: Arc<dyn crate::ram::chunk::PlainWriteGate>) {
+        let _ = self.plain_write_gate.set(gate);
+    }
+
+    /// The plain-write gate of this database, if it runs a data site.
+    pub(crate) fn plain_write_gate(&self) -> Option<&Arc<dyn crate::ram::chunk::PlainWriteGate>> {
+        self.plain_write_gate.get()
     }
 
     /// This database's participant side, if its service is registered here.
@@ -1894,6 +1910,7 @@ impl NebServer {
 
         if let Some(ref index_builder) = index_builder {
             index_builder.initialize_inverted_indexer(&chunks);
+            index_builder.spawn_index_repair_worker(Arc::downgrade(&chunks));
         }
 
         let cleaner = if effective_opts.enable_recovery {

@@ -597,6 +597,62 @@ fn derive_into(
     }
 }
 
+// ---- the repair of one cell after a failed index task (D-F11) ------------
+
+/// The ranged keys and the (bucket, cell) hash pairs that one local cell
+/// implies, or `None` if the cell is absent. Synchronous: the read guard is
+/// released before the caller awaits an RPC.
+fn derive_cell_entries(
+    chunks: &Arc<Chunks>,
+    id: Id,
+) -> Result<Option<(Vec<EntryKey>, Vec<(Id, Id)>)>, String> {
+    let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
+    let (cell, schema) = match read_local_cell(chunk, id) {
+        LocalCell::Found(cell, schema) => (cell, schema),
+        LocalCell::Absent => return Ok(None),
+        LocalCell::Unreadable => return Err(format!("cell {id:?} cannot be read")),
+        LocalCell::SchemaMissing => return Err(format!("the schema of cell {id:?} is missing")),
+    };
+    let mut ranged = Vec::new();
+    let mut hashed = Vec::new();
+    for res in probe_cell_indices(&cell, &*schema) {
+        ranged.extend(res.ranged_keys().cloned());
+        hashed.extend(res.hash_buckets().map(|bucket| (*bucket, id)));
+    }
+    if schema.is_scannable {
+        ranged.push(EntryKey::for_scannable(&id, schema.uid));
+    }
+    Ok(Some((ranged, hashed)))
+}
+
+/// Re-assert the ranged and hash entries that the cell `id` implies now:
+/// the repair of a failed index task (`crate::index::repair`). Insert only,
+/// through the same check-and-insert steps as the reconcile, so a present
+/// entry is not written again. An absent cell implies no entry. `Err` if an
+/// entry could not be confirmed or inserted: the repair stays pending.
+pub(crate) async fn reassert_cell_entries(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    id: Id,
+) -> Result<(), String> {
+    let Some((ranged, hashed)) = derive_cell_entries(chunks, id)? else {
+        return Ok(());
+    };
+    let mut report = reconcile(indexers, &ranged, ScrubMode::Repair).await;
+    report.merge(&fill_hash_batch(chunks, indexers, hashed, ScrubMode::Repair).await);
+    let failed = report.entries_unreachable
+        + report.repairs_failed
+        + report.repairs_not_stuck
+        + report.hash_repairs_failed
+        + report.hash_buckets_unreachable;
+    if failed > 0 {
+        return Err(format!(
+            "{failed} entr(ies) of cell {id:?} could not be confirmed or inserted: {report}"
+        ));
+    }
+    Ok(())
+}
+
 // ---- the prune direction: what the index holds that no cell implies -------
 
 /// Keys per `scan_keys` round trip while pruning.

@@ -56,6 +56,13 @@ impl EntryKey {
         Self::from_props(&Id::unit_id(), &Default::default(), 0, schema_uid)
     }
 
+    /// The schema family of the key: its leading 4 bytes.
+    pub fn schema_family(&self) -> SchemaUid {
+        let mut family = [0u8; 4];
+        family.copy_from_slice(&self.slice[..4]);
+        SchemaUid(u32::from_be_bytes(family))
+    }
+
     pub fn for_schema_field_feature(schema_uid: SchemaUid, field: u64, feature: &Feature) -> Self {
         Self::from_props(&Id::unit_id(), feature, field, schema_uid)
     }

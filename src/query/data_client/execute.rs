@@ -43,6 +43,9 @@ impl IndexedDataClient {
         _ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
+        // A failed index task of this schema is not repaired yet: the index
+        // answer could miss rows (D-F11).
+        self.index_clients.repairs.refuse_if_pending(schema)?;
         match clause {
             IndexedClausePlan::HashedEq { field_id, value } => {
                 let mut ids = Vec::new();

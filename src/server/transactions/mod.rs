@@ -1,11 +1,12 @@
 //! Transactions: the coordinator (`manager`) and the participant (`data_site`).
 //!
-//! Contract: a cell takes plain (non-transactional) writes or transactions,
-//! not both. If a caller mixes them on one cell, Neb does not guarantee that
-//! an acknowledged plain write or delete survives the resolution of an
-//! in-doubt transaction: after a restart with a transaction T in doubt, the
-//! plain write and T's write can get the same version, and only one is kept;
-//! an acknowledged delete is undone when the resolution installs T's cell.
+//! Contract for plain (non-transactional) writes of a cell that transactions
+//! also write: a plain write or delete is refused with the retryable
+//! `WriteError::CellInTransaction` while a transaction holds the cell (from
+//! the lock of its prepare to its end) or the cell is in doubt after a
+//! restart. A plain write that is admitted is ordered with the transactions
+//! of the cell, and an in-doubt resolution cannot undo it. The caller retries
+//! a refused write.
 
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
@@ -222,8 +223,11 @@ pub enum EndResult {
     },
     Success,
     /// A multi-site transaction is decided COMMIT, but every site refused
-    /// to close its brackets for now. Each site keeps it decided and
-    /// finishes the close later. The client must not retry it.
+    /// to close its brackets for now. Each site keeps it decided in memory
+    /// and finishes the close later. No COMMIT is durable yet: a crash of
+    /// such a site before its close can still abort the transaction, so the
+    /// client reports `OutcomeUnknown` (TLA+ OccCommit F5). The client must
+    /// not retry it blindly.
     DecidedPending,
 }
 
@@ -242,6 +246,9 @@ pub enum CheckError {
     AlreadyAborted,
     AlreadyCleanup,
     CannotEnd,
+    /// A participant fenced the transaction on this site (D29), so its
+    /// writes are not applied here: the participant fence aborts it.
+    Fenced,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -534,6 +534,59 @@ fn set_transaction_id(
 /// job (commit, or abort with its rollback), because only the decider knows
 /// whether the cell index still names the span. A panicking apply is aborted
 /// by its caller, which holds that knowledge (see `DataManager`).
+/// The question a plain (non-transactional) write asks under the word lock
+/// of its cell, in the step of its write: does a transaction hold this cell
+/// (fix G, TLA+ OccCommit `OccShippedM1PlainWord`)? The data site answers it
+/// (`TxnCellGate`). A prepare marks the cell held before it checks the cell,
+/// and the check reads the cell under the same word lock, so a plain write
+/// is ordered with the prepare: before it (the prepare sees the write) or
+/// after it (the write is refused).
+pub trait PlainWriteGate: Send + Sync {
+    fn refuses(&self, id: u64) -> bool;
+}
+
+thread_local! {
+    /// The gate of the plain write that runs on this thread, if any. Only
+    /// `with_plain_write_gate` sets it, for one synchronous chunk write.
+    static PLAIN_WRITE_GATE: std::cell::Cell<Option<std::ptr::NonNull<dyn PlainWriteGate>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run the synchronous plain write `write` with `gate` asked under the cell
+/// word lock of each cell it writes. A cell that the gate refuses is not
+/// written: the write answers `WriteError::CellInTransaction`.
+pub fn with_plain_write_gate<R>(gate: &dyn PlainWriteGate, write: impl FnOnce() -> R) -> R {
+    struct Restore(Option<std::ptr::NonNull<dyn PlainWriteGate>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAIN_WRITE_GATE.with(|slot| slot.set(self.0));
+        }
+    }
+    // SAFETY: the pointer is cleared (restored) by `Restore` on every exit of
+    // this frame, unwinding included, and `gate` outlives the frame.
+    let gate: std::ptr::NonNull<dyn PlainWriteGate> = unsafe {
+        std::mem::transmute::<std::ptr::NonNull<dyn PlainWriteGate + '_>, _>(
+            std::ptr::NonNull::from(gate),
+        )
+    };
+    let _restore = Restore(PLAIN_WRITE_GATE.with(|slot| slot.replace(Some(gate))));
+    write()
+}
+
+/// `Err(CellInTransaction)` if a plain write runs on this thread and its gate
+/// refuses the cell `hash`. The caller holds the word lock of the cell.
+#[inline]
+fn refuse_plain_write(hash: u64) -> Result<(), WriteError> {
+    let Some(gate) = PLAIN_WRITE_GATE.with(|slot| slot.get()) else {
+        return Ok(());
+    };
+    // SAFETY: set only inside `with_plain_write_gate`, whose frame is live.
+    if unsafe { gate.as_ref() }.refuses(hash) {
+        return Err(WriteError::CellInTransaction);
+    }
+    Ok(())
+}
+
 #[must_use = "the transaction is named only while the scope lives"]
 pub struct TransactionScope {
     previous: Option<crate::server::transactions::TxnId>,
@@ -3914,6 +3967,10 @@ impl Chunk {
                     cell.header.id.bits(),
                 );
 
+                if let Err(error) = refuse_plain_write(cell.header.id.bits()) {
+                    guard.remove();
+                    return Err(error);
+                }
                 if let Err(error) = pending_entry.append() {
                     guard.remove();
                     return Err(error);
@@ -3972,6 +4029,7 @@ impl Chunk {
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
+            refuse_plain_write(hash)?;
             let cell_location = cell_guard.get_ptr();
             let cell_version =
                 cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
@@ -4097,6 +4155,16 @@ impl Chunk {
                 let mut guard = self.lock_or_insert_cell(hash);
                 WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let loc = guard.get_ptr();
+                // Before the encode: the run stops here, and its Drop stamps
+                // the rest of the reservation as padding.
+                if let Err(error) = refuse_plain_write(hash) {
+                    if loc == 0 {
+                        guard.remove_cell();
+                    }
+                    results.push(Err(error));
+                    results.extend((j + 1..cells.len()).map(|_| Err(WriteError::BatchAborted)));
+                    return results;
+                }
                 let (old_version, old_loc) = if loc == 0 {
                     (self.create_version(&cells[j]), None)
                 } else {
@@ -4171,6 +4239,7 @@ impl Chunk {
         loop {
             if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
                 trace!("Cell {} exists, will update for upsert", hash);
+                refuse_plain_write(hash)?;
                 let cell_location = cell_guard.get_ptr();
                 let cell_version = cell_version_from_chunk_raw(cell_location)
                     .map_err(|e| WriteError::ReadError(e))?;
@@ -4220,6 +4289,10 @@ impl Chunk {
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
+                    if let Err(error) = refuse_plain_write(hash) {
+                        guard.remove();
+                        return Err(error);
+                    }
                     let t_copy = std::time::Instant::now();
                     let write_result = self.write_cell_to_chunk(
                         cell,
@@ -4283,6 +4356,7 @@ impl Chunk {
         U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
+            refuse_plain_write(hash)?;
             let old_loc = cell_guard.get_ptr();
             match SharedCellData::from_chunk_raw(hash, *cell_guard, self) {
                 Ok((cell, schema)) => {
@@ -4405,6 +4479,7 @@ impl Chunk {
                         hook();
                     }
                 });
+                refuse_plain_write(hash)?;
                 return Ok(RemoveLock {
                     pending,
                     guard,
@@ -4426,6 +4501,7 @@ impl Chunk {
         });
         // Use location_for_read to ensure promotion happens if segment is cold
         let guard = CellGuard::for_read(hash, self).map_err(read_error)?;
+        refuse_plain_write(hash)?;
         let target = self.tombstone_target(guard.get_ptr())?;
         Ok(RemoveLock {
             pending,
@@ -5499,6 +5575,7 @@ impl Chunk {
         pending_entry: PendingEntry,
         version: u64,
     ) -> Result<WriteToChunkResult, WriteError> {
+        refuse_plain_write(guard.hash)?;
         guard.update_cell_in_entry(cell, &write_plan, &pending_entry, version)
     }
 

@@ -375,7 +375,91 @@ pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCann
 }
 
 type CommitHistory = BTreeMap<Id, CellHistory>;
-type CellMetaMutex = Arc<Mutex<CellMeta>>;
+type CellMetaMutex = Arc<CellMetaLock>;
+
+/// The metadata of a cell and its lock, with a flag that a plain write reads
+/// without the lock: `held` is true while a transaction owns the cell
+/// (`CellMeta::owner`), and also while a prepare checks the cell before it
+/// takes it.
+///
+/// A plain write reads the flag under the cell word lock of the chunk, in the
+/// step of its write (`chunk::PlainWriteGate`). It cannot take the metadata
+/// lock there: a prepare and an apply hold the metadata lock and then take the
+/// word lock. Each guard stores the flag from `owner` when it is dropped, so
+/// the flag follows every change of the owner.
+pub(crate) struct CellMetaLock {
+    held: std::sync::atomic::AtomicBool,
+    meta: Mutex<CellMeta>,
+}
+
+impl CellMetaLock {
+    fn new(meta: CellMeta) -> Self {
+        Self {
+            held: std::sync::atomic::AtomicBool::new(meta.owner.is_some()),
+            meta: Mutex::new(meta),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> CellMetaGuard<'_> {
+        CellMetaGuard {
+            lock: self,
+            guard: self.meta.lock(),
+        }
+    }
+
+    /// Mark the cell held before a prepare checks it. The guard puts the flag
+    /// back to the owner when it is dropped.
+    fn claim(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+pub(crate) struct CellMetaGuard<'a> {
+    lock: &'a CellMetaLock,
+    guard: parking_lot::MutexGuard<'a, CellMeta>,
+}
+
+impl std::ops::Deref for CellMetaGuard<'_> {
+    type Target = CellMeta;
+    fn deref(&self) -> &CellMeta {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for CellMetaGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CellMeta {
+        &mut self.guard
+    }
+}
+
+impl Drop for CellMetaGuard<'_> {
+    fn drop(&mut self) {
+        // Before the lock is released (the field drops after this).
+        self.lock
+            .held
+            .store(self.guard.owner.is_some(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The plain-write gate of a database (fix G, TLA+ OccCommit
+/// `OccShippedM1PlainWord`): it tells a plain write of a cell, under the cell
+/// word lock, whether a transaction holds the cell. A cell without metadata
+/// costs one probe of the lock-free map and allocates nothing.
+pub(crate) struct TxnCellGate {
+    cells: Arc<crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>>,
+}
+
+impl crate::ram::chunk::PlainWriteGate for TxnCellGate {
+    fn refuses(&self, id: u64) -> bool {
+        self.cells
+            .get(&Id::from_bits(id))
+            .is_some_and(|entry| entry.as_ref().is_some_and(|meta| meta.held()))
+    }
+}
 type TxnMutex = Arc<Mutex<Transaction>>;
 
 /// Per-cell metadata for concurrency control
@@ -601,7 +685,7 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    cells: crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>,
+    cells: Arc<crate::utils::keyed_state::KeyedState<Id, CellMetaMutex>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: SkipSet<Id>,
     txns_sorted: SkipSet<TxnId>,
@@ -712,6 +796,12 @@ service! {
     // Operator tool: decide one in-doubt transaction on this site, when a
     // participant is lost for good. See `ForceResolveResult`.
     rpc force_resolve(tid: TxnId, outcome: ForcedOutcome) -> DataSiteResponse<ForceResolveResult>;
+
+    // The end of a read-only transaction that read 2 or more cells (TLA+
+    // OccCommit F4): each read cell has no lock owner and still holds the
+    // version that was read. `Wait` while a transaction holds a cell,
+    // `NotRealizable` if a cell changed, else `Success`.
+    rpc validate_reads(clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -742,7 +832,7 @@ impl DataManager {
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: Default::default(),
+            cells: Arc::new(Default::default()),
             txns: LFMap::with_capacity(128),
             cell_list: SkipSet::new(),
             txns_sorted: SkipSet::new(),
@@ -755,6 +845,12 @@ impl DataManager {
             aborted: SkipSet::new(),
             hlc,
         });
+        // The first data site of a database gates its plain writes (fix G).
+        manager
+            .database_runtime
+            .set_plain_write_gate(Arc::new(TxnCellGate {
+                cells: manager.cells.clone(),
+            }));
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
@@ -988,8 +1084,8 @@ impl DataManager {
     }
 
     /// Whether the owner of a cell lock has applied writes here that are
-    /// not decided commit and not yet restored: applied and undecided, or
-    /// aborted with its restoration still pending.
+    /// not closed and not yet restored: applied and undecided, decided with
+    /// its close not finished, or aborted with its restoration pending.
     ///
     /// Its lock is never reclaimed as stale. The abort of the owner rolls its
     /// writes back only while it owns the cells, and a reader without the
@@ -998,10 +1094,52 @@ impl DataManager {
     /// a cell lock, so it must not wait for the owner's lock.
     fn owner_waits_with_writes(&self, owner: &TxnPriority) -> bool {
         self.find_transaction(&owner.tid).is_some_and(|txn_lock| {
-            txn_lock.try_lock().map_or(true, |txn| {
-                !txn.decided_commit && !txn.history.is_empty() && !txn.restored
-            })
+            // A decided owner whose close is not finished keeps its history
+            // and counts too: its COMMIT is not durable yet, and a crash can
+            // still discard its writes (TLA+ OccCommit F7). A close clears
+            // the history.
+            txn_lock
+                .try_lock()
+                .map_or(true, |txn| !txn.history.is_empty() && !txn.restored)
         })
+    }
+
+    /// Validate the reads of a read-only transaction at its end (TLA+
+    /// OccCommit F4, `FixROValidate`).
+    ///
+    /// A read waits while a transaction holds its cell, but the reads of one
+    /// transaction happen at different times, so without this check a
+    /// read-only transaction can read one cell before a writer and another
+    /// cell after it. Each cell is checked at one instant: no other
+    /// transaction holds it, it is not in doubt, and its version is the one
+    /// that was read. All reads come before all checks, so if every check
+    /// passes, an instant exists at which every cell held the value read, and
+    /// no writer of these cells held a lock at that instant: the reads are
+    /// one serial point. The checks need no lock between cells.
+    fn validate_reads_now(&self, tid: &TxnId, ops: &[PrepareOp]) -> DMPrepareResult {
+        let registry = self.chunks().txn_status();
+        for op in ops {
+            if self.slot_read_refusal(&op.id).is_some() {
+                return DMPrepareResult::NotRealizable;
+            }
+            if registry.is_in_doubt_cell(op.id.bits()) {
+                return DMPrepareResult::Wait;
+            }
+            let matches = match self.existing_cell_meta_mutex(&op.id) {
+                Some(meta) => {
+                    let meta = meta.lock();
+                    if meta.owner.as_ref().is_some_and(|owner| owner.tid != *tid) {
+                        return DMPrepareResult::Wait;
+                    }
+                    self.prepare_expectation_matches(op)
+                }
+                None => self.prepare_expectation_matches(op),
+            };
+            if !matches {
+                return DMPrepareResult::NotRealizable;
+            }
+        }
+        DMPrepareResult::Success
     }
 
     /// The index gate of `tid`, if this site holds the transaction.
@@ -1031,7 +1169,7 @@ impl DataManager {
         let mut entry = crate::profile_lock!(H07, self.cells.entry(id));
         entry.get_or_insert_with(|| {
             self.cell_list.insert(*id);
-            Arc::new(Mutex::new(CellMeta {
+            Arc::new(CellMetaLock::new(CellMeta {
                 read: TxnId::default(),
                 write: TxnId::default(),
                 owner: None,
@@ -1263,7 +1401,7 @@ impl DataManager {
         tid: &TxnId,
         txn: &mut Transaction,
         guarded_cell_ids: &[Id],
-        cell_guards: &mut [parking_lot::MutexGuard<'_, CellMeta>],
+        cell_guards: &mut [CellMetaGuard<'_>],
     ) -> Result<Option<Vec<RollbackFailure>>, WriteError> {
         debug!(
             ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
@@ -1433,7 +1571,72 @@ impl DataManager {
         for tid in crate::ram::chunk::retire_expired_transaction_leases(orphans, idle, &store) {
             self.wipe_out_transaction(&tid);
         }
+        self.end_idle_unleased_transactions(idle);
         self.finish_aborted_transactions(idle).await;
+    }
+
+    /// End each transaction object that holds no write lease and had no
+    /// activity for `idle` (TLA+ OccCommit F2, fix B): a `Started` object, a
+    /// `Prepared` one, and a `Committed` part that applied no write and is not
+    /// decided. The lease sweep and the participant fence never see such an
+    /// object, so a coordinator that stopped, or a lost `abort` or `end`,
+    /// would leave it and its cell locks for good.
+    ///
+    /// Under the index gate and the transaction lock, the object becomes
+    /// `Aborted` before its locks go: a late `commit` then finds it aborted or
+    /// gone and applies nothing. A `Prepared` participant records the abort,
+    /// so a peer in doubt is told `Aborted`.
+    fn end_idle_unleased_transactions(&self, idle: std::time::Duration) {
+        let now = get_time();
+        let idle_ms = idle.as_millis().min(i64::MAX as u128) as i64;
+        for tid in self.transaction_ids() {
+            let Some(txn_lock) = self.find_transaction(&tid) else {
+                continue;
+            };
+            let gate = txn_lock.lock().index_gate.clone();
+            // A busy gate is an RPC of this transaction still running.
+            let Ok(_gate) = gate.try_lock() else {
+                continue;
+            };
+            let ended = {
+                let mut txn = txn_lock.lock();
+                let unleased = match txn.state {
+                    TxnState::Started | TxnState::Prepared => true,
+                    TxnState::Committed => txn.history.is_empty() && !txn.decided_commit,
+                    TxnState::Aborted | TxnState::Cleanup => false,
+                };
+                if !unleased || now.saturating_sub(txn.last_activity) < idle_ms {
+                    None
+                } else {
+                    let participant = txn.state == TxnState::Prepared
+                        && txn
+                            .certified
+                            .values()
+                            .any(|op| op.intent == PrepareIntent::Write);
+                    txn.state = TxnState::Aborted;
+                    let owner = txn
+                        .coordinator_id
+                        .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
+                    Some((owner, Self::guarded_txn_cell_ids(&txn), participant))
+                }
+            };
+            let Some((owner, cells, participant)) = ended else {
+                continue;
+            };
+            warn!(
+                "transaction {:?} held no write lease and had no activity for {:?}; its \
+                 object and {} cell lock(s) are released",
+                tid,
+                idle,
+                cells.len()
+            );
+            self.attempt_lock_release(owner.as_ref(), &cells);
+            if participant {
+                self.record_decision(&tid, TxnOutcome::Aborted);
+            }
+            self.wipe_out_transaction(&tid);
+            self.cleanup_signal.store(true, Relaxed);
+        }
     }
 
     /// The work of `end`, under the index gate of `tid`: close or finish
@@ -1605,6 +1808,19 @@ impl DataManager {
         }
         self.cleanup_signal.store(true, Relaxed);
 
+        // An aborted transaction is never reported as a success, whoever
+        // sends the `end`: a late coordinator `end` for its COMMIT must not
+        // tell the client that it committed (TLA+ OccCommit F1). The abort
+        // cleanup of the coordinator takes this answer as a finished end.
+        if txn_state == TxnState::Aborted {
+            if let Err((released, total, _)) = &lock_release_result {
+                error!(
+                    "ENDED aborted {:?} with lock release failures ({}/{} released)",
+                    tid, released, total
+                );
+            }
+            return EndResult::CheckFailed(CheckError::AlreadyAborted);
+        }
         // Return appropriate result based on lock release outcome
         match lock_release_result {
             Ok(()) => {
@@ -3021,6 +3237,13 @@ impl DataManager {
             }
             TxnState::Prepared => {}
         };
+        // A participant in doubt fenced this site before the apply came
+        // (TLA+ OccCommit F3). `fence_here` sets the flag under this lock, so
+        // the apply and the fence are ordered: an apply after the fence would
+        // publish writes that the fence then aborts.
+        if txn.fenced {
+            return DMCommitResult::CheckFailed(CheckError::Fenced);
+        }
 
         if let Err(result) = Self::validate_commit_subset(&txn, &cells) {
             return result;
@@ -3971,7 +4194,8 @@ mod tests {
         let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        // The `end` of an aborted transaction never answers Success (fix A).
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
     }
 
     /// A server whose chunk has room for several segments. A transaction only
@@ -4099,7 +4323,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -4187,7 +4411,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -4833,7 +5057,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(owner_of(&manager, &ids[0]), Some(owner.clone()));
         assert_eq!(owner_of(&manager, &ids[1]), None);
@@ -5132,7 +5356,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(owner_of(&manager, &id), None);
         server.shutdown().await;
@@ -5572,7 +5796,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(
             runtime.chunks().read_cell(&id).unwrap().header.version,
@@ -5784,7 +6008,11 @@ mod tests {
             <DataManager as Service>::end(&manager, tid, tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            if commit {
+                EndResult::Success
+            } else {
+                EndResult::CheckFailed(CheckError::AlreadyAborted)
+            }
         );
         if commit {
             for location in previous {
@@ -5944,7 +6172,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert_no_open_bracket(&runtime);
         server.shutdown().await;
     }
@@ -5997,7 +6225,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -7277,7 +7505,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7348,7 +7576,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7438,7 +7666,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
         assert!(manager.cell_meta_mutex(&cell_b).lock().owner.is_none());
         server.shutdown().await;
@@ -7525,7 +7753,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7756,6 +7984,7 @@ mod tests {
                     result,
                     EndResult::Success
                         | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::AlreadyAborted)
                         | EndResult::CheckFailed(CheckError::CannotEnd)
                         | EndResult::LockReleaseRetriesExhausted { .. }
                         | EndResult::SomeLocksNotReleased { .. }
@@ -8095,7 +8324,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -8199,7 +8428,7 @@ mod tests {
         let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
-        assert_eq!(end_t2, EndResult::Success);
+        assert_eq!(end_t2, EndResult::CheckFailed(CheckError::AlreadyAborted));
 
         let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
             .await
@@ -8208,7 +8437,7 @@ mod tests {
         let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
-        assert_eq!(end_t1, EndResult::Success);
+        assert_eq!(end_t1, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -9093,6 +9322,492 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    /// MODEL CHECK F1 (docs/tla/OccCommit.tla, OccR1F1.cfg). A presumed
+    /// abort that cannot restore a cell keeps the object Aborted. A late
+    /// coordinator `end` for the COMMIT answered Success, and the
+    /// coordinator told the client that the transaction committed
+    /// (`end_sites`); the retry of the restoration then removed the write.
+    /// Fix A: `end` of an aborted object answers `AlreadyAborted`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f1_late_end_after_failed_presumed_abort_is_not_success() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f1";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9471);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9471);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9471,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "new"))]
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // The lease sweep presumes abort; the restore of the cell fails.
+        manager
+            .txns
+            .get(&tid)
+            .unwrap()
+            .lock()
+            .history
+            .get_mut(&id)
+            .unwrap()
+            .current_version += 1;
+        assert!(manager.presume_abort(&tid, true).await);
+        assert!(manager.has_transaction_for_test(&tid));
+        // The coordinator was slow, not dead: its COMMIT `end` comes now.
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+            .await
+            .payload;
+        // Repair the injection; the sweep retries the restore.
+        if let Some(txn) = manager.txns.get(&tid) {
+            if let Some(history) = txn.lock().history.get_mut(&id) {
+                history.current_version -= 1;
+            }
+        }
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        let score = score_of(&runtime, &id);
+        server.shutdown().await;
+        assert_ne!(
+            end,
+            EndResult::Success,
+            "the COMMIT `end` of a transaction this site aborted answered Success; \
+             the cell is now back at {score:?}, so the client was told a commit that \
+             did not happen"
+        );
+    }
+
+    /// MODEL CHECK F2 (docs/tla/OccCommit.tla, OccR1Lock.cfg). A participant
+    /// prepared a transaction and its coordinator went away before the
+    /// apply. The object holds no write lease, so no lease sweep ends it,
+    /// and a transactional read waited on its lock for good (`prepare_read`
+    /// waits on any owner and never reclaims). Fix B: the sweep ends idle
+    /// objects without leases.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f2_prepared_object_without_coordinator_blocks_reads_for_good() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f2";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9481);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9481);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9481,
+                &tid,
+                vec![PrepareOp {
+                    id,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Write,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        // The coordinator is gone. Age the lock past every timeout and run
+        // every background pass of the participant.
+        manager.cell_meta_for_test(&id).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        manager.sweep_idle_transactions(Duration::ZERO).await;
+        manager.finish_aborted_transactions(Duration::ZERO).await;
+        let reader = test_hlc(tid.ts + 10, 9489);
+        let read = <DataManager as Service>::read(&manager, 0, reader.clone(), reader, id)
+            .await
+            .payload;
+        let still_there = manager.has_transaction_for_test(&tid);
+        server.shutdown().await;
+        assert!(
+            !matches!(read, TxnExecResult::Wait),
+            "a transactional read still waits on the lock of a prepared transaction \
+             whose coordinator is gone (object present: {still_there})"
+        );
+    }
+
+    /// MODEL CHECK F3 (OccShippedNoFenceCheck.cfg). A participant fenced
+    /// this site before the delayed `commit` came. The apply must not run:
+    /// it would publish writes that the fence then aborts, and plain readers
+    /// would see them until the lease sweep rolled them back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f3_a_fenced_site_refuses_the_apply() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f3";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9491);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9491);
+        let op = PrepareOp {
+            id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 9491, &tid, vec![op]).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(manager.fence_here(&tid), FenceAnswer::Fenced);
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "late"))],
+        )
+        .await;
+        let score = score_of(&runtime, &id);
+        server.shutdown().await;
+        assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::Fenced));
+        assert_eq!(score, Some(5), "a fenced site published a write of the apply");
+    }
+
+    /// MODEL CHECK F6 (OccM1Plain.cfg, OccPlainKept.cfg; fix G). A plain
+    /// write or delete of a cell that a transaction holds, or of a cell in
+    /// doubt after a restart, is refused with the retryable
+    /// `CellInTransaction`. After the transaction ends, it is accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f6_a_plain_write_is_refused_while_a_transaction_holds_the_cell() {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f6";
+        let server = start_lease_test_server(&address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("the server runs a data site");
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![address.clone()],
+                group,
+            )
+            .await
+            .unwrap(),
+        );
+        let held = Id::allocated(0, 0, 9501);
+        let free = Id::allocated(0, 0, 9502);
+        let in_doubt = Id::allocated(0, 0, 9503);
+        let version = seed_cell_version(&runtime, schema.vid.get(), held, 5, 0);
+        seed_cell_version(&runtime, schema.vid.get(), free, 5, 0);
+        seed_cell_version(&runtime, schema.vid.get(), in_doubt, 5, 0);
+        let tid = test_hlc(1, 9501);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9501,
+                &tid,
+                vec![PrepareOp {
+                    id: held,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Read,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        let cell = |id, score| counter_cell(schema.vid.get(), id, score, "plain");
+        let upsert_held = client.upsert_cell(cell(held, 77)).await.unwrap();
+        let remove_held = client.remove_cell(held).await.unwrap();
+        let cas_held = client
+            .compare_version_and_update_cell(held, version, cell(held, 78))
+            .await
+            .unwrap();
+        // Control: a cell that no transaction holds takes the write.
+        let upsert_free = client.upsert_cell(cell(free, 77)).await.unwrap();
+        let doubt = test_hlc(2, 9503);
+        runtime
+            .chunks()
+            .txn_status()
+            .begin_resolving(doubt.clone(), vec![1, 2], vec![in_doubt.bits()]);
+        let upsert_in_doubt = client.upsert_cell(cell(in_doubt, 77)).await.unwrap();
+        runtime.chunks().txn_status().end_resolving(&doubt);
+        let upsert_resolved = client.upsert_cell(cell(in_doubt, 79)).await.unwrap();
+        abort_and_end_local(&manager, &tid).await;
+        let upsert_ended = client.upsert_cell(cell(held, 80)).await.unwrap();
+        let score = score_of(&runtime, &held);
+        server.shutdown().await;
+        assert_eq!(upsert_held.err(), Some(WriteError::CellInTransaction));
+        assert_eq!(remove_held.err(), Some(WriteError::CellInTransaction));
+        assert_eq!(cas_held.err(), Some(WriteError::CellInTransaction));
+        assert!(upsert_free.is_ok(), "{upsert_free:?}");
+        assert_eq!(upsert_in_doubt.err(), Some(WriteError::CellInTransaction));
+        assert!(upsert_resolved.is_ok(), "{upsert_resolved:?}");
+        assert!(upsert_ended.is_ok(), "{upsert_ended:?}");
+        assert_eq!(score, Some(80));
+    }
+
+    /// Fix G as the word-lock check: a prepare marks its cells held before
+    /// it checks them. A prepare that is refused gives the mark back, so a
+    /// plain write of the cell is admitted again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_prepare_leaves_the_cell_free_for_plain_writes() {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_refused_prepare_plain_write";
+        let server = start_lease_test_server(&address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("the server runs a data site");
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![address.clone()],
+                group,
+            )
+            .await
+            .unwrap(),
+        );
+        let id = Id::allocated(0, 0, 9531);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9531);
+        let prepare = prepare_ops_local(
+            &manager,
+            9531,
+            &tid,
+            vec![PrepareOp {
+                id,
+                expectation: CellExpectation::Present(version + 7),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        let held = manager.cell_meta_for_test(&id).held();
+        let upsert = client
+            .upsert_cell(counter_cell(schema.vid.get(), id, 77, "plain"))
+            .await
+            .unwrap();
+        server.shutdown().await;
+        assert_eq!(prepare, DMPrepareResult::NotRealizable);
+        assert!(!held, "a refused prepare left the cell marked held");
+        assert!(upsert.is_ok(), "{upsert:?}");
+    }
+
+    /// MODEL CHECK F7 (OccLUCrashAll.cfg; fix F). A transaction decided
+    /// COMMIT whose close was refused keeps its applied write without a
+    /// durable COMMIT: a crash still discards it. Its lock must not be
+    /// reclaimed as stale, or another transaction commits on top of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f7_a_decided_unclosed_lock_is_not_reclaimed() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f7";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell = Id::allocated(0, 0, 9511);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell, 5, 0);
+        let decided = test_hlc(1, 9511);
+        let write = |expectation| PrepareOp {
+            id: cell,
+            expectation,
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9511,
+                &decided,
+                vec![write(CellExpectation::Present(version))]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &decided,
+                vec![CommitOp::Update(counter_cell(schema.vid.get(), cell, 50, "decided"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // The close was refused and its retraction is not durable
+        // (`CommitRefusal::Unresolved`): decided, not closed.
+        manager.txns.get(&decided).unwrap().lock().decided_commit = true;
+        manager.cell_meta_for_test(&cell).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let later = test_hlc(2, 9512);
+        let prepare = prepare_ops_local(
+            &manager,
+            9512,
+            &later,
+            vec![write(CellExpectation::Present(version + 1))],
+        )
+        .await;
+        let owner = owner_of(&manager, &cell);
+        server.shutdown().await;
+        assert_ne!(prepare, DMPrepareResult::Success);
+        assert_eq!(
+            owner,
+            Some(TxnPriority::new(decided.clone(), 9511)),
+            "a stale reclaim took the lock of a decided transaction whose close is not done"
+        );
+    }
+
+    /// MODEL CHECK D-F11 (docs/tla/IndexRepair.tla, IndexRepairShipped.cfg).
+    /// A failed index task of a transaction apply records a repair. While
+    /// it is pending, an index query of the schema answers
+    /// `IndexRepairPending`, not fewer rows. The worker then re-asserts the
+    /// entry, and the query finds the row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_d_f11_a_failed_index_task_is_repaired() {
+        use crate::index::repair::IndexRepairPending;
+        use crate::query::planner::{ValueRange, ValueRangeTerm};
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("txn_model_check_d_f11", 9521).await;
+        let id = Id::allocated(0, 0, 9521);
+        let tid = test_hlc(1, 9521);
+        let versions = seed_indexed(&runtime, &schema, &[id]).await;
+        // The repair stays pending until the readers below have asked.
+        crate::index::builder::INDEX_REPAIR_PAUSED_FOR_TEST
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::index::builder::fail_next_index_task_of(id);
+        assert_eq!(
+            prepare_ops_local(&manager, 9521, &tid, present_writes(&[id], &versions)).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(&manager, &tid, updates_to(&schema, &[id], 50)).await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        let indexer = runtime.indexer().unwrap();
+        let repairs = indexer.clients.repairs.clone();
+        let pending_after_commit = repairs.is_pending(schema.uid);
+        let range = |score: u64| {
+            let feature = OwnedValue::U64(score).feature();
+            ValueRange {
+                start: ValueRangeTerm::Inclusive(feature),
+                end: ValueRangeTerm::Inclusive(feature),
+            }
+        };
+        let query = |data: crate::query::data_client::IndexedDataClient| async move {
+            match data
+                .range_index_scan(
+                    schema.uid,
+                    hash_str("score"),
+                    range(50),
+                    vec![],
+                    dovahkiin::expr::serde::Expr::nothing(),
+                    dovahkiin::expr::serde::Expr::nothing(),
+                    crate::index::ranged::tree::btree::Ordering::Forward,
+                )
+                .await
+            {
+                Ok(mut cursor) => {
+                    let mut ids = Vec::new();
+                    while let Some(cell) = cursor.next().await.unwrap() {
+                        ids.push(cell.id());
+                    }
+                    Ok(ids)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let during = query(runtime.indexed_data_client()).await;
+        // A ranged reader that is not an `IndexedDataClient`: the client of
+        // `client::ranged`, as the gRPC scan and the job store use it.
+        let client = server
+            .data_client(&vec![server.rpc.address().clone()])
+            .await
+            .unwrap();
+        let feature = OwnedValue::U64(50).feature();
+        let ranged_query = || async {
+            match client
+                .ranged()
+                .range_query(
+                    schema.uid,
+                    hash_str("score"),
+                    Some(&feature),
+                    Some(&feature),
+                    crate::client::ranged::ScanOrder::Forward,
+                    16,
+                    crate::index::verification::Verify::Exists,
+                )
+                .await
+            {
+                Ok(Some(mut cursor)) => {
+                    let mut ids = Vec::new();
+                    while let Some(id) = cursor.next().await.unwrap() {
+                        ids.push(id);
+                    }
+                    Ok(ids)
+                }
+                Ok(None) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        };
+        let ranged_during = ranged_query().await;
+        crate::index::builder::INDEX_REPAIR_PAUSED_FOR_TEST
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while repairs.pending() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pending_after_worker = repairs.pending();
+        let entry_present = indexer
+            .clients
+            .ranged_client
+            .contains(&score_key(&schema, &id, 50))
+            .await;
+        let after = query(runtime.indexed_data_client()).await;
+        let ranged_after = ranged_query().await;
+        server.shutdown().await;
+        assert!(pending_after_commit, "the failed index task recorded no repair");
+        assert!(
+            during
+                .as_ref()
+                .err()
+                .is_some_and(|error| IndexRepairPending::of(error).is_some()),
+            "a query during the repair answered {during:?}, not IndexRepairPending"
+        );
+        assert_eq!(pending_after_worker, 0, "the worker did not finish the repair");
+        assert!(matches!(entry_present, Ok(true)), "{entry_present:?}");
+        assert_eq!(after.unwrap(), vec![id]);
+        assert!(
+            ranged_during
+                .as_ref()
+                .err()
+                .is_some_and(|error| IndexRepairPending::of(error).is_some()),
+            "a ranged-client scan during the repair answered {ranged_during:?}, not \
+             IndexRepairPending"
+        );
+        assert_eq!(ranged_after.unwrap(), vec![id]);
+    }
 }
 
 impl Service for DataManager {
@@ -9437,6 +10152,13 @@ impl Service for DataManager {
                     cell_guards.push(meta);
                 }
 
+                // A plain write that comes after this point is refused
+                // (`CellMetaLock`); one that came before is seen by the check
+                // below. A guard puts the flag back to its owner when the
+                // prepare refuses.
+                for cell_mutex in &cell_mutices {
+                    cell_mutex.claim();
+                }
                 for op in &prepared_ops {
                     if !self.prepare_expectation_matches(op) {
                         debug!(
@@ -9619,6 +10341,17 @@ impl Service for DataManager {
             self.response_with(result).await
         }
         .boxed()
+    }
+
+    fn validate_reads(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        ops: Vec<PrepareOp>,
+    ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
+        self.update_clock(clock);
+        let result = self.validate_reads_now(&tid, &ops);
+        self.response_with(result)
     }
 
     fn end(
