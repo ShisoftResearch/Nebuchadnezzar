@@ -3103,6 +3103,13 @@ impl DataManager {
             }
             TxnState::Prepared => {}
         };
+        // A participant in doubt fenced this site before the apply came
+        // (TLA+ OccCommit F3). `fence_here` sets the flag under this lock, so
+        // the apply and the fence are ordered: an apply after the fence would
+        // publish writes that the fence then aborts.
+        if txn.fenced {
+            return DMCommitResult::CheckFailed(CheckError::Fenced);
+        }
 
         if let Err(result) = Self::validate_commit_subset(&txn, &cells) {
             return result;
@@ -9302,6 +9309,44 @@ mod tests {
              whose coordinator is gone (object present: {still_there})"
         );
     }
+    /// MODEL CHECK F3 (OccShippedNoFenceCheck.cfg). A participant fenced
+    /// this site before the delayed `commit` came. The apply must not run:
+    /// it would publish writes that the fence then aborts, and plain readers
+    /// would see them until the lease sweep rolled them back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f3_a_fenced_site_refuses_the_apply() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f3";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let id = Id::allocated(0, 0, 9491);
+        let version = seed_cell_version(&runtime, schema.vid.get(), id, 5, 0);
+        let tid = test_hlc(1, 9491);
+        let op = PrepareOp {
+            id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 9491, &tid, vec![op]).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(manager.fence_here(&tid), FenceAnswer::Fenced);
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![CommitOp::Update(counter_cell(schema.vid.get(), id, 50, "late"))],
+        )
+        .await;
+        let score = score_of(&runtime, &id);
+        server.shutdown().await;
+        assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::Fenced));
+        assert_eq!(score, Some(5), "a fenced site published a write of the apply");
+    }
+
     /// MODEL CHECK F7 (OccLUCrashAll.cfg; fix F). A transaction decided
     /// COMMIT whose close was refused keeps its applied write without a
     /// durable COMMIT: a crash still discards it. Its lock must not be

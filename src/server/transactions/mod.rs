@@ -245,6 +245,9 @@ pub enum CheckError {
     AlreadyAborted,
     AlreadyCleanup,
     CannotEnd,
+    /// A participant fenced the transaction on this site (D29), so its
+    /// writes are not applied here: the participant fence aborts it.
+    Fenced,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
