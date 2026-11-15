@@ -1894,6 +1894,7 @@ impl NebServer {
 
         if let Some(ref index_builder) = index_builder {
             index_builder.initialize_inverted_indexer(&chunks);
+            index_builder.spawn_index_repair_worker(Arc::downgrade(&chunks));
         }
 
         let cleaner = if effective_opts.enable_recovery {

@@ -9395,6 +9395,7 @@ mod tests {
              whose coordinator is gone (object present: {still_there})"
         );
     }
+
     /// MODEL CHECK F3 (OccShippedNoFenceCheck.cfg). A participant fenced
     /// this site before the delayed `commit` came. The apply must not run:
     /// it would publish writes that the fence then aborts, and plain readers
@@ -9571,6 +9572,94 @@ mod tests {
         );
     }
 
+    /// MODEL CHECK D-F11 (docs/tla/IndexRepair.tla, IndexRepairShipped.cfg).
+    /// A failed index task of a transaction apply records a repair. While
+    /// it is pending, an index query of the schema answers
+    /// `IndexRepairPending`, not fewer rows. The worker then re-asserts the
+    /// entry, and the query finds the row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_d_f11_a_failed_index_task_is_repaired() {
+        use crate::index::repair::IndexRepairPending;
+        use crate::query::planner::{ValueRange, ValueRangeTerm};
+        let _ = env_logger::try_init();
+        let (server, runtime, schema, manager) =
+            start_indexed_txn_server("txn_model_check_d_f11", 9521).await;
+        let id = Id::allocated(0, 0, 9521);
+        let tid = test_hlc(1, 9521);
+        let versions = seed_indexed(&runtime, &schema, &[id]).await;
+        crate::index::builder::fail_next_index_task_of(id);
+        assert_eq!(
+            prepare_ops_local(&manager, 9521, &tid, present_writes(&[id], &versions)).await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(&manager, &tid, updates_to(&schema, &[id], 50)).await,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        let indexer = runtime.indexer().unwrap();
+        let repairs = indexer.clients.repairs.clone();
+        let pending_after_commit = repairs.is_pending(schema.uid);
+        let range = |score: u64| {
+            let feature = OwnedValue::U64(score).feature();
+            ValueRange {
+                start: ValueRangeTerm::Inclusive(feature),
+                end: ValueRangeTerm::Inclusive(feature),
+            }
+        };
+        let query = |data: crate::query::data_client::IndexedDataClient| async move {
+            match data
+                .range_index_scan(
+                    schema.uid,
+                    hash_str("score"),
+                    range(50),
+                    vec![],
+                    dovahkiin::expr::serde::Expr::nothing(),
+                    dovahkiin::expr::serde::Expr::nothing(),
+                    crate::index::ranged::tree::btree::Ordering::Forward,
+                )
+                .await
+            {
+                Ok(mut cursor) => {
+                    let mut ids = Vec::new();
+                    while let Some(cell) = cursor.next().await.unwrap() {
+                        ids.push(cell.id());
+                    }
+                    Ok(ids)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let during = query(runtime.indexed_data_client()).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while repairs.pending() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pending_after_worker = repairs.pending();
+        let entry_present = indexer
+            .clients
+            .ranged_client
+            .contains(&score_key(&schema, &id, 50))
+            .await;
+        let after = query(runtime.indexed_data_client()).await;
+        server.shutdown().await;
+        assert!(pending_after_commit, "the failed index task recorded no repair");
+        assert!(
+            during
+                .as_ref()
+                .err()
+                .is_some_and(|error| IndexRepairPending::of(error).is_some()),
+            "a query during the repair answered {during:?}, not IndexRepairPending"
+        );
+        assert_eq!(pending_after_worker, 0, "the worker did not finish the repair");
+        assert!(matches!(entry_present, Ok(true)), "{entry_present:?}");
+        assert_eq!(after.unwrap(), vec![id]);
+    }
 }
 
 impl Service for DataManager {

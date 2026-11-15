@@ -48,6 +48,7 @@ impl IndexedDataClient {
         schema: SchemaUid,
         _ordering: QueryOrdering,
     ) -> Result<Vec<Id>, RPCError> {
+        self.index_clients.repairs.refuse_if_pending(schema)?;
         let key = EntryKey::for_schema(schema);
         let Some(mut index_cursor) = self
             .index_clients
@@ -120,6 +121,7 @@ impl IndexedDataClient {
         limit: usize,
         start_after: Option<Id>,
     ) -> Result<ScanPage, RPCError> {
+        self.index_clients.repairs.refuse_if_pending(schema)?;
         if limit == 0 {
             return Ok(ScanPage {
                 ids: vec![],

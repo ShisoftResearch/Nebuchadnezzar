@@ -672,6 +672,27 @@ async fn index_task_point(point: &'static str, cell: Id) {
     released.await;
 }
 
+/// How often the repair worker looks for repairs of failed index tasks.
+const INDEX_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Test hook: the next forward index task of these cells fails.
+#[cfg(test)]
+fn index_task_failures() -> &'static parking_lot::Mutex<std::collections::BTreeSet<Id>> {
+    static FAILURES: std::sync::OnceLock<parking_lot::Mutex<std::collections::BTreeSet<Id>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_index_task_of(cell: Id) {
+    index_task_failures().lock().insert(cell);
+}
+
+#[cfg(test)]
+fn take_index_task_failure(cell: Id) -> bool {
+    index_task_failures().lock().remove(&cell)
+}
+
 struct RequestIndexScope;
 
 impl RequestIndexScope {
@@ -831,9 +852,13 @@ impl IndexBuilder {
             // cell, which is not what the key is prefixed by.
             let schema_uid = schema.uid;
             let t_spawn = std::time::Instant::now();
-            new_index_task(&self.clients.pending_tasks, async move {
+            let task = async move {
                 #[cfg(test)]
                 index_task_point("forward", cell_id).await;
+                #[cfg(test)]
+                if take_index_task_failure(cell_id) {
+                    return Err(IndexError::Other("test: injected index task failure".into()));
+                }
                 if let Some(key) = scannable_key {
                     Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid)
                         .await?;
@@ -841,7 +866,8 @@ impl IndexBuilder {
                 let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
                 debug!("Ensure indices result: {:?}", res);
                 res
-            });
+            };
+            self.spawn_repairable(cell_id, schema_uid, task);
             IDX_SPAWN_NANOS.fetch_add(
                 t_spawn.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -876,7 +902,7 @@ impl IndexBuilder {
         let indexers = self.clients.clone();
         let cell_id = cell.id();
         let schema_uid = schema.uid;
-        new_index_task(&self.clients.pending_tasks, async move {
+        self.spawn_repairable(cell_id, schema_uid, async move {
             #[cfg(test)]
             index_task_point("restore", cell_id).await;
             if let Some(key) = restored_scannable_key {
@@ -975,7 +1001,7 @@ impl IndexBuilder {
             self.remove_scannable(cell, schema.uid, &indexers);
         }
         let indices = probe_cell_indices(cell, schema);
-        new_index_task(&self.clients.pending_tasks, async move {
+        self.spawn_repairable(cell.id(), schema.uid, async move {
             Self::remove_indices_(indices, indexers).await
         });
     }
@@ -993,13 +1019,78 @@ impl IndexBuilder {
     ) {
         let key = EntryKey::for_scannable(&cell.id(), schema_uid);
         let indexers = indexers.clone();
-        new_index_task(&self.clients.pending_tasks, async move {
+        self.spawn_repairable(cell.id(), schema_uid, async move {
             indexers
                 .ranged_client
                 .delete(&key)
                 .await
                 .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
+        });
+    }
+
+    /// Queue the index task `task` of the cell `cell`. If it fails, a repair
+    /// of the cell is recorded (`crate::index::repair`, D-F11), so the worker
+    /// re-asserts its entries and the queries of its schema answer
+    /// `IndexRepairPending` until then.
+    fn spawn_repairable(
+        &self,
+        cell: Id,
+        schema: SchemaUid,
+        task: impl Future<Output = Result<(), IndexError>> + Send + 'static,
+    ) {
+        let repairs = self.clients.repairs.clone();
+        new_index_task(&self.clients.pending_tasks, async move {
+            let result = task.await;
+            if result.is_err() {
+                repairs.record(cell, schema);
+            }
+            result
+        });
+    }
+
+    /// Start the worker that works off the repairs of failed index tasks
+    /// (D-F11). Each pass takes the generation of each pending repair, then
+    /// re-asserts the entries that the cell implies at that moment, then
+    /// removes the repair if no new failure of the cell came in between. A
+    /// repair whose entries cannot be confirmed stays for the next pass. The
+    /// worker ends when the store is dropped.
+    pub fn spawn_index_repair_worker(&self, chunks: std::sync::Weak<crate::ram::chunk::Chunks>) {
+        let clients = self.clients.clone();
+        tokio::spawn(async move {
+            let mut failures: u64 = 0;
+            loop {
+                tokio::time::sleep(INDEX_REPAIR_INTERVAL).await;
+                let Some(chunks) = chunks.upgrade() else { break };
+                for (cell, generation) in clients.repairs.snapshot() {
+                    match crate::index::scrub::reassert_cell_entries(&chunks, &clients, cell)
+                        .await
+                    {
+                        Ok(()) => {
+                            if clients.repairs.clear(&cell, generation) {
+                                log::warn!(
+                                    "index entries of cell {:?} are repaired after a failed \
+                                     index task",
+                                    cell
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            failures += 1;
+                            // The first one, then each power of two.
+                            if failures.is_power_of_two() {
+                                log::error!(
+                                    "the repair of the index entries of cell {:?} failed \
+                                     ({} failed repair attempt(s) so far): {}",
+                                    cell,
+                                    failures,
+                                    error
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         });
     }
 

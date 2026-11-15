@@ -195,6 +195,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
+        self.index_clients.repairs.refuse_if_pending(schema)?;
         let range = range.to_key_range(schema, field, ordering);
         let checks = vec![
             crate::index::verification::IndexCheck::Schema(schema),
@@ -1048,6 +1049,7 @@ impl IndexedDataClient {
         value: &OwnedValue,
         verify: Verify,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        self.index_clients.repairs.refuse_if_pending(schema)?;
         if Self::hashed_query_rejects_value(value) {
             return Err(Self::hashed_query_invalid_input_error(
                 schema, field_id, value,
