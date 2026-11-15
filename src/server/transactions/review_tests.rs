@@ -330,7 +330,7 @@ async fn rollback_failure_on_one_cell_retires_heads_and_recovery_discards_the_br
         <DataManager as Service>::end(&manager, tid, tid, false)
             .await
             .payload,
-        EndResult::Success
+        EndResult::CheckFailed(CheckError::AlreadyAborted)
     );
     runtime.chunks().sync_all().unwrap();
     server.shutdown().await;

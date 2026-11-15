@@ -4275,7 +4275,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -4363,7 +4363,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -5009,7 +5009,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(owner_of(&manager, &ids[0]), Some(owner.clone()));
         assert_eq!(owner_of(&manager, &ids[1]), None);
@@ -5308,7 +5308,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(owner_of(&manager, &id), None);
         server.shutdown().await;
@@ -5748,7 +5748,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid.clone(), tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         assert_eq!(
             runtime.chunks().read_cell(&id).unwrap().header.version,
@@ -5960,7 +5960,7 @@ mod tests {
             <DataManager as Service>::end(&manager, tid, tid, false)
                 .await
                 .payload,
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::AlreadyAborted)
         );
         if commit {
             for location in previous {
@@ -6120,7 +6120,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, victim.clone(), victim.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert_no_open_bracket(&runtime);
         server.shutdown().await;
     }
@@ -6173,7 +6173,7 @@ mod tests {
         let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
         server.shutdown().await;
     }
 
@@ -7453,7 +7453,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7524,7 +7524,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7614,7 +7614,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
         assert!(manager.cell_meta_mutex(&cell_b).lock().owner.is_none());
         server.shutdown().await;
@@ -7701,7 +7701,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -7932,6 +7932,7 @@ mod tests {
                     result,
                     EndResult::Success
                         | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::AlreadyAborted)
                         | EndResult::CheckFailed(CheckError::CannotEnd)
                         | EndResult::LockReleaseRetriesExhausted { .. }
                         | EndResult::SomeLocksNotReleased { .. }
@@ -8271,7 +8272,7 @@ mod tests {
         let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end_result, EndResult::Success);
+        assert_eq!(end_result, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
@@ -8375,7 +8376,7 @@ mod tests {
         let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone(), false)
             .await
             .payload;
-        assert_eq!(end_t2, EndResult::Success);
+        assert_eq!(end_t2, EndResult::CheckFailed(CheckError::AlreadyAborted));
 
         let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
             .await
@@ -8384,7 +8385,7 @@ mod tests {
         let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone(), false)
             .await
             .payload;
-        assert_eq!(end_t1, EndResult::Success);
+        assert_eq!(end_t1, EndResult::CheckFailed(CheckError::AlreadyAborted));
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
