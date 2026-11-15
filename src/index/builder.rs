@@ -675,6 +675,11 @@ async fn index_task_point(point: &'static str, cell: Id) {
 /// How often the repair worker looks for repairs of failed index tasks.
 const INDEX_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Test hook: the repair worker skips its passes while this is set.
+#[cfg(test)]
+pub(crate) static INDEX_REPAIR_PAUSED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test hook: the next forward index task of these cells fails.
 #[cfg(test)]
 fn index_task_failures() -> &'static parking_lot::Mutex<std::collections::BTreeSet<Id>> {
@@ -1062,6 +1067,10 @@ impl IndexBuilder {
             loop {
                 tokio::time::sleep(INDEX_REPAIR_INTERVAL).await;
                 let Some(chunks) = chunks.upgrade() else { break };
+                #[cfg(test)]
+                if INDEX_REPAIR_PAUSED_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
                 for (cell, generation) in clients.repairs.snapshot() {
                     match crate::index::scrub::reassert_cell_entries(&chunks, &clients, cell)
                         .await

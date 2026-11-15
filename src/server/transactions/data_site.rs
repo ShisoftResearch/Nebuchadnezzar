@@ -9687,6 +9687,9 @@ mod tests {
         let id = Id::allocated(0, 0, 9521);
         let tid = test_hlc(1, 9521);
         let versions = seed_indexed(&runtime, &schema, &[id]).await;
+        // The repair stays pending until the readers below have asked.
+        crate::index::builder::INDEX_REPAIR_PAUSED_FOR_TEST
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         crate::index::builder::fail_next_index_task_of(id);
         assert_eq!(
             prepare_ops_local(&manager, 9521, &tid, present_writes(&[id], &versions)).await,
@@ -9736,6 +9739,41 @@ mod tests {
             }
         };
         let during = query(runtime.indexed_data_client()).await;
+        // A ranged reader that is not an `IndexedDataClient`: the client of
+        // `client::ranged`, as the gRPC scan and the job store use it.
+        let client = server
+            .data_client(&vec![server.rpc.address().clone()])
+            .await
+            .unwrap();
+        let feature = OwnedValue::U64(50).feature();
+        let ranged_query = || async {
+            match client
+                .ranged()
+                .range_query(
+                    schema.uid,
+                    hash_str("score"),
+                    Some(&feature),
+                    Some(&feature),
+                    crate::client::ranged::ScanOrder::Forward,
+                    16,
+                    crate::index::verification::Verify::Exists,
+                )
+                .await
+            {
+                Ok(Some(mut cursor)) => {
+                    let mut ids = Vec::new();
+                    while let Some(id) = cursor.next().await.unwrap() {
+                        ids.push(id);
+                    }
+                    Ok(ids)
+                }
+                Ok(None) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        };
+        let ranged_during = ranged_query().await;
+        crate::index::builder::INDEX_REPAIR_PAUSED_FOR_TEST
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while repairs.pending() > 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9747,6 +9785,7 @@ mod tests {
             .contains(&score_key(&schema, &id, 50))
             .await;
         let after = query(runtime.indexed_data_client()).await;
+        let ranged_after = ranged_query().await;
         server.shutdown().await;
         assert!(pending_after_commit, "the failed index task recorded no repair");
         assert!(
@@ -9759,6 +9798,15 @@ mod tests {
         assert_eq!(pending_after_worker, 0, "the worker did not finish the repair");
         assert!(matches!(entry_present, Ok(true)), "{entry_present:?}");
         assert_eq!(after.unwrap(), vec![id]);
+        assert!(
+            ranged_during
+                .as_ref()
+                .err()
+                .is_some_and(|error| IndexRepairPending::of(error).is_some()),
+            "a ranged-client scan during the repair answered {ranged_during:?}, not \
+             IndexRepairPending"
+        );
+        assert_eq!(ranged_after.unwrap(), vec![id]);
     }
 }
 

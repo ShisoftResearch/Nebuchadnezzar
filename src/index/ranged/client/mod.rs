@@ -78,6 +78,8 @@ pub struct RangedIndexerClient {
     group_name: String,
     database_name: String,
     placement: PlacementCache,
+    /// The index repairs of this database in this process (D-F11 C3).
+    repairs: Arc<crate::index::repair::IndexRepairs>,
 }
 
 /// The three outcomes of asking for the tree after a key. See
@@ -104,6 +106,7 @@ impl RangedIndexerClient {
             group_name: String::new(),
             database_name: String::new(),
             placement: PlacementCache::default(),
+            repairs: crate::index::repair::IndexRepairs::for_database("", ""),
         }
     }
 
@@ -124,6 +127,7 @@ impl RangedIndexerClient {
             group_name: group_name.to_string(),
             database_name: database_name.to_string(),
             placement: PlacementCache::default(),
+            repairs: crate::index::repair::IndexRepairs::for_database(group_name, database_name),
         }
     }
 
@@ -133,6 +137,10 @@ impl RangedIndexerClient {
         buffer_size: u16,
         pattern: Option<Vec<u8>>,
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
+        // A failed index task of a cell in this range is not repaired yet:
+        // the scan could miss its rows (D-F11 C3). Every ranged reader of the
+        // process seeks here.
+        self_ref.repairs.refuse_range_if_pending(&range)?;
         let trace_seek = log::log_enabled!(log::Level::Debug);
         let mut range = range;
         // The follow-empty walk below has no bound and no sleep: a server

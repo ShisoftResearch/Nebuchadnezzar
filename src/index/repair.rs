@@ -22,10 +22,15 @@
 //!   entry again.
 //! * A record has a generation. The worker removes a record only if no new
 //!   failure of the cell came while it worked (`IndexRepairNoGen` fails).
-//! * Full-text entries are not re-asserted: their insert is not idempotent.
-//!   A failed task of a full-text cell is repaired for its other index types.
-//! * The records are per process. A query served by the indexer clients of
-//!   another process does not see them.
+//! * The worker re-asserts the ranged, scannable and hash entries, the types
+//!   that the recovery reconcile covers. Full-text, vector and embedding
+//!   entries are not re-asserted (a full-text insert is not idempotent).
+//! * The records are per process and per database (`IndexRepairs::for_database`):
+//!   every index reader of the process sees them -- `IndexedDataClient`, and
+//!   every ranged seek (`RangedIndexerClient::seek`, which the ranged client
+//!   `client::ranged` and the scans use). A reader in another process does
+//!   not see them: it can miss the rows of a cell until the repair of the
+//!   process that wrote the cell is done.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -49,6 +54,7 @@ pub struct IndexRepairs {
     cells: KeyedState<Id, CellRepair>,
     /// Pending repairs per schema family. Updated under the entry of the
     /// cell, so it is never below the number of records of the schema.
+    /// Ordered, so a refusal of a scan over several families can name one.
     schemas: KeyedState<u64, usize>,
     /// All pending repairs: the fast path of a query is one atomic load.
     pending: AtomicUsize,
@@ -58,13 +64,25 @@ impl Default for IndexRepairs {
     fn default() -> Self {
         Self {
             cells: KeyedState::ordered(),
-            schemas: KeyedState::default(),
+            schemas: KeyedState::ordered(),
             pending: AtomicUsize::new(0),
         }
     }
 }
 
 impl IndexRepairs {
+    /// The repairs of the database `database` of `group` in this process. All
+    /// index clients of the process share them, so every reader sees a
+    /// repair that any writer of the process recorded.
+    pub fn for_database(group: &str, database: &str) -> Arc<IndexRepairs> {
+        use lightning::map::Map;
+        static ALL: std::sync::OnceLock<lightning::map::PtrHashMap<u64, Arc<IndexRepairs>>> =
+            std::sync::OnceLock::new();
+        let all = ALL.get_or_init(|| lightning::map::PtrHashMap::with_capacity(16));
+        let key = bifrost_hasher::hash_str(&format!("{group}/{database}"));
+        crate::utils::keyed_state::get_or_insert(all, key, || Arc::new(IndexRepairs::default()))
+    }
+
     /// Record that an index task of `cell` (of the schema family `schema`)
     /// failed.
     pub fn record(&self, cell: Id, schema: SchemaUid) {
@@ -130,6 +148,34 @@ impl IndexRepairs {
         self.schemas
             .get(&(schema.get() as u64))
             .is_some_and(|count| count.is_some())
+    }
+
+    /// `Err(IndexRepairPending)` if a seek over `range` can meet a cell with a
+    /// pending repair: the families at both ends are one family with a
+    /// pending repair, or the range is open or spans families and any repair
+    /// is pending.
+    pub fn refuse_range_if_pending(
+        &self,
+        range: &crate::index::ranged::tree::service::Range,
+    ) -> Result<(), RPCError> {
+        use crate::index::ranged::tree::service::RangeTerm;
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let family = |term: &RangeTerm| match term {
+            RangeTerm::Inclusive(key) | RangeTerm::Exclusive(key) => Some(key.schema_family()),
+            RangeTerm::Open => None,
+        };
+        match (family(&range.start), family(&range.end)) {
+            (Some(start), Some(end)) if start == end => self.refuse_if_pending(start),
+            _ => match self.schemas.keys().next() {
+                Some(schema) => Err(IndexRepairPending {
+                    schema: SchemaUid(schema as u32),
+                }
+                .into_rpc_error()),
+                None => Ok(()),
+            },
+        }
     }
 
     /// `Err(IndexRepairPending)` if the schema family `schema` has a pending

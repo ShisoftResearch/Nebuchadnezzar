@@ -431,6 +431,11 @@ cell's value finds the cell or answers an error. `RepairEnds` (liveness,
 | `IndexRepairNoReconcile.cfg` | a crash loses the records and the reconcile is off | `NoSilentMiss` violated | 73 | 3 |
 | `IndexRepairSanity.cfg` | `SanityRepaired` violated on purpose | violated | 2,687 | 8 |
 
+C3 is checked by every index reader of the process: `IndexedDataClient` and
+every ranged seek (`RangedIndexerClient::seek`, so also `client::ranged`).
+The records are per process and per database; a reader in another process
+does not see them, and the model has one process.
+
 The records are memory, not a WAL record: with the recovery reconcile on (the
 default), a crash needs no record (`IndexRepairShipped` has the crash on).
 The worker only inserts; a stale entry stays until the full scrub prunes it,
