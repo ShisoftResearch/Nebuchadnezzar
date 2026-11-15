@@ -1891,7 +1891,10 @@ impl TransactionManager {
                 Ok(response) => {
                     self.merge_clock(response.clock);
                     match response.payload {
-                        EndResult::Success | EndResult::CheckFailed(CheckError::NotExisted) => {}
+                        // `end` of an aborted participant answers AlreadyAborted.
+                        EndResult::Success
+                        | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::AlreadyAborted) => {}
                         other => {
                             error!(
                                 "Abort cleanup could not end participant {} for {:?}: {:?}",

@@ -1605,6 +1605,19 @@ impl DataManager {
         }
         self.cleanup_signal.store(true, Relaxed);
 
+        // An aborted transaction is never reported as a success, whoever
+        // sends the `end`: a late coordinator `end` for its COMMIT must not
+        // tell the client that it committed (TLA+ OccCommit F1). The abort
+        // cleanup of the coordinator takes this answer as a finished end.
+        if txn_state == TxnState::Aborted {
+            if let Err((released, total, _)) = &lock_release_result {
+                error!(
+                    "ENDED aborted {:?} with lock release failures ({}/{} released)",
+                    tid, released, total
+                );
+            }
+            return EndResult::CheckFailed(CheckError::AlreadyAborted);
+        }
         // Return appropriate result based on lock release outcome
         match lock_release_result {
             Ok(()) => {
@@ -3971,7 +3984,8 @@ mod tests {
         let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone(), false)
             .await
             .payload;
-        assert_eq!(end, EndResult::Success);
+        // The `end` of an aborted transaction never answers Success (fix A).
+        assert_eq!(end, EndResult::CheckFailed(CheckError::AlreadyAborted));
     }
 
     /// A server whose chunk has room for several segments. A transaction only
@@ -9096,10 +9110,10 @@ mod tests {
 
     /// MODEL CHECK F1 (docs/tla/OccCommit.tla, OccR1F1.cfg). A presumed
     /// abort that cannot restore a cell keeps the object Aborted. A late
-    /// coordinator `end` for the COMMIT then answers Success, and the
-    /// coordinator tells the client that the transaction committed
-    /// (M:2061 `end_sites`). The retry of the restoration then removes the
-    /// write. Expected to FAIL on the current code. Do not commit.
+    /// coordinator `end` for the COMMIT answered Success, and the
+    /// coordinator told the client that the transaction committed
+    /// (`end_sites`); the retry of the restoration then removed the write.
+    /// Fix A: `end` of an aborted object answers `AlreadyAborted`.
     #[tokio::test(flavor = "multi_thread")]
     async fn model_check_f1_late_end_after_failed_presumed_abort_is_not_success() {
         let _ = env_logger::try_init();
