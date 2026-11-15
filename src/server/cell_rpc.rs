@@ -695,14 +695,22 @@ impl Service for NebRPCService {
             let _fence =
                 self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
+                .with_indices_ensured(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .write_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_indices_ensured(|| {
-                        self.database_runtime.chunks().write_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .write_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -717,14 +725,22 @@ impl Service for NebRPCService {
             let _fence =
                 self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
+                .with_indices_ensured(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .update_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_indices_ensured(|| {
-                        self.database_runtime.chunks().update_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .update_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -1315,9 +1331,11 @@ impl Service for NebRPCService {
                 self.admit_write(&key, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_indices_ensured(|| {
-                    self.database_runtime
-                        .chunks()
-                        .compare_version_and_update_cell(&key, version, &mut cell)
+                    self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_update_cell(&key, version, &mut cell)
+                    })
                 })
                 .await;
             match result {
@@ -1325,9 +1343,11 @@ impl Service for NebRPCService {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_indices_ensured(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_update_cell(&key, version, &mut cell)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_update_cell(&key, version, &mut cell)
+                        })
                     })
                     .await
                 }
@@ -1349,9 +1369,11 @@ impl Service for NebRPCService {
             let first_value = value.clone();
             let result = self
                 .with_indices_ensured(|| {
-                    self.database_runtime
-                        .chunks()
-                        .compare_version_and_set_field(&key, version, field, first_value)
+                    self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_set_field(&key, version, field, first_value)
+                    })
                 })
                 .await;
             match result {
@@ -1359,9 +1381,11 @@ impl Service for NebRPCService {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_indices_ensured(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_set_field(&key, version, field, value)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_set_field(&key, version, field, value)
+                        })
                     })
                     .await
                 }
@@ -1379,9 +1403,11 @@ impl Service for NebRPCService {
             let _fence =
                 self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let remove = || {
-                self.database_runtime
-                    .chunks()
-                    .compare_version_and_remove_cell(&key, version)
+                self.plain_write(key, || {
+                    self.database_runtime
+                        .chunks()
+                        .compare_version_and_remove_cell(&key, version)
+                })
             };
             match self.with_indices_ensured(remove).await {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
@@ -1704,14 +1730,22 @@ impl Service for NebRPCService {
             let _fence =
                 self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
-                .with_durable_indices(|| self.database_runtime.chunks().write_cell(&mut cell))
+                .with_durable_indices(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .write_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_durable_indices(|| {
-                        self.database_runtime.chunks().write_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .write_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -1729,14 +1763,22 @@ impl Service for NebRPCService {
             let _fence =
                 self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
-                .with_durable_indices(|| self.database_runtime.chunks().update_cell(&mut cell))
+                .with_durable_indices(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .update_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_durable_indices(|| {
-                        self.database_runtime.chunks().update_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .update_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -1780,7 +1822,11 @@ impl Service for NebRPCService {
                 self.admit_write(&cell.header.id, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_captured_op(|| {
-                    self.capture_for_rpc(|| self.database_runtime.chunks().write_cell(&mut cell))
+                    self.capture_for_rpc(|| self.plain_write(cell.header.id, || {
+                        self.database_runtime
+                            .chunks()
+                            .write_cell(&mut cell)
+                    }))
                 })
                 .await;
             match result {
@@ -1789,7 +1835,11 @@ impl Service for NebRPCService {
                         .await?;
                     self.with_captured_op(|| {
                         self.capture_for_rpc(|| {
-                            self.database_runtime.chunks().write_cell(&mut cell)
+                            self.plain_write(cell.header.id, || {
+                                self.database_runtime
+                                    .chunks()
+                                    .write_cell(&mut cell)
+                            })
                         })
                     })
                     .await
@@ -1806,14 +1856,22 @@ impl Service for NebRPCService {
                 self.admit_write(&key, || self.fence_for_cell_id(&key)).await?;
             let result = self
                 .with_captured_op(|| {
-                    self.capture_for_rpc(|| self.database_runtime.chunks().remove_cell(&key))
+                    self.capture_for_rpc(|| self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .remove_cell(&key)
+                    }))
                 })
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(schema)) => {
                     self.refresh_local_schema_cache_for_write(schema).await?;
                     self.with_captured_op(|| {
-                        self.capture_for_rpc(|| self.database_runtime.chunks().remove_cell(&key))
+                        self.capture_for_rpc(|| self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .remove_cell(&key)
+                        }))
                     })
                     .await
                 }
@@ -1835,9 +1893,11 @@ impl Service for NebRPCService {
             let result = self
                 .with_captured_op(|| {
                     self.capture_for_rpc(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_update_cell(&key, version, &mut cell)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_update_cell(&key, version, &mut cell)
+                        })
                     })
                 })
                 .await;
@@ -1847,9 +1907,11 @@ impl Service for NebRPCService {
                         .await?;
                     self.with_captured_op(|| {
                         self.capture_for_rpc(|| {
-                            self.database_runtime
-                                .chunks()
-                                .compare_version_and_update_cell(&key, version, &mut cell)
+                            self.plain_write(key, || {
+                                self.database_runtime
+                                    .chunks()
+                                    .compare_version_and_update_cell(&key, version, &mut cell)
+                            })
                         })
                     })
                     .await
@@ -1874,9 +1936,11 @@ impl Service for NebRPCService {
             let result = self
                 .with_captured_op(|| {
                     self.capture_for_rpc(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_set_field(&key, version, field, first_value)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_set_field(&key, version, field, first_value)
+                        })
                     })
                 })
                 .await;
@@ -1886,9 +1950,11 @@ impl Service for NebRPCService {
                         .await?;
                     self.with_captured_op(|| {
                         self.capture_for_rpc(|| {
-                            self.database_runtime
-                                .chunks()
-                                .compare_version_and_set_field(&key, version, field, value)
+                            self.plain_write(key, || {
+                                self.database_runtime
+                                    .chunks()
+                                    .compare_version_and_set_field(&key, version, field, value)
+                            })
                         })
                     })
                     .await
@@ -1953,9 +2019,11 @@ impl Service for NebRPCService {
                 self.admit_write(&key, || self.fence_for_cell_body(&cell)).await?;
             let result = self
                 .with_durable_indices(|| {
-                    self.database_runtime
-                        .chunks()
-                        .compare_version_and_update_cell(&key, version, &mut cell)
+                    self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_update_cell(&key, version, &mut cell)
+                    })
                 })
                 .await;
             match result {
@@ -1963,9 +2031,11 @@ impl Service for NebRPCService {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_durable_indices(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_update_cell(&key, version, &mut cell)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_update_cell(&key, version, &mut cell)
+                        })
                     })
                     .await
                 }
@@ -1988,9 +2058,11 @@ impl Service for NebRPCService {
             let first_value = value.clone();
             let result = self
                 .with_durable_indices(|| {
-                    self.database_runtime
-                        .chunks()
-                        .compare_version_and_set_field(&key, version, field, first_value)
+                    self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_set_field(&key, version, field, first_value)
+                    })
                 })
                 .await;
             match result {
@@ -1998,9 +2070,11 @@ impl Service for NebRPCService {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_durable_indices(|| {
-                        self.database_runtime
-                            .chunks()
-                            .compare_version_and_set_field(&key, version, field, value)
+                        self.plain_write(key, || {
+                            self.database_runtime
+                                .chunks()
+                                .compare_version_and_set_field(&key, version, field, value)
+                        })
                     })
                     .await
                 }
@@ -2309,14 +2383,22 @@ impl NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().upsert_cell(&mut cell))
+                .with_indices_ensured(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .upsert_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_indices_ensured(|| {
-                        self.database_runtime.chunks().upsert_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .upsert_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -2328,13 +2410,21 @@ impl NebRPCService {
     fn remove_cell_unchecked(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
             let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                .with_indices_ensured(|| self.plain_write(key, || {
+                    self.database_runtime
+                        .chunks()
+                        .remove_cell(&key)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
-                    self.with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                    self.with_indices_ensured(|| self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .remove_cell(&key)
+                    }))
                         .await
                 }
                 other => other,
@@ -2349,14 +2439,22 @@ impl NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
             let result = self
-                .with_durable_indices(|| self.database_runtime.chunks().upsert_cell(&mut cell))
+                .with_durable_indices(|| self.plain_write(cell.header.id, || {
+                    self.database_runtime
+                        .chunks()
+                        .upsert_cell(&mut cell)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
                     self.with_durable_indices(|| {
-                        self.database_runtime.chunks().upsert_cell(&mut cell)
+                        self.plain_write(cell.header.id, || {
+                            self.database_runtime
+                                .chunks()
+                                .upsert_cell(&mut cell)
+                        })
                     })
                     .await
                 }
@@ -2369,13 +2467,21 @@ impl NebRPCService {
     fn remove_cell_durable_unchecked(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
             let result = self
-                .with_durable_indices(|| self.database_runtime.chunks().remove_cell(&key))
+                .with_durable_indices(|| self.plain_write(key, || {
+                    self.database_runtime
+                        .chunks()
+                        .remove_cell(&key)
+                }))
                 .await;
             match result {
                 Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
                     self.refresh_local_schema_cache_for_write(missing_schema_id)
                         .await?;
-                    self.with_durable_indices(|| self.database_runtime.chunks().remove_cell(&key))
+                    self.with_durable_indices(|| self.plain_write(key, || {
+                        self.database_runtime
+                            .chunks()
+                            .remove_cell(&key)
+                    }))
                         .await
                 }
                 other => other,
@@ -2506,6 +2612,24 @@ impl NebRPCService {
                 })
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Run the plain write `write` of the cell `id`, unless a transaction of
+    /// this database holds the cell (`WriteError::CellInTransaction`).
+    ///
+    /// Called inside the synchronous part of the write, so the check and the
+    /// write are one step for the transactions: see
+    /// `DataManager::admit_plain_write`. A database without a transaction
+    /// service has no transaction that could hold the cell.
+    fn plain_write<R>(
+        &self,
+        id: Id,
+        write: impl FnOnce() -> Result<R, WriteError>,
+    ) -> Result<R, WriteError> {
+        match self.database_runtime.data_site() {
+            Some(site) => site.admit_plain_write(&id, write),
+            None => write(),
         }
     }
 
@@ -2643,9 +2767,9 @@ impl NebRPCService {
     ) -> Result<CellHeader, WriteError> {
         let _fence = self.admit_write_now(&cell.header.id, || self.fence_for_cell_body(cell))?;
         if insert {
-            self.database_runtime.chunks().write_cell(cell)
+            self.plain_write(cell.header.id, || self.database_runtime.chunks().write_cell(cell))
         } else {
-            self.database_runtime.chunks().upsert_cell(cell)
+            self.plain_write(cell.header.id, || self.database_runtime.chunks().upsert_cell(cell))
         }
     }
 
@@ -2659,9 +2783,17 @@ impl NebRPCService {
         let (result, tasks) = IndexBuilder::with_request_index_scope(|| {
             crate::ram::durability::capture(|| {
                 if insert {
-                    self.database_runtime.chunks().write_cell(cell)
+                    self.plain_write(cell.header.id, || {
+                        self.database_runtime
+                            .chunks()
+                            .write_cell(cell)
+                    })
                 } else {
-                    self.database_runtime.chunks().upsert_cell(cell)
+                    self.plain_write(cell.header.id, || {
+                        self.database_runtime
+                            .chunks()
+                            .upsert_cell(cell)
+                    })
                 }
             })
             .0

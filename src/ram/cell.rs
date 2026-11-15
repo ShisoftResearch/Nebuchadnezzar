@@ -139,6 +139,15 @@ pub enum WriteError {
     /// member, and the handover did not end in the time that a write waits.
     /// Nothing was written; the write is retryable.
     SlotMoving,
+    /// A plain (non-transactional) write or delete of a cell that a
+    /// transaction holds: the transaction locked the cell at its prepare and
+    /// did not end yet, or the cell is in doubt after a restart. Nothing was
+    /// written; the write is retryable when the transaction ends.
+    ///
+    /// Refused because the write would break the transaction: an abort could
+    /// not restore the cell, and the resolution of an in-doubt transaction
+    /// would install its cell over the write (TLA+ OccCommit F6).
+    CellInTransaction,
 }
 
 impl WriteError {

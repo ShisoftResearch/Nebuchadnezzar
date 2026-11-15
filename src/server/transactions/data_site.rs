@@ -1008,6 +1008,48 @@ impl DataManager {
         })
     }
 
+    /// Run the plain (non-transactional) write `write` of the cell `id`,
+    /// unless a transaction holds the cell (TLA+ OccCommit F6, fix G).
+    ///
+    /// A transaction holds a cell from the lock of its prepare to its end,
+    /// and a cell of a bracket in doubt after a restart until the resolution.
+    /// A plain write in between would break it: an abort could not restore
+    /// the cell (a leftover lock and object), and a resolution would install
+    /// the transaction's cell over the acknowledged write. Such a write is
+    /// refused with the retryable `WriteError::CellInTransaction`.
+    ///
+    /// The check and the write are one step for the transactions (the model
+    /// config `OccShippedPlainSplit` shows that a check before the write is
+    /// not enough). With cell metadata, the write runs under its lock, which
+    /// every prepare, apply and abort takes. Without metadata, the write runs
+    /// under the entry guard of the metadata map, so a prepare cannot create
+    /// the metadata and lock the cell until the write ends. The guard and the
+    /// lock are per cell, and the write holds no other lock of this site.
+    pub(crate) fn admit_plain_write<R>(
+        &self,
+        id: &Id,
+        write: impl FnOnce() -> Result<R, WriteError>,
+    ) -> Result<R, WriteError> {
+        // A cell leaves the in-doubt set only after its resolution installed
+        // or discarded the bracket, so a write that passes here is after it.
+        if self.chunks().txn_status().is_in_doubt_cell(id.bits()) {
+            return Err(WriteError::CellInTransaction);
+        }
+        let entry = crate::profile_lock!(H07, self.cells.entry(id));
+        let Some(meta) = entry.as_ref().cloned() else {
+            return write();
+        };
+        // The metadata lock is taken after the entry guard is released, as
+        // in `cell_meta_mutex`: `cell_meta_cleanup` takes them in the other
+        // order. The clone keeps the cleanup from unmapping this metadata.
+        drop(entry);
+        let meta = meta.lock();
+        if meta.owner.is_some() {
+            return Err(WriteError::CellInTransaction);
+        }
+        write()
+    }
+
     /// The index gate of `tid`, if this site holds the transaction.
     fn index_gate(&self, tid: &TxnId) -> Option<Arc<tokio::sync::Mutex<()>>> {
         let txn_lock = self.find_transaction(tid)?;
@@ -9345,6 +9387,81 @@ mod tests {
         server.shutdown().await;
         assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::Fenced));
         assert_eq!(score, Some(5), "a fenced site published a write of the apply");
+    }
+
+    /// MODEL CHECK F6 (OccM1Plain.cfg, OccPlainKept.cfg; fix G). A plain
+    /// write or delete of a cell that a transaction holds, or of a cell in
+    /// doubt after a restart, is refused with the retryable
+    /// `CellInTransaction`. After the transaction ends, it is accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f6_a_plain_write_is_refused_while_a_transaction_holds_the_cell() {
+        let _ = env_logger::try_init();
+        let address = crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f6";
+        let server = start_lease_test_server(&address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = runtime.data_site().expect("the server runs a data site");
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![address.clone()],
+                group,
+            )
+            .await
+            .unwrap(),
+        );
+        let held = Id::allocated(0, 0, 9501);
+        let free = Id::allocated(0, 0, 9502);
+        let in_doubt = Id::allocated(0, 0, 9503);
+        let version = seed_cell_version(&runtime, schema.vid.get(), held, 5, 0);
+        seed_cell_version(&runtime, schema.vid.get(), free, 5, 0);
+        seed_cell_version(&runtime, schema.vid.get(), in_doubt, 5, 0);
+        let tid = test_hlc(1, 9501);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9501,
+                &tid,
+                vec![PrepareOp {
+                    id: held,
+                    expectation: CellExpectation::Present(version),
+                    intent: PrepareIntent::Read,
+                }]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        let cell = |id, score| counter_cell(schema.vid.get(), id, score, "plain");
+        let upsert_held = client.upsert_cell(cell(held, 77)).await.unwrap();
+        let remove_held = client.remove_cell(held).await.unwrap();
+        let cas_held = client
+            .compare_version_and_update_cell(held, version, cell(held, 78))
+            .await
+            .unwrap();
+        // Control: a cell that no transaction holds takes the write.
+        let upsert_free = client.upsert_cell(cell(free, 77)).await.unwrap();
+        let doubt = test_hlc(2, 9503);
+        runtime
+            .chunks()
+            .txn_status()
+            .begin_resolving(doubt.clone(), vec![1, 2], vec![in_doubt.bits()]);
+        let upsert_in_doubt = client.upsert_cell(cell(in_doubt, 77)).await.unwrap();
+        runtime.chunks().txn_status().end_resolving(&doubt);
+        let upsert_resolved = client.upsert_cell(cell(in_doubt, 79)).await.unwrap();
+        abort_and_end_local(&manager, &tid).await;
+        let upsert_ended = client.upsert_cell(cell(held, 80)).await.unwrap();
+        let score = score_of(&runtime, &held);
+        server.shutdown().await;
+        assert_eq!(upsert_held.err(), Some(WriteError::CellInTransaction));
+        assert_eq!(remove_held.err(), Some(WriteError::CellInTransaction));
+        assert_eq!(cas_held.err(), Some(WriteError::CellInTransaction));
+        assert!(upsert_free.is_ok(), "{upsert_free:?}");
+        assert_eq!(upsert_in_doubt.err(), Some(WriteError::CellInTransaction));
+        assert!(upsert_resolved.is_ok(), "{upsert_resolved:?}");
+        assert!(upsert_ended.is_ok(), "{upsert_ended:?}");
+        assert_eq!(score, Some(80));
     }
 
     /// MODEL CHECK F7 (OccLUCrashAll.cfg; fix F). A transaction decided
