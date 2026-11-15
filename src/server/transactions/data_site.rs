@@ -1433,7 +1433,72 @@ impl DataManager {
         for tid in crate::ram::chunk::retire_expired_transaction_leases(orphans, idle, &store) {
             self.wipe_out_transaction(&tid);
         }
+        self.end_idle_unleased_transactions(idle);
         self.finish_aborted_transactions(idle).await;
+    }
+
+    /// End each transaction object that holds no write lease and had no
+    /// activity for `idle` (TLA+ OccCommit F2, fix B): a `Started` object, a
+    /// `Prepared` one, and a `Committed` part that applied no write and is not
+    /// decided. The lease sweep and the participant fence never see such an
+    /// object, so a coordinator that stopped, or a lost `abort` or `end`,
+    /// would leave it and its cell locks for good.
+    ///
+    /// Under the index gate and the transaction lock, the object becomes
+    /// `Aborted` before its locks go: a late `commit` then finds it aborted or
+    /// gone and applies nothing. A `Prepared` participant records the abort,
+    /// so a peer in doubt is told `Aborted`.
+    fn end_idle_unleased_transactions(&self, idle: std::time::Duration) {
+        let now = get_time();
+        let idle_ms = idle.as_millis().min(i64::MAX as u128) as i64;
+        for tid in self.transaction_ids() {
+            let Some(txn_lock) = self.find_transaction(&tid) else {
+                continue;
+            };
+            let gate = txn_lock.lock().index_gate.clone();
+            // A busy gate is an RPC of this transaction still running.
+            let Ok(_gate) = gate.try_lock() else {
+                continue;
+            };
+            let ended = {
+                let mut txn = txn_lock.lock();
+                let unleased = match txn.state {
+                    TxnState::Started | TxnState::Prepared => true,
+                    TxnState::Committed => txn.history.is_empty() && !txn.decided_commit,
+                    TxnState::Aborted | TxnState::Cleanup => false,
+                };
+                if !unleased || now.saturating_sub(txn.last_activity) < idle_ms {
+                    None
+                } else {
+                    let participant = txn.state == TxnState::Prepared
+                        && txn
+                            .certified
+                            .values()
+                            .any(|op| op.intent == PrepareIntent::Write);
+                    txn.state = TxnState::Aborted;
+                    let owner = txn
+                        .coordinator_id
+                        .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id));
+                    Some((owner, Self::guarded_txn_cell_ids(&txn), participant))
+                }
+            };
+            let Some((owner, cells, participant)) = ended else {
+                continue;
+            };
+            warn!(
+                "transaction {:?} held no write lease and had no activity for {:?}; its \
+                 object and {} cell lock(s) are released",
+                tid,
+                idle,
+                cells.len()
+            );
+            self.attempt_lock_release(owner.as_ref(), &cells);
+            if participant {
+                self.record_decision(&tid, TxnOutcome::Aborted);
+            }
+            self.wipe_out_transaction(&tid);
+            self.cleanup_signal.store(true, Relaxed);
+        }
     }
 
     /// The work of `end`, under the index gate of `tid`: close or finish
@@ -9185,10 +9250,10 @@ mod tests {
 
     /// MODEL CHECK F2 (docs/tla/OccCommit.tla, OccR1Lock.cfg). A participant
     /// prepared a transaction and its coordinator went away before the
-    /// apply. The object holds no write lease, so no sweep ends it, and a
-    /// transactional read waits on its lock for good (D:2755 waits on any
-    /// owner and never reclaims). Expected to FAIL on the current code. Do
-    /// not commit.
+    /// apply. The object holds no write lease, so no lease sweep ends it,
+    /// and a transactional read waited on its lock for good (`prepare_read`
+    /// waits on any owner and never reclaims). Fix B: the sweep ends idle
+    /// objects without leases.
     #[tokio::test(flavor = "multi_thread")]
     async fn model_check_f2_prepared_object_without_coordinator_blocks_reads_for_good() {
         let _ = env_logger::try_init();
