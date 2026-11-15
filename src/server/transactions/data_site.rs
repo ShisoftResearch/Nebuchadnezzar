@@ -988,8 +988,8 @@ impl DataManager {
     }
 
     /// Whether the owner of a cell lock has applied writes here that are
-    /// not decided commit and not yet restored: applied and undecided, or
-    /// aborted with its restoration still pending.
+    /// not closed and not yet restored: applied and undecided, decided with
+    /// its close not finished, or aborted with its restoration pending.
     ///
     /// Its lock is never reclaimed as stale. The abort of the owner rolls its
     /// writes back only while it owns the cells, and a reader without the
@@ -998,9 +998,13 @@ impl DataManager {
     /// a cell lock, so it must not wait for the owner's lock.
     fn owner_waits_with_writes(&self, owner: &TxnPriority) -> bool {
         self.find_transaction(&owner.tid).is_some_and(|txn_lock| {
-            txn_lock.try_lock().map_or(true, |txn| {
-                !txn.decided_commit && !txn.history.is_empty() && !txn.restored
-            })
+            // A decided owner whose close is not finished keeps its history
+            // and counts too: its COMMIT is not durable yet, and a crash can
+            // still discard its writes (TLA+ OccCommit F7). A close clears
+            // the history.
+            txn_lock
+                .try_lock()
+                .map_or(true, |txn| !txn.history.is_empty() && !txn.restored)
         })
     }
 
@@ -9298,6 +9302,69 @@ mod tests {
              whose coordinator is gone (object present: {still_there})"
         );
     }
+    /// MODEL CHECK F7 (OccLUCrashAll.cfg; fix F). A transaction decided
+    /// COMMIT whose close was refused keeps its applied write without a
+    /// durable COMMIT: a crash still discards it. Its lock must not be
+    /// reclaimed as stale, or another transaction commits on top of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_check_f7_a_decided_unclosed_lock_is_not_reclaimed() {
+        let _ = env_logger::try_init();
+        let address = &crate::utils::test_port::unique_localhost_addr();
+        let group = "txn_model_check_f7";
+        let server = start_lease_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell = Id::allocated(0, 0, 9511);
+        let version = seed_cell_version(&runtime, schema.vid.get(), cell, 5, 0);
+        let decided = test_hlc(1, 9511);
+        let write = |expectation| PrepareOp {
+            id: cell,
+            expectation,
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                9511,
+                &decided,
+                vec![write(CellExpectation::Present(version))]
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &decided,
+                vec![CommitOp::Update(counter_cell(schema.vid.get(), cell, 50, "decided"))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        // The close was refused and its retraction is not durable
+        // (`CommitRefusal::Unresolved`): decided, not closed.
+        manager.txns.get(&decided).unwrap().lock().decided_commit = true;
+        manager.cell_meta_for_test(&cell).lock().lock_acquired_at =
+            Some(get_time() - LOCK_TIMEOUT_MS - 1_000);
+        let later = test_hlc(2, 9512);
+        let prepare = prepare_ops_local(
+            &manager,
+            9512,
+            &later,
+            vec![write(CellExpectation::Present(version + 1))],
+        )
+        .await;
+        let owner = owner_of(&manager, &cell);
+        server.shutdown().await;
+        assert_ne!(prepare, DMPrepareResult::Success);
+        assert_eq!(
+            owner,
+            Some(TxnPriority::new(decided.clone(), 9511)),
+            "a stale reclaim took the lock of a decided transaction whose close is not done"
+        );
+    }
+
 }
 
 impl Service for DataManager {
