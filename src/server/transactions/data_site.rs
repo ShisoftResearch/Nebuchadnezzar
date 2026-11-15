@@ -712,6 +712,12 @@ service! {
     // Operator tool: decide one in-doubt transaction on this site, when a
     // participant is lost for good. See `ForceResolveResult`.
     rpc force_resolve(tid: TxnId, outcome: ForcedOutcome) -> DataSiteResponse<ForceResolveResult>;
+
+    // The end of a read-only transaction that read 2 or more cells (TLA+
+    // OccCommit F4): each read cell has no lock owner and still holds the
+    // version that was read. `Wait` while a transaction holds a cell,
+    // `NotRealizable` if a cell changed, else `Success`.
+    rpc validate_reads(clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -1048,6 +1054,44 @@ impl DataManager {
             return Err(WriteError::CellInTransaction);
         }
         write()
+    }
+
+    /// Validate the reads of a read-only transaction at its end (TLA+
+    /// OccCommit F4, `FixROValidate`).
+    ///
+    /// A read waits while a transaction holds its cell, but the reads of one
+    /// transaction happen at different times, so without this check a
+    /// read-only transaction can read one cell before a writer and another
+    /// cell after it. Each cell is checked at one instant: no other
+    /// transaction holds it, it is not in doubt, and its version is the one
+    /// that was read. All reads come before all checks, so if every check
+    /// passes, an instant exists at which every cell held the value read, and
+    /// no writer of these cells held a lock at that instant: the reads are
+    /// one serial point. The checks need no lock between cells.
+    fn validate_reads_now(&self, tid: &TxnId, ops: &[PrepareOp]) -> DMPrepareResult {
+        let registry = self.chunks().txn_status();
+        for op in ops {
+            if self.slot_read_refusal(&op.id).is_some() {
+                return DMPrepareResult::NotRealizable;
+            }
+            if registry.is_in_doubt_cell(op.id.bits()) {
+                return DMPrepareResult::Wait;
+            }
+            let matches = match self.existing_cell_meta_mutex(&op.id) {
+                Some(meta) => {
+                    let meta = meta.lock();
+                    if meta.owner.as_ref().is_some_and(|owner| owner.tid != *tid) {
+                        return DMPrepareResult::Wait;
+                    }
+                    self.prepare_expectation_matches(op)
+                }
+                None => self.prepare_expectation_matches(op),
+            };
+            if !matches {
+                return DMPrepareResult::NotRealizable;
+            }
+        }
+        DMPrepareResult::Success
     }
 
     /// The index gate of `tid`, if this site holds the transaction.
@@ -10053,6 +10097,17 @@ impl Service for DataManager {
             self.response_with(result).await
         }
         .boxed()
+    }
+
+    fn validate_reads(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        ops: Vec<PrepareOp>,
+    ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
+        self.update_clock(clock);
+        let result = self.validate_reads_now(&tid, &ops);
+        self.response_with(result)
     }
 
     fn end(
