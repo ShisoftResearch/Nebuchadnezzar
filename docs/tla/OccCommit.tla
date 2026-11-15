@@ -1095,6 +1095,17 @@ NoLeftoverLocks == Quiescent =>
 \* F3: no apply runs on an object that a participant fenced.
 NoApplyAfterFence == \A s \in Sites, t \in Tids : ~obj[s][t].lf
 
+\* Sanity, violated on purpose: the sweep of fix B ended a Prepared write
+\* participant (it recorded Aborted and its object is gone) while the
+\* coordinator has not sent the apply to it yet -- the slow coordinator. The
+\* apply that comes later finds no object, so the coordinator cannot decide
+\* COMMIT (it decides only after every apply succeeded); `Atomic` and
+\* `NoLeftovers` of the shipped configs cover what follows.
+SanityStaleEndBeforeApply ==
+    ~\E s \in Sites, t \in Tids :
+        /\ s \in Part(t) /\ "Aborted" \in gdec[s][t] /\ obj[s][t].st = "none"
+        /\ pc[t] = "apply" /\ s \in pend[t]
+
 \* Sanity, violated on purpose: a read-only transaction that read 2 cells
 \* commits after its validation, and the system settles.
 SanityNoROCommit ==

@@ -325,6 +325,18 @@ Controls and sanity for the new fixes (each is violated on purpose):
 | `OccShippedNoROValidate.cfg` | shipped without F4 | `SerialAll` violated | 22,004 | 14 |
 | `OccROSkewFix.cfg` | `OccROSkew` with F4 only | no error | 10,809 | 30 |
 | `OccSanityRO.cfg` | a validated read-only transaction commits and the system settles | `SanityNoROCommit` violated | 647,931 | 21 |
+| `OccSanityStaleEnd.cfg` | fix B ends a Prepared write participant (no lease: it did not apply) while the slow coordinator has not sent it the apply | `SanityStaleEndBeforeApply` violated | 198 | 8 |
+
+Fix B and a slow coordinator: a participant becomes `Prepared` at its
+prepare and gets its writes and its leases only at the apply (`commit` RPC),
+so every `Prepared` write participant holds no lease. Its yes vote is the
+apply, not the prepare: the coordinator sends `end` (the decision) only
+after every apply answered Success (`sites_commit`). After fix B ended the
+object, a late apply finds it Aborted or gone and is refused, so the
+coordinator can never decide COMMIT for it. `OccSanityStaleEnd` shows that
+the model reaches this case; the `OccShipped*` configs, in which time is
+abstract (a coordinator can be slow beyond any bound), pass `Atomic` and
+`NoLeftovers` with it.
 
 The configs of the table above this section were checked again with the new
 constants (`PlainAtomic = TRUE`, `FixApplyFenced = FALSE`, `FixROValidate =
