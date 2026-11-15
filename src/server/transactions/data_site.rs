@@ -6008,7 +6008,11 @@ mod tests {
             <DataManager as Service>::end(&manager, tid, tid, false)
                 .await
                 .payload,
-            EndResult::CheckFailed(CheckError::AlreadyAborted)
+            if commit {
+                EndResult::Success
+            } else {
+                EndResult::CheckFailed(CheckError::AlreadyAborted)
+            }
         );
         if commit {
             for location in previous {
