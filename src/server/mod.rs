@@ -2571,10 +2571,32 @@ impl NebServer {
         // FlyWire connectome databases: after a SIGTERM restart the recently
         // written sidecar cells were unreadable while older, already-evicted
         // cells read fine.
+        //
+        // The map also holds the default runtime under its own name. Steps
+        // 0-1.6 already flushed, closed and archived it; a second flush here
+        // found its chunks closed and logged a refused head publish at every
+        // shutdown (triage 2026-11-17, D5).
         let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self.database_runtimes.load()
             .iter()
+            .filter(|(_, runtime)| !Arc::ptr_eq(runtime, &self.database_runtime))
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();
+        // Client writes stop for every other database before any of their
+        // trees is flushed, the same as step 0 does for the default. Without
+        // this a client (the Morpheus sidecar rebuild, Genoa phase 12) wrote
+        // after its database's flush and hub reset: the hub discarded the
+        // queued page writes, and a durable page could link to a page that
+        // never landed (model `ShutdownWriteBack.tla`, triage D4). The
+        // write-back's own page writes still go through until `close_writes`.
+        for (_, secondary_runtime) in &secondary_runtimes {
+            secondary_runtime.chunks().close_client_writes();
+        }
+        for (database_name, secondary_runtime) in &secondary_runtimes {
+            if secondary_runtime.indexer.is_some() {
+                let _ = secondary_runtime.await_index_tasks().await;
+                debug!("Index tasks of {database_name} drained before its flush");
+            }
+        }
         // Order matters and mirrors the default's steps exactly: flush every
         // tree FIRST, take the write-back barrier, and only then close and
         // archive the chunks. The first version of this block closed writes
