@@ -2748,10 +2748,11 @@ async fn a_secondary_database_written_during_shutdown_keeps_every_acked_index_en
                 let mut cell = OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &id, value);
                 match dynamic.chunks().write_cell(&mut cell) {
                     Ok(_) => acked += 1,
-                    Err(_) => {
+                    Err(crate::ram::cell::WriteError::ServerShuttingDown) => {
                         refused = true;
                         break;
                     }
+                    Err(other) => panic!("write {index} failed before the shutdown: {other:?}"),
                 }
             }
             (acked, refused)
