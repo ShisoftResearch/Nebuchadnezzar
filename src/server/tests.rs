@@ -2725,7 +2725,9 @@ async fn a_secondary_database_written_during_shutdown_keeps_every_acked_index_en
         .expect("dynamic database should load");
     dynamic.meta().schemas.register_internal_schema(schema());
 
-    // The writer runs until the store refuses it (at most 400,000 cells).
+    // The writer runs until the store refuses it, so its writes overlap the
+    // whole shutdown of the database (a run whose writer stopped for another
+    // reason proves nothing and fails below).
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = tokio::runtime::Handle::current();
     let writer = std::thread::spawn({
@@ -2735,7 +2737,8 @@ async fn a_secondary_database_written_during_shutdown_keeps_every_acked_index_en
             // The index inserts of a write are spawned onto the runtime.
             let _runtime = handle.enter();
             let mut acked = 0u64;
-            for index in 0..400_000u64 {
+            let mut refused = false;
+            for index in 0u64.. {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
@@ -2745,16 +2748,24 @@ async fn a_secondary_database_written_during_shutdown_keeps_every_acked_index_en
                 let mut cell = OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &id, value);
                 match dynamic.chunks().write_cell(&mut cell) {
                     Ok(_) => acked += 1,
-                    Err(_) => break,
+                    Err(_) => {
+                        refused = true;
+                        break;
+                    }
                 }
             }
-            acked
+            (acked, refused)
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     server.shutdown().await;
     stop.store(true, std::sync::atomic::Ordering::Release);
-    let acked = writer.join().expect("writer");
+    let (acked, refused) = writer.join().expect("writer");
+    assert!(
+        refused,
+        "the writer stopped before the store refused it ({acked} cells): the run did not \
+         overlap the shutdown"
+    );
     drop(dynamic);
     drop(server);
 
