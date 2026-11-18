@@ -441,3 +441,36 @@ default), a crash needs no record (`IndexRepairShipped` has the crash on).
 The worker only inserts; a stale entry stays until the full scrub prunes it,
 and a query drops it when it reads the candidate cell. Not modelled:
 concurrent plain writes of one cell, which can reorder their index tasks.
+
+## `ShutdownWriteBack.tla` — client writes and the index write-back at shutdown
+
+The graceful shutdown of one database and its ranged-index write-back
+(triage 2026-11-17, D4). The flush takes the write-back barrier, publishes
+the tree heads, drains again and resets the hub; the reset discards what is
+still queued. Before `fix/shutdown-close-first` only the default database
+closed its client writes before the flush. The loop for the other loaded
+databases closed writes after the flush, so a client write (the Morpheus
+sidecar rebuild on Genoa) landed after the hub reset: its index entry was
+lost, and after a split a durable page could link to a page that never
+landed. The fix closes the client writes of every database, and drains its
+index tasks, before any flush of the loop. The loop also skips the default
+database, which steps 0-1.6 already flushed and archived.
+
+Mapping: `CLOSE_CLIENTS_FIRST` = `close_client_writes` before the flush
+(`NebServer::shutdown`, step 0 and step 1.7); `Publish` = the barrier and
+`publish_head` in `flush_all_trees`; `Reset` = `WriteBackHub::reset`;
+`Close` = `close_writes` + `archive_all`. Pages land in any order and as
+they are now (coalesced dirty pages).
+
+| config | expected | result | distinct states | depth |
+|---|---|---|---|---|
+| `ShutdownWriteBackShipped.cfg` | pass (`NoMissingPage`, `IndexCoversCells`) | no error | 59 | 11 |
+| `ShutdownWriteBackControlIndex.cfg` | the code before: an acked entry is lost | `IndexCoversCells` violated | 103 | 9 |
+| `ShutdownWriteBackControlPage.cfg` | the code before: a page links to a page that never landed | `NoMissingPage` violated | 133 | 11 |
+| `ShutdownWriteBackSanity.cfg` | violated on purpose | violated | 115 | 10 |
+
+Test: `server::tests::a_secondary_database_written_during_shutdown_keeps_every_acked_index_entry`
+writes to a secondary database during the shutdown and checks, with the
+recovery scrub off, that every acknowledged cell scans after the restart.
+Before the fix: 3 of 3 runs failed (255,164 of 345,138; 340,845 of 359,131;
+358,090 of 400,000 entries). After the fix: 3 of 3 runs passed.

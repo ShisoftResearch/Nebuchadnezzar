@@ -2656,6 +2656,138 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     server.shutdown().await;
 }
 
+/// A client that keeps writing to a secondary database while the server
+/// shuts down. Every write the store acknowledged must keep its ranged
+/// index entry across the restart, with the recovery scrub OFF: the scrub
+/// repairs lost entries, so it would hide the defect (64 s per start at
+/// 15.9 M cells on Genoa).
+///
+/// Before the fix the loop for the other databases closed their client
+/// writes only after their tree flush and hub reset: an acknowledged write
+/// that landed after the flush lost its entry (Genoa phase 12: "write-back
+/// reset DISCARDED 270 queued page write(s)", then 730 entries repaired).
+/// Model: `docs/tla/ShutdownWriteBack.tla`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secondary_database_written_during_shutdown_keeps_every_acked_index_entry() {
+    let _ = env_logger::try_init();
+    // SAFETY: the isolated runner gives each test its own process.
+    unsafe { std::env::set_var("NEB_SCRUB_ON_RECOVERY", "off") };
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: true,
+        services: vec![Service::Cell, Service::RangedIndexer],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "secondary_write_during_shutdown_group";
+    const SCHEMA_ID: u32 = 9190;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA_ID,
+            "secondary_write_during_shutdown_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true,
+        )
+    };
+    async fn scan_count(runtime: &Arc<DatabaseRuntime>) -> usize {
+        let mut count = 0usize;
+        let Some(mut cursor) = runtime
+            .neb_client
+            .ranged()
+            .scan_schema(SchemaUid(SCHEMA_ID), 256, crate::index::verification::Verify::Predicate)
+            .await
+            .expect("scan should not error")
+        else {
+            return 0;
+        };
+        while let Ok(Some(_)) = cursor.next().await {
+            count += 1;
+        }
+        count
+    }
+
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+        .await
+        .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/during_shutdown")
+        .await
+        .expect("dynamic database should load");
+    dynamic.meta().schemas.register_internal_schema(schema());
+
+    // The writer runs until the store refuses it, so its writes overlap the
+    // whole shutdown of the database (a run whose writer stopped for another
+    // reason proves nothing and fails below).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = tokio::runtime::Handle::current();
+    let writer = std::thread::spawn({
+        let dynamic = dynamic.clone();
+        let stop = stop.clone();
+        move || {
+            // The index inserts of a write are spawned onto the runtime.
+            let _runtime = handle.enter();
+            let mut acked = 0u64;
+            let mut refused = false;
+            for index in 0u64.. {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value["DATA"] = OwnedValue::U64(index);
+                let id = Id::allocated((index % 4) as u16, 19, index + 1);
+                let mut cell = OwnedCell::new_with_id(SchemaVid(SCHEMA_ID), &id, value);
+                match dynamic.chunks().write_cell(&mut cell) {
+                    Ok(_) => acked += 1,
+                    Err(crate::ram::cell::WriteError::ServerShuttingDown) => {
+                        refused = true;
+                        break;
+                    }
+                    Err(other) => panic!("write {index} failed before the shutdown: {other:?}"),
+                }
+            }
+            (acked, refused)
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    server.shutdown().await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (acked, refused) = writer.join().expect("writer");
+    assert!(
+        refused,
+        "the writer stopped before the store refused it ({acked} cells): the run did not \
+         overlap the shutdown"
+    );
+    drop(dynamic);
+    drop(server);
+
+    let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+        .await
+        .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/during_shutdown")
+        .await
+        .expect("dynamic database should reload");
+    dynamic.meta().schemas.register_internal_schema(schema());
+    let recovered = scan_count(&dynamic).await;
+    eprintln!("SHUTDOWN-WRITES acked {acked} cells, the index holds {recovered} after the restart");
+    assert_eq!(
+        recovered, acked as usize,
+        "acknowledged writes lost their index entries across a graceful restart: \
+         {recovered} of {acked}"
+    );
+    server.shutdown().await;
+}
+
 /// A page whose keys were ALL deleted persists with zero keys -- that write
 /// is what makes its tombstones durable -- so a run of empty pages inside
 /// the persisted chain is a legal on-disk state. Reconstruction used to feed
